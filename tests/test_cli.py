@@ -61,3 +61,54 @@ def test_main_invalid_config_returns_error(capsys):
     out = capsys.readouterr().out
     assert code == 2
     assert "error:" in out
+
+
+# --- real delivery mode -----------------------------------------------------
+
+
+def _deliver_args(tmp_path, *extra):
+    return [
+        "Health endpoint",
+        "Add a /health endpoint",
+        "--deliver",
+        "--workspace",
+        str(tmp_path),
+        "--no-commit",
+        "--verify-command",
+        "python -c pass",
+        *extra,
+    ]
+
+
+def test_main_deliver_text_output(tmp_path, capsys):
+    from helpers import engine_responses
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(_deliver_args(tmp_path), runner=runner)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "SUCCESS" in out
+    # QA's authored test file was really written into the workspace
+    assert (tmp_path / "tests" / "test_x.py").exists()
+
+
+def test_main_deliver_json_output(tmp_path, capsys):
+    from helpers import engine_responses
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(_deliver_args(tmp_path, "--json"), runner=runner)
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["success"] is True
+    assert payload["committed"] is False
+    assert "tests/test_x.py" in payload["workspace_files"]
+
+
+def test_main_deliver_failure_exit_code(tmp_path, capsys):
+    from helpers import engine_responses
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses(review=False))
+    code = main(_deliver_args(tmp_path, "--max-attempts", "1"), runner=runner)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "INCOMPLETE" in out

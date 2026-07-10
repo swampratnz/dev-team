@@ -5,12 +5,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shlex
 from typing import List, Optional
 
+from .budget import Budget
 from .config import TeamConfig
+from .engine import EngineConfig
 from .errors import DevTeamError
 from .events import AgentEvent
-from .report import render_summary, result_to_dict
+from .execution import LocalWorkspace
+from .models import FeatureRequest
+from .report import (
+    delivery_to_dict,
+    render_delivery_summary,
+    render_summary,
+    result_to_dict,
+)
 from .sdk import AgentRunner
 from .team import DevTeam
 
@@ -47,7 +57,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-coverage",
         type=float,
         default=100.0,
-        help="Minimum test coverage QA must report to pass a task.",
+        help="Minimum test coverage QA must report to pass a task (simulation mode).",
+    )
+    parser.add_argument(
+        "--deliver",
+        action="store_true",
+        help="Run the real delivery engine (writes files, runs gates, commits) "
+        "instead of the side-effect-free simulation.",
+    )
+    parser.add_argument(
+        "--workspace",
+        default="./build",
+        metavar="DIR",
+        help="Directory the delivery engine works in (with --deliver).",
+    )
+    parser.add_argument(
+        "--verify-command",
+        default="pytest -q",
+        metavar="CMD",
+        help="Quality-gate command run in the workspace (with --deliver).",
+    )
+    parser.add_argument(
+        "--budget-usd",
+        type=float,
+        default=None,
+        metavar="USD",
+        help="Cost ceiling for the run; the run stops gracefully when reached.",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=4,
+        help="How many independent tasks may be implemented at once (with --deliver).",
+    )
+    parser.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="Do not git-commit the delivered work (with --deliver).",
     )
     parser.add_argument(
         "--json",
@@ -79,6 +125,33 @@ def _run(argv: Optional[List[str]], runner: Optional[AgentRunner]) -> int:
             print(str(event))
 
     team = DevTeam(runner, config=config, listener=listener)
+
+    if args.deliver:
+        request = FeatureRequest(
+            title=args.title,
+            description=args.description,
+            constraints=list(args.constraints),
+        )
+        outcome = asyncio.run(
+            team.deliver(
+                request,
+                workspace=LocalWorkspace(args.workspace),
+                budget=Budget(limit_usd=args.budget_usd),
+                config=EngineConfig(
+                    model=args.model,
+                    max_task_attempts=args.max_attempts,
+                    max_concurrency=args.max_concurrency,
+                    verify_command=tuple(shlex.split(args.verify_command)),
+                    commit=not args.no_commit,
+                ),
+            )
+        )
+        if args.json:
+            print(json.dumps(delivery_to_dict(outcome), indent=2))
+        else:
+            print(render_delivery_summary(outcome))
+        return 0 if outcome.success else 1
+
     result = asyncio.run(team.develop_feature(args.title, args.description, args.constraints))
 
     if args.json:

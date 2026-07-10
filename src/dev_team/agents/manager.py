@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from .. import parsing
 from ..models import FeatureRequest, Plan
 from .base import BaseAgent
@@ -20,13 +22,28 @@ class ProductManagerAgent(BaseAgent):
     stage = "planning"
     system_prompt = _SYSTEM
 
-    async def create_plan(self, request: FeatureRequest) -> Plan:
-        """Produce a task breakdown for ``request``."""
+    async def create_plan(
+        self,
+        request: FeatureRequest,
+        *,
+        prior_context: Optional[str] = None,
+    ) -> Plan:
+        """Produce a task breakdown for ``request``.
+
+        ``prior_context`` carries what the team remembers from earlier runs on
+        this workspace (decisions, artifacts), so planning builds on existing
+        work instead of starting amnesiac.
+        """
 
         constraints = (
             "\n".join(f"- {c}" for c in request.constraints)
             if request.constraints
             else "- none"
+        )
+        memory = (
+            f"\nContext from previous runs on this workspace:\n{prior_context}\n"
+            if prior_context
+            else ""
         )
         prompt = f"""\
 Break the following feature request into engineering tasks.
@@ -37,7 +54,7 @@ Description:
 
 Constraints:
 {constraints}
-
+{memory}
 Respond with JSON of the form:
 {{
   "summary": "one paragraph plan summary",

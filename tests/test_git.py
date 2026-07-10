@@ -69,3 +69,42 @@ def test_unchecked_command_does_not_raise():
     # _git with check=False should return the failed result rather than raise.
     result = GitRepo(runner)._git("status", check=False)
     assert result.exit_code == 1
+
+
+def test_is_repo_true_and_false():
+    cmd = FakeCommandRunner()
+    cmd.add_rule("rev-parse --is-inside-work-tree", CommandResult(["git"], 0, "true\n", ""))
+    assert GitRepo(cmd).is_repo() is True
+    assert GitRepo(FakeCommandRunner()).is_repo() is False
+
+
+def test_ensure_repo_initialises_and_sets_identity():
+    cmd = FakeCommandRunner()
+    GitRepo(cmd).ensure_repo()
+    assert ["git", "init"] in cmd.calls
+    assert ["git", "config", "user.name", "dev-team"] in cmd.calls
+    assert ["git", "config", "user.email", "dev-team@localhost"] in cmd.calls
+
+
+def test_ensure_repo_skips_existing_repo_and_identity():
+    cmd = FakeCommandRunner()
+    cmd.add_rule("rev-parse --is-inside-work-tree", CommandResult(["git"], 0, "true", ""))
+    cmd.add_rule("config user.name", CommandResult(["git"], 0, "someone", ""))
+    GitRepo(cmd).ensure_repo()
+    assert ["git", "init"] not in cmd.calls
+    # name already configured -> untouched; email missing -> set
+    assert ["git", "config", "user.name", "dev-team"] not in cmd.calls
+    assert ["git", "config", "user.email", "dev-team@localhost"] in cmd.calls
+
+
+def test_diff_returns_patch():
+    cmd = FakeCommandRunner()
+    cmd.add_rule("diff HEAD", CommandResult(["git"], 0, "the-patch", ""))
+    assert GitRepo(cmd).diff() == "the-patch"
+
+
+def test_discard_changes_resets_and_cleans():
+    cmd = FakeCommandRunner()
+    GitRepo(cmd).discard_changes()
+    assert ["git", "reset", "--hard"] in cmd.calls
+    assert ["git", "clean", "-fd"] in cmd.calls

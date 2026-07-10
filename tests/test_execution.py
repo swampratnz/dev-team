@@ -141,3 +141,13 @@ def test_fake_runner_rules_and_default():
 def test_fake_runner_custom_default_exit():
     runner = FakeCommandRunner(default_exit_code=1)
     assert runner.run(["anything"]).exit_code == 1
+
+
+def test_dry_run_command_runner_is_honest():
+    from dev_team.execution import DryRunCommandRunner
+
+    runner = DryRunCommandRunner()
+    result = runner.run(["pytest", "-q"])
+    assert result.ok
+    assert "not executed" in result.stdout
+    assert runner.calls == [["pytest", "-q"]]

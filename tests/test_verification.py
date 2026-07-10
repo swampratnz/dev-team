@@ -87,3 +87,22 @@ def test_definition_of_done_some_fail():
 def test_definition_of_done_empty_is_not_passed():
     report = DefinitionOfDone().evaluate(_ctx(FakeCommandRunner()))
     assert report.passed is False
+
+
+def test_coverage_gate_prefers_total_line():
+    # A stray percentage after the TOTAL row must not win.
+    output = "TOTAL    120   6   95%\nwarning: 3% of runs were slow"
+    runner = FakeCommandRunner().add_rule("cov", CommandResult(["cov"], 0, output, ""))
+    gate = CoverageGate("coverage", ["cov"], minimum=90.0)
+    result = gate.evaluate(GateContext(runner=runner))
+    assert result.passed is True
+    assert "95.0%" in result.detail
+
+
+def test_coverage_gate_total_line_without_percent_falls_back():
+    output = "TOTAL row pending\ncoverage: 88%"
+    runner = FakeCommandRunner().add_rule("cov", CommandResult(["cov"], 0, output, ""))
+    gate = CoverageGate("coverage", ["cov"], minimum=90.0)
+    result = gate.evaluate(GateContext(runner=runner))
+    assert result.passed is False
+    assert "88.0%" in result.detail

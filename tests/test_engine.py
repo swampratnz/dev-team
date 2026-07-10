@@ -3,17 +3,28 @@
 from __future__ import annotations
 
 import pytest
-from helpers import engine_responses, run
+from helpers import engine_responses, qa_suite_dict, run
 
+from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.budget import Budget
 from dev_team.engine import (
     DeliveryEngine,
     DeliveryOutcome,
     EngineConfig,
     _dod_to_test_report,
+    _prior_context,
     _review_from_dod,
 )
-from dev_team.execution import CommandResult, FakeCommandRunner, InMemoryWorkspace
+from dev_team.execution import (
+    CommandResult,
+    DryRunCommandRunner,
+    FakeCommandRunner,
+    InMemoryWorkspace,
+    LocalWorkspace,
+    SubprocessCommandRunner,
+)
+from dev_team.git import GitRepo
+from dev_team.memory import CheckpointStore
 from dev_team.models import Design, FeatureRequest, TaskStatus
 from dev_team.sdk import AgentResult
 from dev_team.testing import ScriptedRunner, json_response
@@ -37,12 +48,16 @@ class KeyedQueueRunner:
         self.mapping = {k: list(v) for k, v in mapping.items()}
         self.calls = []
 
-    async def run(self, prompt, *, system_prompt=None, allowed_tools=None, model=None):
-        self.calls.append(prompt)
+    async def run(
+        self, prompt, *, system_prompt=None, allowed_tools=None, model=None, cwd=None
+    ):
+        self.calls.append({"prompt": prompt, "model": model, "cwd": cwd})
         for key, queue in self.mapping.items():
             if system_prompt and key in system_prompt:
-                text = queue.pop(0) if len(queue) > 1 else queue[0]
-                return AgentResult(text=text, num_turns=1)
+                item = queue.pop(0) if len(queue) > 1 else queue[0]
+                if isinstance(item, AgentResult):
+                    return item
+                return AgentResult(text=item, num_turns=1)
         raise AssertionError(f"no queued response for {system_prompt!r}")
 
 
@@ -86,15 +101,31 @@ def test_deliver_happy_path():
     assert outcome.success is True
     assert outcome.tasks_complete is True
     assert outcome.task_results[0].task.status is TaskStatus.DONE
-    assert ws.list_files() == ["src/x.py"]  # engineer's file was written for real
+    # engineer's file and QA's test file were written for real
+    assert "src/x.py" in ws.list_files()
+    assert "tests/test_x.py" in ws.list_files()
+    # internal bookkeeping is kept out of the reported product files
+    assert outcome.workspace_files == ["src/x.py", "tests/test_x.py"]
     assert outcome.security.approved is True
     assert outcome.documentation is not None
     assert outcome.reliability.production_ready is True
     assert outcome.deployment is not None
     assert outcome.blackboard.decisions[0].id == "ADR-001"
     assert outcome.budget.meter.call_count > 0
-    # git add + commit ran through the guarded runner
-    assert ["git", "add", "-A"] in cmd.calls
+    assert outcome.budget_exhausted is False
+    # cross-run memory was persisted
+    assert ws.exists(".dev_team/memory.json")
+
+
+def test_deliver_reviewer_sees_actual_file_content():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner)
+    run(engine.deliver(_request()))
+    review_calls = [
+        c for c in runner.calls if "code reviewer" in (c["system_prompt"] or "")
+    ]
+    # the applied file content (x = 1) is in the review prompt, not just paths
+    assert any("x = 1" in c["prompt"] for c in review_calls)
 
 
 def test_deliver_review_reject_then_approve():
@@ -104,6 +135,7 @@ def test_deliver_review_reject_then_approve():
             "software architect": [json_response(__design())],
             "senior software engineer": [json_response(__impl())],
             "code reviewer": [json_response(__review(False)), json_response(__review(True))],
+            "quality assurance engineer": [json_response(qa_suite_dict())],
             "application security engineer": [json_response(__security())],
             "technical writer": [json_response(__docs())],
             "site reliability engineer": [json_response(__rel())],
@@ -117,6 +149,17 @@ def test_deliver_review_reject_then_approve():
     assert outcome.task_results[0].attempts == 2
 
 
+def test_deliver_rejected_attempt_is_rolled_back():
+    responses = engine_responses(review=False)
+    runner = ScriptedRunner(by_system_prompt=responses)
+    ws = InMemoryWorkspace({"src/x.py": "original"})
+    engine = _engine(runner, workspace=ws, config=EngineConfig(max_task_attempts=1))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is False
+    # the failed attempt's write was rolled back to the pre-existing content
+    assert ws.read_text("src/x.py") == "original"
+
+
 def test_deliver_gates_fail_then_pass():
     runner = ScriptedRunner(by_system_prompt=engine_responses())
     cmd = SeqCommandRunner(
@@ -126,6 +169,20 @@ def test_deliver_gates_fail_then_pass():
     outcome = run(engine.deliver(_request()))
     assert outcome.success is True
     assert outcome.task_results[0].attempts == 2
+
+
+def test_deliver_gate_failure_rolls_back_tests_too():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    cmd = SeqCommandRunner([CommandResult(["pytest"], 1, "", "fail")])
+    ws = InMemoryWorkspace()
+    engine = _engine(
+        runner, workspace=ws, command_runner=cmd, config=EngineConfig(max_task_attempts=1)
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is False
+    # both the implementation and QA's test file were rolled back
+    assert "src/x.py" not in ws.list_files()
+    assert "tests/test_x.py" not in ws.list_files()
 
 
 def test_deliver_task_fails_when_review_never_approves():
@@ -158,20 +215,84 @@ def test_deliver_cascade_skip():
     assert skipped.implementation is None
 
 
-def test_deliver_without_commit_skips_git():
+def test_deliver_qa_stage_can_be_disabled():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    ws = InMemoryWorkspace()
+    engine = _engine(runner, workspace=ws, config=EngineConfig(qa_tests=False))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert "tests/test_x.py" not in ws.list_files()
+
+
+# --- commit behaviour ----------------------------------------------------
+
+
+def _git_with_changes(cmd):
+    cmd.add_rule("status --porcelain", CommandResult(["git"], 0, "M  src/x.py", ""))
+    return GitRepo(cmd)
+
+
+def test_deliver_commits_once_after_security_approval():
     runner = ScriptedRunner(by_system_prompt=engine_responses())
     cmd = FakeCommandRunner()
-    engine = _engine(runner, command_runner=cmd, config=EngineConfig(commit=False))
-    run(engine.deliver(_request()))
-    assert not any(c[:2] == ["git", "commit"] for c in cmd.calls)
+    engine = _engine(runner, git=_git_with_changes(cmd))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.committed is True
+    commits = [c for c in cmd.calls if c[:2] == ["git", "commit"]]
+    assert len(commits) == 1
+    assert "T1" in commits[0][-1]
 
 
-def test_deliver_security_block_fails_success():
+def test_deliver_security_block_prevents_commit():
     runner = ScriptedRunner(by_system_prompt=engine_responses(security=False))
-    outcome = run(_engine(runner).deliver(_request()))
+    cmd = FakeCommandRunner()
+    engine = _engine(runner, git=_git_with_changes(cmd))
+    outcome = run(engine.deliver(_request()))
     assert outcome.tasks_complete is True
     assert outcome.security.approved is False
     assert outcome.success is False
+    assert outcome.committed is False
+    assert not any(c[:2] == ["git", "commit"] for c in cmd.calls)
+
+
+def test_deliver_without_commit_skips_git():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        runner, git=_git_with_changes(cmd), config=EngineConfig(commit=False)
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.committed is False
+    assert not any(c[:2] == ["git", "commit"] for c in cmd.calls)
+
+
+def test_deliver_no_commit_when_nothing_changed():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    cmd = FakeCommandRunner()  # status --porcelain returns empty -> no changes
+    engine = _engine(runner, git=GitRepo(cmd))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.committed is False
+
+
+def test_deliver_commit_failure_is_contained():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    cmd = FakeCommandRunner()
+    cmd.add_rule("status --porcelain", CommandResult(["git"], 0, "M  src/x.py", ""))
+    cmd.add_rule("commit", CommandResult(["git"], 1, "", "boom"))
+    engine = _engine(runner, git=GitRepo(cmd))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.committed is False
+    assert outcome.tasks_complete is True  # the run itself is not sunk
+
+
+def test_deliver_no_commit_without_git_or_root():
+    # In-memory workspace, no injected GitRepo: there is nowhere to commit.
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    cmd = FakeCommandRunner()
+    engine = _engine(runner, command_runner=cmd)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.committed is False
+    assert not any(c and c[0] == "git" for c in cmd.calls)
 
 
 def test_deliver_reliability_block_fails_success():
@@ -181,21 +302,343 @@ def test_deliver_reliability_block_fails_success():
     assert outcome.success is False
 
 
-# --- config & pure helpers ---------------------------------------------
+# --- budget behaviour -----------------------------------------------------
 
 
-@pytest.mark.parametrize("kwargs", [{"max_task_attempts": 0}, {"max_concurrency": 0}])
+def _costly(payload, cost):
+    return AgentResult(text=json_response(payload), cost_usd=cost, num_turns=1)
+
+
+def test_deliver_budget_exhaustion_stops_gracefully():
+    plan = {
+        "summary": "s",
+        "tasks": [
+            {"id": "T1", "title": "a", "description": "", "dependencies": []},
+            {"id": "T2", "title": "b", "description": "", "dependencies": []},
+        ],
+    }
+    mapping = {
+        "product manager": [json_response(plan)],
+        "software architect": [json_response(__design())],
+        # the first engineer call blows the budget
+        "senior software engineer": [_costly(__impl(), 100.0)],
+    }
+    runner = KeyedQueueRunner(mapping)
+    engine = _engine(
+        runner,
+        budget=Budget(limit_usd=50.0),
+        config=EngineConfig(max_concurrency=1),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.budget_exhausted is True
+    assert outcome.success is False
+    # both tasks failed: one mid-flight, one fast-failed before starting
+    assert all(tr.task.status is TaskStatus.FAILED for tr in outcome.task_results)
+    # specialist stages were skipped gracefully instead of crashing the run
+    assert outcome.security is None
+    assert outcome.documentation is None
+    assert outcome.deployment is None
+    assert outcome.committed is False
+
+
+def test_deliver_budget_death_mid_integration_rolls_back():
+    mapping = {
+        "product manager": [json_response(__plan())],
+        "software architect": [json_response(__design())],
+        "senior software engineer": [json_response(__impl())],
+        "code reviewer": [json_response(__review(True))],
+        # QA's call blows the budget after the implementation was applied
+        "quality assurance engineer": [_costly(qa_suite_dict(), 100.0)],
+    }
+    runner = KeyedQueueRunner(mapping)
+    ws = InMemoryWorkspace()
+    engine = _engine(runner, workspace=ws, budget=Budget(limit_usd=50.0))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.budget_exhausted is True
+    # the applied-but-unverified implementation was rolled back
+    assert "a.py" not in ws.list_files()
+
+
+# --- checkpoint / resume --------------------------------------------------
+
+
+def _two_task_plan():
+    return {
+        "summary": "s",
+        "tasks": [
+            {"id": "T1", "title": "first", "description": "", "dependencies": []},
+            {"id": "T2", "title": "second", "description": "", "dependencies": ["T1"]},
+        ],
+    }
+
+
+def test_deliver_resumes_from_checkpoint():
+    ws = InMemoryWorkspace()
+
+    # Run 1: T1 passes review, T2 is rejected -> run incomplete, checkpoint kept.
+    mapping = {
+        "product manager": [json_response(_two_task_plan())],
+        "software architect": [json_response(__design())],
+        "senior software engineer": [json_response(__impl())],
+        "code reviewer": [json_response(__review(True)), json_response(__review(False))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    engine1 = _engine(
+        KeyedQueueRunner(mapping), workspace=ws, config=EngineConfig(max_task_attempts=1)
+    )
+    first = run(engine1.deliver(_request()))
+    assert first.success is False
+    assert ws.exists(".dev_team/checkpoint.json")
+
+    # Run 2: T1 is restored from the checkpoint; only T2 is developed.
+    mapping2 = {
+        "product manager": [json_response(_two_task_plan())],
+        "software architect": [json_response(__design())],
+        "senior software engineer": [json_response(__impl())],
+        "code reviewer": [json_response(__review(True))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    runner2 = KeyedQueueRunner(mapping2)
+    engine2 = _engine(runner2, workspace=ws)
+    second = run(engine2.deliver(_request()))
+    assert second.success is True
+    assert second.resumed_task_ids == ["T1"]
+    engineer_prompts = [
+        c["prompt"] for c in runner2.calls if "Implement the following task" in c["prompt"]
+    ]
+    assert len(engineer_prompts) == 1 and "Task T2" in engineer_prompts[0]
+    # full success clears the checkpoint
+    assert not ws.exists(".dev_team/checkpoint.json")
+    # run 2's planner saw the memory persisted by run 1
+    pm_call = runner2.calls[0]
+    assert "previous runs" in pm_call["prompt"]
+
+
+def test_deliver_resume_disabled_keeps_no_checkpoint():
+    ws = InMemoryWorkspace()
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws, config=EngineConfig(resume=False))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert not ws.exists(".dev_team/checkpoint.json")
+
+
+def test_record_progress_guards():
+    engine = _engine(ScriptedRunner([]))
+    task = next(iter([]), None)
+    # no checkpoint loaded -> no-op
+    engine._checkpoint = None
+    engine._record_progress(task)
+    # checkpoint set but store removed -> no-op
+    from dev_team.memory import RunCheckpoint
+
+    engine._checkpoint = RunCheckpoint(feature_title="F")
+    engine.checkpoints = None
+    engine._record_progress(task)
+    assert engine._checkpoint.done_task_ids == []
+
+
+# --- backlog wiring -------------------------------------------------------
+
+
+def test_deliver_updates_backlog():
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws, backlog_store=store)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    backlog = store.load()
+    assert backlog.epics[0].title == "Login"
+    assert backlog.stories[0].status is ItemStatus.DONE
+
+
+def test_deliver_backlog_marks_failures_blocked():
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    runner = ScriptedRunner(by_system_prompt=engine_responses(review=False))
+    engine = _engine(
+        runner, workspace=ws, backlog_store=store, config=EngineConfig(max_task_attempts=1)
+    )
+    run(engine.deliver(_request()))
+    assert store.load().stories[0].status is ItemStatus.BLOCKED
+
+
+# --- model routing --------------------------------------------------------
+
+
+def test_role_models_route_per_agent():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner, config=EngineConfig(model="base", role_models={"reviewer": "cheap"})
+    )
+    run(engine.deliver(_request()))
+    by_role = {}
+    for call in runner.calls:
+        sp = call["system_prompt"] or ""
+        if "code reviewer" in sp:
+            by_role.setdefault("reviewer", call["model"])
+        elif "product manager" in sp:
+            by_role.setdefault("manager", call["model"])
+    assert by_role == {"reviewer": "cheap", "manager": "base"}
+
+
+def test_escalation_model_used_on_final_attempt():
+    mapping = {
+        "product manager": [json_response(__plan())],
+        "software architect": [json_response(__design())],
+        "senior software engineer": [json_response(__impl())],
+        "code reviewer": [json_response(__review(False)), json_response(__review(True))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    runner = KeyedQueueRunner(mapping)
+    engine = _engine(
+        runner,
+        config=EngineConfig(max_task_attempts=2, escalation_model="smart"),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    engineer_models = [
+        c["model"] for c in runner.calls if "Implement the following task" in c["prompt"]
+    ]
+    assert engineer_models == [None, "smart"]
+
+
+# --- agentic mode ---------------------------------------------------------
+
+
+def test_agentic_mode_engineer_works_in_workspace_root(tmp_path):
+    ws = LocalWorkspace(str(tmp_path))
+
+    class AgenticRunner(KeyedQueueRunner):
+        """Engineer 'does the work': writes the file as a tool side effect."""
+
+        async def run(self, prompt, *, system_prompt=None, **kwargs):
+            if system_prompt and "senior software engineer" in system_prompt:
+                (tmp_path / "src").mkdir(exist_ok=True)
+                (tmp_path / "src" / "x.py").write_text("x = 1\n")
+            return await super().run(prompt, system_prompt=system_prompt, **kwargs)
+
+    inplace_impl = {
+        "summary": "impl",
+        "files": [{"path": "src/x.py", "change_type": "create", "summary": "adds x"}],
+        "notes": "",
+    }
+    mapping = {
+        "product manager": [json_response(__plan())],
+        "software architect": [json_response(__design())],
+        "senior software engineer": [json_response(inplace_impl)],
+        "code reviewer": [json_response(__review(True))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    runner = AgenticRunner(mapping)
+    cmd = FakeCommandRunner()
+    cmd.add_rule("status --porcelain", CommandResult(["git"], 0, "M  src/x.py", ""))
+    engine = _engine(runner, workspace=ws, command_runner=cmd)
+    assert engine.agentic is True
+
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert outcome.committed is True
+    # a baseline commit happened before any task ran (dirty pre-existing tree)
+    assert any("baseline" in " ".join(c) for c in cmd.calls if c[:2] == ["git", "commit"])
+    # the engineer call carried tools and the workspace root as cwd
+    eng_call = next(c for c in runner.calls if "in the current working directory" in c["prompt"])
+    assert eng_call["cwd"] == engine.workdir
+    # reviewer saw the real on-disk content
+    review_call = next(c for c in runner.calls if "Review this implementation" in c["prompt"])
+    assert "x = 1" in review_call["prompt"]
+
+
+def test_agentic_rejection_rolls_back_via_git(tmp_path):
+    ws = LocalWorkspace(str(tmp_path))
+    mapping = engine_responses(review=False)
+    # in-place implementation summary (content-free)
+    mapping["senior software engineer"] = json_response(
+        {"summary": "impl", "files": [{"path": "src/x.py", "change_type": "create", "summary": "s"}]}
+    )
+    runner = ScriptedRunner(by_system_prompt=mapping)
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        runner, workspace=ws, command_runner=cmd, config=EngineConfig(max_task_attempts=1)
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is False
+    # the failed attempt was rolled back through git
+    assert ["git", "reset", "--hard"] in cmd.calls
+    assert ["git", "clean", "-fd"] in cmd.calls
+
+
+def test_agentic_requires_workspace_root():
+    with pytest.raises(ValueError):
+        DeliveryEngine(
+            ScriptedRunner([]),
+            workspace=InMemoryWorkspace(),
+            command_runner=FakeCommandRunner(),
+            config=EngineConfig(agentic=True),
+        )
+
+
+def test_agentic_can_be_disabled_on_local_workspace(tmp_path):
+    engine = DeliveryEngine(
+        ScriptedRunner([]),
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(agentic=False),
+    )
+    assert engine.agentic is False
+
+
+# --- defaults & wiring ----------------------------------------------------
+
+
+def test_default_construction_uses_defaults():
+    # In-memory workspace pairs with an honest dry-run command runner.
+    engine = DeliveryEngine(ScriptedRunner([]))
+    assert engine.workspace is not None
+    assert engine.git is not None
+    assert engine.budget is not None
+    assert isinstance(engine.command_runner.inner, DryRunCommandRunner)
+    assert engine.workdir is None
+    assert engine.agentic is False
+
+
+def test_local_workspace_roots_commands_and_git(tmp_path):
+    engine = DeliveryEngine(ScriptedRunner([]), workspace=LocalWorkspace(str(tmp_path)))
+    inner = engine.command_runner.inner
+    assert isinstance(inner, SubprocessCommandRunner)
+    assert inner.cwd == str(tmp_path)
+    assert engine.git.cwd == str(tmp_path)
+    assert engine.workdir == str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"max_task_attempts": 0}, {"max_concurrency": 0}, {"json_retries": -1}],
+)
 def test_engine_config_validation(kwargs):
     with pytest.raises(ValueError):
         EngineConfig(**kwargs)
 
 
-def test_default_construction_uses_defaults():
-    # Constructing with no injected collaborators exercises every default.
-    engine = DeliveryEngine(ScriptedRunner([]))
-    assert engine.workspace is not None
-    assert engine.git is not None
-    assert engine.budget is not None
+# --- pure helpers ---------------------------------------------------------
 
 
 def test_dod_to_test_report():
@@ -211,6 +654,18 @@ def test_review_from_dod():
     review = _review_from_dod(report)
     assert review.approved is False
     assert "tests: boom" in review.comments[0].message
+
+
+def test_prior_context_rendering():
+    assert _prior_context(None) is None
+    assert _prior_context({}) is None
+    assert _prior_context({"decisions": [], "artifacts": []}) is None
+    snapshot = {
+        "decisions": [{"title": "Arch", "decision": "layered"}],
+        "artifacts": [{"kind": "plan"}],
+    }
+    text = _prior_context(snapshot)
+    assert "Arch" in text and "1 artifact(s)" in text
 
 
 def test_delivery_outcome_property_edges():
@@ -266,3 +721,48 @@ def __rel():
 
 def __deploy():
     return {"environment": "production", "summary": "s", "steps": [], "rollback": []}
+
+
+# --- residual branch coverage ----------------------------------------------
+
+
+def test_snapshot_skips_empty_paths_and_overlapping_qa_files():
+    # The implementation carries an empty-path change (skipped everywhere) and
+    # QA rewrites a path the implementation already touched (already snapshot).
+    impl_payload = {
+        "summary": "impl",
+        "files": [
+            {"path": "src/x.py", "change_type": "create", "summary": "s", "content": "x = 1"},
+            {"path": "", "change_type": "create", "summary": "bogus", "content": "ignored"},
+        ],
+        "notes": "",
+    }
+    qa_payload = {
+        "summary": "tests",
+        "files": [
+            {"path": "src/x.py", "change_type": "modify", "summary": "adds tests inline",
+             "content": "x = 1\ndef test_x(): assert x == 1\n"},
+            {"path": "", "change_type": "create", "summary": "bogus", "content": ""},
+        ],
+        "notes": "",
+    }
+    responses = engine_responses()
+    responses["senior software engineer"] = json_response(impl_payload)
+    responses["quality assurance engineer"] = json_response(qa_payload)
+    ws = InMemoryWorkspace()
+    engine = _engine(ScriptedRunner(by_system_prompt=responses), workspace=ws)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert "test_x" in ws.read_text("src/x.py")
+
+
+def test_finalise_backlog_ignores_unknown_tasks():
+    from dev_team.models import Task, TaskResult
+
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    engine = _engine(ScriptedRunner([]), workspace=ws, backlog_store=store)
+    backlog = store.load()
+    orphan = TaskResult(task=next(iter([Task(id="TX", title="t", description="")])), attempts=0)
+    engine._finalise_backlog(backlog, {}, [orphan])  # no story registered for TX
+    assert store.load().stories == []

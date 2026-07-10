@@ -12,7 +12,7 @@ def test_defaults():
     assert config.model is None
     assert config.max_task_attempts == 2
     assert config.min_coverage == 100.0
-    assert config.permission_mode == "bypassPermissions"
+    assert config.permission_mode == "acceptEdits"
     assert config.working_dir is None
 
 

@@ -38,6 +38,40 @@ class GitRepo:
 
         self._git("init")
 
+    def is_repo(self) -> bool:
+        """Whether the working directory is inside a git work tree."""
+
+        result = self._git("rev-parse", "--is-inside-work-tree", check=False)
+        return result.ok and result.stdout.strip() == "true"
+
+    def ensure_repo(self) -> None:
+        """Initialise a repository (with a usable identity) if none exists.
+
+        A missing ``user.name``/``user.email`` makes ``git commit`` fail on a
+        fresh machine, so a local identity is set when absent.
+        """
+
+        if not self.is_repo():
+            self.init()
+        for key, value in (("user.name", "dev-team"), ("user.email", "dev-team@localhost")):
+            if not self._git("config", key, check=False).stdout.strip():
+                self._git("config", key, value)
+
+    def diff(self) -> str:
+        """Return the combined staged and unstaged diff against HEAD."""
+
+        return self._git("diff", "HEAD", check=False).stdout
+
+    def discard_changes(self) -> None:
+        """Hard-reset tracked files and remove untracked ones.
+
+        Used to roll a workspace back to the last committed state when an
+        agentic attempt fails its gates.
+        """
+
+        self._git("reset", "--hard", check=False)
+        self._git("clean", "-fd")
+
     def current_branch(self) -> str:
         """Return the current branch name."""
 

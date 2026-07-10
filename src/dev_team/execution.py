@@ -212,6 +212,30 @@ class SubprocessCommandRunner:
 
 
 @dataclass
+class DryRunCommandRunner:
+    """A :class:`CommandRunner` that executes nothing, honestly.
+
+    Every command "succeeds" with output that says it was not executed, so a
+    dry run's gate reports are legible as dry-run results rather than
+    masquerading as real verification. This is the default pairing for an
+    :class:`InMemoryWorkspace`, where there is nothing on disk to run against.
+    """
+
+    calls: List[List[str]] = field(default_factory=list)
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> CommandResult:
+        args = list(command)
+        self.calls.append(args)
+        return CommandResult(args, 0, f"dry-run: {' '.join(args)} not executed", "")
+
+
+@dataclass
 class FakeCommandRunner:
     """A scripted :class:`CommandRunner` for tests.
 

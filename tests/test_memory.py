@@ -55,3 +55,27 @@ def test_project_memory_save_and_load():
     memory.save(bb)
     loaded = memory.load()
     assert loaded["entries"]["feature"] == "login"
+
+
+def test_checkpoint_store_roundtrip():
+    from dev_team.memory import CheckpointStore, RunCheckpoint
+
+    ws = InMemoryWorkspace()
+    store = CheckpointStore(ws)
+    # nothing stored -> empty checkpoint for the feature
+    assert store.load("F").done_task_ids == []
+    store.save(RunCheckpoint(feature_title="F", done_task_ids=["T1", "T2"]))
+    loaded = store.load("F")
+    assert loaded.feature_title == "F"
+    assert loaded.done_task_ids == ["T1", "T2"]
+    store.clear()
+    assert store.load("F").done_task_ids == []
+
+
+def test_checkpoint_store_ignores_other_feature():
+    from dev_team.memory import CheckpointStore, RunCheckpoint
+
+    ws = InMemoryWorkspace()
+    store = CheckpointStore(ws)
+    store.save(RunCheckpoint(feature_title="other", done_task_ids=["T1"]))
+    assert store.load("F").done_task_ids == []
