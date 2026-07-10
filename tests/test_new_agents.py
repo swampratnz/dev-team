@@ -1,0 +1,95 @@
+"""Tests for the security, technical writer, and SRE agents."""
+
+from __future__ import annotations
+
+from helpers import run
+
+from dev_team.agents import SecurityEngineerAgent, SREAgent, TechnicalWriterAgent
+from dev_team.models import (
+    ChangeType,
+    Design,
+    Documentation,
+    FeatureRequest,
+    FileChange,
+    Implementation,
+    ReliabilityReport,
+    SecurityReport,
+    Severity,
+    Task,
+)
+from dev_team.testing import ScriptedRunner, json_response
+
+
+def _runner(payload):
+    return ScriptedRunner([json_response(payload)])
+
+
+def _task():
+    return Task(id="T1", title="Build", description="d")
+
+
+def test_security_agent_with_files():
+    payload = {
+        "approved": False,
+        "summary": "vuln",
+        "findings": [
+            {"severity": "critical", "category": "xss", "description": "d", "remediation": "escape"}
+        ],
+    }
+    agent = SecurityEngineerAgent(_runner(payload))
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[FileChange("a.py", ChangeType.CREATE, "adds")],
+    )
+    report = run(agent.review(_task(), impl))
+    assert isinstance(report, SecurityReport)
+    assert report.approved is False
+    assert report.blocking_findings[0].severity is Severity.CRITICAL
+
+
+def test_security_agent_without_files():
+    runner = _runner({"approved": True, "summary": "ok", "findings": []})
+    agent = SecurityEngineerAgent(runner)
+    impl = Implementation(task_id="T1", summary="s", files=[])
+    report = run(agent.review(_task(), impl))
+    assert report.approved is True
+    assert "(no files reported)" in runner.calls[0]["prompt"]
+
+
+def test_technical_writer_agent():
+    payload = {"summary": "docs", "sections": [{"title": "Overview", "content": "..."}]}
+    agent = TechnicalWriterAgent(_runner(payload))
+    docs = run(
+        agent.document(FeatureRequest(title="F", description="d"), Design(overview="o"))
+    )
+    assert isinstance(docs, Documentation)
+    assert docs.sections[0].title == "Overview"
+
+
+def test_sre_agent_with_stack():
+    payload = {
+        "production_ready": True,
+        "summary": "ready",
+        "slos": ["99.9%"],
+        "risks": [],
+        "runbook": ["restart"],
+    }
+    agent = SREAgent(_runner(payload))
+    report = run(
+        agent.assess(
+            FeatureRequest(title="F", description="d"),
+            Design(overview="o", tech_stack=["python"]),
+        )
+    )
+    assert isinstance(report, ReliabilityReport)
+    assert report.production_ready is True
+
+
+def test_sre_agent_without_stack():
+    runner = _runner(
+        {"production_ready": False, "summary": "no", "slos": [], "risks": ["x"], "runbook": []}
+    )
+    agent = SREAgent(runner)
+    run(agent.assess(FeatureRequest(title="F", description="d"), Design(overview="o")))
+    assert "unspecified" in runner.calls[0]["prompt"]

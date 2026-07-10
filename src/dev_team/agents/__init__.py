@@ -7,6 +7,9 @@ from .engineer import EngineerAgent
 from .manager import ProductManagerAgent
 from .qa import QAAgent
 from .reviewer import ReviewerAgent
+from .security import SecurityEngineerAgent
+from .sre import SREAgent
+from .techwriter import TechnicalWriterAgent
 
 __all__ = [
     "ArchitectAgent",
@@ -16,4 +19,7 @@ __all__ = [
     "ProductManagerAgent",
     "QAAgent",
     "ReviewerAgent",
+    "SecurityEngineerAgent",
+    "SREAgent",
+    "TechnicalWriterAgent",
 ]

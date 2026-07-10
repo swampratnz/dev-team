@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dev-team"
-version = "0.1.0"
+version = "0.2.0"
 description = "A multi-agent software development team built on the Claude Agent SDK."
 readme = "README.md"
 requires-python = ">=3.11"

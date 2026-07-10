@@ -49,3 +49,53 @@ def test_devteam_defaults_to_claude_runner():
     assert isinstance(team.runner, ClaudeAgentRunner)
     assert team.runner.default_model == "claude-x"
     assert team.runner.cwd == "/srv"
+
+
+def test_make_engine_defaults_listener_to_team_listener():
+    from dev_team.engine import DeliveryEngine
+    from dev_team.execution import InMemoryWorkspace
+
+    events = []
+    listener = events.append
+    team = DevTeam(ScriptedRunner([]), listener=listener)
+    engine = team.make_engine(workspace=InMemoryWorkspace())
+    assert isinstance(engine, DeliveryEngine)
+    assert engine.listener is listener
+
+
+def test_make_engine_listener_override():
+    from dev_team.execution import InMemoryWorkspace
+
+    other = []
+    listener = other.append
+    team = DevTeam(ScriptedRunner([]))
+    engine = team.make_engine(listener=listener, workspace=InMemoryWorkspace())
+    assert engine.listener is listener
+
+
+def test_deliver_runs_engine():
+    from helpers import engine_responses
+    from dev_team.budget import Budget
+    from dev_team.execution import FakeCommandRunner, InMemoryWorkspace
+    from dev_team.models import FeatureRequest
+    from dev_team.trace import Tracer
+
+    class _Clock:
+        def __init__(self):
+            self.t = 0.0
+
+        def __call__(self):
+            self.t += 1.0
+            return self.t
+
+    team = DevTeam(ScriptedRunner(by_system_prompt=engine_responses()))
+    outcome = run(
+        team.deliver(
+            FeatureRequest(title="F", description="d"),
+            workspace=InMemoryWorkspace(),
+            command_runner=FakeCommandRunner(),
+            budget=Budget(),
+            tracer=Tracer(clock=_Clock()),
+        )
+    )
+    assert outcome.success is True

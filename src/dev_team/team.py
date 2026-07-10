@@ -13,6 +13,7 @@ from .agents import (
     ReviewerAgent,
 )
 from .config import TeamConfig
+from .engine import DeliveryEngine, DeliveryOutcome
 from .events import Listener
 from .models import FeatureRequest, ProjectResult
 from .sdk import AgentRunner, ClaudeAgentRunner
@@ -91,3 +92,18 @@ class DevTeam:
             constraints=list(constraints) if constraints else [],
         )
         return await self.develop(request)
+
+    def make_engine(self, **kwargs) -> DeliveryEngine:
+        """Build a :class:`DeliveryEngine` for real, gated, side-effecting runs.
+
+        Keyword arguments are forwarded to :class:`DeliveryEngine` (e.g.
+        ``workspace``, ``command_runner``, ``config``, ``budget``, ``tracer``).
+        """
+
+        kwargs.setdefault("listener", self.listener)
+        return DeliveryEngine(self.runner, **kwargs)
+
+    async def deliver(self, request: FeatureRequest, **kwargs) -> DeliveryOutcome:
+        """Run the real delivery engine for ``request``."""
+
+        return await self.make_engine(**kwargs).deliver(request)

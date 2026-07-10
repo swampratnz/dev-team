@@ -93,3 +93,52 @@ def happy_responses(task_count: int = 1) -> list:
         responses.append(json_response(qa_report_dict(True)))
     responses.append(json_response(deploy_dict()))
     return responses
+
+
+def security_dict(approved=True):
+    findings = (
+        []
+        if approved
+        else [
+            {
+                "severity": "critical",
+                "category": "injection",
+                "description": "sqli",
+                "remediation": "parameterize",
+            }
+        ]
+    )
+    return {
+        "approved": approved,
+        "summary": "secure" if approved else "vulnerable",
+        "findings": findings,
+    }
+
+
+def docs_dict():
+    return {"summary": "docs", "sections": [{"title": "Overview", "content": "..."}]}
+
+
+def reliability_dict(ready=True):
+    return {
+        "production_ready": ready,
+        "summary": "ready" if ready else "not ready",
+        "slos": ["99.9%"],
+        "risks": [],
+        "runbook": ["restart"],
+    }
+
+
+def engine_responses(*, review=True, security=True, reliability=True):
+    """Keyed-by-system-prompt responses covering every engine agent."""
+
+    return {
+        "product manager": json_response(plan_dict(1)),
+        "software architect": json_response(design_dict()),
+        "senior software engineer": json_response(impl_dict()),
+        "code reviewer": json_response(review_dict(review)),
+        "application security engineer": json_response(security_dict(security)),
+        "technical writer": json_response(docs_dict()),
+        "site reliability engineer": json_response(reliability_dict(reliability)),
+        "DevOps engineer": json_response(deploy_dict()),
+    }
