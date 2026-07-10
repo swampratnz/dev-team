@@ -6,14 +6,29 @@ A **multi-agent software development team** built on the
 `dev-team` coordinates a roster of role-specialised AI agents — the same roles a
 real engineering team has — and drives a feature request through the entire
 software development lifecycle: planning, design, implementation, code review,
-QA, and deployment planning.
+QA, security, docs, reliability, and deployment.
 
 - ✅ **Every role a development team needs**, modelled as an agent.
 - ✅ **Built on the Agent SDK** — the Claude Agent SDK is the execution base.
+- ✅ **Real, gated execution** — writes a workspace, runs executable quality
+  gates, schedules tasks concurrently, commits via git, and is governed by
+  budgets, tracing, approvals, and shared memory.
 - ✅ **100% test coverage** (branch coverage), enforced in `pyproject.toml`.
 - ✅ **Ubuntu-ready** — packaged for deployment as a container or systemd unit.
 
+The v0.2 capability set was chosen from a structured research pass across seven
+dimensions (roles, orchestration, execution, quality gates, memory, governance,
+delivery), grounded in real multi-agent frameworks. See
+[`docs/RESEARCH.md`](docs/RESEARCH.md).
+
 ---
+
+## Two engines
+
+| Engine | Entry point | What it does |
+|--------|-------------|--------------|
+| **Simulation** | `DevTeam.develop` / `DevelopmentWorkflow` | Fast, side-effect-free walk through the lifecycle — agents *describe* the work as structured data. |
+| **Real delivery** | `DevTeam.deliver` / `DeliveryEngine` | *Does* the work: materialises code into a `Workspace`, runs executable gates via a `CommandRunner`, schedules tasks concurrently, commits via git, and threads budget, tracing, memory, approvals, and specialist review through the run. |
 
 ## The team
 
@@ -24,10 +39,32 @@ QA, and deployment planning.
 | `EngineerAgent` | Engineering | Implement each task, and address review feedback on retries. |
 | `ReviewerAgent` | Code review | Approve work or request changes with severities. |
 | `QAAgent` | Quality assurance | Design tests and report pass/fail plus coverage. |
+| `SecurityEngineerAgent` | AppSec | Threat-model and security-review the change; block on major/critical findings. |
+| `TechnicalWriterAgent` | Docs | Produce user docs, API notes, and release notes. |
+| `SREAgent` | Reliability | Assess production readiness: SLOs, runbook, rollback. |
 | `DevOpsAgent` | DevOps | Produce a deployment plan with steps and rollback, targeting Ubuntu. |
 
-These are orchestrated by the `DevelopmentWorkflow` state machine, wrapped by the
-`DevTeam` facade.
+The simulation engine is the `DevelopmentWorkflow` state machine; the real
+engine is the `DeliveryEngine`. Both are wrapped by the `DevTeam` facade.
+
+## Capabilities (v0.2)
+
+Beyond the agents, the real engine composes a set of production-shaped,
+individually-testable building blocks — each a small protocol with a real and a
+fake implementation:
+
+- **Execution** — `Workspace` (in-memory / local) and `CommandRunner`
+  (subprocess / fake); `ChangeApplier` writes the engineer's files for real.
+- **Quality gates** — `Gate` / `DefinitionOfDone` run tests, coverage, lint,
+  type-check, and security scans from *actual* exit codes, driving a self-repair
+  loop until green.
+- **Orchestration** — a dependency-aware, concurrent `schedule`.
+- **Memory** — a shared `Blackboard`, `DecisionRecord` (ADR) log, and
+  cross-run `ProjectMemory`.
+- **Governance** — `Budget` (cost circuit-breaker), `Tracer` (audit spans),
+  `ApprovalGate` (human-in-the-loop), and `SideEffectPolicy` guardrails.
+- **Delivery** — a persistent `Backlog` (epics/stories) with capacity-based
+  iteration planning, `GitRepo` for branch/commit.
 
 ## Lifecycle
 
@@ -135,6 +172,38 @@ async def main():
     print("success:", result.success)
     for tr in result.task_results:
         print(tr.task.id, tr.task.status.value)
+
+asyncio.run(main())
+```
+
+### Real delivery
+
+The delivery engine actually writes files and runs gates. Point it at a
+`Workspace` and a `CommandRunner` (use `LocalWorkspace` + `SubprocessCommandRunner`
+for real side effects, or the in-memory/fake pair for dry runs and tests):
+
+```python
+import asyncio
+from dev_team import (
+    DevTeam, EngineConfig, FeatureRequest,
+    LocalWorkspace, SubprocessCommandRunner, Budget, Tracer,
+)
+
+async def main():
+    team = DevTeam()  # real Claude Agent SDK runner
+    budget = Budget(limit_usd=5.0)          # cost circuit-breaker
+    outcome = await team.deliver(
+        FeatureRequest("Health endpoint", "Add a /health endpoint returning 200"),
+        workspace=LocalWorkspace("./build"),
+        command_runner=SubprocessCommandRunner(),
+        budget=budget,
+        tracer=Tracer(),
+        config=EngineConfig(verify_command=("pytest", "-q"), max_concurrency=4),
+    )
+    print("success:", outcome.success, "cost: $%.4f" % outcome.cost_usd)
+    print("files:", outcome.workspace_files)
+    print("security approved:", outcome.security.approved)
+    print(outcome.tracer.render())
 
 asyncio.run(main())
 ```

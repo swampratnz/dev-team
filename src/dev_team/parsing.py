@@ -13,11 +13,16 @@ from .models import (
     Design,
     DesignComponent,
     DeploymentPlan,
+    DocSection,
+    Documentation,
     FileChange,
     Implementation,
     Plan,
+    ReliabilityReport,
     Review,
     ReviewComment,
+    SecurityFinding,
+    SecurityReport,
     Severity,
     Task,
     TaskStatus,
@@ -215,4 +220,48 @@ def deployment_from_dict(data: Any) -> DeploymentPlan:
         summary=as_str(data, "summary"),
         steps=as_str_list(data, "steps"),
         rollback=as_str_list(data, "rollback"),
+    )
+
+
+def security_report_from_dict(data: Any) -> SecurityReport:
+    """Build a :class:`SecurityReport` from a JSON dict."""
+
+    data = as_dict(data)
+    findings = [
+        SecurityFinding(
+            severity=as_enum(Severity, item.get("severity"), Severity.INFO),
+            category=as_str(item, "category") or "general",
+            description=as_str(item, "description"),
+            remediation=as_str(item, "remediation"),
+        )
+        for item in as_obj_list(data, "findings")
+    ]
+    return SecurityReport(
+        approved=as_bool(data, "approved"),
+        summary=as_str(data, "summary"),
+        findings=findings,
+    )
+
+
+def documentation_from_dict(data: Any) -> Documentation:
+    """Build a :class:`Documentation` from a JSON dict."""
+
+    data = as_dict(data)
+    sections = [
+        DocSection(title=as_str(item, "title"), content=as_str(item, "content"))
+        for item in as_obj_list(data, "sections")
+    ]
+    return Documentation(summary=as_str(data, "summary"), sections=sections)
+
+
+def reliability_from_dict(data: Any) -> ReliabilityReport:
+    """Build a :class:`ReliabilityReport` from a JSON dict."""
+
+    data = as_dict(data)
+    return ReliabilityReport(
+        production_ready=as_bool(data, "production_ready"),
+        summary=as_str(data, "summary"),
+        slos=as_str_list(data, "slos"),
+        risks=as_str_list(data, "risks"),
+        runbook=as_str_list(data, "runbook"),
     )

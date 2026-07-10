@@ -169,6 +169,62 @@ class DeploymentPlan:
 
 
 @dataclass
+class SecurityFinding:
+    """A single issue raised by the security engineer."""
+
+    severity: Severity
+    category: str
+    description: str
+    remediation: str = ""
+
+
+@dataclass
+class SecurityReport:
+    """The security engineer's assessment of an implementation."""
+
+    approved: bool
+    summary: str
+    findings: List[SecurityFinding] = field(default_factory=list)
+
+    @property
+    def blocking_findings(self) -> List[SecurityFinding]:
+        """Findings severe enough to block a release."""
+
+        return [
+            f
+            for f in self.findings
+            if f.severity in (Severity.MAJOR, Severity.CRITICAL)
+        ]
+
+
+@dataclass
+class DocSection:
+    """A single documentation section."""
+
+    title: str
+    content: str
+
+
+@dataclass
+class Documentation:
+    """The technical writer's output for a feature."""
+
+    summary: str
+    sections: List[DocSection] = field(default_factory=list)
+
+
+@dataclass
+class ReliabilityReport:
+    """The SRE's production-readiness assessment."""
+
+    production_ready: bool
+    summary: str
+    slos: List[str] = field(default_factory=list)
+    risks: List[str] = field(default_factory=list)
+    runbook: List[str] = field(default_factory=list)
+
+
+@dataclass
 class TaskResult:
     """The full outcome of developing a single task."""
 

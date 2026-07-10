@@ -71,3 +71,18 @@ def test_project_result_mixed_outcomes():
     assert result.success is False
     assert len(result.completed_tasks) == 1
     assert len(result.failed_tasks) == 1
+
+
+def test_security_report_blocking_findings():
+    from dev_team.models import SecurityFinding, SecurityReport, Severity
+
+    report = SecurityReport(
+        approved=False,
+        summary="s",
+        findings=[
+            SecurityFinding(Severity.INFO, "c", "d"),
+            SecurityFinding(Severity.MAJOR, "c", "d"),
+            SecurityFinding(Severity.CRITICAL, "c", "d"),
+        ],
+    )
+    assert len(report.blocking_findings) == 2

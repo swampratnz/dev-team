@@ -198,3 +198,46 @@ def test_deployment_from_dict_full():
     assert plan.environment == "staging"
     assert plan.steps == ["a"]
     assert plan.rollback == ["b"]
+
+
+def test_security_report_from_dict():
+    from dev_team.models import Severity
+
+    report = parsing.security_report_from_dict(
+        {
+            "approved": False,
+            "summary": "bad",
+            "findings": [
+                {"severity": "major", "category": "authz", "description": "d", "remediation": "fix"},
+                {"description": "no category here"},
+            ],
+        }
+    )
+    assert report.approved is False
+    assert report.findings[0].severity is Severity.MAJOR
+    assert report.findings[0].category == "authz"
+    assert report.findings[1].category == "general"
+    assert report.findings[1].severity is Severity.INFO
+
+
+def test_documentation_from_dict():
+    docs = parsing.documentation_from_dict(
+        {"summary": "s", "sections": [{"title": "T", "content": "C"}]}
+    )
+    assert docs.summary == "s"
+    assert docs.sections[0].title == "T"
+
+
+def test_reliability_from_dict():
+    report = parsing.reliability_from_dict(
+        {
+            "production_ready": True,
+            "summary": "s",
+            "slos": ["a"],
+            "risks": ["b"],
+            "runbook": ["c"],
+        }
+    )
+    assert report.production_ready is True
+    assert report.slos == ["a"]
+    assert report.runbook == ["c"]
