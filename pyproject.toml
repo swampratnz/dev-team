@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dev-team"
+version = "0.1.0"
+description = "A multi-agent software development team built on the Claude Agent SDK."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "dev-team" }]
+keywords = ["agents", "claude", "multi-agent", "sdlc", "automation"]
+dependencies = [
+    "claude-agent-sdk>=0.2.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "coverage>=7",
+]
+
+[project.scripts]
+dev-team = "dev_team.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+# All tests are functions; disable class collection so imported domain models
+# named Test* (TestReport, TestKind, ...) are not mistaken for test classes.
+python_classes = ["_DisabledClassCollection"]
+filterwarnings = ["error"]
+addopts = [
+    "--cov=dev_team",
+    "--cov-branch",
+    "--cov-report=term-missing",
+    "--cov-fail-under=100",
+    "-ra",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["dev_team"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 100
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]

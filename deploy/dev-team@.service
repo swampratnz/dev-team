@@ -1,0 +1,35 @@
+# Templated oneshot unit for running a dev-team job on an Ubuntu host.
+#
+#   sudo cp deploy/dev-team@.service /etc/systemd/system/
+#   sudo systemctl start dev-team@<jobname>.service
+#
+# Each instance reads /etc/dev-team/<jobname>.env, which must define
+# DEV_TEAM_TITLE and DEV_TEAM_DESCRIPTION (and optionally DEV_TEAM_ARGS and
+# ANTHROPIC_API_KEY).
+[Unit]
+Description=dev-team job %i (multi-agent development run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=devteam
+Group=devteam
+WorkingDirectory=/opt/dev-team
+EnvironmentFile=/etc/dev-team/%i.env
+ExecStart=/opt/dev-team/.venv/bin/dev-team "${DEV_TEAM_TITLE}" "${DEV_TEAM_DESCRIPTION}" $DEV_TEAM_ARGS
+
+# Hardening.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/dev-team
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
