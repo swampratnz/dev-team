@@ -44,11 +44,36 @@ LLM, or real-process calls.
 | Git branch/commit via version control | P1 | `git.py` |
 | Technical writer & SRE roles | P1 | `agents/techwriter.py`, `agents/sre.py` |
 
-All of the above are wired into the `DeliveryEngine`, not left as scaffolding.
+**Correction (v0.3):** the original version of this note claimed all of the
+above were wired into the `DeliveryEngine`. Two were not — the backlog and
+cross-run project memory shipped as standalone modules only. As of v0.3 both
+are genuinely wired in: the engine records every run into an optional
+`BacklogStore` and persists/loads `ProjectMemory` around each delivery.
 
-## Deferred (tracked for a later iteration)
+## What v0.3 added (from a deep review of v0.2)
+
+v0.2's biggest flaw was that the "agents" were one-shot JSON generators: the
+engineer never saw the codebase, the reviewer judged summaries instead of
+code, QA's coverage number was fabricated, and gates/git ran in the
+orchestrator's own working directory instead of the workspace. v0.3 fixed the
+foundations:
+
+- Agentic engineer (SDK tools + workspace `cwd`); evidence-based reviewer,
+  security, and QA prompts carrying real file content.
+- QA authors executable tests that the gates actually run.
+- Gates, git, and command execution rooted at the workspace; honest
+  dry-run pairing for in-memory workspaces.
+- Merge-queue integration: parallel implementation, serialised
+  apply→review→test→accept with rollback of failed attempts.
+- Single commit per delivery, gated on security approval.
+- Graceful budget stops, malformed-JSON retries, checkpoint & resume,
+  per-role model routing with final-attempt escalation.
+- An eval harness so team quality is a measured pass rate, not a claim.
+
+## Deferred (tracked in docs/ROADMAP.md)
 
 Dynamic re-planning, hierarchical delegation / group-chat consensus, codebase
-retrieval (RAG) + context budgeting, checkpoint & resume, MCP tool provider,
-CI required-checks integration, and Reflexion-style retrospective learning.
-These are valuable but larger; they are intentionally out of this slice.
+retrieval (RAG) + context budgeting, MCP tool provider, CI required-checks and
+PR integration, container-level sandboxing, per-task git worktrees, and
+Reflexion-style retrospective learning. These are valuable but larger; they
+are intentionally out of this slice.

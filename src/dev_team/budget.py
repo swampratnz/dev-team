@@ -103,6 +103,22 @@ class Budget:
             return float("inf")
         return max(0.0, self.limit_usd - self.spent)
 
+    @property
+    def exhausted(self) -> bool:
+        """Whether spending has reached or passed the ceiling."""
+
+        return self.limit_usd is not None and self.spent >= self.limit_usd
+
+    def check(self) -> None:
+        """Raise if the budget is already exhausted (pre-flight guard).
+
+        Raises:
+            BudgetExceededError: If spend has already reached the limit.
+        """
+
+        if self.exhausted:
+            raise BudgetExceededError(self.spent, self.limit_usd or 0.0)
+
     def record(self, role: str, result: AgentResult) -> UsageRecord:
         """Record usage, then enforce the ceiling.
 

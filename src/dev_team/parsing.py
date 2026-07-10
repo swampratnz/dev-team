@@ -184,11 +184,16 @@ def review_from_dict(data: Any) -> Review:
         )
         for item in as_obj_list(data, "comments")
     ]
-    return Review(
+    review = Review(
         approved=as_bool(data, "approved"),
         summary=as_str(data, "summary"),
         comments=comments,
     )
+    # Enforce the stated review contract: a major or critical comment blocks
+    # approval regardless of what the model put in the ``approved`` field.
+    if review.approved and review.blocking_comments:
+        review.approved = False
+    return review
 
 
 def test_report_from_dict(data: Any) -> TestReport:
@@ -236,11 +241,16 @@ def security_report_from_dict(data: Any) -> SecurityReport:
         )
         for item in as_obj_list(data, "findings")
     ]
-    return SecurityReport(
+    report = SecurityReport(
         approved=as_bool(data, "approved"),
         summary=as_str(data, "summary"),
         findings=findings,
     )
+    # A major or critical finding blocks release regardless of the model's
+    # self-reported ``approved`` flag.
+    if report.approved and report.blocking_findings:
+        report.approved = False
+    return report
 
 
 def documentation_from_dict(data: Any) -> Documentation:

@@ -36,10 +36,12 @@ from .errors import (
     JSONExtractionError,
     WorkflowError,
 )
+from .evals import EvalCase, EvalReport, EvalResult, evaluate
 from .events import AgentEvent
 from .execution import (
     CommandResult,
     CommandRunner,
+    DryRunCommandRunner,
     FakeCommandRunner,
     InMemoryWorkspace,
     LocalWorkspace,
@@ -49,7 +51,14 @@ from .execution import (
 )
 from .git import GitError, GitRepo
 from .instrument import InstrumentedRunner
-from .memory import Artifact, Blackboard, DecisionRecord, ProjectMemory
+from .memory import (
+    Artifact,
+    Blackboard,
+    CheckpointStore,
+    DecisionRecord,
+    ProjectMemory,
+    RunCheckpoint,
+)
 from .models import (
     ChangeType,
     Design,
@@ -92,7 +101,7 @@ from .verification import (
 )
 from .workflow import DevelopmentWorkflow
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",
@@ -118,6 +127,7 @@ __all__ = [
     "CommandRunner",
     "CommandResult",
     "SubprocessCommandRunner",
+    "DryRunCommandRunner",
     "FakeCommandRunner",
     "ChangeApplier",
     "ApplyResult",
@@ -146,6 +156,13 @@ __all__ = [
     "Artifact",
     "DecisionRecord",
     "ProjectMemory",
+    "CheckpointStore",
+    "RunCheckpoint",
+    # evals
+    "EvalCase",
+    "EvalResult",
+    "EvalReport",
+    "evaluate",
     # verification
     "Gate",
     "GateContext",

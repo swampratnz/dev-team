@@ -62,6 +62,25 @@ class CommandGate:
 _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 
+def _coverage_percent(output: str) -> Optional[float]:
+    """Extract the overall coverage percentage from tool output.
+
+    Prefers a percentage on a line containing ``TOTAL`` (coverage.py's summary
+    row) so that stray percentages in warnings or test names cannot win; falls
+    back to the last percentage found anywhere.
+    """
+
+    for line in output.splitlines():
+        if "TOTAL" in line.upper():
+            matches = _PERCENT.findall(line)
+            if matches:
+                return float(matches[-1])
+    matches = _PERCENT.findall(output)
+    if matches:
+        return float(matches[-1])
+    return None
+
+
 @dataclass
 class CoverageGate:
     """Runs a coverage command and passes when coverage ≥ ``minimum``."""
@@ -74,10 +93,9 @@ class CoverageGate:
         result = context.runner.run(list(self.command), cwd=context.cwd)
         if not result.ok:
             return GateResult(self.name, False, f"command failed: {result.output}")
-        matches = _PERCENT.findall(result.output)
-        if not matches:
+        coverage = _coverage_percent(result.output)
+        if coverage is None:
             return GateResult(self.name, False, "no coverage percentage found")
-        coverage = float(matches[-1])
         passed = coverage >= self.minimum
         return GateResult(
             self.name, passed, f"coverage {coverage:.1f}% (min {self.minimum:.1f}%)"

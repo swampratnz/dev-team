@@ -32,6 +32,7 @@ class ScheduledResult:
 
     task_id: str
     status: ScheduleStatus
+    error: Optional[str] = None
 
 
 # An async worker returns True on success, False on failure.
@@ -64,15 +65,22 @@ async def schedule(
     status: Dict[str, ScheduleStatus] = {}
     semaphore = asyncio.Semaphore(max_concurrency)
 
-    def resolve(task_id: str, outcome: ScheduleStatus) -> None:
+    def resolve(task_id: str, outcome: ScheduleStatus, error: Optional[str] = None) -> None:
         status[task_id] = outcome
         if listener is not None:
-            listener(ScheduledResult(task_id, outcome))
+            listener(ScheduledResult(task_id, outcome, error))
 
     async def run_one(task: Task) -> None:
-        async with semaphore:
-            ok = await worker(task)
-        resolve(task.id, ScheduleStatus.DONE if ok else ScheduleStatus.FAILED)
+        # A worker exception fails this task (and cascades to dependants)
+        # instead of unwinding the whole run and losing every result.
+        error: Optional[str] = None
+        try:
+            async with semaphore:
+                ok = await worker(task)
+        except Exception as exc:  # noqa: BLE001 - contain per-task failures
+            ok = False
+            error = f"{type(exc).__name__}: {exc}"
+        resolve(task.id, ScheduleStatus.DONE if ok else ScheduleStatus.FAILED, error)
 
     while len(status) < len(tasks):
         pending = [t for t in tasks if t.id not in status]

@@ -35,7 +35,12 @@ class AgentResult:
 
 @runtime_checkable
 class AgentRunner(Protocol):
-    """Minimal async interface an agent uses to talk to a model."""
+    """Minimal async interface an agent uses to talk to a model.
+
+    ``allowed_tools`` and ``cwd`` are what turn a call from a one-shot text
+    completion into a real agent loop: when set, the model may read, edit, and
+    run things inside ``cwd`` before answering.
+    """
 
     async def run(
         self,
@@ -44,6 +49,7 @@ class AgentRunner(Protocol):
         system_prompt: Optional[str] = None,
         allowed_tools: Optional[Sequence[str]] = None,
         model: Optional[str] = None,
+        cwd: Optional[str] = None,
     ) -> AgentResult:
         """Execute ``prompt`` and return an :class:`AgentResult`."""
         ...
@@ -94,13 +100,17 @@ class ClaudeAgentRunner:
 
     Attributes:
         default_model: Model used when a call does not override it.
-        permission_mode: Permission mode passed to the SDK.
-        cwd: Working directory the agent operates in.
+        permission_mode: Permission mode passed to the SDK. The default,
+            ``acceptEdits``, auto-accepts file edits but leaves other tools
+            governed by ``allowed_tools`` — a per-call allowlist the SDK
+            auto-permits. ``bypassPermissions`` is opt-in, never the default.
+        cwd: Default working directory the agent operates in (a per-call
+            ``cwd`` overrides it).
         max_turns: Optional cap on the number of SDK turns.
     """
 
     default_model: Optional[str] = None
-    permission_mode: str = "bypassPermissions"
+    permission_mode: str = "acceptEdits"
     cwd: Optional[str] = None
     max_turns: Optional[int] = None
     _last_options: Optional[ClaudeAgentOptions] = field(
@@ -114,13 +124,14 @@ class ClaudeAgentRunner:
         system_prompt: Optional[str] = None,
         allowed_tools: Optional[Sequence[str]] = None,
         model: Optional[str] = None,
+        cwd: Optional[str] = None,
     ) -> AgentResult:
         options = build_options(
             system_prompt=system_prompt,
             allowed_tools=allowed_tools,
             model=model or self.default_model,
             permission_mode=self.permission_mode,
-            cwd=self.cwd,
+            cwd=cwd or self.cwd,
             max_turns=self.max_turns,
         )
         self._last_options = options

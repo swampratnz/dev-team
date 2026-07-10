@@ -59,7 +59,8 @@ def test_base_agent_emits_events():
 
 
 def test_ask_json_raises_on_non_json():
-    agent = ProductManagerAgent(ScriptedRunner(["not json at all"]))
+    # two bad responses: the first is retried, the second exhausts the retry
+    agent = ProductManagerAgent(ScriptedRunner(["not json at all", "still not json"]))
     with pytest.raises(AgentResponseError) as excinfo:
         run(agent.create_plan(FeatureRequest(title="t", description="d")))
     assert excinfo.value.role == "product-manager"
@@ -225,3 +226,162 @@ def test_devops_without_stack():
 def test_status_enum_roundtrip():
     # Guards against accidental enum value drift used across prompts.
     assert TaskStatus("done") is TaskStatus.DONE
+
+
+# --- json retry behaviour -------------------------------------------------
+
+
+def test_ask_json_retries_then_succeeds():
+    runner = ScriptedRunner(["not json", json_response(plan_dict())])
+    agent = ProductManagerAgent(runner)
+    plan = run(agent.create_plan(FeatureRequest(title="t", description="d")))
+    assert plan.summary == "the plan"
+    assert len(runner.calls) == 2
+    assert "could not be used" in runner.calls[1]["prompt"]
+
+
+def test_ask_json_retries_on_error_result():
+    from dev_team.sdk import AgentResult
+
+    runner = ScriptedRunner(
+        [AgentResult(text="{}", is_error=True), json_response(plan_dict())]
+    )
+    agent = ProductManagerAgent(runner)
+    plan = run(agent.create_plan(FeatureRequest(title="t", description="d")))
+    assert plan.summary == "the plan"
+    assert "reported an error" in runner.calls[1]["prompt"]
+
+
+def test_json_retries_validation():
+    with pytest.raises(ValueError):
+        ProductManagerAgent(ScriptedRunner([]), json_retries=-1)
+
+
+# --- prior context / workspace listing ------------------------------------
+
+
+def test_manager_includes_prior_context():
+    runner = _runner(plan_dict())
+    agent = ProductManagerAgent(runner)
+    run(
+        agent.create_plan(
+            FeatureRequest(title="t", description="d"),
+            prior_context="- decision: use layers",
+        )
+    )
+    assert "previous runs" in runner.calls[0]["prompt"]
+    assert "use layers" in runner.calls[0]["prompt"]
+
+
+def test_engineer_prompt_lists_workspace():
+    runner = _runner(impl_dict())
+    agent = EngineerAgent(runner)
+    task = Task(id="T1", title="t", description="d")
+    run(agent.implement(task, Design(overview="o"), workspace_listing=["src/a.py"]))
+    assert "src/a.py" in runner.calls[0]["prompt"]
+
+
+def test_engineer_prompt_empty_workspace():
+    runner = _runner(impl_dict())
+    agent = EngineerAgent(runner)
+    task = Task(id="T1", title="t", description="d")
+    run(agent.implement(task, Design(overview="o")))
+    assert "workspace is currently empty" in runner.calls[0]["prompt"]
+
+
+def test_engineer_implement_in_place_uses_tools_and_cwd():
+    payload = {
+        "summary": "s",
+        "files": [{"path": "x.py", "change_type": "create", "summary": "s"}],
+        "notes": "",
+    }
+    runner = _runner(payload)
+    agent = EngineerAgent(runner)
+    task = Task(id="T1", title="t", description="d", acceptance_criteria=["works"])
+    impl = run(agent.implement_in_place(task, Design(overview="o"), cwd="/w"))
+    assert impl.files[0].path == "x.py"
+    call = runner.calls[0]
+    assert call["cwd"] == "/w"
+    assert "Read" in call["allowed_tools"] and "Bash" in call["allowed_tools"]
+
+
+# --- evidence-based review prompts -----------------------------------------
+
+
+def test_reviewer_prompt_contains_file_contents():
+    runner = _runner(review_dict(True))
+    agent = ReviewerAgent(runner)
+    task = Task(id="T1", title="t", description="d")
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[FileChange(path="src/x.py", change_type=ChangeType.CREATE, summary="s")],
+    )
+    run(agent.review(task, impl, file_contents={"src/x.py": "SECRET_CONTENT"}))
+    assert "SECRET_CONTENT" in runner.calls[0]["prompt"]
+
+
+def test_render_changed_files_branches():
+    from dev_team.agents.reviewer import render_changed_files
+
+    empty = Implementation(task_id="T", summary="s", files=[])
+    assert render_changed_files(empty) == "- (no files reported)"
+
+    # empty body -> header only; long bodies -> trimmed to the total budget
+    impl = Implementation(
+        task_id="T",
+        summary="s",
+        files=[
+            FileChange(path="a.py", change_type=ChangeType.CREATE, summary="s", content=""),
+            FileChange(path="b.py", change_type=ChangeType.CREATE, summary="s", content="B" * 100),
+            FileChange(path="c.py", change_type=ChangeType.CREATE, summary="s", content="C" * 100),
+        ],
+    )
+    text = render_changed_files(impl, per_file_chars=100, total_chars=50)
+    assert "truncated" in text
+    assert "B" * 50 in text and "B" * 51 not in text
+    assert "C" not in text.replace("c.py", "x")  # over budget: c.py body skipped
+
+    # short content fits without a truncation marker
+    small = Implementation(
+        task_id="T",
+        summary="s",
+        files=[FileChange(path="a.py", change_type=ChangeType.CREATE, summary="s", content="ok")],
+    )
+    assert "truncated" not in render_changed_files(small)
+
+
+def test_qa_author_tests():
+    payload = {
+        "summary": "covers criteria",
+        "files": [
+            {
+                "path": "tests/test_x.py",
+                "change_type": "create",
+                "summary": "unit",
+                "content": "def test_a(): pass",
+            }
+        ],
+        "notes": "",
+    }
+    runner = _runner(payload)
+    agent = QAAgent(runner)
+    task = Task(id="T1", title="t", description="d", acceptance_criteria=["works"])
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[FileChange(path="src/x.py", change_type=ChangeType.CREATE, summary="s")],
+    )
+    suite = run(agent.author_tests(task, impl, file_contents={"src/x.py": "x = 1"}))
+    assert suite.files[0].path == "tests/test_x.py"
+    assert "x = 1" in runner.calls[0]["prompt"]
+
+
+def test_qa_author_tests_without_criteria():
+    payload = {"summary": "s", "files": [], "notes": ""}
+    runner = _runner(payload)
+    agent = QAAgent(runner)
+    task = Task(id="T1", title="t", description="d")
+    impl = Implementation(task_id="T1", summary="s", files=[])
+    run(agent.author_tests(task, impl))
+    assert "(none specified)" in runner.calls[0]["prompt"]

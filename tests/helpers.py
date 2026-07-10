@@ -129,6 +129,23 @@ def reliability_dict(ready=True):
     }
 
 
+def qa_suite_dict():
+    """A QA ``author_tests`` payload: real test files to materialise."""
+
+    return {
+        "summary": "authored tests",
+        "files": [
+            {
+                "path": "tests/test_x.py",
+                "change_type": "create",
+                "summary": "unit tests",
+                "content": "def test_ok():\n    assert True\n",
+            }
+        ],
+        "notes": "",
+    }
+
+
 def engine_responses(*, review=True, security=True, reliability=True):
     """Keyed-by-system-prompt responses covering every engine agent."""
 
@@ -137,6 +154,7 @@ def engine_responses(*, review=True, security=True, reliability=True):
         "software architect": json_response(design_dict()),
         "senior software engineer": json_response(impl_dict()),
         "code reviewer": json_response(review_dict(review)),
+        "quality assurance engineer": json_response(qa_suite_dict()),
         "application security engineer": json_response(security_dict(security)),
         "technical writer": json_response(docs_dict()),
         "site reliability engineer": json_response(reliability_dict(reliability)),

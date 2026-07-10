@@ -62,6 +62,17 @@ docker run --rm -e ANTHROPIC_API_KEY \
     dev-team:latest "Health endpoint" "Add a /health endpoint" --json
 ```
 
+For real delivery, mount a workspace volume and pass `--deliver`. The
+container is also the recommended isolation boundary: delivery runs execute
+agent-authored tests, so give the container no extra credentials and restrict
+its network where possible.
+
+```bash
+docker run --rm -e ANTHROPIC_API_KEY -v "$PWD/build:/build" \
+    dev-team:latest "Health endpoint" "Add a /health endpoint" \
+    --deliver --workspace /build --budget-usd 5.0 --json
+```
+
 ## 4b. Run as a systemd unit
 
 `dev-team` is a task runner rather than a daemon, so it is deployed as a
@@ -95,6 +106,9 @@ To run it on a schedule, pair the service with a systemd timer
   (`ProtectSystem=strict`, `NoNewPrivileges=yes`, private tmp).
 - Keep `ANTHROPIC_API_KEY` in the root-owned `*.env` files (`chmod 600`), not in
   the unit or the repo.
-- The agents run the Claude CLI in `bypassPermissions` mode by default; scope
-  the host and the working directory accordingly, or set a stricter
-  `permission_mode` via `TeamConfig`.
+- The agents run the Claude CLI in `acceptEdits` mode by default, with tools
+  granted per call via `allowed_tools`. `bypassPermissions` is opt-in via
+  `TeamConfig`; only enable it inside a sandboxed container/VM.
+- Delivery runs (`--deliver`) execute the code the agents write (that is what
+  running the quality gates means). Treat the workspace host as untrusted-code
+  execution: no ambient credentials, restricted network, disposable machine.

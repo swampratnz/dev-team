@@ -76,3 +76,22 @@ def test_unknown_and_self_deps_ignored():
     tasks = [_task("A", ["ghost", "A"])]
     status = _status(run(schedule(tasks, worker)))
     assert status["A"] is ScheduleStatus.DONE
+
+
+def test_worker_exception_fails_task_not_run():
+    tasks = [
+        Task(id="T1", title="a", description=""),
+        Task(id="T2", title="b", description="", dependencies=["T1"]),
+    ]
+    results = []
+
+    async def worker(task):
+        raise RuntimeError("boom")
+
+    scheduled = run(schedule(tasks, worker, listener=results.append))
+    statuses = {r.task_id: r.status for r in scheduled}
+    assert statuses["T1"] is ScheduleStatus.FAILED
+    assert statuses["T2"] is ScheduleStatus.SKIPPED
+    errors = {r.task_id: r.error for r in results}
+    assert "RuntimeError: boom" in errors["T1"]
+    assert errors["T2"] is None

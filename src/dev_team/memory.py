@@ -107,6 +107,60 @@ class Blackboard:
         }
 
 
+_CHECKPOINT_PATH = ".dev_team/checkpoint.json"
+
+
+@dataclass
+class RunCheckpoint:
+    """Durable progress of an in-flight delivery run."""
+
+    feature_title: str
+    done_task_ids: List[str] = field(default_factory=list)
+
+
+@dataclass
+class CheckpointStore:
+    """Persists a :class:`RunCheckpoint` so a crashed run can resume.
+
+    The delivery engine records each task as it completes; a later run for the
+    same feature skips tasks already done instead of re-paying for them.
+    """
+
+    workspace: Workspace
+    path: str = _CHECKPOINT_PATH
+
+    def save(self, checkpoint: RunCheckpoint) -> None:
+        """Write ``checkpoint`` to the workspace as JSON."""
+
+        payload = {
+            "feature_title": checkpoint.feature_title,
+            "done_task_ids": list(checkpoint.done_task_ids),
+        }
+        self.workspace.write_text(self.path, json.dumps(payload, indent=2))
+
+    def load(self, feature_title: str) -> RunCheckpoint:
+        """Load the checkpoint for ``feature_title``, or an empty one.
+
+        A stored checkpoint for a *different* feature is ignored — resuming
+        someone else's progress would silently skip real work.
+        """
+
+        if not self.workspace.exists(self.path):
+            return RunCheckpoint(feature_title=feature_title)
+        data = json.loads(self.workspace.read_text(self.path))
+        if data.get("feature_title") != feature_title:
+            return RunCheckpoint(feature_title=feature_title)
+        return RunCheckpoint(
+            feature_title=feature_title,
+            done_task_ids=[str(t) for t in data.get("done_task_ids", [])],
+        )
+
+    def clear(self) -> None:
+        """Remove any stored checkpoint (called after a fully successful run)."""
+
+        self.workspace.delete(self.path)
+
+
 _MEMORY_PATH = ".dev_team/memory.json"
 
 

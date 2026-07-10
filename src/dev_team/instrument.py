@@ -39,7 +39,11 @@ class InstrumentedRunner:
         system_prompt: Optional[str] = None,
         allowed_tools: Optional[Sequence[str]] = None,
         model: Optional[str] = None,
+        cwd: Optional[str] = None,
     ) -> AgentResult:
+        if self.budget is not None:
+            # Pre-flight: refuse to spend anything once the ceiling is hit.
+            self.budget.check()
         span = None
         if self.tracer is not None:
             span = self.tracer.start("agent", self.role)
@@ -48,6 +52,7 @@ class InstrumentedRunner:
             system_prompt=system_prompt,
             allowed_tools=allowed_tools,
             model=model,
+            cwd=cwd,
         )
         if self.tracer is not None:
             self.tracer.end(span, "error" if result.is_error else "ok")

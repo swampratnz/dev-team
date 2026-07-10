@@ -241,3 +241,23 @@ def test_reliability_from_dict():
     assert report.production_ready is True
     assert report.slos == ["a"]
     assert report.runbook == ["c"]
+
+
+def test_review_blocking_comment_forces_rejection():
+    data = {
+        "approved": True,
+        "summary": "lgtm",
+        "comments": [{"severity": "critical", "message": "broken"}],
+    }
+    review = parsing.review_from_dict(data)
+    assert review.approved is False
+
+
+def test_security_blocking_finding_forces_rejection():
+    data = {
+        "approved": True,
+        "summary": "fine",
+        "findings": [{"severity": "major", "category": "injection", "description": "sqli"}],
+    }
+    report = parsing.security_report_from_dict(data)
+    assert report.approved is False

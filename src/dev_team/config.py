@@ -19,14 +19,17 @@ class TeamConfig:
             task's tests to be considered passing.
         working_dir: Directory the agents operate in (passed to the SDK as
             ``cwd``). ``None`` uses the process working directory.
-        permission_mode: Permission mode handed to the Agent SDK.
+        permission_mode: Permission mode handed to the Agent SDK. Defaults to
+            ``acceptEdits``; tools the team actually needs are granted per
+            call via ``allowed_tools``. Set ``bypassPermissions`` only for
+            fully sandboxed environments.
     """
 
     model: Optional[str] = None
     max_task_attempts: int = 2
     min_coverage: float = 100.0
     working_dir: Optional[str] = None
-    permission_mode: str = "bypassPermissions"
+    permission_mode: str = "acceptEdits"
 
     def __post_init__(self) -> None:
         if self.max_task_attempts < 1:

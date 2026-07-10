@@ -3,6 +3,11 @@
 A :class:`SideEffectPolicy` decides whether a shell command is permitted, and
 :class:`GuardedCommandRunner` enforces that policy (plus an approval gate) in
 front of any real :class:`~dev_team.execution.CommandRunner`.
+
+These guardrails are defence-in-depth, not a sandbox: any gate that *executes*
+agent-authored code (e.g. running its tests) is arbitrary code execution, and
+no argv-level policy can contain that. For untrusted or unattended runs, put
+the whole workspace inside an isolated container or VM as well.
 """
 
 from __future__ import annotations
@@ -34,13 +39,16 @@ class SideEffectPolicy:
             is in this set are allowed.
         denied_substrings: Any command whose joined form contains one of these
             is denied outright.
-        approval_substrings: Commands containing one of these are allowed only
-            after approval (e.g. ``push``, ``deploy``, ``rm``).
+        approval_commands: Commands are allowed only after approval when any
+            argv token (or the basename of argv[0]) equals one of these
+            words (e.g. ``push``, ``deploy``, ``rm``). Token equality — not
+            substring matching — so ``rm`` gates ``rm -rf x`` and
+            ``git push`` without tripping on e.g. ``format`` or ``brm``.
     """
 
     allowed_programs: Sequence[str] = field(default_factory=tuple)
     denied_substrings: Sequence[str] = ("rm -rf /", "sudo", ":(){", "mkfs")
-    approval_substrings: Sequence[str] = ("push", "deploy", "rm ")
+    approval_commands: Sequence[str] = ("push", "deploy", "rm")
 
     def evaluate(self, command: Sequence[str]) -> PolicyVerdict:
         """Evaluate ``command`` and return a :class:`PolicyVerdict`."""
@@ -57,8 +65,9 @@ class SideEffectPolicy:
         if self.allowed_programs and args[0] not in self.allowed_programs:
             return PolicyVerdict(False, f"program not allow-listed: {args[0]!r}")
 
-        for risky in self.approval_substrings:
-            if risky in joined:
+        tokens = set(args) | {args[0].rsplit("/", 1)[-1]}
+        for risky in self.approval_commands:
+            if risky in tokens:
                 return PolicyVerdict(
                     True, f"requires approval: contains {risky!r}", requires_approval=True
                 )
