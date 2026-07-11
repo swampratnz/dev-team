@@ -110,7 +110,9 @@ class ChatSession:
     async def _read(self, prompt: str) -> Optional[str]:
         try:
             return await asyncio.to_thread(self.input_fn, prompt)
-        except EOFError:
+        except (EOFError, OSError):
+            # EOF and a closed stream (e.g. BrokenPipeError from a piped
+            # stdout) both mean the conversation partner is gone.
             return None
 
     async def _say(self, text: str) -> None:

@@ -157,6 +157,12 @@ journalctl -u dev-team@health.service -f
 To run it on a schedule, pair the service with a systemd timer
 (`dev-team@health.timer`).
 
+Note: `--interactive` and `--chat` are terminal features — use them in an
+SSH session, not in the unit (a oneshot service has no stdin; interactive
+prompts would fall back to their defaults, i.e. run autonomously). To drive
+runs from a web UI or chat bot instead, see
+[`docs/INTERACTION.md`](docs/INTERACTION.md).
+
 ## 6. Security notes
 
 - The unit runs as the unprivileged `devteam` user with a hardened sandbox

@@ -135,6 +135,29 @@ def test_console_channel_eof_during_text_gives_empty():
     assert reply == Reply(choice="revise", text="")
 
 
+def test_console_channel_broken_pipe_takes_default():
+    def broken(prompt):
+        raise BrokenPipeError
+
+    out = io.StringIO()
+    channel = ConsoleChannel(input_fn=broken, output=out)
+    assert channel.ask(_question()).choice == "approve"
+    assert "defaulting" in out.getvalue()
+
+
+def test_console_channel_broken_pipe_during_text_gives_empty():
+    answers = iter(["revise"])
+
+    def flaky(prompt):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise BrokenPipeError from None
+
+    channel = ConsoleChannel(input_fn=flaky, output=io.StringIO())
+    assert channel.ask(_question()) == Reply(choice="revise", text="")
+
+
 def test_console_channel_writes_to_stderr_by_default(capsys):
     channel = ConsoleChannel(input_fn=lambda prompt: "approve")
     channel.ask(_question())

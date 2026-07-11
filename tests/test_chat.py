@@ -129,6 +129,16 @@ def test_chat_eof_quits():
     assert backend.closed is True
 
 
+def test_chat_broken_pipe_quits_gracefully():
+    def broken(prompt):
+        raise BrokenPipeError
+
+    session, backend, _, _ = _session([])
+    session.input_fn = broken
+    assert run(session.run()) == 0
+    assert backend.closed is True
+
+
 def test_chat_free_text_gets_reply():
     session, backend, _, out = _session(["I want login", "/quit"], FakeBackend(["what kind?"]))
     run(session.run())

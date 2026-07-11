@@ -142,7 +142,9 @@ class ConsoleChannel:
             while True:
                 try:
                     raw = self.input_fn(f"{menu} > ")
-                except EOFError:
+                except (EOFError, OSError):
+                    # EOF or a closed stream: degrade to autonomous rather
+                    # than crash a run that has agent work banked.
                     self._write(
                         f"(no input available; defaulting to '{question.default.key}')"
                     )
@@ -158,7 +160,7 @@ class ConsoleChannel:
                 if choice.accepts_text:
                     try:
                         text = self.input_fn(f"{choice.label} — details: ").strip()
-                    except EOFError:
+                    except (EOFError, OSError):
                         text = ""
                 return Reply(choice=choice.key, text=text)
 

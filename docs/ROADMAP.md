@@ -13,8 +13,12 @@ and behavioural eval checks. v0.6 made every agent benchmark-grounded (see
 docs/BENCHMARKS.md): fail-to-pass QA validation, SAST-triaging security,
 budgeted evidence-based review, ADR-consistent designs with tradeoffs,
 INVEST-linted plans, artifact-shipping writer/DevOps, checklist-driven SRE,
-and a per-run quality scorecard. The items below are the known, deliberately
-deferred capabilities, roughly in priority order.
+and a per-run quality scorecard. v0.7 opened the loop to humans: named
+personas, interactive plan review / failure escalation / approvals over an
+`InteractionChannel`, a chat front door on a persistent session, and a
+`QueueChannel` integration surface for external UIs (see
+`docs/INTERACTION.md`). The items below are the known, deliberately deferred
+capabilities, roughly in priority order.
 
 ## 1. Container-level sandboxing
 
@@ -36,15 +40,17 @@ CI, not a local commit.
 opens a PR (with the outcome report as the body), watches required checks,
 and feeds CI failures back into the task loop as gate feedback.
 
-## 3. Dynamic re-planning & escalation
+## 3. Dynamic re-planning
 
-**Why:** today a failed task just fails the run (dependants cascade-skip). A
-real team re-plans: split the task, try another approach, or surface a
-decision to a human.
+**Why:** interactive runs now escalate a failed task to the *human* (skip, or
+retry with guidance), but unattended runs still just fail it, and the plan
+itself never mutates mid-run. A real team re-plans: split the task, try
+another approach.
 
 **Shape:** on task failure, return control to the manager with the failure
-evidence; allow plan mutation (replace/split tasks) within budget; route
-"stuck" decisions through the `ApprovalGate` as questions, not just yes/no.
+evidence; allow plan mutation (replace/split tasks) within budget, using the
+same question vocabulary interactive runs use so a human can supervise the
+re-plan when a channel is attached.
 
 ## 4. Retrieval + context budgeting
 
@@ -60,7 +66,9 @@ artifacts.
 
 **Why:** each engineer attempt is a fresh SDK session; on retry it re-explores
 the repo from zero. Attempt N should continue attempt N-1's session with the
-gate feedback appended — cheaper and smarter.
+gate feedback appended — cheaper and smarter. (`--chat` already holds a
+persistent `ClaudeSDKClient` session, so the transport pattern is proven —
+it just isn't used for engineering attempts yet.)
 
 **Shape:** a session-holding `AgentRunner` built on `ClaudeSDKClient`, keyed
 per task, with explicit reset on rollback.
@@ -75,7 +83,20 @@ causes; a standing benchmark suite run in CI against the real runner
 (budget-capped, nightly) with score history so prompt/orchestration changes
 show up as deltas.
 
-## 7. MCP tool provider & group review
+## 7. Richer interaction surfaces
+
+**Why:** the interactive core (plan review, escalation, approvals, chat)
+lives on a UI-agnostic `InteractionChannel`, but the only shipped surface is
+the terminal. On a headless server the natural interfaces are a web
+dashboard, Slack, or the pull request itself.
+
+**Shape:** thin adapters servicing a `QueueChannel` — a web dashboard
+(events over SSE/WebSocket, questions as buttons), a Slack bot (questions as
+threads), and a PR-comment loop that composes with roadmap item 2. The
+engine needs no changes; each surface is an adapter plus notification
+routing.
+
+## 8. MCP tool provider & group review
 
 **Why:** specialist agents benefit from real tools (dependency scanners,
 linters, issue trackers) and from debate on contentious calls.
