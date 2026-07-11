@@ -5,89 +5,73 @@ the workspace, merge-queue integration, graceful budgets, checkpoint/resume,
 evals). v0.4 made the team behave professionally in a repo (green-baseline
 requirement, dedicated delivery branch, curated commits, diff-defined review,
 project-profile gate detection, ignore-aware listings, gate timeouts,
-fingerprinted checkpoints). The items below are the known, deliberately
-deferred capabilities, roughly in priority order. Each entry says why it
-matters and the intended shape, so a future slice can start from a design
-rather than a blank page.
+fingerprinted checkpoints). v0.5 delivered brownfield depth and scale: a repo
+map feeding the planner/architect, test-level baseline attribution (tolerated
+red baselines gate on *new* failures only), per-task git worktrees with
+squash-merge integration, deterministic retrospectives feeding the next run,
+and behavioural eval checks. The items below are the known, deliberately
+deferred capabilities, roughly in priority order.
 
-## 1. Repo onboarding & context (brownfield depth)
-
-**Why:** v0.4 makes existing repos *safe* (baseline check, branch, curated
-staging); what's still missing is making agents *smart* about them: a repo
-map (files, symbols, conventions) feeding the planner and engineer, and
-test-level baseline attribution so a red baseline can be tolerated by gating
-tasks only on *newly* failing tests rather than halting.
-
-**Shape:** a `RepoContext` builder (tree + key file summaries, cached in
-`ProjectMemory`), used by the manager (planning against reality), the
-engineer (which files to read first), and the reviewer (house style); parse
-test IDs from the verify command's output to diff baseline vs. post-change
-failures.
-
-## 2. Per-task git worktrees
-
-**Why:** integration is currently serialised under a lock — correct, but
-tasks contend for one working tree. Worktrees give true parallel
-implementation *and* parallel gate runs, with merge-on-green.
-
-**Shape:** `WorktreeManager` creating `git worktree` per task; the DoD runs in
-the task's worktree; a merge step (rebase + rerun gates) replaces the lock.
-Conflict → feedback to the engineer like any other gate failure.
-
-## 3. Container-level sandboxing
+## 1. Container-level sandboxing
 
 **Why:** running agent-authored tests is arbitrary code execution.
-`SideEffectPolicy` is defence-in-depth, not containment.
+`SideEffectPolicy` is defence-in-depth, not containment — and the agentic
+engineer's own Bash tool is bounded only by SDK permissions and `max_turns`.
 
 **Shape:** a `CommandRunner` implementation that executes inside a rootless
 container (no credentials, no network by default, workspace bind-mounted),
-so the isolation boundary matches the trust boundary.
+so the isolation boundary matches the trust boundary; the same container
+hosts the engineer's tool loop.
 
-## 4. PR / CI integration
+## 2. PR / CI integration
 
 **Why:** a dev team's real interface is a pull request reviewed by humans and
 CI, not a local commit.
 
-**Shape:** a delivery target that pushes a branch, opens a PR (with the
-outcome report as the body), watches required checks, and feeds CI failures
-back into the task loop as gate feedback.
+**Shape:** a delivery target that pushes the `dev-team/<feature>` branch,
+opens a PR (with the outcome report as the body), watches required checks,
+and feeds CI failures back into the task loop as gate feedback.
 
-## 5. Dynamic re-planning & escalation
+## 3. Dynamic re-planning & escalation
 
-**Why:** today a failed task just fails the run. A real team re-plans: split
-the task, try another approach, or surface a decision to a human.
+**Why:** today a failed task just fails the run (dependants cascade-skip). A
+real team re-plans: split the task, try another approach, or surface a
+decision to a human.
 
 **Shape:** on task failure, return control to the manager with the failure
 evidence; allow plan mutation (replace/split tasks) within budget; route
 "stuck" decisions through the `ApprovalGate` as questions, not just yes/no.
 
-## 6. Retrieval + context budgeting
+## 4. Retrieval + context budgeting
 
-**Why:** large repos exceed any context window; prompts currently carry
-whole files (truncated). Retrieval keeps evidence high while cost stays flat.
+**Why:** large repos exceed any context window. The v0.5 repo map is a capped
+tree + manifest heads; prompts still carry whole files (truncated). Retrieval
+keeps evidence high while cost stays flat.
 
-**Shape:** embed-and-retrieve over the repo map; per-role token budgets;
-summarised hand-offs on the blackboard instead of raw artifacts.
+**Shape:** embed-and-retrieve over the repo map (symbols, not just paths);
+per-role token budgets; summarised hand-offs on the blackboard instead of raw
+artifacts.
 
-## 7. Retrospective learning (Reflexion-style)
+## 5. Session continuity across attempts
 
-**Why:** the team should get better *between* runs, not just within one.
+**Why:** each engineer attempt is a fresh SDK session; on retry it re-explores
+the repo from zero. Attempt N should continue attempt N-1's session with the
+gate feedback appended — cheaper and smarter.
 
-**Shape:** after each delivery, a retrospective agent distils what failed and
-why into `ProjectMemory`; the manager and engineer prompts consume it (the
-plumbing — memory load → prior context — already exists).
+**Shape:** a session-holding `AgentRunner` built on `ClaudeSDKClient`, keyed
+per task, with explicit reset on rollback.
 
-## 8. Richer eval benchmark
+## 6. LLM retrospectives & benchmark history
 
-**Why:** `dev_team.evals` scores file presence and run success. World-class
-needs behavioural checks and regression tracking over time.
+**Why:** v0.5's retrospectives are deterministic distillations, and evals run
+on demand. Getting *better over time* needs richer lessons and a score trail.
 
-**Shape:** eval cases with executable assertions (run a command against the
-delivered workspace), a small standing benchmark suite in CI against the real
-runner (budget-capped, nightly), and score history so prompt/orchestration
-changes show up as deltas.
+**Shape:** an optional retrospective agent that mines the trace for root
+causes; a standing benchmark suite run in CI against the real runner
+(budget-capped, nightly) with score history so prompt/orchestration changes
+show up as deltas.
 
-## 9. MCP tool provider & group review
+## 7. MCP tool provider & group review
 
 **Why:** specialist agents benefit from real tools (dependency scanners,
 linters, issue trackers) and from debate on contentious calls.

@@ -1,0 +1,93 @@
+"""A compact, deterministic map of the workspace for planning agents.
+
+Brownfield work fails when the planner and architect design against an
+imagined codebase. :func:`build_repo_context` distils what is actually there —
+the file tree, the heads of the manifests and README, and where the tests
+live — into a bounded prompt block. It is deliberately deterministic (no LLM
+summarisation) so it costs nothing and can be tested exactly.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List
+
+from .execution import Workspace
+
+# Root-level files whose beginnings orient a planner better than any listing.
+_MANIFESTS = (
+    "README.md",
+    "pyproject.toml",
+    "package.json",
+    "Cargo.toml",
+    "go.mod",
+    "requirements.txt",
+    "setup.py",
+)
+
+MAX_TREE_ENTRIES = 150
+MANIFEST_HEAD_CHARS = 1_500
+
+
+@dataclass
+class RepoContext:
+    """What the workspace holds, in prompt-ready form."""
+
+    files: List[str] = field(default_factory=list)
+    total_files: int = 0
+    manifest_heads: Dict[str, str] = field(default_factory=dict)
+    test_paths: List[str] = field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        """Whether there is anything to describe (greenfield)."""
+
+        return self.total_files == 0
+
+    def render(self) -> str:
+        """Render the context as a compact prompt block."""
+
+        if self.is_empty:
+            return ""
+        lines = [f"The workspace contains {self.total_files} file(s):"]
+        lines.extend(f"- {path}" for path in self.files)
+        if self.total_files > len(self.files):
+            lines.append(f"- ... and {self.total_files - len(self.files)} more")
+        if self.test_paths:
+            lines.append(f"Tests live under: {', '.join(self.test_paths)}")
+        for name, head in self.manifest_heads.items():
+            lines.append(f"\n--- {name} (beginning) ---\n{head}")
+        return "\n".join(lines)
+
+
+def build_repo_context(
+    workspace: Workspace,
+    *,
+    max_tree_entries: int = MAX_TREE_ENTRIES,
+    manifest_head_chars: int = MANIFEST_HEAD_CHARS,
+) -> RepoContext:
+    """Inspect ``workspace`` and return its :class:`RepoContext`."""
+
+    files = [f for f in workspace.list_files() if not f.startswith(".dev_team/")]
+    heads: Dict[str, str] = {}
+    for name in _MANIFESTS:
+        if name in files:
+            content = workspace.read_text(name)
+            head = content[:manifest_head_chars]
+            if len(head) < len(content):
+                head += "\n... (truncated)"
+            heads[name] = head
+    test_dirs = sorted(
+        {
+            path.split("/")[0]
+            for path in files
+            if path.split("/")[0] in ("tests", "test")
+            or path.rsplit("/", 1)[-1].startswith("test_")
+        }
+    )
+    return RepoContext(
+        files=files[:max_tree_entries],
+        total_files=len(files),
+        manifest_heads=heads,
+        test_paths=test_dirs,
+    )

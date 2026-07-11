@@ -28,6 +28,7 @@ from .backlog import Backlog, BacklogStore, Epic, Iteration, ItemStatus, Story
 from .budget import Budget, BudgetExceededError, UsageMeter, UsageRecord
 from .changes import AppliedChange, ApplyResult, ChangeApplier
 from .config import TeamConfig
+from .context import RepoContext, build_repo_context
 from .engine import DeliveryEngine, DeliveryOutcome, EngineConfig
 from .errors import (
     AgentResponseError,
@@ -38,6 +39,7 @@ from .errors import (
 )
 from .evals import EvalCase, EvalReport, EvalResult, evaluate
 from .events import AgentEvent
+from .failures import new_failures, parse_failed_tests
 from .execution import (
     CommandResult,
     CommandRunner,
@@ -102,7 +104,7 @@ from .verification import (
 )
 from .workflow import DevelopmentWorkflow
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "__version__",
@@ -164,9 +166,13 @@ __all__ = [
     "EvalResult",
     "EvalReport",
     "evaluate",
-    # project profile
+    # project profile & context
     "ProjectProfile",
     "detect_project",
+    "RepoContext",
+    "build_repo_context",
+    "parse_failed_tests",
+    "new_failures",
     # verification
     "Gate",
     "GateContext",

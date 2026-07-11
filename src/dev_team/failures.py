@@ -1,0 +1,54 @@
+"""Extract failing test identities from verify-command output.
+
+This is what lets a delivery *tolerate* a red baseline instead of halting on
+it: record which tests were already failing before any work started, then
+gate each task only on **newly** failing tests. Attribution is best-effort —
+when the output format isn't recognised, callers fall back to whole-gate
+pass/fail semantics rather than guessing.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import FrozenSet, Optional
+
+# pytest:  "FAILED tests/test_x.py::test_y[param] - AssertionError"
+#          "ERROR tests/test_x.py::test_y"
+_PYTEST = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
+# go test: "--- FAIL: TestName (0.00s)"
+_GO = re.compile(r"^--- FAIL: (\S+)", re.MULTILINE)
+# cargo:   "test module::name ... FAILED"
+_CARGO = re.compile(r"^test (\S+) \.\.\. FAILED", re.MULTILINE)
+
+
+def parse_failed_tests(output: str) -> Optional[FrozenSet[str]]:
+    """Return the identities of failing tests, or ``None`` if unparseable.
+
+    ``None`` means "this output carries no recognisable per-test failures" —
+    distinct from ``frozenset()``, which would mean "parsed fine, nothing
+    failed". Callers must treat ``None`` as *no attribution possible*.
+    """
+
+    if not output:
+        return None
+    found = set()
+    for pattern in (_PYTEST, _GO, _CARGO):
+        found.update(match.rstrip(" -") for match in pattern.findall(output))
+    if not found:
+        return None
+    return frozenset(found)
+
+
+def new_failures(
+    current: Optional[FrozenSet[str]],
+    baseline: Optional[FrozenSet[str]],
+) -> Optional[FrozenSet[str]]:
+    """Failures in ``current`` that are not inherited from ``baseline``.
+
+    Returns ``None`` when either side is unattributable — in that case the
+    caller cannot safely claim the failures are inherited.
+    """
+
+    if current is None or baseline is None:
+        return None
+    return current - baseline

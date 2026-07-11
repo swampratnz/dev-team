@@ -86,3 +86,24 @@ def test_score_direct():
     result = score(case, outcome)
     assert result.passed is False
     assert "expected file missing: a.py" in result.failures
+
+
+def test_check_commands_run_in_workspace():
+    from dev_team.execution import CommandResult
+
+    def factory(case):
+        engine = _factory()(case)
+        engine.command_runner.inner.add_rule(
+            "smoke-check", CommandResult(["smoke-check"], 1, "", "no such endpoint")
+        )
+        return engine
+
+    case = _case(
+        "behaviour",
+        check_commands=[["python", "-c", "pass"], ["smoke-check"]],
+    )
+    report = run(evaluate(factory, [case]))
+    assert report.passed == 0
+    assert any("check failed" in f for f in report.results[0].failures)
+    # the passing check produced no failure entry
+    assert len(report.results[0].failures) == 1

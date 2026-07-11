@@ -23,6 +23,16 @@ QA, security, docs, reliability, and deployment.
   uncommitted work, does everything on a dedicated `dev-team/<feature>`
   branch, authors a `.gitignore`, and stages a curated change set (never
   `git add -A` into the feature commit).
+- ✅ **Works on legacy suites** — a tolerated red baseline records the failing
+  test identities and gates each task only on *newly* failing tests
+  (pytest/go/cargo output attribution).
+- ✅ **Knows the codebase** — a deterministic repo map (tree, manifest heads,
+  test layout) feeds the planner and architect on brownfield runs, and a
+  retrospective of what failed last time feeds the next run's plan.
+- ✅ **True parallelism (opt-in)** — `worktrees=True` gives every task its own
+  git worktree: implementation *and* gate runs proceed concurrently; tasks
+  squash-merge into the delivery branch one at a time with a full gate check
+  on the merged state.
 - ✅ **Adapts to the project** — the verify command is auto-detected from the
   workspace's manifests (npm / cargo / go / pytest), with optional
   `setup_command` provisioning and per-gate timeouts.
