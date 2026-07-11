@@ -100,6 +100,12 @@ def test_console_channel_returns_choice():
     assert "the plan" in out.getvalue()
 
 
+def test_console_channel_skips_empty_context():
+    channel, out = _console(["approve"])
+    channel.ask(_question(context=""))
+    assert "Approve?" in out.getvalue()
+
+
 def test_console_channel_empty_input_takes_default():
     channel, _ = _console([""])
     assert channel.ask(_question()).choice == "approve"
