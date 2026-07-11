@@ -95,12 +95,40 @@ class InMemoryWorkspace:
         return sorted(self._files)
 
 
-class LocalWorkspace:
-    """A :class:`Workspace` rooted at a real directory on disk."""
+# Directories that are tooling internals or dependency caches, never product
+# code. Listing them bloats prompts (a repo's .git alone can be tens of
+# thousands of paths) and leaks bookkeeping into reports.
+DEFAULT_EXCLUDED_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".dev_team",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        "node_modules",
+        ".venv",
+        "venv",
+    }
+)
 
-    def __init__(self, root: str) -> None:
+
+class LocalWorkspace:
+    """A :class:`Workspace` rooted at a real directory on disk.
+
+    ``list_files`` skips :data:`DEFAULT_EXCLUDED_DIRS` (override with
+    ``excluded_dirs``); reads and writes are unaffected by the exclusions.
+    """
+
+    def __init__(self, root: str, *, excluded_dirs: Optional[frozenset] = None) -> None:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.excluded_dirs = (
+            excluded_dirs if excluded_dirs is not None else DEFAULT_EXCLUDED_DIRS
+        )
 
     def _path(self, path: str) -> Path:
         return self.root / _normalise(path)
@@ -125,11 +153,15 @@ class LocalWorkspace:
             target.unlink()
 
     def list_files(self) -> List[str]:
-        return sorted(
-            str(p.relative_to(self.root)).replace("\\", "/")
-            for p in self.root.rglob("*")
-            if p.is_file()
-        )
+        results = []
+        for p in self.root.rglob("*"):
+            if not p.is_file():
+                continue
+            relative = p.relative_to(self.root)
+            if any(part in self.excluded_dirs for part in relative.parts):
+                continue
+            results.append(str(relative).replace("\\", "/"))
+        return sorted(results)
 
 
 # --------------------------------------------------------------------------

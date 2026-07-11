@@ -18,6 +18,14 @@ QA, security, docs, reliability, and deployment.
 - ✅ **Real, gated execution** — gates and git run in the *workspace root*;
   integration is serialised like a merge queue; failed attempts are rolled
   back; nothing is committed until security approves.
+- ✅ **Behaves like a professional in your repo** — refuses to start on a red
+  baseline (inherited breakage never gets blamed on the engineer) or over
+  uncommitted work, does everything on a dedicated `dev-team/<feature>`
+  branch, authors a `.gitignore`, and stages a curated change set (never
+  `git add -A` into the feature commit).
+- ✅ **Adapts to the project** — the verify command is auto-detected from the
+  workspace's manifests (npm / cargo / go / pytest), with optional
+  `setup_command` provisioning and per-gate timeouts.
 - ✅ **Governed and resumable** — cost budgets stop the run gracefully,
   checkpoints let a later run resume where a crashed or over-budget run
   stopped, and every agent call is traced and metered.
@@ -202,16 +210,22 @@ dev-team "Password reset" "Let users reset their password via an emailed link" \
     --verbose
 ```
 
-Real delivery — builds in a workspace directory, runs the gates, commits:
+Real delivery — builds in a workspace directory, runs the gates, commits to a
+`dev-team/<feature>` branch:
 
 ```bash
 dev-team "Health endpoint" "Add a /health endpoint returning 200" \
     --deliver --workspace ./build \
-    --verify-command "pytest -q" \
     --budget-usd 5.0
 ```
 
-Useful `--deliver` flags: `--max-concurrency N`, `--no-commit`, `--json`.
+The verify command is auto-detected from the workspace (override with
+`--verify-command "npm test"`). On an existing repo the run halts up front —
+before any agent spend — if the working tree is dirty
+(`--allow-dirty-baseline` to override) or the quality gates are already red
+(`--proceed-on-red-baseline` to override). Other `--deliver` flags:
+`--setup-command "npm install"`, `--branch NAME`, `--max-concurrency N`,
+`--no-commit`, `--json`.
 
 Output as JSON for scripting:
 

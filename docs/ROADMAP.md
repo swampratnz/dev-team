@@ -2,19 +2,27 @@
 
 v0.3 fixed the foundations (agentic engineer, evidence-based review, gates in
 the workspace, merge-queue integration, graceful budgets, checkpoint/resume,
-evals). The items below are the known, deliberately deferred capabilities,
-roughly in priority order. Each entry says why it matters and the intended
-shape, so a future slice can start from a design rather than a blank page.
+evals). v0.4 made the team behave professionally in a repo (green-baseline
+requirement, dedicated delivery branch, curated commits, diff-defined review,
+project-profile gate detection, ignore-aware listings, gate timeouts,
+fingerprinted checkpoints). The items below are the known, deliberately
+deferred capabilities, roughly in priority order. Each entry says why it
+matters and the intended shape, so a future slice can start from a design
+rather than a blank page.
 
-## 1. Operate on an existing repository
+## 1. Repo onboarding & context (brownfield depth)
 
-**Why:** most dev work is brownfield. Agentic mode already works *in* a
-directory; what's missing is repo onboarding: clone/branch, build a repo map
-(files, symbols, conventions), and feed the relevant slice to each agent.
+**Why:** v0.4 makes existing repos *safe* (baseline check, branch, curated
+staging); what's still missing is making agents *smart* about them: a repo
+map (files, symbols, conventions) feeding the planner and engineer, and
+test-level baseline attribution so a red baseline can be tolerated by gating
+tasks only on *newly* failing tests rather than halting.
 
 **Shape:** a `RepoContext` builder (tree + key file summaries, cached in
 `ProjectMemory`), used by the manager (planning against reality), the
-engineer (which files to read first), and the reviewer (house style).
+engineer (which files to read first), and the reviewer (house style); parse
+test IDs from the verify command's output to diff baseline vs. post-change
+failures.
 
 ## 2. Per-task git worktrees
 

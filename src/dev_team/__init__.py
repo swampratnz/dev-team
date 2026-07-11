@@ -85,6 +85,7 @@ from .models import (
     TestReport,
 )
 from .policy import GuardedCommandRunner, PolicyVerdict, SideEffectPolicy
+from .profile import ProjectProfile, detect_project
 from .scheduler import ScheduledResult, ScheduleStatus, schedule
 from .sdk import AgentResult, AgentRunner, ClaudeAgentRunner
 from .team import DevTeam, build_workflow
@@ -101,7 +102,7 @@ from .verification import (
 )
 from .workflow import DevelopmentWorkflow
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",
@@ -163,6 +164,9 @@ __all__ = [
     "EvalResult",
     "EvalReport",
     "evaluate",
+    # project profile
+    "ProjectProfile",
+    "detect_project",
     # verification
     "Gate",
     "GateContext",

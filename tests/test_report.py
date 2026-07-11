@@ -185,3 +185,35 @@ def test_render_delivery_summary_branches():
     assert "SUCCESS" in good
     assert "approved" in good
     assert "Committed: yes" in good
+
+
+def test_render_delivery_summary_halted():
+    from dev_team.verification import DoDReport, GateResult
+
+    halted = _outcome(
+        halted_reason="baseline quality gates are already failing",
+        baseline=DoDReport([GateResult("tests", False, "3 legacy failures")]),
+    )
+    text = render_delivery_summary(halted)
+    assert "Halted:" in text
+    assert "3 legacy failures" in text
+    assert "Tasks:" not in text  # nothing ran; report stops at the halt
+
+    data = delivery_to_dict(halted)
+    assert data["halted_reason"].startswith("baseline")
+    assert data["baseline_green"] is False
+
+
+def test_render_delivery_summary_shows_branch():
+    from dev_team.models import Task, TaskResult, TaskStatus
+
+    task = Task(id="T1", title="t", description="", status=TaskStatus.DONE)
+    text = render_delivery_summary(
+        _outcome(task_results=[TaskResult(task=task, attempts=1)], branch="dev-team/login")
+    )
+    assert "Branch:  dev-team/login" in text
+
+
+def test_render_delivery_summary_halted_without_baseline():
+    text = render_delivery_summary(_outcome(halted_reason="working tree is dirty"))
+    assert "Halted:  working tree is dirty" in text

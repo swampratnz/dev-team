@@ -8,6 +8,7 @@ later run can pick up where the last one left off.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -110,12 +111,39 @@ class Blackboard:
 _CHECKPOINT_PATH = ".dev_team/checkpoint.json"
 
 
+def task_fingerprint(title: str, description: str) -> str:
+    """A stable identity for a task's *content* (not just its id).
+
+    Plans are regenerated on resume, and nothing guarantees the new plan's
+    ``T1`` describes the same work as the old plan's ``T1``. A task is only
+    treated as already-done when both the id and this fingerprint match.
+    """
+
+    digest = hashlib.sha256(f"{title}\n{description}".encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
 @dataclass
 class RunCheckpoint:
     """Durable progress of an in-flight delivery run."""
 
     feature_title: str
     done_task_ids: List[str] = field(default_factory=list)
+    fingerprints: Dict[str, str] = field(default_factory=dict)
+
+    def mark_done(self, task_id: str, fingerprint: str) -> None:
+        """Record a completed task with its content fingerprint."""
+
+        self.done_task_ids.append(task_id)
+        self.fingerprints[task_id] = fingerprint
+
+    def is_done(self, task_id: str, fingerprint: str) -> bool:
+        """Whether ``task_id`` completed earlier *with the same content*."""
+
+        return (
+            task_id in self.done_task_ids
+            and self.fingerprints.get(task_id) == fingerprint
+        )
 
 
 @dataclass
@@ -135,6 +163,7 @@ class CheckpointStore:
         payload = {
             "feature_title": checkpoint.feature_title,
             "done_task_ids": list(checkpoint.done_task_ids),
+            "fingerprints": dict(checkpoint.fingerprints),
         }
         self.workspace.write_text(self.path, json.dumps(payload, indent=2))
 
@@ -142,7 +171,9 @@ class CheckpointStore:
         """Load the checkpoint for ``feature_title``, or an empty one.
 
         A stored checkpoint for a *different* feature is ignored — resuming
-        someone else's progress would silently skip real work.
+        someone else's progress would silently skip real work. Checkpoints
+        without fingerprints (older format) never match, which is the safe
+        direction: work is redone rather than wrongly skipped.
         """
 
         if not self.workspace.exists(self.path):
@@ -153,6 +184,9 @@ class CheckpointStore:
         return RunCheckpoint(
             feature_title=feature_title,
             done_task_ids=[str(t) for t in data.get("done_task_ids", [])],
+            fingerprints={
+                str(k): str(v) for k, v in data.get("fingerprints", {}).items()
+            },
         )
 
     def clear(self) -> None:

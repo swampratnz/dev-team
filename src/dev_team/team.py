@@ -68,6 +68,7 @@ class DevTeam:
             default_model=self.config.model,
             permission_mode=self.config.permission_mode,
             cwd=self.config.working_dir,
+            max_turns=self.config.max_turns,
         )
         self.workflow = build_workflow(
             self.runner, config=self.config, listener=listener

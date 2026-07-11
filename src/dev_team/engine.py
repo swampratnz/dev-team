@@ -52,12 +52,20 @@ from .execution import (
 )
 from .git import GitError, GitRepo
 from .instrument import InstrumentedRunner
-from .memory import Blackboard, CheckpointStore, ProjectMemory, RunCheckpoint
+from .memory import (
+    Blackboard,
+    CheckpointStore,
+    ProjectMemory,
+    RunCheckpoint,
+    task_fingerprint,
+)
 from .models import (
+    ChangeType,
     Design,
     DeploymentPlan,
     Documentation,
     FeatureRequest,
+    FileChange,
     Implementation,
     ReliabilityReport,
     Review,
@@ -70,6 +78,7 @@ from .models import (
     TestReport,
 )
 from .policy import GuardedCommandRunner, SideEffectPolicy
+from .profile import detect_project
 from .scheduler import ScheduledResult, schedule
 from .sdk import AgentRunner
 from .trace import Tracer
@@ -81,12 +90,30 @@ _INTERNAL_PREFIX = ".dev_team/"
 
 @dataclass
 class EngineConfig:
-    """Settings for a :class:`DeliveryEngine`."""
+    """Settings for a :class:`DeliveryEngine`.
+
+    Notable fields:
+
+    - ``verify_command``: the quality-gate command. ``None`` (the default)
+      auto-detects it from the workspace's manifests (see
+      :func:`~dev_team.profile.detect_project`).
+    - ``setup_command``: run once in the workspace before anything else
+      (e.g. ``("npm", "install")``); a failure halts the run cleanly.
+    - ``require_green_baseline``: refuse to start on a workspace whose gates
+      are already red — inherited breakage otherwise poisons every task and
+      gets blamed on the engineer.
+    - ``branch`` / ``use_branch``: agentic deliveries work on a dedicated
+      ``dev-team/<feature>`` branch (never the caller's current branch).
+    - ``allow_dirty_baseline``: by default a dirty working tree halts the run
+      instead of being silently swept into a baseline commit.
+    - ``engineer_tools``: override the agentic engineer's tool allowlist.
+    """
 
     model: Optional[str] = None
     max_task_attempts: int = 3
     max_concurrency: int = 4
-    verify_command: Sequence[str] = ("pytest", "-q")
+    verify_command: Optional[Sequence[str]] = None
+    setup_command: Optional[Sequence[str]] = None
     commit: bool = True
     agentic: Optional[bool] = None
     qa_tests: bool = True
@@ -94,6 +121,13 @@ class EngineConfig:
     role_models: Mapping[str, str] = field(default_factory=dict)
     escalation_model: Optional[str] = None
     resume: bool = True
+    require_green_baseline: bool = True
+    branch: Optional[str] = None
+    use_branch: bool = True
+    allow_dirty_baseline: bool = False
+    write_gitignore: bool = True
+    gate_timeout_seconds: Optional[float] = 1800.0
+    engineer_tools: Optional[Sequence[str]] = None
 
     def __post_init__(self) -> None:
         if self.max_task_attempts < 1:
@@ -123,6 +157,9 @@ class DeliveryOutcome:
     committed: bool = False
     budget_exhausted: bool = False
     resumed_task_ids: List[str] = field(default_factory=list)
+    branch: Optional[str] = None
+    baseline: Optional[DoDReport] = None
+    halted_reason: Optional[str] = None
 
     @property
     def tasks_complete(self) -> bool:
@@ -193,6 +230,27 @@ def _prior_context(snapshot: Optional[dict]) -> Optional[str]:
 # A snapshot maps path -> prior content, or None when the file did not exist.
 _Snapshot = Dict[str, Optional[str]]
 
+# Written on greenfield agentic deliveries so add-by-path staging (and human
+# eyes) never see bytecode, caches, or the engine's own bookkeeping.
+_DEFAULT_GITIGNORE = """\
+.dev_team/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+node_modules/
+.venv/
+venv/
+"""
+
+
+def _branch_slug(title: str) -> str:
+    """Derive a git-safe branch segment from a feature title."""
+
+    cleaned = "".join(c.lower() if c.isalnum() else "-" for c in title)
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned[:40] or "feature"
+
 
 class DeliveryEngine:
     """Delivers a feature for real, with gates, concurrency, and observability."""
@@ -257,9 +315,17 @@ class DeliveryEngine:
             raise ValueError("agentic mode requires a workspace with a real root directory")
 
         self.change_applier = ChangeApplier(self.workspace)
-        self.definition_of_done = definition_of_done or DefinitionOfDone(
-            [CommandGate("tests", self.config.verify_command)]
-        )
+        # Gate resolution: an injected DoD wins; an explicit verify_command
+        # builds one; otherwise the command is auto-detected from the
+        # workspace at deliver time (after setup, when manifests exist).
+        if definition_of_done is not None:
+            self.definition_of_done: Optional[DefinitionOfDone] = definition_of_done
+        elif self.config.verify_command is not None:
+            self.definition_of_done = DefinitionOfDone(
+                [CommandGate("tests", self.config.verify_command)]
+            )
+        else:
+            self.definition_of_done = None
         self.backlog_store = backlog_store
         self.memory = memory or ProjectMemory(self.workspace)
         self.checkpoints = checkpoints or (
@@ -268,6 +334,7 @@ class DeliveryEngine:
         self._integration_lock = asyncio.Lock()
         self._checkpoint: Optional[RunCheckpoint] = None
         self._budget_exhausted = False
+        self._branch: Optional[str] = None
 
         def make(cls):
             wrapped = InstrumentedRunner(
@@ -302,14 +369,36 @@ class DeliveryEngine:
         run_span = self.tracer.start("workflow", "deliver", feature=request.title)
         self._event("start", f"Delivering: {request.title}")
         self._budget_exhausted = False
+        self._branch = None
 
         if self.agentic:
-            # Agentic attempts are rolled back via git, so the baseline (any
-            # pre-existing uncommitted work included) must be committed first.
-            self.git.ensure_repo()
-            if self.git.has_changes():
-                self.git.add_all()
-                self.git.commit("chore(dev-team): baseline before delivery")
+            halted = self._prepare_git_baseline(request)
+            if halted is not None:
+                self.tracer.end(run_span, "halted")
+                return halted
+
+        if self.config.setup_command is not None:
+            result = self.command_runner.run(
+                list(self.config.setup_command), cwd=self.workdir
+            )
+            if not result.ok:
+                self.tracer.end(run_span, "halted")
+                return self._halted(
+                    request,
+                    f"setup command failed ({result.exit_code}): {result.output[:500]}",
+                )
+
+        self._resolve_gates()
+
+        baseline = self._check_baseline()
+        if baseline is not None and not baseline.passed and self.config.require_green_baseline:
+            self.tracer.end(run_span, "halted")
+            return self._halted(
+                request,
+                "baseline quality gates are already failing — fix the existing "
+                f"breakage first or set require_green_baseline=False ({baseline.summary()})",
+                baseline=baseline,
+            )
 
         prior = _prior_context(self.memory.load())
         plan = await self.manager.create_plan(request, prior_context=prior)
@@ -333,7 +422,10 @@ class DeliveryEngine:
         results: Dict[str, TaskResult] = {}
         pending: List[Task] = []
         for task in plan.tasks:
-            if self._checkpoint is not None and task.id in self._checkpoint.done_task_ids:
+            fingerprint = task_fingerprint(task.title, task.description)
+            if self._checkpoint is not None and self._checkpoint.is_done(
+                task.id, fingerprint
+            ):
                 task.status = TaskStatus.DONE
                 results[task.id] = TaskResult(task=task, attempts=0)
                 resumed.append(task.id)
@@ -400,12 +492,113 @@ class DeliveryEngine:
             committed=committed,
             budget_exhausted=self._budget_exhausted,
             resumed_task_ids=resumed,
+            branch=self._branch,
+            baseline=baseline,
         )
         if outcome.success and self.checkpoints is not None:
             self.checkpoints.clear()
         verdict = "succeeded" if outcome.success else "with issues"
         self._event("done", f"Delivery finished {verdict}", detail=f"${outcome.cost_usd:.4f}")
         return outcome
+
+    # -- run preparation -------------------------------------------------------
+
+    def _prepare_git_baseline(self, request: FeatureRequest) -> Optional[DeliveryOutcome]:
+        """Get the repo ready for agentic work; return a halted outcome if unsafe.
+
+        Ensures a repo exists, refuses to run over uncommitted work (unless
+        explicitly allowed), authors a minimal .gitignore on repos that lack
+        one, switches to a dedicated delivery branch, and commits the baseline
+        that failed attempts roll back to.
+        """
+
+        self.git.ensure_repo()
+        if self.git.has_changes() and not self.config.allow_dirty_baseline:
+            return self._halted(
+                request,
+                "the working tree has uncommitted changes; commit or stash them "
+                "first, or set allow_dirty_baseline=True to sweep them into a "
+                "baseline commit on the delivery branch",
+            )
+        if self.config.write_gitignore and not self.workspace.exists(".gitignore"):
+            self.workspace.write_text(".gitignore", _DEFAULT_GITIGNORE)
+        if self.config.use_branch:
+            self._branch = self.config.branch or f"dev-team/{_branch_slug(request.title)}"
+            self.git.switch_to(self._branch)
+        if self.git.has_changes():
+            self.git.add_all()
+            self.git.commit("chore(dev-team): baseline before delivery")
+        return None
+
+    def _resolve_gates(self) -> None:
+        """Build the Definition of Done from the workspace when not configured."""
+
+        if self.definition_of_done is not None:
+            return
+        profile = detect_project(self.workspace)
+        self.definition_of_done = DefinitionOfDone(
+            [CommandGate("tests", profile.verify_command)]
+        )
+        self.blackboard.put("project_profile", profile.kind)
+        self._event(
+            "gates",
+            f"Auto-detected {profile.kind} project",
+            detail=f"verify: {' '.join(profile.verify_command)} ({profile.reason})",
+        )
+
+    def _gate_context(self, task: Optional[Task] = None) -> GateContext:
+        return GateContext(
+            runner=self.command_runner,
+            workspace=self.workspace,
+            task=task,
+            cwd=self.workdir,
+            timeout=self.config.gate_timeout_seconds,
+        )
+
+    def _check_baseline(self) -> Optional[DoDReport]:
+        """Evaluate the gates before any work starts, when there is anything
+        to evaluate.
+
+        An empty workspace (greenfield) has no baseline to check — and a
+        ``.gitignore`` the engine itself just authored doesn't make it any
+        less empty. On a populated workspace this is what separates inherited
+        breakage from breakage the team introduces — without it, a legacy
+        repo's one flaky test fails every task and the engineer gets blamed
+        for code it never touched.
+        """
+
+        if not [f for f in self.workspace.list_files() if f != ".gitignore"]:
+            return None
+        report = self.definition_of_done.evaluate(self._gate_context())
+        status = "green" if report.passed else "RED"
+        self._event("baseline", f"Baseline gates: {status}", detail=report.summary())
+        return report
+
+    def _halted(
+        self,
+        request: FeatureRequest,
+        reason: str,
+        *,
+        baseline: Optional[DoDReport] = None,
+    ) -> DeliveryOutcome:
+        """Build the outcome for a run stopped before any task work began."""
+
+        self._event("halted", f"Delivery halted: {reason}")
+        return DeliveryOutcome(
+            request=request,
+            plan_summary="",
+            design=Design(overview=""),
+            task_results=[],
+            blackboard=self.blackboard,
+            tracer=self.tracer,
+            budget=self.budget,
+            workspace_files=[
+                f for f in self.workspace.list_files() if not f.startswith(_INTERNAL_PREFIX)
+            ],
+            branch=self._branch,
+            baseline=baseline,
+            halted_reason=reason,
+        )
 
     async def _specialist(self, coro):
         """Run a post-task specialist stage, degrading gracefully on budget."""
@@ -445,7 +638,12 @@ class DeliveryEngine:
                 # the whole attempt runs inside the integration lock.
                 async with self._integration_lock:
                     implementation = await self.engineer.implement_in_place(
-                        task, design, feedback, cwd=str(self.workdir), model=model
+                        task,
+                        design,
+                        feedback,
+                        cwd=str(self.workdir),
+                        model=model,
+                        tools=self.config.engineer_tools,
                     )
                     done, review, test_report, feedback = await self._integrate(
                         task, implementation, span
@@ -455,7 +653,11 @@ class DeliveryEngine:
                     task,
                     design,
                     feedback,
-                    workspace_listing=self.workspace.list_files(),
+                    workspace_listing=[
+                        f
+                        for f in self.workspace.list_files()
+                        if not f.startswith(_INTERNAL_PREFIX)
+                    ],
                     model=model,
                 )
                 async with self._integration_lock:
@@ -486,15 +688,24 @@ class DeliveryEngine:
         """
 
         snapshot: Optional[_Snapshot] = None
+        diff: Optional[str] = None
         try:
-            if not self.agentic:
+            if self.agentic:
+                # The diff, not the engineer's self-report, defines the change:
+                # any touched file the engineer forgot to list still gets
+                # reviewed (and none of it can sneak into the commit unseen).
+                self._merge_unreported_changes(implementation)
+                diff = self.git.diff()
+            else:
                 snapshot = self._snapshot(implementation)
                 self.change_applier.apply(implementation)
             contents = self._contents(implementation)
             self.blackboard.post_artifact("implementation", task.id, implementation.summary)
 
             task.status = TaskStatus.IN_REVIEW
-            review = await self.reviewer.review(task, implementation, file_contents=contents)
+            review = await self.reviewer.review(
+                task, implementation, file_contents=contents, diff=diff
+            )
             if not review.approved:
                 self._rollback(snapshot)
                 task.status = TaskStatus.CHANGES_REQUESTED
@@ -518,13 +729,7 @@ class DeliveryEngine:
 
             task.status = TaskStatus.TESTING
             dod = await asyncio.to_thread(
-                self.definition_of_done.evaluate,
-                GateContext(
-                    runner=self.command_runner,
-                    workspace=self.workspace,
-                    task=task,
-                    cwd=self.workdir,
-                ),
+                self.definition_of_done.evaluate, self._gate_context(task)
             )
             test_report = _dod_to_test_report(dod)
             if not dod.passed:
@@ -539,6 +744,21 @@ class DeliveryEngine:
             # not leave unreviewed changes in the workspace.
             self._rollback(snapshot)
             raise
+
+    def _merge_unreported_changes(self, implementation: Implementation) -> None:
+        """Append files git saw change that the engineer did not report."""
+
+        reported = {c.path for c in implementation.files}
+        for path in self.git.changed_files():
+            if path.startswith(_INTERNAL_PREFIX) or path in reported:
+                continue
+            implementation.files.append(
+                FileChange(
+                    path=path,
+                    change_type=ChangeType.MODIFY,
+                    summary="(change detected via git, not reported by the engineer)",
+                )
+            )
 
     def _snapshot(self, implementation: Implementation) -> _Snapshot:
         """Record the pre-apply state of every path the attempt touches."""
@@ -579,7 +799,7 @@ class DeliveryEngine:
 
         if self._checkpoint is None or self.checkpoints is None:
             return
-        self._checkpoint.done_task_ids.append(task.id)
+        self._checkpoint.mark_done(task.id, task_fingerprint(task.title, task.description))
         self.checkpoints.save(self._checkpoint)
 
     # -- post-task stages ----------------------------------------------------
@@ -625,9 +845,16 @@ class DeliveryEngine:
             return False
         try:
             self.git.ensure_repo()
-            self.git.add_all()
-            if not self.git.has_changes():
+            # Stage a curated change set, never `add -A`: the engine's own
+            # bookkeeping must not ship in the feature commit.
+            paths = [
+                p
+                for p in self.git.changed_files()
+                if not p.startswith(_INTERNAL_PREFIX)
+            ]
+            if not paths:
                 return False
+            self.git.add_paths(paths)
             self.git.commit(f"{request.title} ({', '.join(done)})")
         except GitError as exc:
             self._event("commit", "Commit failed", detail=str(exc))

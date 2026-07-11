@@ -385,3 +385,23 @@ def test_qa_author_tests_without_criteria():
     impl = Implementation(task_id="T1", summary="s", files=[])
     run(agent.author_tests(task, impl))
     assert "(none specified)" in runner.calls[0]["prompt"]
+
+
+def test_render_diff_branches():
+    from dev_team.agents.reviewer import render_diff
+
+    assert render_diff(None) == ""
+    assert render_diff("") == ""
+    small = render_diff("+++ small")
+    assert "+++ small" in small and "truncated" not in small
+    big = render_diff("x" * 100, limit=10)
+    assert "diff truncated" in big
+
+
+def test_reviewer_prompt_includes_diff():
+    runner = _runner(review_dict(True))
+    agent = ReviewerAgent(runner)
+    task = Task(id="T1", title="t", description="d")
+    impl = Implementation(task_id="T1", summary="s", files=[])
+    run(agent.review(task, impl, diff="+++ THE-DIFF"))
+    assert "THE-DIFF" in runner.calls[0]["prompt"]

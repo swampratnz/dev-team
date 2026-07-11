@@ -112,3 +112,37 @@ def test_main_deliver_failure_exit_code(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 1
     assert "INCOMPLETE" in out
+
+
+def test_main_deliver_passes_new_flags(tmp_path):
+    from helpers import engine_responses
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(
+        _deliver_args(
+            tmp_path,
+            "--branch", "custom/branch",
+            "--allow-dirty-baseline",
+            "--proceed-on-red-baseline",
+            "--setup-command", "python -c pass",
+        ),
+        runner=runner,
+    )
+    assert code == 0
+
+
+def test_main_deliver_auto_detects_verify_command(tmp_path, capsys):
+    from helpers import engine_responses
+
+    # a package.json makes auto-detection pick npm; npm test will fail here,
+    # which surfaces as a red-baseline halt -> exit code 1 with the reason
+    (tmp_path / "package.json").write_text("{}")
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    args = [
+        "F", "d", "--deliver", "--workspace", str(tmp_path),
+        "--no-commit", "--allow-dirty-baseline",
+    ]
+    code = main(args, runner=runner)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "Halted:" in out
