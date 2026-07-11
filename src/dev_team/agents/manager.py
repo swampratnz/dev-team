@@ -1,4 +1,11 @@
-"""The product manager agent: turns a request into a plan of tasks."""
+"""The product manager agent: turns a request into a plan of tasks.
+
+Decomposition quality is what downstream success is built on, so the plan is
+held to an INVEST-style bar: tasks independently shippable and small, with
+acceptance criteria phrased so an automated test can verify them. The engine
+lints the plan (see :func:`~dev_team.ordering.lint_plan`) and asks for one
+revision when it falls short.
+"""
 
 from __future__ import annotations
 
@@ -10,8 +17,11 @@ from .base import BaseAgent
 
 _SYSTEM = """\
 You are an experienced product manager and delivery lead. You break feature
-requests into small, independently shippable engineering tasks with clear
-acceptance criteria and explicit dependencies between tasks.
+requests into small, independently shippable engineering tasks with explicit
+dependencies. Every task's acceptance criteria are objectively verifiable —
+phrased so an automated test could assert each one (inputs, outputs, observable
+behaviour), never vague qualities like "works well". Tasks follow INVEST:
+independent, negotiable, valuable, estimable, small, testable.
 Always respond with a single JSON object and nothing else."""
 
 
@@ -27,12 +37,14 @@ class ProductManagerAgent(BaseAgent):
         request: FeatureRequest,
         *,
         prior_context: Optional[str] = None,
+        revision_feedback: Optional[str] = None,
     ) -> Plan:
         """Produce a task breakdown for ``request``.
 
         ``prior_context`` carries what the team remembers from earlier runs on
-        this workspace (decisions, artifacts), so planning builds on existing
-        work instead of starting amnesiac.
+        this workspace (decisions, artifacts, retrospectives) plus the repo
+        map. ``revision_feedback`` is set when a previous plan failed lint —
+        the plan must be re-issued with those problems fixed.
         """
 
         constraints = (
@@ -45,6 +57,12 @@ class ProductManagerAgent(BaseAgent):
             if prior_context
             else ""
         )
+        revision = (
+            "\nYour previous plan had these problems — fix all of them:\n"
+            f"{revision_feedback}\n"
+            if revision_feedback
+            else ""
+        )
         prompt = f"""\
 Break the following feature request into engineering tasks.
 
@@ -54,7 +72,7 @@ Description:
 
 Constraints:
 {constraints}
-{memory}
+{memory}{revision}
 Respond with JSON of the form:
 {{
   "summary": "one paragraph plan summary",
@@ -63,7 +81,7 @@ Respond with JSON of the form:
       "id": "T1",
       "title": "short title",
       "description": "what to build",
-      "acceptance_criteria": ["..."],
+      "acceptance_criteria": ["objectively verifiable criterion"],
       "dependencies": ["T0"]
     }}
   ]

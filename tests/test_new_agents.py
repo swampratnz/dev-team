@@ -57,14 +57,55 @@ def test_security_agent_without_files():
     assert "(no files reported)" in runner.calls[0]["prompt"]
 
 
-def test_technical_writer_agent():
-    payload = {"summary": "docs", "sections": [{"title": "Overview", "content": "..."}]}
-    agent = TechnicalWriterAgent(_runner(payload))
-    docs = run(
-        agent.document(FeatureRequest(title="F", description="d"), Design(overview="o"))
+def test_technical_writer_produces_doc_files():
+    payload = {
+        "summary": "docs",
+        "sections": [{"title": "Overview", "content": "..."}],
+        "files": [
+            {
+                "path": "docs/feature.md",
+                "change_type": "create",
+                "summary": "user docs",
+                "content": "# Feature\nUsage...",
+            }
+        ],
+    }
+    runner = _runner(payload)
+    agent = TechnicalWriterAgent(runner)
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[FileChange("a.py", ChangeType.CREATE, "adds")],
+    )
+    docs, doc_files = run(
+        agent.write_docs(
+            FeatureRequest(title="F", description="d"),
+            Design(overview="o"),
+            impl,
+            file_contents={"a.py": "GROUNDING_CONTENT"},
+            existing_docs=["README.md"],
+        )
     )
     assert isinstance(docs, Documentation)
     assert docs.sections[0].title == "Overview"
+    assert doc_files.files[0].path == "docs/feature.md"
+    prompt = runner.calls[0]["prompt"]
+    assert "GROUNDING_CONTENT" in prompt  # grounded in real code
+    assert "README.md" in prompt  # aware of existing docs
+
+
+def test_technical_writer_without_docs_or_files():
+    payload = {"summary": "docs", "sections": []}
+    runner = _runner(payload)
+    agent = TechnicalWriterAgent(runner)
+    impl = Implementation(task_id="T1", summary="s", files=[])
+    docs, doc_files = run(
+        agent.write_docs(
+            FeatureRequest(title="F", description="d"), Design(overview="o"), impl
+        )
+    )
+    assert doc_files.files == []
+    assert "- (none)" in runner.calls[0]["prompt"]
 
 
 def test_sre_agent_with_stack():

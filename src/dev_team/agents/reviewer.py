@@ -18,7 +18,18 @@ the task's acceptance criteria and follows good engineering practice, based on
 the actual code you are shown. You only approve work that is correct and
 complete. Flag issues with a severity of info, minor, major, or critical. Any
 major or critical issue blocks approval.
+
+Review discipline (a good review is precise, not prolific):
+- Raise at most {budget} comments; spend them on the issues that matter most.
+- Every comment must be actionable: it names the file and states the concrete
+  change a developer would make. Never restate what static analysis already
+  reported unless you are escalating its severity with a reason.
+- No style nitpicks a formatter or linter would catch; no vague advice.
 Always respond with a single JSON object and nothing else."""
+
+# The comment budget: production review systems (Google, Meta, GitHub) all
+# optimize precision at a fixed comment count, not comment volume.
+COMMENT_BUDGET = 6
 
 # Caps keep prompts bounded on large changes; truncation is labelled so the
 # reviewer knows it saw a prefix, not the whole file.
@@ -71,7 +82,7 @@ class ReviewerAgent(BaseAgent):
 
     role = "reviewer"
     stage = "review"
-    system_prompt = _SYSTEM
+    system_prompt = _SYSTEM.format(budget=COMMENT_BUDGET)
 
     async def review(
         self,
@@ -80,19 +91,28 @@ class ReviewerAgent(BaseAgent):
         *,
         file_contents: Optional[Mapping[str, str]] = None,
         diff: Optional[str] = None,
+        static_findings: Optional[str] = None,
     ) -> Review:
         """Review ``implementation`` against ``task``.
 
         ``file_contents`` maps changed paths to their current (post-apply)
         content, so the reviewer judges what is actually in the workspace.
         ``diff`` (when git is available) shows precisely what changed, which
-        matters when a modified file is large.
+        matters when a modified file is large. ``static_findings`` is linter/
+        type-checker output — the reviewer triages it rather than re-deriving
+        it, and spends its own judgment on what tools cannot see.
         """
 
         criteria = "\n".join(
             f"- {c}" for c in task.acceptance_criteria
         ) or "- (none specified)"
         files = render_changed_files(implementation, file_contents)
+        analysis = (
+            "\nStatic analysis output (triage: escalate what matters, ignore noise):\n"
+            f"{static_findings[:4000]}\n"
+            if static_findings
+            else ""
+        )
         prompt = f"""\
 Review this implementation.
 
@@ -105,7 +125,7 @@ Engineer notes: {implementation.notes or "(none)"}
 
 Changed files (with content):
 {files}
-{render_diff(diff)}
+{render_diff(diff)}{analysis}
 Respond with JSON of the form:
 {{
   "approved": true,

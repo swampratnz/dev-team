@@ -136,3 +136,24 @@ def test_changed_files_expands_untracked_and_renames():
         CommandResult(["git"], 0, "R  old.py -> new.py\n?? sub/added.py\n\n", ""),
     )
     assert GitRepo(cmd).changed_files() == ["new.py", "sub/added.py"]
+
+
+def test_stash_push_and_pop():
+    cmd = FakeCommandRunner()
+    repo = GitRepo(cmd)
+    assert repo.stash_push(["src/x.py"]) is True
+    repo.stash_pop()
+    assert ["git", "stash", "push", "-u", "--", "src/x.py"] in cmd.calls
+    assert ["git", "stash", "pop"] in cmd.calls
+
+
+def test_stash_push_reports_failure():
+    cmd = FakeCommandRunner()
+    cmd.add_rule("stash push", CommandResult(["git"], 1, "", "nothing to stash"))
+    assert GitRepo(cmd).stash_push(["a.py"]) is False
+
+
+def test_commit_allow_empty():
+    cmd = FakeCommandRunner()
+    GitRepo(cmd).commit("msg", allow_empty=True)
+    assert ["git", "commit", "--allow-empty", "-m", "msg"] in cmd.calls

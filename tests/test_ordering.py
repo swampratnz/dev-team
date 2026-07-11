@@ -39,3 +39,63 @@ def test_detects_cycle():
 def test_preserves_input_order_for_independent_tasks():
     tasks = [_task("A"), _task("B"), _task("C")]
     assert [t.id for t in topological_order(tasks)] == ["A", "B", "C"]
+
+
+def test_lint_plan_clean():
+    from dev_team.models import Plan
+    from dev_team.ordering import lint_plan
+
+    plan = Plan(
+        summary="s",
+        tasks=[
+            Task(id="T1", title="a", description="", acceptance_criteria=["x == 1"]),
+            Task(
+                id="T2",
+                title="b",
+                description="",
+                acceptance_criteria=["y"],
+                dependencies=["T1"],
+            ),
+        ],
+    )
+    assert lint_plan(plan) == []
+
+
+def test_lint_plan_catches_defects():
+    from dev_team.models import Plan
+    from dev_team.ordering import lint_plan
+
+    plan = Plan(
+        summary="s",
+        tasks=[
+            Task(id="T1", title="a", description=""),  # no criteria
+            Task(id="T1", title="dup", description="", acceptance_criteria=["x"]),
+            Task(
+                id="T3",
+                title="c",
+                description="",
+                acceptance_criteria=["x"],
+                dependencies=["T9", "T3"],
+            ),
+        ],
+    )
+    issues = lint_plan(plan)
+    assert any("no acceptance criteria" in i for i in issues)
+    assert any("duplicate task id" in i for i in issues)
+    assert any("unknown task 'T9'" in i for i in issues)
+    assert any("depends on itself" in i for i in issues)
+
+
+def test_lint_plan_empty_and_oversized():
+    from dev_team.models import Plan
+    from dev_team.ordering import MAX_PLAN_TASKS, lint_plan
+
+    assert lint_plan(Plan(summary="s", tasks=[])) == ["the plan contains no tasks"]
+    big = Plan(
+        summary="s",
+        tasks=[
+            Task(id=f"T{i}", title="t", description="", acceptance_criteria=["x"])
+            for i in range(MAX_PLAN_TASKS + 1)
+        ],
+    )
+    assert any("split the feature" in i for i in lint_plan(big))

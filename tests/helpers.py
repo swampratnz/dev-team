@@ -160,3 +160,41 @@ def engine_responses(*, review=True, security=True, reliability=True):
         "site reliability engineer": json_response(reliability_dict(reliability)),
         "DevOps engineer": json_response(deploy_dict()),
     }
+
+
+class GateCycleRunner:
+    """Command runner modelling a healthy change for fail-to-pass checks.
+
+    The engine runs the verify command twice per accepted attempt: on the
+    changed code (should pass) and with the implementation reverted (should
+    fail). Verify commands therefore alternate pass/fail; everything else
+    succeeds. ``add_rule`` overrides by substring, like FakeCommandRunner.
+    """
+
+    VERIFY_PROGRAMS = ("pytest", "npm", "cargo", "go")
+
+    def __init__(self):
+        self.calls = []
+        self.rules = []
+        self._verify_calls = 0
+
+    def add_rule(self, match, result):
+        self.rules.append((match, result))
+        return self
+
+    def run(self, command, *, cwd=None, timeout=None):
+        from dev_team.execution import CommandResult
+
+        args = list(command)
+        self.calls.append(args)
+        joined = " ".join(args)
+        for match, result in self.rules:
+            if match in joined:
+                return result
+        if args and args[0] in self.VERIFY_PROGRAMS:
+            self._verify_calls += 1
+            if self._verify_calls % 2 == 0:
+                return CommandResult(
+                    args, 1, "FAILED tests/test_change.py::test_new - reverted", ""
+                )
+        return CommandResult(args, 0, "", "")

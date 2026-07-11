@@ -30,7 +30,7 @@ def _factory(*, review=True):
             command_runner=FakeCommandRunner(),
             budget=Budget(),
             tracer=Tracer(clock=_Clock()),
-            config=EngineConfig(max_task_attempts=1),
+            config=EngineConfig(max_task_attempts=1, fail_to_pass_check=False),
         )
 
     return build

@@ -88,6 +88,8 @@ def test_deliver_runs_engine():
             self.t += 1.0
             return self.t
 
+    from dev_team.engine import EngineConfig
+
     team = DevTeam(ScriptedRunner(by_system_prompt=engine_responses()))
     outcome = run(
         team.deliver(
@@ -96,6 +98,7 @@ def test_deliver_runs_engine():
             command_runner=FakeCommandRunner(),
             budget=Budget(),
             tracer=Tracer(clock=_Clock()),
+            config=EngineConfig(fail_to_pass_check=False),
         )
     )
     assert outcome.success is True

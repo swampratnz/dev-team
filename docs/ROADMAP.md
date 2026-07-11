@@ -9,7 +9,11 @@ fingerprinted checkpoints). v0.5 delivered brownfield depth and scale: a repo
 map feeding the planner/architect, test-level baseline attribution (tolerated
 red baselines gate on *new* failures only), per-task git worktrees with
 squash-merge integration, deterministic retrospectives feeding the next run,
-and behavioural eval checks. The items below are the known, deliberately
+and behavioural eval checks. v0.6 made every agent benchmark-grounded (see
+docs/BENCHMARKS.md): fail-to-pass QA validation, SAST-triaging security,
+budgeted evidence-based review, ADR-consistent designs with tradeoffs,
+INVEST-linted plans, artifact-shipping writer/DevOps, checklist-driven SRE,
+and a per-run quality scorecard. The items below are the known, deliberately
 deferred capabilities, roughly in priority order.
 
 ## 1. Container-level sandboxing

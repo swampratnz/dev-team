@@ -80,6 +80,7 @@ from .models import (
     TaskStatus,
     TestReport,
 )
+from .ordering import lint_plan
 from .policy import GuardedCommandRunner, SideEffectPolicy
 from .profile import detect_project
 from .scheduler import ScheduledResult, schedule
@@ -118,6 +119,15 @@ class EngineConfig:
     - ``tolerate_baseline_failures``: when a red baseline is tolerated
       (``require_green_baseline=False``), record the failing test identities
       and gate tasks only on *newly* failing tests.
+    - ``lint_command``: static analysis run over each attempt; its output is
+      handed to the reviewer for triage (grounding review in tool findings).
+    - ``security_scan_command``: SAST/dependency scanner whose output the
+      security agent triages; defaults to the detected project profile's
+      suggestion (bandit / npm audit).
+    - ``fail_to_pass_check``: after gates pass, re-run them with the
+      implementation reverted; if the tests still pass they never exercised
+      the change, and the attempt is rejected as vacuous (SWT-bench logic).
+      Skipped for dry runs.
     """
 
     model: Optional[str] = None
@@ -141,6 +151,9 @@ class EngineConfig:
     gate_timeout_seconds: Optional[float] = 1800.0
     engineer_tools: Optional[Sequence[str]] = None
     worktrees: bool = False
+    lint_command: Optional[Sequence[str]] = None
+    security_scan_command: Optional[Sequence[str]] = None
+    fail_to_pass_check: bool = True
 
     def __post_init__(self) -> None:
         if self.max_task_attempts < 1:
@@ -379,6 +392,8 @@ class DeliveryEngine:
         self._branch: Optional[str] = None
         self._baseline_failures = None
         self._baseline_sha: Optional[str] = None
+        self._profile = None
+        self._scorecard: Dict[str, int] = {}
 
         def make(cls):
             wrapped = InstrumentedRunner(
@@ -432,7 +447,14 @@ class DeliveryEngine:
                     f"setup command failed ({result.exit_code}): {result.output[:500]}",
                 )
 
+        self._profile = detect_project(self.workspace)
         self._resolve_gates()
+        self._scorecard: Dict[str, int] = {
+            "plan_lint_issues": 0,
+            "review_rejections": 0,
+            "gate_failures": 0,
+            "vacuous_test_rejections": 0,
+        }
 
         self._baseline_failures = None
         baseline = self._check_baseline()
@@ -458,23 +480,50 @@ class DeliveryEngine:
                     )
 
         repo_ctx = build_repo_context(self.workspace)
+        snapshot_memory = self.memory.load()
         context_parts = [
             part
-            for part in (_prior_context(self.memory.load()), repo_ctx.render() or None)
+            for part in (_prior_context(snapshot_memory), repo_ctx.render() or None)
             if part
         ]
         prior = "\n\n".join(context_parts) if context_parts else None
         plan = await self.manager.create_plan(request, prior_context=prior)
+        issues = lint_plan(plan)
+        if issues:
+            # One INVEST-lint revision pass: a plan QA can't verify or the
+            # scheduler can't order wastes every downstream agent's budget.
+            self._scorecard["plan_lint_issues"] += len(issues)
+            self._event("plan-lint", f"Plan failed lint ({len(issues)} issue(s)); revising")
+            plan = await self.manager.create_plan(
+                request,
+                prior_context=prior,
+                revision_feedback="\n".join(f"- {i}" for i in issues),
+            )
+            remaining = lint_plan(plan)
+            if remaining:
+                self._event(
+                    "plan-lint",
+                    f"Plan still has {len(remaining)} lint issue(s); proceeding anyway",
+                    detail="; ".join(remaining[:5]),
+                )
         self.blackboard.post_artifact("plan", "plan", plan.summary)
         self._event("planned", "Plan ready", detail=f"{len(plan.tasks)} task(s)")
 
+        prior_decisions = [
+            f"{d.get('title')}: {d.get('decision')}"
+            for d in (snapshot_memory or {}).get("decisions", [])
+        ]
         design = await self.architect.design(
-            request, plan, repo_context=repo_ctx.render() or None
+            request,
+            plan,
+            repo_context=repo_ctx.render() or None,
+            prior_decisions=prior_decisions or None,
         )
         self.blackboard.record_decision(
             title=f"Architecture for {request.title}",
             context=request.description,
             decision=design.overview,
+            consequences=design.rationale,
         )
         self._event("designed", "Design ready")
 
@@ -530,15 +579,22 @@ class DeliveryEngine:
                 task_results.append(TaskResult(task=task, attempts=0))
 
         security = await self._specialist(self._security_review(request, task_results))
-        documentation = await self._specialist(self.writer.document(request, design))
-        reliability = await self._specialist(self.sre.assess(request, design))
-        deployment = await self._specialist(self.devops.plan_deployment(request, design))
+        deployment = await self._specialist(
+            self._provision_deployment(request, design)
+        )
+        reliability = await self._specialist(
+            self._assess_reliability(request, design, task_results, deployment)
+        )
+        documentation = await self._specialist(
+            self._write_documentation(request, design, task_results)
+        )
 
         committed = self._commit_if_approved(request, task_results, security)
         self._finalise_backlog(backlog, stories, task_results)
         notes = _retrospective(task_results, security)
         if notes:
             self.blackboard.put("retrospective", notes)
+        self.blackboard.put("scorecard", dict(self._scorecard))
         self.memory.save(self.blackboard)
 
         self.tracer.end(run_span)
@@ -609,7 +665,7 @@ class DeliveryEngine:
 
         if self.definition_of_done is not None:
             return
-        profile = detect_project(self.workspace)
+        profile = self._profile or detect_project(self.workspace)
         self.definition_of_done = DefinitionOfDone(
             [CommandGate("tests", profile.verify_command)]
         )
@@ -643,7 +699,12 @@ class DeliveryEngine:
         for code it never touched.
         """
 
-        if not [f for f in self.workspace.list_files() if f != ".gitignore"]:
+        product_files = [
+            f
+            for f in self.workspace.list_files()
+            if f != ".gitignore" and not f.startswith(_INTERNAL_PREFIX)
+        ]
+        if not product_files:
             return None
         report = self.definition_of_done.evaluate(self._gate_context())
         status = "green" if report.passed else "RED"
@@ -883,11 +944,19 @@ class DeliveryEngine:
             contents = self._contents(implementation, ws)
             self.blackboard.post_artifact("implementation", task.id, implementation.summary)
 
+            static_findings = await self._static_findings(cwd)
             task.status = TaskStatus.IN_REVIEW
             review = await self.reviewer.review(
-                task, implementation, file_contents=contents, diff=diff
+                task,
+                implementation,
+                file_contents=contents,
+                diff=diff,
+                static_findings=static_findings,
             )
             if not review.approved:
+                self._scorecard["review_rejections"] = (
+                    self._scorecard.get("review_rejections", 0) + 1
+                )
                 self._rollback(snapshot, repo)
                 task.status = TaskStatus.CHANGES_REQUESTED
                 self.tracer.end(span, "changes-requested")
@@ -926,10 +995,40 @@ class DeliveryEngine:
                         "baseline failures)",
                     )
                 else:
+                    self._scorecard["gate_failures"] = (
+                        self._scorecard.get("gate_failures", 0) + 1
+                    )
                     self._rollback(snapshot, repo)
                     task.status = TaskStatus.CHANGES_REQUESTED
                     self.tracer.end(span, "gates-failed")
                     return False, review, test_report, _review_from_dod(dod)
+
+            if await self._tests_are_vacuous(implementation, ws, repo, cwd, snapshot):
+                self._scorecard["vacuous_test_rejections"] = (
+                    self._scorecard.get("vacuous_test_rejections", 0) + 1
+                )
+                self._rollback(snapshot, repo)
+                task.status = TaskStatus.CHANGES_REQUESTED
+                self.tracer.end(span, "vacuous-tests")
+                feedback = Review(
+                    approved=False,
+                    summary="The test suite still passes with the implementation "
+                    "reverted — the tests never exercise this change.",
+                    comments=[
+                        ReviewComment(
+                            severity=Severity.MAJOR,
+                            message="Write tests that fail on the pre-change code: "
+                            "assert on the new behaviour's concrete inputs and "
+                            "outputs, not merely that code imports or runs.",
+                        )
+                    ],
+                )
+                test_report = TestReport(
+                    passed=False,
+                    coverage=0.0,
+                    summary="rejected: tests pass even without the implementation",
+                )
+                return False, review, test_report, feedback
 
             return True, review, test_report, None
         except Exception:
@@ -937,6 +1036,74 @@ class DeliveryEngine:
             # not leave unreviewed changes in the workspace.
             self._rollback(snapshot, repo)
             raise
+
+    async def _static_findings(self, cwd: Optional[str]) -> Optional[str]:
+        """Run the configured linter and return its output for review triage."""
+
+        if self.config.lint_command is None:
+            return None
+        result = await asyncio.to_thread(
+            self.command_runner.run,
+            list(self.config.lint_command),
+            cwd=cwd if cwd is not None else self.workdir,
+            timeout=self.config.gate_timeout_seconds,
+        )
+        return result.output or None
+
+    async def _tests_are_vacuous(
+        self,
+        implementation: Implementation,
+        ws: Workspace,
+        repo: GitRepo,
+        cwd: Optional[str],
+        snapshot: Optional[_Snapshot],
+    ) -> bool:
+        """Whether the gates still pass with the implementation reverted.
+
+        A suite that passes without the change never tested it (SWT-bench's
+        fail-to-pass principle). The check reverts only the implementation's
+        files — QA's test files stay — reruns the gates, and restores the
+        change afterwards. Skipped for dry runs, when disabled, or when there
+        is nothing on disk to revert.
+        """
+
+        if not self.config.fail_to_pass_check or not self.config.qa_tests:
+            return False
+        if isinstance(self.command_runner.inner, DryRunCommandRunner):
+            return False
+        impl_paths = [
+            c.path for c in implementation.files if c.path and ws.exists(c.path)
+        ]
+        if not impl_paths:
+            return False
+
+        if self.agentic:
+            if not repo.stash_push(impl_paths):
+                return False
+            try:
+                dod = await asyncio.to_thread(
+                    self.definition_of_done.evaluate, self._gate_context(cwd=cwd)
+                )
+            finally:
+                repo.stash_pop()
+        else:
+            # impl_paths were filtered on existence, so every current read works.
+            current = {p: ws.read_text(p) for p in impl_paths}
+            reverted = snapshot or {}
+            for path in impl_paths:
+                prior = reverted.get(path)
+                if prior is None:
+                    ws.delete(path)
+                else:
+                    ws.write_text(path, prior)
+            try:
+                dod = await asyncio.to_thread(
+                    self.definition_of_done.evaluate, self._gate_context(cwd=cwd)
+                )
+            finally:
+                for path, content in current.items():
+                    ws.write_text(path, content)
+        return dod.passed or self._inherited_failures_only(dod)
 
     def _inherited_failures_only(self, dod: DoDReport) -> bool:
         """Whether every failing test in ``dod`` was already failing at baseline.
@@ -1015,28 +1182,124 @@ class DeliveryEngine:
 
     # -- post-task stages ----------------------------------------------------
 
-    async def _security_review(
-        self,
-        request: FeatureRequest,
-        task_results: List[TaskResult],
-    ) -> SecurityReport:
+    def _aggregate_implementation(
+        self, request: FeatureRequest, task_results: List[TaskResult]
+    ) -> Implementation:
+        """The whole feature's change set as one implementation."""
+
         files = [
             change
             for tr in task_results
             if tr.implementation is not None
             for change in tr.implementation.files
         ]
-        aggregate = Implementation(
+        return Implementation(
             task_id="FEATURE",
             summary=f"All changes for {request.title}",
             files=files,
         )
+
+    async def _security_review(
+        self,
+        request: FeatureRequest,
+        task_results: List[TaskResult],
+    ) -> SecurityReport:
+        aggregate = self._aggregate_implementation(request, task_results)
         pseudo_task = Task(id="FEATURE", title=request.title, description=request.description)
+        scan_command = self.config.security_scan_command or (
+            self._profile.security_scan_command if self._profile else None
+        )
+        scanner_output = None
+        if scan_command is not None:
+            result = await asyncio.to_thread(
+                self.command_runner.run,
+                list(scan_command),
+                cwd=self.workdir,
+                timeout=self.config.gate_timeout_seconds,
+            )
+            scanner_output = result.output or None
         report = await self.security.review(
-            pseudo_task, aggregate, file_contents=self._contents(aggregate)
+            pseudo_task,
+            aggregate,
+            file_contents=self._contents(aggregate),
+            scanner_output=scanner_output,
         )
         self.blackboard.post_artifact("security", "FEATURE", report.summary)
         return report
+
+    async def _provision_deployment(
+        self, request: FeatureRequest, design: Design
+    ) -> DeploymentPlan:
+        """Get the deployment plan plus real artifacts, and materialise them."""
+
+        listing = [
+            f for f in self.workspace.list_files() if not f.startswith(_INTERNAL_PREFIX)
+        ]
+        plan, artifacts = await self.devops.plan_and_provision(
+            request,
+            design,
+            workspace_listing=listing,
+            project_kind=self._profile.kind if self._profile else None,
+        )
+        if artifacts.files:
+            ChangeApplier(self.workspace).apply(artifacts)
+            self.blackboard.post_artifact(
+                "deployment-artifacts",
+                "FEATURE",
+                ", ".join(c.path for c in artifacts.files if c.path),
+            )
+        return plan
+
+    async def _assess_reliability(
+        self,
+        request: FeatureRequest,
+        design: Design,
+        task_results: List[TaskResult],
+        deployment: Optional[DeploymentPlan],
+    ) -> ReliabilityReport:
+        """Production-readiness review over the delivered evidence."""
+
+        aggregate = self._aggregate_implementation(request, task_results)
+        done = sum(1 for tr in task_results if tr.task.status is TaskStatus.DONE)
+        gate_summary = f"{done}/{len(task_results)} task(s) passed their quality gates"
+        return await self.sre.assess(
+            request,
+            design,
+            aggregate,
+            file_contents=self._contents(aggregate),
+            deployment=deployment,
+            gate_summary=gate_summary,
+        )
+
+    async def _write_documentation(
+        self,
+        request: FeatureRequest,
+        design: Design,
+        task_results: List[TaskResult],
+    ) -> Documentation:
+        """Write docs grounded in the delivered code, into the workspace."""
+
+        aggregate = self._aggregate_implementation(request, task_results)
+        existing_docs = [
+            f
+            for f in self.workspace.list_files()
+            if f.endswith((".md", ".rst")) and not f.startswith(_INTERNAL_PREFIX)
+        ]
+        documentation, doc_files = await self.writer.write_docs(
+            request,
+            design,
+            aggregate,
+            file_contents=self._contents(aggregate),
+            existing_docs=existing_docs,
+        )
+        if doc_files.files:
+            ChangeApplier(self.workspace).apply(doc_files)
+            self.blackboard.post_artifact(
+                "documentation-files",
+                "FEATURE",
+                ", ".join(c.path for c in doc_files.files if c.path),
+            )
+        return documentation
 
     def _commit_if_approved(
         self,
@@ -1057,11 +1320,19 @@ class DeliveryEngine:
         try:
             if self._use_worktrees:
                 # Accepted tasks already live as WIP commits on the delivery
-                # branch; collapse them into the single feature commit.
+                # branch; collapse them into the single feature commit, and
+                # pick up post-task artifacts (docs, deployment files) that
+                # were written after the last merge.
                 head = self.git.rev_parse("HEAD")
                 if not self._baseline_sha or head == self._baseline_sha:
                     return False
                 self.git.reset_soft(self._baseline_sha)
+                extras = [
+                    p
+                    for p in self.git.changed_files()
+                    if not p.startswith(_INTERNAL_PREFIX)
+                ]
+                self.git.add_paths(extras)
                 self.git.commit(f"{request.title} ({', '.join(done)})")
             else:
                 self.git.ensure_repo()

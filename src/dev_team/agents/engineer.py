@@ -140,7 +140,9 @@ Respond with JSON of the form:
 Implement the following task in the current working directory. Use your tools:
 read the existing code before changing it, create or edit files directly,
 write automated tests for the acceptance criteria, and run the test suite to
-check your work before answering.
+check your work before answering. If the task is fixing incorrect behaviour,
+write a test that reproduces the problem FIRST, watch it fail, then implement
+until it passes.
 
 {_task_section(task, design)}
 

@@ -83,12 +83,19 @@ class DesignComponent:
 
 @dataclass
 class Design:
-    """The technical design for a feature."""
+    """The technical design for a feature.
+
+    ``alternatives`` and ``rationale`` capture ATAM-style tradeoff analysis:
+    what other approaches were considered and why this one won. A design
+    without rejected alternatives usually means no alternatives were weighed.
+    """
 
     overview: str
     components: List[DesignComponent] = field(default_factory=list)
     tech_stack: List[str] = field(default_factory=list)
     risks: List[str] = field(default_factory=list)
+    alternatives: List[str] = field(default_factory=list)
+    rationale: str = ""
 
 
 @dataclass
