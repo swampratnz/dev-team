@@ -69,11 +69,13 @@ QA, security, docs, reliability, and deployment.
   [`docs/INTERACTION.md`](docs/INTERACTION.md)).
 - ✅ **Ubuntu-ready** — packaged for deployment as a container or systemd unit.
 
-The v0.2 capability set was chosen from a structured research pass across seven
+The capability set was chosen from a structured research pass across seven
 dimensions (roles, orchestration, execution, quality gates, memory, governance,
 delivery), grounded in real multi-agent frameworks — see
-[`docs/RESEARCH.md`](docs/RESEARCH.md). v0.3 hardened it from a deep review:
-see [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is still deliberately out.
+[`docs/RESEARCH.md`](docs/RESEARCH.md). [`docs/ROADMAP.md`](docs/ROADMAP.md)
+tracks how each release built on it and what is still deliberately out;
+[`docs/INTERACTION.md`](docs/INTERACTION.md) covers working *with* the team
+interactively.
 
 ---
 
@@ -112,7 +114,7 @@ Personas are configurable (`--roster roster.json`) or removable
 The simulation engine is the `DevelopmentWorkflow` state machine; the real
 engine is the `DeliveryEngine`. Both are wrapped by the `DevTeam` facade.
 
-## Capabilities (v0.2)
+## Capabilities
 
 Beyond the agents, the real engine composes a set of production-shaped,
 individually-testable building blocks — each a small protocol with a real and a
@@ -144,6 +146,11 @@ fake implementation:
   branch/commit — one commit per delivery, after security approval.
 - **Evals** — `EvalCase` / `evaluate` score deliveries against fixed
   expectations (success, expected files, cost) so quality is a tracked number.
+- **Interactivity** — an `InteractionChannel` (console / queue-serviced /
+  scripted / auto) pauses a run for plan review, failed-task escalation, and
+  approvals; `Persona` / `Roster` give every agent a configurable name; a
+  persistent `ChatBackend` powers `--chat`. Defaults preserve fully
+  autonomous behaviour.
 
 ## Lifecycle
 
@@ -193,9 +200,10 @@ the original baseline.
 
 ## Architecture
 
-The one and only integration point with the Claude Agent SDK is
-`dev_team.sdk.ClaudeAgentRunner`, which implements the tiny `AgentRunner`
-protocol (`prompt`, `system_prompt`, `allowed_tools`, `model`, `cwd`).
+The one and only integration boundary with the Claude Agent SDK is the
+`dev_team.sdk` module: `ClaudeAgentRunner` implements the tiny `AgentRunner`
+protocol (`prompt`, `system_prompt`, `allowed_tools`, `model`, `cwd`), and
+`ClaudeChatBackend` holds the persistent conversation behind `--chat`.
 `allowed_tools` + `cwd` are what turn a call into a real agent loop — the
 agentic engineer passes both. Everything above the protocol is testable to
 100% coverage without spawning the Claude CLI or making network calls — tests
@@ -204,8 +212,9 @@ corrective instruction (`EngineConfig.json_retries`) before failing the stage.
 
 ```
 cli ─▶ team.DevTeam ─▶ workflow.DevelopmentWorkflow ─▶ agents/* ─▶ sdk.AgentRunner
-                                                                     ├─ ClaudeAgentRunner (real SDK)
-                                                                     └─ ScriptedRunner (tests)
+  │                                                                  ├─ ClaudeAgentRunner (real SDK)
+  │                                                                  └─ ScriptedRunner (tests)
+  └─ --chat ─▶ chat.ChatSession ─▶ sdk.ChatBackend (persistent session)
 ```
 
 Key modules:
@@ -222,6 +231,8 @@ Key modules:
 - `memory.py` / `backlog.py` — blackboard, ADRs, cross-run memory,
   checkpoints, persistent backlog.
 - `budget.py` / `trace.py` / `approval.py` / `policy.py` — governance.
+- `interaction.py` / `persona.py` / `chat.py` — human-in-the-loop questions
+  and approvals, the named-agent roster, and the conversational front door.
 - `scheduler.py` / `ordering.py` — dependency-aware concurrency and ordering.
 - `json_utils.py` / `parsing.py` — robust extraction of structured data from
   model output (with contract enforcement: blocking findings force rejection).
@@ -285,6 +296,11 @@ escalation, approvals), or start from a conversation:
 dev-team "Password reset" "Reset via emailed link" --interactive
 dev-team --chat            # shape the request with the PM, then /run or /deliver
 ```
+
+Agent names come from the default cast; rename them with `--roster FILE` or
+disable with `--no-personas`. [`docs/INTERACTION.md`](docs/INTERACTION.md)
+walks through all of it, including driving runs from your own UI via
+`QueueChannel`.
 
 Exit codes: `0` success, `1` completed with failed tasks, `2` invalid input
 (including an interactive abort at plan review).
