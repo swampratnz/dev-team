@@ -60,6 +60,12 @@ from .execution import (
 )
 from .git import GitError, GitRepo
 from .instrument import InstrumentedRunner
+from .interaction import (
+    InteractionChannel,
+    ask_in_thread,
+    plan_review_question,
+    task_failure_question,
+)
 from .memory import (
     Blackboard,
     CheckpointStore,
@@ -87,6 +93,7 @@ from .models import (
     TestReport,
 )
 from .ordering import lint_plan
+from .persona import Roster
 from .policy import GuardedCommandRunner, SideEffectPolicy
 from .profile import detect_project
 from .scheduler import ScheduledResult, schedule
@@ -373,6 +380,8 @@ class DeliveryEngine:
         checkpoints: Optional[CheckpointStore] = None,
         memory: Optional[ProjectMemory] = None,
         listener: Optional[Listener] = None,
+        roster: Optional[Roster] = None,
+        interaction: Optional[InteractionChannel] = None,
     ) -> None:
         self.config = config or EngineConfig()
         self.workspace: Workspace = workspace or InMemoryWorkspace()
@@ -381,6 +390,8 @@ class DeliveryEngine:
         self.blackboard = blackboard or Blackboard()
         self.approval = approval or AutoApprover()
         self.listener = listener
+        self.roster = roster if roster is not None else Roster.default()
+        self.interaction = interaction
 
         # Everything side-effecting is rooted at the workspace, never at the
         # orchestrator's own working directory.
@@ -461,6 +472,7 @@ class DeliveryEngine:
                 model=self.config.role_models.get(cls.role, self.config.model),
                 listener=listener,
                 json_retries=self.config.json_retries,
+                persona=self.roster.get(cls.role),
             )
 
         self.manager = make(ProductManagerAgent)
@@ -596,6 +608,15 @@ class DeliveryEngine:
                 self._dedupe_task_ids(plan.tasks)
             self.blackboard.post_artifact("plan", "plan", plan.summary)
             self._event("planned", "Plan ready", detail=f"{len(plan.tasks)} task(s)")
+
+            if not resuming:
+                # A checkpointed plan was already approved by the run that
+                # created it; re-litigating it on resume would let a second
+                # approval drift from the banked work.
+                plan = await self._review_plan(request, plan, prior)
+                if plan is None:
+                    self.tracer.end(run_span, "halted")
+                    return self._halted(request, "plan rejected at interactive review")
 
             prior_decisions = [
                 f"{d.get('title')}: {d.get('decision')}"
@@ -892,11 +913,99 @@ class DeliveryEngine:
             return self.config.escalation_model
         return None
 
+    async def _review_plan(
+        self, request: FeatureRequest, plan: Plan, prior: Optional[str]
+    ) -> Optional[Plan]:
+        """Interactive plan review: approve, revise (repeatedly), or abort.
+
+        Returns the approved plan, or ``None`` when the human aborts. Without
+        an interaction channel the plan passes straight through.
+        """
+
+        if self.interaction is None:
+            return plan
+        asked_by = self.roster.display_name("product-manager")
+        while True:
+            reply = await ask_in_thread(
+                self.interaction, plan_review_question(plan, asked_by=asked_by)
+            )
+            if reply.choice == "approve":
+                self._event("plan-approved", "Plan approved interactively")
+                return plan
+            if reply.choice == "abort":
+                self._event("plan-review", "Plan rejected; aborting the run")
+                return None
+            self._event(
+                "plan-review", "Plan revision requested", detail=reply.text or None
+            )
+            plan = await self.manager.create_plan(
+                request,
+                prior_context=prior,
+                revision_feedback=reply.text or "Revise the plan.",
+            )
+            self._dedupe_task_ids(plan.tasks)
+            self._event(
+                "planned", "Revised plan ready", detail=f"{len(plan.tasks)} task(s)"
+            )
+
+    async def _escalate_failure(
+        self, task: Task, result: TaskResult
+    ) -> Optional[Review]:
+        """Ask the human what to do with a task that failed all attempts.
+
+        Returns guidance (as reviewer-style feedback for a fresh attempt
+        round) when the human chooses to retry, else ``None`` to accept the
+        failure. Unattended runs (no channel) and exhausted budgets always
+        accept the failure.
+        """
+
+        if self.interaction is None or self.budget.exhausted:
+            return None
+        parts = []
+        if result.review is not None:
+            parts.append(f"review: {result.review.summary}")
+        if result.test_report is not None:
+            parts.append(f"tests: {result.test_report.summary}")
+        evidence = "\n".join(parts) or "no evidence captured"
+        reply = await ask_in_thread(
+            self.interaction,
+            task_failure_question(
+                task.id, evidence, asked_by=self.roster.display_name("engineer")
+            ),
+        )
+        if reply.choice != "retry":
+            self._event("task-failed", f"{task.id} failure accepted interactively")
+            return None
+        guidance = reply.text or "Please try a different approach."
+        self._event("task-retry", f"Retrying {task.id} with guidance", detail=guidance)
+        return Review(
+            approved=False,
+            summary=f"Human guidance for the retry: {guidance}",
+            comments=[ReviewComment(severity=Severity.MAJOR, message=guidance)],
+        )
+
     async def _develop_task(self, task: Task, design: Design) -> TaskResult:
-        if self._use_worktrees:
-            return await self._develop_task_in_worktree(task, design)
+        """Develop ``task``, escalating exhausted attempts to the human."""
 
         feedback: Optional[Review] = None
+        total_attempts = 0
+        while True:
+            result = await self._attempt_task(task, design, feedback)
+            total_attempts += result.attempts
+            result.attempts = total_attempts
+            if result.succeeded:
+                return result
+            feedback = await self._escalate_failure(task, result)
+            if feedback is None:
+                return result
+
+    async def _attempt_task(
+        self, task: Task, design: Design, initial_feedback: Optional[Review] = None
+    ) -> TaskResult:
+        if self._use_worktrees:
+            return await self._develop_task_in_worktree(task, design, initial_feedback)
+
+        feedback: Optional[Review] = initial_feedback
         implementation: Optional[Implementation] = None
         review: Optional[Review] = None
         test_report: Optional[TestReport] = None
@@ -953,7 +1062,12 @@ class DeliveryEngine:
         task.status = TaskStatus.FAILED
         return TaskResult(task, attempts, implementation, review, test_report)
 
-    async def _develop_task_in_worktree(self, task: Task, design: Design) -> TaskResult:
+    async def _develop_task_in_worktree(
+        self,
+        task: Task,
+        design: Design,
+        initial_feedback: Optional[Review] = None,
+    ) -> TaskResult:
         """Develop ``task`` in its own git worktree, merging only when green.
 
         Implementation, review, and gate runs all happen inside the task's
@@ -973,7 +1087,7 @@ class DeliveryEngine:
         arena_ws = LocalWorkspace(wt_path)
         arena_git = GitRepo(self.command_runner, cwd=wt_path)
 
-        feedback: Optional[Review] = None
+        feedback: Optional[Review] = initial_feedback
         implementation: Optional[Implementation] = None
         review: Optional[Review] = None
         test_report: Optional[TestReport] = None

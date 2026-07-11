@@ -15,7 +15,9 @@ from .agents import (
 from .config import TeamConfig
 from .engine import DeliveryEngine, DeliveryOutcome
 from .events import Listener
+from .interaction import InteractionChannel
 from .models import FeatureRequest, ProjectResult
+from .persona import Roster
 from .sdk import AgentRunner, ClaudeAgentRunner
 from .workflow import DevelopmentWorkflow
 
@@ -25,14 +27,22 @@ def build_workflow(
     *,
     config: Optional[TeamConfig] = None,
     listener: Optional[Listener] = None,
+    roster: Optional[Roster] = None,
+    interaction: Optional[InteractionChannel] = None,
 ) -> DevelopmentWorkflow:
     """Construct a :class:`DevelopmentWorkflow` with the full agent roster."""
 
     config = config or TeamConfig()
     model = config.model
+    cast = roster if roster is not None else Roster.default()
 
     def make(agent_cls):
-        return agent_cls(runner, model=model, listener=listener)
+        return agent_cls(
+            runner,
+            model=model,
+            listener=listener,
+            persona=cast.get(agent_cls.role),
+        )
 
     return DevelopmentWorkflow(
         manager=make(ProductManagerAgent),
@@ -43,6 +53,7 @@ def build_workflow(
         devops=make(DevOpsAgent),
         config=config,
         listener=listener,
+        interaction=interaction,
     )
 
 
@@ -61,9 +72,13 @@ class DevTeam:
         *,
         config: Optional[TeamConfig] = None,
         listener: Optional[Listener] = None,
+        roster: Optional[Roster] = None,
+        interaction: Optional[InteractionChannel] = None,
     ) -> None:
         self.config = config or TeamConfig()
         self.listener = listener
+        self.roster = roster if roster is not None else Roster.default()
+        self.interaction = interaction
         self.runner = runner or ClaudeAgentRunner(
             default_model=self.config.model,
             permission_mode=self.config.permission_mode,
@@ -71,7 +86,11 @@ class DevTeam:
             max_turns=self.config.max_turns,
         )
         self.workflow = build_workflow(
-            self.runner, config=self.config, listener=listener
+            self.runner,
+            config=self.config,
+            listener=listener,
+            roster=self.roster,
+            interaction=interaction,
         )
 
     async def develop(self, request: FeatureRequest) -> ProjectResult:
@@ -102,6 +121,8 @@ class DevTeam:
         """
 
         kwargs.setdefault("listener", self.listener)
+        kwargs.setdefault("roster", self.roster)
+        kwargs.setdefault("interaction", self.interaction)
         return DeliveryEngine(self.runner, **kwargs)
 
     async def deliver(self, request: FeatureRequest, **kwargs) -> DeliveryOutcome:

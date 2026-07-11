@@ -60,6 +60,13 @@ QA, security, docs, reliability, and deployment.
   enforced in `pyproject.toml`. Note what this does and doesn't claim: the
   suite proves the machinery with test doubles; it does not exercise the real
   Claude CLI (see *Testing*).
+- ✅ **Interactive, when you want it** — `--interactive` pauses at the moments
+  a human wants a say (plan review with revise/abort, failed-task escalation
+  with retry guidance, commit/risky-command approval); `--chat` opens a
+  conversation with the product manager to shape the request before any run
+  starts; every agent has a configurable name/persona; and a `QueueChannel`
+  lets you drive runs from your own UI (see
+  [`docs/INTERACTION.md`](docs/INTERACTION.md)).
 - ✅ **Ubuntu-ready** — packaged for deployment as a container or systemd unit.
 
 The v0.2 capability set was chosen from a structured research pass across seven
@@ -86,17 +93,21 @@ and runs commands in that directory via SDK tools. An `InMemoryWorkspace` runs
 
 ## The team
 
-| Agent | Role | Responsibility |
-|-------|------|----------------|
-| `ProductManagerAgent` | Product / delivery | Decompose a request into ordered, acceptance-criteria-bearing tasks. |
-| `ArchitectAgent` | Architecture | Produce a technical design: components, tech stack, risks. |
-| `EngineerAgent` | Engineering | Implement each task, and address review feedback on retries. |
-| `ReviewerAgent` | Code review | Approve work or request changes with severities. |
-| `QAAgent` | Quality assurance | Design tests and report pass/fail plus coverage. |
-| `SecurityEngineerAgent` | AppSec | Threat-model and security-review the change; block on major/critical findings. |
-| `TechnicalWriterAgent` | Docs | Produce user docs, API notes, and release notes. |
-| `SREAgent` | Reliability | Assess production readiness: SLOs, runbook, rollback. |
-| `DevOpsAgent` | DevOps | Produce a deployment plan with steps and rollback, targeting Ubuntu. |
+| Agent | Persona | Role | Responsibility |
+|-------|---------|------|----------------|
+| `ProductManagerAgent` | Priya | Product / delivery | Decompose a request into ordered, acceptance-criteria-bearing tasks. |
+| `ArchitectAgent` | Anders | Architecture | Produce a technical design: components, tech stack, risks. |
+| `EngineerAgent` | Sam | Engineering | Implement each task, and address review feedback on retries. |
+| `ReviewerAgent` | Rey | Code review | Approve work or request changes with severities. |
+| `QAAgent` | Quinn | Quality assurance | Design tests and report pass/fail plus coverage. |
+| `SecurityEngineerAgent` | Sasha | AppSec | Threat-model and security-review the change; block on major/critical findings. |
+| `TechnicalWriterAgent` | Wren | Docs | Produce user docs, API notes, and release notes. |
+| `SREAgent` | Riley | Reliability | Assess production readiness: SLOs, runbook, rollback. |
+| `DevOpsAgent` | Devon | DevOps | Produce a deployment plan with steps and rollback, targeting Ubuntu. |
+
+Personas are configurable (`--roster roster.json`) or removable
+(`--no-personas`); internally everything stays keyed by role — see
+[`docs/INTERACTION.md`](docs/INTERACTION.md).
 
 The simulation engine is the `DevelopmentWorkflow` state machine; the real
 engine is the `DeliveryEngine`. Both are wrapped by the `DevTeam` facade.
@@ -267,7 +278,16 @@ Output as JSON for scripting:
 dev-team "Health endpoint" "Add a /health endpoint" --json
 ```
 
-Exit codes: `0` success, `1` completed with failed tasks, `2` invalid input.
+Collaborate with the run instead of watching it (plan review, failure
+escalation, approvals), or start from a conversation:
+
+```bash
+dev-team "Password reset" "Reset via emailed link" --interactive
+dev-team --chat            # shape the request with the PM, then /run or /deliver
+```
+
+Exit codes: `0` success, `1` completed with failed tasks, `2` invalid input
+(including an interactive abort at plan review).
 
 ### Library
 

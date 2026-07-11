@@ -3,9 +3,38 @@
 All notable changes to this project are documented in this file. Version
 sections below are reconstructed from the repository history.
 
-## [Unreleased] — Review hardening
+## [Unreleased]
 
-### CLI & deployment
+### Interactivity & personas
+
+#### Interactive runs
+- **An `InteractionChannel` puts a human in the loop**: `--interactive` runs
+  pause for plan review (approve / revise with feedback / abort) before any
+  task work, escalate a task that exhausted its attempts (skip, or retry
+  with guidance fed to the engineer as review feedback), and route the
+  feature commit and policy-gated commands (`push`/`deploy`/`rm`) through
+  interactive approval. Every question's default answer preserves the
+  autonomous behaviour, EOF degrades to it, and resumed checkpoints don't
+  re-litigate an already-approved plan. `QueueChannel` (thread-serviced,
+  with timeout fallback) is the integration surface for external UIs;
+  `ScriptedChannel` is the test double. See `docs/INTERACTION.md`.
+- **`--chat` opens a conversation with the product manager** on a persistent
+  `ClaudeSDKClient` session (context retained across turns) to shape the
+  feature request before any run; `/run` / `/deliver` distil the
+  conversation into the brief and hand it to the team, returning to the
+  chat afterwards.
+
+#### Personas
+- **Every agent has a name**: a default cast (Priya, Anders, Sam, Rey,
+  Quinn, Sasha, Wren, Riley, Devon) is injected additively into system
+  prompts and carried on progress events (`[Priya (product-manager)/...]`).
+  `--roster FILE` overlays custom names/styles (unknown roles rejected);
+  `--no-personas` disables. Names are presentation only — checkpoints,
+  memory, and events stay keyed by role.
+
+### Review hardening
+
+#### CLI & deployment
 - **Claude subscription support is first-class**: the CLI now preflights
   credentials and accepts `CLAUDE_CODE_OAUTH_TOKEN` (a Pro/Max/Team/Enterprise
   subscription token from `claude setup-token`) alongside
@@ -15,7 +44,7 @@ sections below are reconstructed from the repository history.
   Ubuntu server install guide covering both auth options, and the systemd
   unit and Docker examples document the subscription token.
 
-### Delivery engine
+#### Delivery engine
 - **Accepted work is banked**: every task that passes its gates is committed
   as a `wip(dev-team)` commit on the delivery branch, so a later task's
   rollback (hard reset) can no longer destroy earlier gated work, per-task
@@ -45,7 +74,7 @@ sections below are reconstructed from the repository history.
 - Security review evidence is reconciled against git so resumed tasks' files
   cannot be committed unseen.
 
-### Governance & measurement
+#### Governance & measurement
 - The approval gate is consulted before the feature commit; approval-token
   matching is by command position (`git push` gates, `git stash push` does
   not); a denied fail-to-pass stash is reported instead of silently skipped.
@@ -59,7 +88,7 @@ sections below are reconstructed from the repository history.
   `check_commands` fail honestly on dry-run workspaces instead of vacuously
   passing; trace spans are closed when an agent call raises.
 
-### Agents & model I/O
+#### Agents & model I/O
 - `extract_json` prefers the last JSON object in output (mid-task narration
   can no longer hijack the answer); non-object roots are rejected and
   retried; unknown severity strings fail **closed** (high/blocker block
@@ -72,7 +101,7 @@ sections below are reconstructed from the repository history.
   and marked as data-not-instructions in prompts; omitted/truncated review
   evidence is labelled; the JSON-retry prompt is self-contained.
 
-### Packaging & tooling
+#### Packaging & tooling
 - Added a `LICENSE` file (MIT), `CHANGELOG.md`, and a `py.typed` marker.
 - CLI: `--version` flag; deliver-only flags are rejected without `--deliver`
   (exit code 2); errors and `--verbose` progress go to stderr so `--json`

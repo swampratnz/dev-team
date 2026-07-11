@@ -277,3 +277,177 @@ def test_main_with_injected_runner_skips_credential_check(monkeypatch, tmp_path,
     code = main(["Login", "Add login"], runner=runner)
     assert code == 0
     assert "SUCCESS" in capsys.readouterr().out
+
+
+# --- personas, interactivity, chat -------------------------------------------
+
+
+def test_main_rejects_chat_with_positionals(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--chat"], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "--chat" in capsys.readouterr().err
+
+
+def test_main_rejects_chat_with_json(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--chat", "--json"], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "--json" in capsys.readouterr().err
+
+
+def test_main_requires_positionals_without_chat(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main([], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "required" in capsys.readouterr().err
+
+
+def test_main_rejects_roster_with_no_personas(tmp_path, capsys):
+    roster = tmp_path / "roster.json"
+    roster.write_text("{}")
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["Login", "Add login", "--roster", str(roster), "--no-personas"],
+            runner=ScriptedRunner([]),
+        )
+    assert excinfo.value.code == 2
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+def test_main_verbose_events_use_persona_names(capsys):
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(["Login", "Add login", "--verbose"], runner=runner)
+    assert code == 0
+    assert "Priya (product-manager)" in capsys.readouterr().err
+
+
+def test_main_no_personas_uses_bare_roles(capsys):
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(["Login", "Add login", "--verbose", "--no-personas"], runner=runner)
+    err = capsys.readouterr().err
+    assert code == 0
+    assert "[product-manager/planning]" in err
+    assert "Priya" not in err
+
+
+def test_main_roster_file_renames_agents(tmp_path, capsys):
+    roster = tmp_path / "roster.json"
+    roster.write_text(json.dumps({"product-manager": {"name": "Petra"}}))
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(
+        ["Login", "Add login", "--verbose", "--roster", str(roster)], runner=runner
+    )
+    assert code == 0
+    assert "Petra (product-manager)" in capsys.readouterr().err
+
+
+def test_main_bad_roster_file_exits_2(tmp_path, capsys):
+    roster = tmp_path / "roster.json"
+    roster.write_text("{broken")
+    code = main(
+        ["Login", "Add login", "--roster", str(roster)], runner=ScriptedRunner([])
+    )
+    assert code == 2
+    assert "not valid JSON" in capsys.readouterr().err
+
+
+def test_main_interactive_simulation_reads_stdin(monkeypatch, capsys):
+    import io as _io
+
+    monkeypatch.setattr("sys.stdin", _io.StringIO("approve\n"))
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(["Login", "Add login", "--interactive"], runner=runner)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "SUCCESS" in captured.out
+    assert "Approve this plan" in captured.err
+
+
+def test_main_interactive_abort_exits_2(monkeypatch, capsys):
+    import io as _io
+
+    monkeypatch.setattr("sys.stdin", _io.StringIO("abort\n"))
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(["Login", "Add login", "--interactive"], runner=runner)
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "aborted at plan review" in captured.err
+
+
+def test_main_interactive_deliver_wires_approval_gate(monkeypatch, tmp_path, capsys):
+    import io as _io
+
+    from helpers import engine_responses
+
+    monkeypatch.setattr("sys.stdin", _io.StringIO("approve\n"))
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(_deliver_args(tmp_path, "--interactive"), runner=runner)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "SUCCESS" in captured.out
+    assert "Approve this plan" in captured.err
+
+
+def test_main_chat_runs_simulation_from_conversation(monkeypatch, capsys):
+    import io as _io
+
+    from test_chat import FakeBackend
+
+    monkeypatch.setattr("sys.stdin", _io.StringIO("I want login\n/run\n/quit\n"))
+    backend = FakeBackend(["what kind of login?"])
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(["--chat"], runner=runner, chat_backend=backend)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "chatting with Priya" in captured.out
+    assert "Priya > what kind of login?" in captured.out
+    assert "SUCCESS" in captured.out
+    assert backend.closed is True
+
+
+def test_main_chat_deliver_from_conversation(monkeypatch, tmp_path, capsys):
+    import io as _io
+
+    from helpers import engine_responses
+    from test_chat import FakeBackend
+
+    monkeypatch.setattr("sys.stdin", _io.StringIO("/deliver\n/quit\n"))
+    backend = FakeBackend()
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(
+        ["--chat", "--workspace", str(tmp_path), "--no-commit",
+         "--verify-command", "python -c pass"],
+        runner=runner,
+        chat_backend=backend,
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "handing off to the team (delivery)" in captured.out
+    assert "SUCCESS" in captured.out
+
+
+def test_main_chat_without_personas_uses_role_name(monkeypatch, capsys):
+    import io as _io
+
+    from test_chat import FakeBackend
+
+    monkeypatch.setattr("sys.stdin", _io.StringIO("/quit\n"))
+    code = main(
+        ["--chat", "--no-personas"],
+        runner=ScriptedRunner([]),
+        chat_backend=FakeBackend(),
+    )
+    assert code == 0
+    assert "chatting with product-manager" in capsys.readouterr().out
+
+
+def test_main_chat_builds_real_backend_lazily(monkeypatch, capsys):
+    import io as _io
+
+    # No injected backend: the real ClaudeChatBackend is constructed but its
+    # session never starts because the user quits before saying anything.
+    monkeypatch.setattr("sys.stdin", _io.StringIO("/quit\n"))
+    code = main(["--chat"], runner=ScriptedRunner([]))
+    assert code == 0
+    assert "chatting with Priya" in capsys.readouterr().out

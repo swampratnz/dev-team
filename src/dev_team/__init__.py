@@ -53,6 +53,17 @@ from .execution import (
 )
 from .git import GitError, GitRepo
 from .instrument import InstrumentedRunner
+from .interaction import (
+    AutoChannel,
+    ChannelApprovalGate,
+    Choice,
+    ConsoleChannel,
+    InteractionChannel,
+    Question,
+    QueueChannel,
+    Reply,
+    ScriptedChannel,
+)
 from .memory import (
     Artifact,
     Blackboard,
@@ -62,6 +73,7 @@ from .memory import (
     RunCheckpoint,
 )
 from .ordering import lint_plan, topological_order
+from .persona import DEFAULT_CAST, Persona, Roster
 from .models import (
     ChangeType,
     Design,
@@ -152,6 +164,19 @@ __all__ = [
     "DenyAll",
     "PolicyApprovalGate",
     "CallbackApprovalGate",
+    # interactivity & personas
+    "InteractionChannel",
+    "Question",
+    "Choice",
+    "Reply",
+    "AutoChannel",
+    "ConsoleChannel",
+    "QueueChannel",
+    "ScriptedChannel",
+    "ChannelApprovalGate",
+    "Persona",
+    "Roster",
+    "DEFAULT_CAST",
     "SideEffectPolicy",
     "GuardedCommandRunner",
     "PolicyVerdict",

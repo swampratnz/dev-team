@@ -15,15 +15,19 @@ class AgentEvent:
         stage: A short machine-friendly stage name (e.g. ``"planning"``).
         message: A human-readable description of what happened.
         detail: Optional extra context (task id, counts, etc.).
+        name: The emitting agent's persona name, when one is cast. Purely
+            presentational — consumers key on ``role``.
     """
 
     role: str
     stage: str
     message: str
     detail: Optional[str] = None
+    name: Optional[str] = None
 
     def __str__(self) -> str:
-        base = f"[{self.role}/{self.stage}] {self.message}"
+        who = f"{self.name} ({self.role})" if self.name else self.role
+        base = f"[{who}/{self.stage}] {self.message}"
         if self.detail:
             return f"{base} ({self.detail})"
         return base
