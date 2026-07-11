@@ -24,6 +24,18 @@ Always respond with a single JSON object and nothing else."""
 # reviewer knows it saw a prefix, not the whole file.
 PER_FILE_CHARS = 6_000
 TOTAL_CHARS = 30_000
+DIFF_CHARS = 20_000
+
+
+def render_diff(diff: Optional[str], *, limit: int = DIFF_CHARS) -> str:
+    """Render a git diff for the prompt, truncated with a visible marker."""
+
+    if not diff:
+        return ""
+    body = diff[:limit]
+    if len(body) < len(diff):
+        body += "\n... (diff truncated)"
+    return f"\nGit diff of the change (what actually changed):\n{body}\n"
 
 
 def render_changed_files(
@@ -67,11 +79,14 @@ class ReviewerAgent(BaseAgent):
         implementation: Implementation,
         *,
         file_contents: Optional[Mapping[str, str]] = None,
+        diff: Optional[str] = None,
     ) -> Review:
         """Review ``implementation`` against ``task``.
 
         ``file_contents`` maps changed paths to their current (post-apply)
         content, so the reviewer judges what is actually in the workspace.
+        ``diff`` (when git is available) shows precisely what changed, which
+        matters when a modified file is large.
         """
 
         criteria = "\n".join(
@@ -90,7 +105,7 @@ Engineer notes: {implementation.notes or "(none)"}
 
 Changed files (with content):
 {files}
-
+{render_diff(diff)}
 Respond with JSON of the form:
 {{
   "approved": true,

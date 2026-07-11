@@ -23,6 +23,8 @@ class TeamConfig:
             ``acceptEdits``; tools the team actually needs are granted per
             call via ``allowed_tools``. Set ``bypassPermissions`` only for
             fully sandboxed environments.
+        max_turns: Cap on SDK turns per agent call, so one runaway agentic
+            session cannot spin (or spend) forever. ``None`` removes the cap.
     """
 
     model: Optional[str] = None
@@ -30,9 +32,12 @@ class TeamConfig:
     min_coverage: float = 100.0
     working_dir: Optional[str] = None
     permission_mode: str = "acceptEdits"
+    max_turns: Optional[int] = 50
 
     def __post_init__(self) -> None:
         if self.max_task_attempts < 1:
             raise ValueError("max_task_attempts must be at least 1")
         if not 0.0 <= self.min_coverage <= 100.0:
             raise ValueError("min_coverage must be between 0 and 100")
+        if self.max_turns is not None and self.max_turns < 1:
+            raise ValueError("max_turns must be at least 1 (or None)")

@@ -551,14 +551,26 @@ def test_agentic_mode_engineer_works_in_workspace_root(tmp_path):
     runner = AgenticRunner(mapping)
     cmd = FakeCommandRunner()
     cmd.add_rule("status --porcelain", CommandResult(["git"], 0, "M  src/x.py", ""))
-    engine = _engine(runner, workspace=ws, command_runner=cmd)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(allow_dirty_baseline=True),
+    )
     assert engine.agentic is True
 
     outcome = run(engine.deliver(_request()))
     assert outcome.success is True
     assert outcome.committed is True
+    # the delivery worked on its own branch, not whatever was checked out
+    assert outcome.branch == "dev-team/login"
+    assert ["git", "checkout", "-b", "dev-team/login"] in cmd.calls
     # a baseline commit happened before any task ran (dirty pre-existing tree)
     assert any("baseline" in " ".join(c) for c in cmd.calls if c[:2] == ["git", "commit"])
+    # a .gitignore was authored for the fresh workspace
+    assert ws.exists(".gitignore")
+    # the final commit staged a curated path list (add -A is baseline-only)
+    assert ["git", "add", "--", "src/x.py"] in cmd.calls
     # the engineer call carried tools and the workspace root as cwd
     eng_call = next(c for c in runner.calls if "in the current working directory" in c["prompt"])
     assert eng_call["cwd"] == engine.workdir
@@ -766,3 +778,211 @@ def test_finalise_backlog_ignores_unknown_tasks():
     orphan = TaskResult(task=next(iter([Task(id="TX", title="t", description="")])), attempts=0)
     engine._finalise_backlog(backlog, {}, [orphan])  # no story registered for TX
     assert store.load().stories == []
+
+
+# --- v0.4: baseline, branch, setup, and diff behaviour ----------------------
+
+
+def test_deliver_halts_on_red_baseline():
+    ws = InMemoryWorkspace({"src/app.py": "x = 1"})
+    cmd = FakeCommandRunner()
+    cmd.add_rule("pytest", CommandResult(["pytest"], 1, "", "legacy test broken"))
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws, command_runner=cmd)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.halted_reason is not None
+    assert "baseline quality gates" in outcome.halted_reason
+    assert outcome.baseline is not None and outcome.baseline.passed is False
+    assert outcome.success is False
+    assert outcome.task_results == []
+    # no agent was ever paid: the halt happened before planning
+    assert runner.calls == []
+
+
+def test_deliver_proceeds_on_red_baseline_when_allowed():
+    ws = InMemoryWorkspace({"src/app.py": "x = 1"})
+    cmd = FakeCommandRunner()
+    cmd.add_rule("pytest", CommandResult(["pytest"], 1, "", "legacy test broken"))
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(require_green_baseline=False, max_task_attempts=1),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.halted_reason is None
+    assert outcome.baseline is not None and outcome.baseline.passed is False
+    # gates still fail during integration, so the run completes incomplete
+    assert outcome.success is False
+
+
+def test_deliver_skips_baseline_check_on_empty_workspace():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.baseline is None
+    assert outcome.success is True
+
+
+def test_deliver_halts_on_dirty_tree(tmp_path):
+    ws = LocalWorkspace(str(tmp_path))
+    cmd = FakeCommandRunner()
+    cmd.add_rule("status --porcelain", CommandResult(["git"], 0, "M  src/x.py", ""))
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws, command_runner=cmd)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.halted_reason is not None
+    assert "uncommitted changes" in outcome.halted_reason
+    assert runner.calls == []  # halted before any agent spend
+
+
+def test_deliver_halts_on_setup_failure():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    cmd = FakeCommandRunner()
+    cmd.add_rule("npm install", CommandResult(["npm"], 1, "", "registry down"))
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(setup_command=("npm", "install")),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.halted_reason is not None
+    assert "setup command failed" in outcome.halted_reason
+    assert "registry down" in outcome.halted_reason
+
+
+def test_deliver_setup_success_proceeds():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(setup_command=("pip", "install", "-e", ".")),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert ["pip", "install", "-e", "."] in cmd.calls
+
+
+def test_gates_auto_detected_from_workspace():
+    ws = InMemoryWorkspace({"package.json": "{}"})
+    cmd = FakeCommandRunner()
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws, command_runner=cmd)
+    assert engine.definition_of_done is None  # deferred until deliver
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    # the auto-detected gate ran npm test, not pytest
+    assert any(c[:2] == ["npm", "test"] for c in cmd.calls)
+    assert not any(c and c[0] == "pytest" for c in cmd.calls)
+
+
+def test_injected_dod_wins_over_detection():
+    from dev_team.verification import DefinitionOfDone, PredicateGate
+
+    dod = DefinitionOfDone([PredicateGate("always", lambda ctx: True)])
+    engine = _engine(ScriptedRunner([]), definition_of_done=dod)
+    assert engine.definition_of_done is dod
+
+
+def test_agentic_no_branch_when_disabled(tmp_path):
+    ws = LocalWorkspace(str(tmp_path))
+    cmd = FakeCommandRunner()
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(use_branch=False, write_gitignore=False),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.branch is None
+    assert not ws.exists(".gitignore")
+    assert not any(c[:2] == ["git", "checkout"] for c in cmd.calls)
+
+
+def test_agentic_keeps_existing_gitignore(tmp_path):
+    ws = LocalWorkspace(str(tmp_path))
+    ws.write_text(".gitignore", "custom\n")
+    cmd = FakeCommandRunner()
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws, command_runner=cmd)
+    run(engine.deliver(_request()))
+    assert ws.read_text(".gitignore") == "custom\n"
+
+
+def test_agentic_unreported_changes_are_reviewed(tmp_path):
+    ws = LocalWorkspace(str(tmp_path))
+    cmd = FakeCommandRunner()
+    # git reports an extra file the engineer never mentioned, plus internal noise
+    cmd.add_rule(
+        "status --porcelain -uall",
+        CommandResult(["git"], 0, "M  src/x.py\n?? src/sneaky.py\n?? .dev_team/checkpoint.json", ""),
+    )
+    cmd.add_rule("diff HEAD", CommandResult(["git"], 0, "+++ the-diff-body", ""))
+    mapping = engine_responses()
+    mapping["senior software engineer"] = json_response(
+        {"summary": "impl", "files": [{"path": "src/x.py", "change_type": "modify", "summary": "s"}]}
+    )
+    runner = ScriptedRunner(by_system_prompt=mapping)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(allow_dirty_baseline=True),
+    )
+    outcome = run(engine.deliver(_request()))
+    impl = outcome.task_results[0].implementation
+    paths = [f.path for f in impl.files]
+    assert "src/sneaky.py" in paths  # unreported file was surfaced
+    assert ".dev_team/checkpoint.json" not in paths  # internal noise excluded
+    review_call = next(c for c in runner.calls if "Review this implementation" in c["prompt"])
+    assert "src/sneaky.py" in review_call["prompt"]
+    assert "the-diff-body" in review_call["prompt"]  # reviewer got the git diff
+
+
+def test_gate_timeout_flows_into_gate_context():
+    calls = {}
+
+    class RecordingRunner:
+        def run(self, command, *, cwd=None, timeout=None):
+            calls["timeout"] = timeout
+            return CommandResult(list(command), 0, "", "")
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        command_runner=RecordingRunner(),
+        config=EngineConfig(gate_timeout_seconds=123.0),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert calls["timeout"] == 123.0
+
+
+def test_checkpoint_fingerprint_mismatch_reruns_task():
+    from dev_team.memory import CheckpointStore, RunCheckpoint
+
+    ws = InMemoryWorkspace()
+    # a stale checkpoint claims T1 is done, but for different task content
+    store = CheckpointStore(ws)
+    stale = RunCheckpoint(feature_title="Login")
+    stale.mark_done("T1", "0000000000000000")
+    store.save(stale)
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws)
+    outcome = run(engine.deliver(_request()))
+    # fingerprint mismatch -> not resumed, task genuinely developed
+    assert outcome.resumed_task_ids == []
+    assert outcome.task_results[0].attempts >= 1
+    assert outcome.success is True
+
+
+def test_branch_slug():
+    from dev_team.engine import _branch_slug
+
+    assert _branch_slug("Add OAuth 2.0 login!") == "add-oauth-2-0-login"
+    assert _branch_slug("???") == "feature"
+    assert len(_branch_slug("x" * 100)) <= 40

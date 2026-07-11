@@ -45,12 +45,20 @@ def _feedback_section(review: Optional[Review]) -> str:
     )
 
 
+# Cap the listing so a large repo cannot flood the prompt.
+MAX_LISTING_ENTRIES = 200
+
+
 def _listing_section(listing: Optional[Sequence[str]]) -> str:
     """Render the current workspace contents for inclusion in the prompt."""
 
     if not listing:
         return "The workspace is currently empty."
-    files = "\n".join(f"- {path}" for path in listing)
+    shown = list(listing[:MAX_LISTING_ENTRIES])
+    files = "\n".join(f"- {path}" for path in shown)
+    remainder = len(listing) - len(shown)
+    if remainder > 0:
+        files += f"\n- ... and {remainder} more file(s)"
     return f"Files currently in the workspace:\n{files}"
 
 
@@ -119,6 +127,7 @@ Respond with JSON of the form:
         *,
         cwd: str,
         model: Optional[str] = None,
+        tools: Optional[Sequence[str]] = None,
     ) -> Implementation:
         """Implement ``task`` directly in ``cwd`` using real tools.
 
@@ -147,6 +156,6 @@ the files on disk are the deliverable):
   "notes": "anything reviewers should know"
 }}"""
         data = await self.ask_json(
-            prompt, allowed_tools=TOOLS, cwd=cwd, model=model
+            prompt, allowed_tools=tools if tools is not None else TOOLS, cwd=cwd, model=model
         )
         return parsing.implementation_from_dict(data, task.id)

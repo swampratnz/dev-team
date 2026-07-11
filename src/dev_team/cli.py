@@ -73,9 +73,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--verify-command",
-        default="pytest -q",
+        default=None,
         metavar="CMD",
-        help="Quality-gate command run in the workspace (with --deliver).",
+        help="Quality-gate command run in the workspace (with --deliver). "
+        "Defaults to auto-detection from the workspace's manifests.",
+    )
+    parser.add_argument(
+        "--setup-command",
+        default=None,
+        metavar="CMD",
+        help="Command run once in the workspace before delivery starts, "
+        "e.g. 'npm install' (with --deliver).",
+    )
+    parser.add_argument(
+        "--branch",
+        default=None,
+        metavar="NAME",
+        help="Branch the delivery works on (default: dev-team/<feature-slug>).",
+    )
+    parser.add_argument(
+        "--allow-dirty-baseline",
+        action="store_true",
+        help="Proceed over uncommitted changes by sweeping them into a "
+        "baseline commit on the delivery branch (with --deliver).",
+    )
+    parser.add_argument(
+        "--proceed-on-red-baseline",
+        action="store_true",
+        help="Start even when the workspace's quality gates already fail "
+        "(with --deliver). By default a red baseline halts the run.",
     )
     parser.add_argument(
         "--budget-usd",
@@ -141,8 +167,20 @@ def _run(argv: Optional[List[str]], runner: Optional[AgentRunner]) -> int:
                     model=args.model,
                     max_task_attempts=args.max_attempts,
                     max_concurrency=args.max_concurrency,
-                    verify_command=tuple(shlex.split(args.verify_command)),
+                    verify_command=(
+                        tuple(shlex.split(args.verify_command))
+                        if args.verify_command
+                        else None
+                    ),
+                    setup_command=(
+                        tuple(shlex.split(args.setup_command))
+                        if args.setup_command
+                        else None
+                    ),
                     commit=not args.no_commit,
+                    branch=args.branch,
+                    allow_dirty_baseline=args.allow_dirty_baseline,
+                    require_green_baseline=not args.proceed_on_red_baseline,
                 ),
             )
         )

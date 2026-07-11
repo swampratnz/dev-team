@@ -108,3 +108,31 @@ def test_discard_changes_resets_and_cleans():
     GitRepo(cmd).discard_changes()
     assert ["git", "reset", "--hard"] in cmd.calls
     assert ["git", "clean", "-fd"] in cmd.calls
+
+
+def test_switch_to_creates_new_branch():
+    cmd = FakeCommandRunner()
+    GitRepo(cmd).switch_to("dev-team/x")
+    assert ["git", "checkout", "-b", "dev-team/x"] in cmd.calls
+
+
+def test_switch_to_falls_back_to_existing_branch():
+    cmd = FakeCommandRunner()
+    cmd.add_rule("checkout -b", CommandResult(["git"], 1, "", "already exists"))
+    GitRepo(cmd).switch_to("dev-team/x")
+    assert ["git", "checkout", "dev-team/x"] in cmd.calls
+
+
+def test_add_paths_skips_empty_list():
+    cmd = FakeCommandRunner()
+    GitRepo(cmd).add_paths([])
+    assert cmd.calls == []
+
+
+def test_changed_files_expands_untracked_and_renames():
+    cmd = FakeCommandRunner()
+    cmd.add_rule(
+        "status --porcelain -uall",
+        CommandResult(["git"], 0, "R  old.py -> new.py\n?? sub/added.py\n\n", ""),
+    )
+    assert GitRepo(cmd).changed_files() == ["new.py", "sub/added.py"]

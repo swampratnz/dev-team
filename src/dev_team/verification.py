@@ -25,6 +25,7 @@ class GateContext:
     workspace: Optional[Workspace] = None
     task: Optional[Task] = None
     cwd: Optional[str] = None
+    timeout: Optional[float] = None
 
 
 @dataclass
@@ -55,7 +56,9 @@ class CommandGate:
     command: Sequence[str]
 
     def evaluate(self, context: GateContext) -> GateResult:
-        result = context.runner.run(list(self.command), cwd=context.cwd)
+        result = context.runner.run(
+            list(self.command), cwd=context.cwd, timeout=context.timeout
+        )
         return GateResult(self.name, result.ok, result.output)
 
 
@@ -90,7 +93,9 @@ class CoverageGate:
     minimum: float = 100.0
 
     def evaluate(self, context: GateContext) -> GateResult:
-        result = context.runner.run(list(self.command), cwd=context.cwd)
+        result = context.runner.run(
+            list(self.command), cwd=context.cwd, timeout=context.timeout
+        )
         if not result.ok:
             return GateResult(self.name, False, f"command failed: {result.output}")
         coverage = _coverage_percent(result.output)

@@ -87,10 +87,23 @@ class GitRepo:
 
         self._git("checkout", name)
 
+    def switch_to(self, name: str) -> None:
+        """Create and switch to ``name``, or just switch if it already exists."""
+
+        result = self._git("checkout", "-b", name, check=False)
+        if not result.ok:
+            self._git("checkout", name)
+
     def add_all(self) -> None:
         """Stage all changes."""
 
         self._git("add", "-A")
+
+    def add_paths(self, paths: List[str]) -> None:
+        """Stage only ``paths`` (a curated product change set, not add -A)."""
+
+        if paths:
+            self._git("add", "--", *paths)
 
     def commit(self, message: str) -> None:
         """Commit staged changes with ``message``."""
@@ -103,7 +116,20 @@ class GitRepo:
         return bool(self._git("status", "--porcelain").stdout.strip())
 
     def changed_files(self) -> List[str]:
-        """Return the paths reported by ``git status --porcelain``."""
+        """Return changed paths, one entry per file (untracked included).
 
-        lines = self._git("status", "--porcelain").stdout.splitlines()
-        return [line[3:] for line in lines if line.strip()]
+        ``-uall`` expands untracked directories into individual files so new
+        files inside new directories are reported (and reviewable) one by one.
+        Renames report the new path.
+        """
+
+        lines = self._git("status", "--porcelain", "-uall").stdout.splitlines()
+        paths = []
+        for line in lines:
+            if not line.strip():
+                continue
+            path = line[3:]
+            if " -> " in path:
+                path = path.split(" -> ")[-1]
+            paths.append(path)
+        return paths

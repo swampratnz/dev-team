@@ -106,6 +106,9 @@ def delivery_to_dict(outcome: "DeliveryOutcome") -> Dict[str, Any]:
         "resumed_task_ids": list(outcome.resumed_task_ids),
         "cost_usd": outcome.cost_usd,
         "workspace_files": list(outcome.workspace_files),
+        "branch": outcome.branch,
+        "halted_reason": outcome.halted_reason,
+        "baseline_green": outcome.baseline.passed if outcome.baseline else None,
     }
 
 
@@ -116,6 +119,14 @@ def render_delivery_summary(outcome: "DeliveryOutcome") -> str:
     verdict = "SUCCESS" if outcome.success else "INCOMPLETE"
     lines.append(f"Result:  {verdict}")
     lines.append(f"Cost:    ${outcome.cost_usd:.4f}")
+    if outcome.halted_reason:
+        lines.append(f"Halted:  {outcome.halted_reason}")
+        if outcome.baseline is not None:
+            for gate in outcome.baseline.failed_gates:
+                lines.append(f"  baseline gate failed — {gate.name}: {gate.detail[:200]}")
+        return "\n".join(lines)
+    if outcome.branch:
+        lines.append(f"Branch:  {outcome.branch}")
     lines.append("")
     lines.append("Tasks:")
     if outcome.task_results:

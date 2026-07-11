@@ -32,3 +32,9 @@ def test_rejects_zero_attempts():
 def test_rejects_out_of_range_coverage(coverage):
     with pytest.raises(ValueError, match="min_coverage"):
         TeamConfig(min_coverage=coverage)
+
+
+def test_max_turns_validation():
+    with pytest.raises(ValueError):
+        TeamConfig(max_turns=0)
+    assert TeamConfig(max_turns=None).max_turns is None
