@@ -10,9 +10,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, List, Optional, Protocol, Sequence, runtime_checkable
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKError, query
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ClaudeSDKError,
+    query,
+)
 
 # A single agent turn that takes longer than this has hung, not thought hard.
 DEFAULT_TIMEOUT_SECONDS = 600.0
@@ -188,3 +193,71 @@ class ClaudeAgentRunner:
             model=used_model,
             is_error=is_error,
         )
+
+
+def _default_client_factory(options: ClaudeAgentOptions) -> Any:
+    """Construct the real SDK client (its subprocess starts on ``connect``)."""
+
+    return ClaudeSDKClient(options=options)
+
+
+@runtime_checkable
+class ChatBackend(Protocol):
+    """A multi-turn conversation that keeps context between messages."""
+
+    async def send(self, text: str) -> str:
+        """Send ``text`` and return the assistant's full reply."""
+        ...
+
+    async def close(self) -> None:
+        """Release the underlying session."""
+        ...
+
+
+@dataclass
+class ClaudeChatBackend:
+    """A :class:`ChatBackend` on a persistent ``ClaudeSDKClient`` session.
+
+    Unlike :class:`ClaudeAgentRunner` (one fresh SDK session per call), this
+    holds a single conversation open across :meth:`send` calls, so the model
+    retains everything said earlier — what a chat needs. The session has no
+    tools: it is a conversation, not an agent loop.
+
+    Attributes:
+        system_prompt: The persona/system prompt for the conversation.
+        model: Optional model override.
+        client_factory: Injection point for tests; defaults to the real
+            ``ClaudeSDKClient``.
+    """
+
+    system_prompt: str
+    model: Optional[str] = None
+    client_factory: Optional[Callable[[ClaudeAgentOptions], Any]] = None
+    _client: Any = field(default=None, repr=False, compare=False)
+
+    async def _ensure_client(self) -> Any:
+        if self._client is None:
+            kwargs: dict[str, Any] = {
+                "system_prompt": self.system_prompt,
+                "allowed_tools": [],
+            }
+            if self.model is not None:
+                kwargs["model"] = self.model
+            options = ClaudeAgentOptions(**kwargs)
+            factory = self.client_factory or _default_client_factory
+            self._client = factory(options)
+            await self._client.connect()
+        return self._client
+
+    async def send(self, text: str) -> str:
+        client = await self._ensure_client()
+        await client.query(text)
+        texts: List[str] = []
+        async for message in client.receive_response():
+            texts.extend(extract_text(message))
+        return "\n".join(texts)
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.disconnect()
+            self._client = None

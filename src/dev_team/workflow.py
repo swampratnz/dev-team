@@ -13,7 +13,13 @@ from .agents import (
     ReviewerAgent,
 )
 from .config import TeamConfig
+from .errors import WorkflowError
 from .events import AgentEvent, Listener, emit
+from .interaction import (
+    InteractionChannel,
+    ask_in_thread,
+    plan_review_question,
+)
 from .models import (
     Design,
     FeatureRequest,
@@ -48,6 +54,7 @@ class DevelopmentWorkflow:
         devops: DevOpsAgent,
         config: Optional[TeamConfig] = None,
         listener: Optional[Listener] = None,
+        interaction: Optional[InteractionChannel] = None,
     ) -> None:
         self.manager = manager
         self.architect = architect
@@ -57,6 +64,7 @@ class DevelopmentWorkflow:
         self.devops = devops
         self.config = config or TeamConfig()
         self.listener = listener
+        self.interaction = interaction
 
     def _emit(self, stage: str, message: str, detail: Optional[str] = None) -> None:
         emit(
@@ -96,6 +104,7 @@ class DevelopmentWorkflow:
 
         plan = await self.manager.create_plan(request)
         self._emit("planned", "Plan ready", detail=f"{len(plan.tasks)} task(s)")
+        plan = await self._reviewed_plan(request, plan)
 
         design = await self.architect.design(request, plan)
         self._emit(
@@ -124,6 +133,43 @@ class DevelopmentWorkflow:
             detail=f"{len(result.completed_tasks)}/{len(task_results)} task(s) done",
         )
         return result
+
+    async def _reviewed_plan(self, request: FeatureRequest, plan):
+        """Present the plan for interactive review, revising until approved.
+
+        Without an interaction channel the plan passes through untouched.
+        Raises :class:`WorkflowError` when the human aborts the run.
+        """
+
+        if self.interaction is None:
+            return plan
+        asker = (
+            self.manager.persona.name
+            if self.manager.persona is not None
+            else self.manager.role
+        )
+        while True:
+            reply = await ask_in_thread(
+                self.interaction, plan_review_question(plan, asked_by=asker)
+            )
+            if reply.choice == "approve":
+                self._emit("plan-approved", "Plan approved interactively")
+                return plan
+            if reply.choice == "abort":
+                self._emit("aborted", "Run aborted at plan review")
+                raise WorkflowError("run aborted at plan review")
+            self._emit(
+                "plan-revision",
+                "Plan revision requested",
+                detail=reply.text or None,
+            )
+            plan = await self.manager.create_plan(
+                request,
+                revision_feedback=reply.text or "Revise the plan.",
+            )
+            self._emit(
+                "planned", "Revised plan ready", detail=f"{len(plan.tasks)} task(s)"
+            )
 
     async def _develop_task(self, task: Task, design: Design) -> TaskResult:
         """Implement, review, and test a single task with retries."""

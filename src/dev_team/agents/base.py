@@ -7,6 +7,7 @@ from typing import Any, Optional, Sequence
 from ..errors import AgentResponseError, JSONExtractionError
 from ..events import AgentEvent, Listener, emit
 from ..json_utils import extract_json
+from ..persona import Persona
 from ..sdk import AgentResult, AgentRunner
 
 # Tools granted to evidence-reading roles (reviewer, security, QA, SRE): they
@@ -57,6 +58,7 @@ class BaseAgent:
         model: Optional[str] = None,
         listener: Optional[Listener] = None,
         json_retries: int = 1,
+        persona: Optional[Persona] = None,
     ) -> None:
         if json_retries < 0:
             raise ValueError("json_retries must be non-negative")
@@ -64,6 +66,19 @@ class BaseAgent:
         self.model = model
         self.listener = listener
         self.json_retries = json_retries
+        self.persona = persona
+
+    @property
+    def effective_system_prompt(self) -> str:
+        """The role's system prompt, introduced by the persona when cast.
+
+        The persona preamble is additive and comes first; the role's own
+        contract (including the JSON-only instruction) always follows intact.
+        """
+
+        if self.persona is None:
+            return self.system_prompt
+        return f"{self.persona.preamble()}\n\n{self.system_prompt}"
 
     def _emit(self, message: str, detail: Optional[str] = None) -> None:
         emit(
@@ -73,6 +88,7 @@ class BaseAgent:
                 stage=self.stage,
                 message=message,
                 detail=detail,
+                name=self.persona.name if self.persona is not None else None,
             ),
         )
 
@@ -89,7 +105,7 @@ class BaseAgent:
         self._emit("working")
         result = await self.runner.run(
             prompt,
-            system_prompt=self.system_prompt,
+            system_prompt=self.effective_system_prompt,
             allowed_tools=allowed_tools,
             model=model or self.model,
             cwd=cwd,

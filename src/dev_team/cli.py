@@ -13,21 +13,23 @@ from typing import List, Mapping, Optional
 
 from . import __version__
 from .budget import Budget
+from .chat import ChatSession, chat_system_prompt
 from .config import TeamConfig
 from .engine import EngineConfig
 from .errors import DevTeamError
 from .events import AgentEvent
 from .execution import LocalWorkspace
+from .interaction import ChannelApprovalGate, ConsoleChannel
 from .models import FeatureRequest
+from .persona import Roster
 from .report import (
     delivery_to_dict,
     render_delivery_summary,
     render_summary,
     result_to_dict,
 )
-from .sdk import AgentRunner
+from .sdk import AgentRunner, ChatBackend, ClaudeChatBackend
 from .team import DevTeam
-
 
 # Any one of these satisfies the credential preflight. The Claude CLI (which
 # the Agent SDK spawns) resolves them itself; dev-team only checks presence so
@@ -82,10 +84,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"%(prog)s {__version__}",
     )
-    parser.add_argument("title", help="Short title of the feature to build.")
+    parser.add_argument(
+        "title",
+        nargs="?",
+        default=None,
+        help="Short title of the feature to build (omit with --chat).",
+    )
     parser.add_argument(
         "description",
-        help="Detailed description of what the feature should do.",
+        nargs="?",
+        default=None,
+        help="Detailed description of what the feature should do (omit with --chat).",
     )
     parser.add_argument(
         "-c",
@@ -108,6 +117,33 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=100.0,
         help="Minimum test coverage QA must report to pass a task (simulation mode).",
+    )
+    parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Collaborate with the run: review/revise the plan before work "
+        "starts, decide what happens when a task fails, and approve the "
+        "feature commit and risky commands on this terminal.",
+    )
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Start a conversation with the product manager to shape the "
+        "feature first; /run or /deliver hands the agreed brief to the team.",
+    )
+    parser.add_argument(
+        "--roster",
+        default=None,
+        metavar="FILE",
+        help="JSON file customising agent personas, e.g. "
+        '{"engineer": {"name": "Ada", "style": "..."}}. '
+        "Entries overlay the default cast.",
+    )
+    parser.add_argument(
+        "--no-personas",
+        action="store_true",
+        help="Disable agent personas; agents present as bare roles.",
     )
     parser.add_argument(
         "--deliver",
@@ -186,16 +222,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject argument combinations that would silently misbehave."""
+
+    if args.chat:
+        if args.title is not None or args.description is not None:
+            parser.error("--chat shapes the feature in conversation; omit "
+                         "the title/description arguments")
+        if args.json:
+            parser.error("--json: not available with --chat (stdout is the conversation)")
+    else:
+        if args.title is None or args.description is None:
+            parser.error("title and description are required (or use --chat)")
+    if args.roster is not None and args.no_personas:
+        parser.error("--roster and --no-personas are mutually exclusive")
+    _reject_deliver_only_flags(parser, args)
+
+
 def _reject_deliver_only_flags(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
     """Error out (exit code 2) on deliver-only flags passed without --deliver.
 
     These flags only affect the delivery engine; silently ignoring them in
-    simulation mode would let e.g. ``--budget-usd`` go unenforced.
+    simulation mode would let e.g. ``--budget-usd`` go unenforced. A chat
+    session may end in ``/deliver``, so chat mode accepts them too.
     """
 
-    if args.deliver:
+    if args.deliver or args.chat:
         return
     passed = [
         flag
@@ -216,10 +272,101 @@ def _reject_deliver_only_flags(
         parser.error(f"{', '.join(passed)}: only valid with --deliver")
 
 
-def _run(argv: Optional[List[str]], runner: Optional[AgentRunner]) -> int:
+def _build_roster(args: argparse.Namespace) -> Optional[Roster]:
+    """The roster implied by the flags (``None`` means the default cast)."""
+
+    if args.no_personas:
+        return Roster.anonymous()
+    if args.roster is not None:
+        return Roster.from_file(args.roster)
+    return None
+
+
+def _engine_config(args: argparse.Namespace) -> EngineConfig:
+    return EngineConfig(
+        model=args.model,
+        max_task_attempts=args.max_attempts,
+        max_concurrency=args.max_concurrency,
+        verify_command=(
+            tuple(shlex.split(args.verify_command)) if args.verify_command else None
+        ),
+        setup_command=(
+            tuple(shlex.split(args.setup_command)) if args.setup_command else None
+        ),
+        commit=not args.no_commit,
+        branch=args.branch,
+        allow_dirty_baseline=args.allow_dirty_baseline,
+        require_green_baseline=not args.proceed_on_red_baseline,
+    )
+
+
+async def _deliver(team: DevTeam, request: FeatureRequest, args) -> int:
+    """Run real delivery and print the result; returns the exit code."""
+
+    kwargs = {}
+    if team.interaction is not None:
+        # Route the engine's approval points (feature commit, push/deploy/rm
+        # commands) through the same conversation as plan review.
+        kwargs["approval"] = ChannelApprovalGate(team.interaction)
+    outcome = await team.deliver(
+        request,
+        workspace=LocalWorkspace(args.workspace),
+        budget=Budget(limit_usd=args.budget_usd),
+        config=_engine_config(args),
+        **kwargs,
+    )
+    if args.json:
+        print(json.dumps(delivery_to_dict(outcome), indent=2))
+    else:
+        print(render_delivery_summary(outcome))
+    return 0 if outcome.success else 1
+
+
+async def _simulate(team: DevTeam, request: FeatureRequest, args) -> int:
+    """Run the simulation workflow and print the result; returns the exit code."""
+
+    result = await team.develop(request)
+    if args.json:
+        print(json.dumps(result_to_dict(result), indent=2))
+    else:
+        print(render_summary(result))
+    return 0 if result.success else 1
+
+
+async def _chat(
+    team: DevTeam,
+    args: argparse.Namespace,
+    backend: Optional[ChatBackend],
+) -> int:
+    """Run the ``--chat`` session; returns the last run's exit code."""
+
+    pm_persona = team.roster.get("product-manager")
+    if backend is None:
+        backend = ClaudeChatBackend(
+            system_prompt=chat_system_prompt(pm_persona), model=args.model
+        )
+
+    async def run_feature(request: FeatureRequest, deliver: bool) -> int:
+        if deliver:
+            return await _deliver(team, request, args)
+        return await _simulate(team, request, args)
+
+    session = ChatSession(
+        backend=backend,
+        run_feature=run_feature,
+        pm_name=pm_persona.name if pm_persona is not None else "product-manager",
+    )
+    return await session.run()
+
+
+def _run(
+    argv: Optional[List[str]],
+    runner: Optional[AgentRunner],
+    chat_backend: Optional[ChatBackend],
+) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    _reject_deliver_only_flags(parser, args)
+    _validate_args(parser, args)
 
     if runner is None:
         # Only the real SDK runner needs credentials; an injected runner
@@ -239,67 +386,44 @@ def _run(argv: Optional[List[str]], runner: Optional[AgentRunner]) -> int:
         def listener(event: AgentEvent) -> None:  # noqa: E306
             print(str(event), file=sys.stderr)
 
-    team = DevTeam(runner, config=config, listener=listener)
+    team = DevTeam(
+        runner,
+        config=config,
+        listener=listener,
+        roster=_build_roster(args),
+        interaction=ConsoleChannel() if args.interactive else None,
+    )
 
+    if args.chat:
+        return asyncio.run(_chat(team, args, chat_backend))
+
+    request = FeatureRequest(
+        title=args.title,
+        description=args.description,
+        constraints=list(args.constraints),
+    )
     if args.deliver:
-        request = FeatureRequest(
-            title=args.title,
-            description=args.description,
-            constraints=list(args.constraints),
-        )
-        outcome = asyncio.run(
-            team.deliver(
-                request,
-                workspace=LocalWorkspace(args.workspace),
-                budget=Budget(limit_usd=args.budget_usd),
-                config=EngineConfig(
-                    model=args.model,
-                    max_task_attempts=args.max_attempts,
-                    max_concurrency=args.max_concurrency,
-                    verify_command=(
-                        tuple(shlex.split(args.verify_command))
-                        if args.verify_command
-                        else None
-                    ),
-                    setup_command=(
-                        tuple(shlex.split(args.setup_command))
-                        if args.setup_command
-                        else None
-                    ),
-                    commit=not args.no_commit,
-                    branch=args.branch,
-                    allow_dirty_baseline=args.allow_dirty_baseline,
-                    require_green_baseline=not args.proceed_on_red_baseline,
-                ),
-            )
-        )
-        if args.json:
-            print(json.dumps(delivery_to_dict(outcome), indent=2))
-        else:
-            print(render_delivery_summary(outcome))
-        return 0 if outcome.success else 1
-
-    result = asyncio.run(team.develop_feature(args.title, args.description, args.constraints))
-
-    if args.json:
-        print(json.dumps(result_to_dict(result), indent=2))
-    else:
-        print(render_summary(result))
-
-    return 0 if result.success else 1
+        return asyncio.run(_deliver(team, request, args))
+    return asyncio.run(_simulate(team, request, args))
 
 
-def main(argv: Optional[List[str]] = None, runner: Optional[AgentRunner] = None) -> int:
+def main(
+    argv: Optional[List[str]] = None,
+    runner: Optional[AgentRunner] = None,
+    chat_backend: Optional[ChatBackend] = None,
+) -> int:
     """CLI entry point. Returns a process exit code.
 
     Args:
         argv: Argument list (defaults to ``sys.argv[1:]``).
         runner: Optional runner override (used for testing); defaults to the
             real Claude Agent SDK runner.
+        chat_backend: Optional chat backend override for ``--chat`` (used for
+            testing); defaults to a persistent Claude session.
     """
 
     try:
-        return _run(argv, runner)
+        return _run(argv, runner, chat_backend)
     except (DevTeamError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
