@@ -5,6 +5,16 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased] — Review hardening
 
+### CLI & deployment
+- **Claude subscription support is first-class**: the CLI now preflights
+  credentials and accepts `CLAUDE_CODE_OAUTH_TOKEN` (a Pro/Max/Team/Enterprise
+  subscription token from `claude setup-token`) alongside
+  `ANTHROPIC_API_KEY`, a stored `claude` login, or gateway/Bedrock/Vertex
+  variables — a missing credential now fails fast with guidance instead of
+  surfacing as an opaque CLI error mid-run. `DEPLOYMENT.md` is now a full
+  Ubuntu server install guide covering both auth options, and the systemd
+  unit and Docker examples document the subscription token.
+
 ### Delivery engine
 - **Accepted work is banked**: every task that passes its gates is committed
   as a `wip(dev-team)` commit on the delivery branch, so a later task's

@@ -227,6 +227,11 @@ pip install -e '.[test]'
 The Claude Agent SDK requires the Claude Code CLI to be available at runtime;
 see the [SDK docs](https://github.com/anthropics/claude-agent-sdk-python).
 
+Credentials: set `CLAUDE_CODE_OAUTH_TOKEN` (a Claude subscription token from
+`claude setup-token`) or `ANTHROPIC_API_KEY` (a Claude API key). The CLI
+fails fast with guidance when neither — nor a stored `claude` login — is
+found. See [DEPLOYMENT.md](DEPLOYMENT.md#2-authentication) for details.
+
 ## Usage
 
 ### Command line

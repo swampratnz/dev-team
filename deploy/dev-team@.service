@@ -4,8 +4,9 @@
 #   sudo systemctl start dev-team@<jobname>.service
 #
 # Each instance reads /etc/dev-team/<jobname>.env, which must define
-# DEV_TEAM_TITLE and DEV_TEAM_DESCRIPTION (and optionally DEV_TEAM_ARGS and
-# ANTHROPIC_API_KEY).
+# DEV_TEAM_TITLE and DEV_TEAM_DESCRIPTION, plus credentials: either
+# CLAUDE_CODE_OAUTH_TOKEN (Claude subscription, from `claude setup-token`)
+# or ANTHROPIC_API_KEY (Claude API). DEV_TEAM_ARGS is optional.
 [Unit]
 Description=dev-team job %i (multi-agent development run)
 After=network-online.target

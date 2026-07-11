@@ -203,3 +203,77 @@ def test_main_deliver_auto_detects_verify_command(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 1
     assert "Halted:" in out
+
+
+# --- credential preflight -----------------------------------------------------
+
+
+def _no_credentials(monkeypatch, tmp_path):
+    """Clear every credential source: env vars and the stored-login file."""
+    from dev_team.cli import CREDENTIAL_ENV_VARS
+
+    for name in CREDENTIAL_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.claude/.credentials.json
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    ],
+)
+def test_ensure_credentials_accepts_each_env_var(name, tmp_path):
+    from dev_team.cli import ensure_credentials
+
+    ensure_credentials(environ={name: "value"}, home=tmp_path)
+
+
+def test_ensure_credentials_ignores_empty_env_var(tmp_path):
+    from dev_team.cli import ensure_credentials
+    from dev_team.errors import DevTeamError
+
+    with pytest.raises(DevTeamError):
+        ensure_credentials(environ={"ANTHROPIC_API_KEY": ""}, home=tmp_path)
+
+
+def test_ensure_credentials_accepts_stored_login(tmp_path):
+    from dev_team.cli import ensure_credentials
+
+    creds = tmp_path / ".claude" / ".credentials.json"
+    creds.parent.mkdir()
+    creds.write_text("{}")
+    ensure_credentials(environ={}, home=tmp_path)
+
+
+def test_ensure_credentials_error_mentions_setup_token(tmp_path):
+    from dev_team.cli import ensure_credentials
+    from dev_team.errors import DevTeamError
+
+    with pytest.raises(DevTeamError) as excinfo:
+        ensure_credentials(environ={}, home=tmp_path)
+    message = str(excinfo.value)
+    assert "claude setup-token" in message
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in message
+    assert "ANTHROPIC_API_KEY" in message
+
+
+def test_main_without_credentials_fails_fast(monkeypatch, tmp_path, capsys):
+    _no_credentials(monkeypatch, tmp_path)
+    code = main(["Login", "Add login"])  # no injected runner -> real SDK path
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "claude setup-token" in captured.err
+    assert captured.out == ""
+
+
+def test_main_with_injected_runner_skips_credential_check(monkeypatch, tmp_path, capsys):
+    _no_credentials(monkeypatch, tmp_path)
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(["Login", "Add login"], runner=runner)
+    assert code == 0
+    assert "SUCCESS" in capsys.readouterr().out
