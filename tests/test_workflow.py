@@ -28,6 +28,19 @@ def _workflow(responses, config=None, listener=None):
     return build_workflow(runner, config=config, listener=listener)
 
 
+def test_qa_prompt_carries_implementation_file_contents():
+    runner = ScriptedRunner(happy_responses(1))
+    wf = build_workflow(runner)
+    run(wf.run(_request()))
+    qa_calls = [
+        c for c in runner.calls if "quality assurance" in c["system_prompt"]
+    ]
+    assert qa_calls
+    # impl_dict()'s file body ("x = 1") reaches QA, fenced as data.
+    assert "x = 1" in qa_calls[0]["prompt"]
+    assert '<file-content path="src/x.py">' in qa_calls[0]["prompt"]
+
+
 def test_happy_path_single_task():
     events = []
     wf = _workflow(happy_responses(1), listener=events.append)

@@ -13,7 +13,7 @@ from typing import Mapping, Optional
 
 from .. import parsing
 from ..models import Implementation, SecurityReport, Task
-from .base import BaseAgent
+from .base import READ_ONLY_TOOLS, UNTRUSTED_CONTENT_NOTE, BaseAgent
 from .reviewer import render_changed_files
 
 _SYSTEM = """\
@@ -39,7 +39,7 @@ class SecurityEngineerAgent(BaseAgent):
 
     role = "security-engineer"
     stage = "security-review"
-    system_prompt = _SYSTEM
+    system_prompt = _SYSTEM + UNTRUSTED_CONTENT_NOTE
 
     async def review(
         self,
@@ -48,17 +48,19 @@ class SecurityEngineerAgent(BaseAgent):
         *,
         file_contents: Optional[Mapping[str, str]] = None,
         scanner_output: Optional[str] = None,
+        workspace_root: Optional[str] = None,
     ) -> SecurityReport:
         """Security-review ``implementation`` for ``task``.
 
         ``scanner_output`` is the raw output of a SAST/dependency scanner run
         over the workspace; the agent triages it rather than working blind.
+        ``workspace_root`` is where the read-only evidence tools operate.
         """
 
         files = render_changed_files(implementation, file_contents)
         scan = (
             "\nSecurity scanner output (triage these findings):\n"
-            f"{scanner_output[:6000]}\n"
+            f"<scanner-output>\n{scanner_output[:6000]}\n</scanner-output>\n"
             if scanner_output
             else "\n(no scanner output available — rely on the code alone)\n"
         )
@@ -79,5 +81,7 @@ Respond with JSON of the form:
     {{"severity": "major", "category": "injection", "description": "file + code + attack path", "remediation": "..."}}
   ]
 }}"""
-        data = await self.ask_json(prompt)
+        data = await self.ask_json(
+            prompt, allowed_tools=READ_ONLY_TOOLS, cwd=workspace_root
+        )
         return parsing.security_report_from_dict(data)

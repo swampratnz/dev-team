@@ -397,11 +397,13 @@ def test_deliver_resumes_from_checkpoint():
     )
     first = run(engine1.deliver(_request()))
     assert first.success is False
-    assert ws.exists(".dev_team/checkpoint.json")
+    ckpt_path = CheckpointStore(ws)._path_for("Login")
+    assert ws.exists(ckpt_path)
 
-    # Run 2: T1 is restored from the checkpoint; only T2 is developed.
+    # Run 2: T1 is restored from the checkpoint; only T2 is developed. The
+    # plan itself is reused from the checkpoint, so the product manager is
+    # never consulted (a missing mapping entry would raise if it were).
     mapping2 = {
-        "product manager": [json_response(_two_task_plan())],
         "software architect": [json_response(__design())],
         "senior software engineer": [json_response(__impl())],
         "code reviewer": [json_response(__review(True))],
@@ -422,10 +424,7 @@ def test_deliver_resumes_from_checkpoint():
     # T1 was restored from the checkpoint: every engineer call is for T2 only
     assert engineer_prompts and all("Task T2" in p for p in engineer_prompts)
     # full success clears the checkpoint
-    assert not ws.exists(".dev_team/checkpoint.json")
-    # run 2's planner saw the memory persisted by run 1
-    pm_call = runner2.calls[0]
-    assert "previous runs" in pm_call["prompt"]
+    assert not ws.exists(ckpt_path)
 
 
 def test_deliver_resume_disabled_keeps_no_checkpoint():
@@ -914,7 +913,10 @@ def test_agentic_keeps_existing_gitignore(tmp_path):
     runner = ScriptedRunner(by_system_prompt=engine_responses())
     engine = _engine(runner, workspace=ws, command_runner=cmd)
     run(engine.deliver(_request()))
-    assert ws.read_text(".gitignore") == "custom\n"
+    content = ws.read_text(".gitignore")
+    # the user's entries are kept; the engine appends its bookkeeping ignore
+    assert content.startswith("custom\n")
+    assert ".dev_team/" in content
 
 
 def test_agentic_unreported_changes_are_reviewed(tmp_path):
@@ -967,7 +969,7 @@ def test_gate_timeout_flows_into_gate_context():
 
 
 def test_checkpoint_fingerprint_mismatch_reruns_task():
-    from dev_team.memory import CheckpointStore, RunCheckpoint
+    from dev_team.memory import RunCheckpoint
 
     ws = InMemoryWorkspace()
     # a stale checkpoint claims T1 is done, but for different task content
@@ -999,21 +1001,29 @@ def test_branch_slug():
 class DispatchCommandRunner:
     """Routes pytest results by call order/cwd; records every call with cwd."""
 
-    def __init__(self, pytest_results=None, worktree_pytest_ok=True, rev_shas=None):
+    def __init__(
+        self, pytest_results=None, worktree_pytest_ok=True, rev_shas=None, diff_names=None
+    ):
         self.pytest = list(pytest_results or [])
         self.worktree_pytest_ok = worktree_pytest_ok
         self.rev = list(rev_shas or [])
+        self.diff_names = list(diff_names or [])
         self.calls = []
 
     def run(self, command, *, cwd=None, timeout=None):
         args = list(command)
         self.calls.append((tuple(args), cwd))
         joined = " ".join(args)
+        if "rev-parse --verify --quiet" in joined:
+            # GitRepo.rev_parse: dispatch scripted shas; unresolvable without.
+            if self.rev:
+                sha = self.rev.pop(0) if len(self.rev) > 1 else self.rev[0]
+                return CommandResult(args, 0, sha, "")
+            return CommandResult(args, 1, "", "")
         if "rev-parse --verify" in joined:
             return CommandResult(args, 0, "ok", "")
-        if args[:2] == ["git", "rev-parse"] and args[-1] == "HEAD" and self.rev:
-            sha = self.rev.pop(0) if len(self.rev) > 1 else self.rev[0]
-            return CommandResult(args, 0, sha, "")
+        if "diff --name-only" in joined:
+            return CommandResult(args, 0, "\n".join(self.diff_names), "")
         # match the verify program itself, not a path that merely contains
         # "pytest" (pytest's own tmp_path does: /tmp/pytest-of-root/...)
         if args and args[0] == "pytest":
@@ -1181,7 +1191,7 @@ def test_worktree_happy_path(tmp_path):
     assert outcome.committed is True
     wt_path = f"{engine.workdir}/.dev_team/worktrees/t1"
     calls = [c for c, _ in cmd.calls]
-    assert ("git", "worktree", "add", "-b", "dev-team/login-task-t1", wt_path) in calls
+    assert ("git", "worktree", "add", "-B", "dev-team/login-task-t1", wt_path) in calls
     assert ("git", "merge", "--squash", "dev-team/login-task-t1") in calls
     # WIP commits collapsed into one feature commit at the baseline sha
     assert ("git", "reset", "--soft", "BASE") in calls
@@ -1536,7 +1546,7 @@ def test_writer_docs_are_written_to_workspace():
     ws = InMemoryWorkspace({"README.md": "# App"})
     runner = ScriptedRunner(by_system_prompt=responses)
     engine = _engine(runner, workspace=ws)
-    outcome = run(engine.deliver(_request()))
+    run(engine.deliver(_request()))
     assert ws.read_text("docs/login.md") == "# Login\n"
     writer_prompt = next(
         c["prompt"] for c in runner.calls if "technical writer" in (c["system_prompt"] or "")
@@ -1558,3 +1568,187 @@ def test_sre_sees_deployment_rollback_and_gates():
     assert "revert" in sre_prompt  # deploy_dict rollback step
     assert "passed their quality gates" in sre_prompt
     assert "x = 1" in sre_prompt  # the delivered code itself
+
+
+# --- review-hardening: planning resilience, WIP banking, resume ------------
+
+
+def test_planning_failure_returns_halted_outcome():
+    mapping = engine_responses()
+    mapping["product manager"] = "utter garbage, no JSON here"
+    runner = ScriptedRunner(by_system_prompt=mapping)
+    engine = _engine(runner, config=EngineConfig(json_retries=0))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.halted_reason is not None
+    assert "planning failed" in outcome.halted_reason
+    assert outcome.task_results == []
+
+
+def test_budget_exhausted_during_planning_halts_gracefully():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, budget=Budget(limit_usd=0.0))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.halted_reason == "budget exhausted before any task work began"
+
+
+def test_duplicate_task_ids_are_renamed_not_fatal():
+    dup_plan = {
+        "summary": "s",
+        "tasks": [
+            {"id": "T1", "title": "a", "description": "", "dependencies": []},
+            {"id": "T1", "title": "b", "description": "", "dependencies": []},
+            {"id": "T1", "title": "c", "description": "", "dependencies": []},
+        ],
+    }
+    mapping = engine_responses()
+    mapping["product manager"] = json_response(dup_plan)
+    runner = ScriptedRunner(by_system_prompt=mapping)
+    engine = _engine(runner)
+    outcome = run(engine.deliver(_request()))
+    ids = [tr.task.id for tr in outcome.task_results]
+    assert ids == ["T1", "T1-2", "T1-3"]
+    assert outcome.tasks_complete is True
+
+
+def test_commit_denied_by_approval_gate(tmp_path):
+    from dev_team.approval import DenyAll
+
+    cmd = DispatchCommandRunner(rev_shas=["BASE", "TIP"])
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=cmd,
+        approval=DenyAll(),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.tasks_complete is True
+    assert outcome.committed is False
+
+
+def _banked_first_run(tmp_path):
+    """Run 1 of the WIP-banking scenario: T1 accepted, T2 review-rejected."""
+
+    mapping = {
+        "product manager": [json_response(_two_task_plan())],
+        "software architect": [json_response(__design())],
+        "senior software engineer": [json_response(__impl())],
+        "code reviewer": [json_response(__review(True)), json_response(__review(False))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    ws = LocalWorkspace(str(tmp_path))
+    cmd = DispatchCommandRunner(rev_shas=["BASE"])
+    engine = _engine(
+        KeyedQueueRunner(mapping),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(max_task_attempts=1),
+    )
+    first = run(engine.deliver(_request()))
+    return ws, cmd, first
+
+
+def test_agentic_wip_commits_bank_each_accepted_task(tmp_path):
+    _, cmd, first = _banked_first_run(tmp_path)
+    assert first.success is False  # T2 was rejected
+    calls = [c for c, _ in cmd.calls]
+    # T1's accepted work was banked as a WIP commit on the delivery branch...
+    assert ("git", "commit", "--allow-empty", "-m", "wip(dev-team): T1") in calls
+    # ...so T2's rollback (hard reset) rewound to the banked state, not baseline
+    assert ("git", "reset", "--hard") in calls
+    # head == baseline sha (fake git repeats BASE) -> nothing squashed/committed
+    assert first.committed is False
+
+
+def test_resume_reuses_plan_and_original_baseline(tmp_path):
+    ws, _, _ = _banked_first_run(tmp_path)
+    # a file changed by run 1 (visible only via git) still reaches security
+    ws.write_text("carried.py", "carried = 1")
+
+    mapping2 = {
+        "software architect": [json_response(__design())],
+        "senior software engineer": [json_response(__impl())],
+        "code reviewer": [json_response(__review(True))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    runner2 = KeyedQueueRunner(mapping2)
+    # a.py is already reported by T2's implementation; carried.py is git-only
+    cmd2 = DispatchCommandRunner(rev_shas=["NEW", "TIP"], diff_names=["carried.py", "a.py"])
+    engine2 = _engine(runner2, workspace=ws, command_runner=cmd2)
+    second = run(engine2.deliver(_request()))
+
+    # the plan came from the checkpoint (no PM in mapping2: a call would raise)
+    assert second.resumed_task_ids == ["T1"]
+    assert second.success is True
+    assert second.committed is True
+    calls2 = [c for c, _ in cmd2.calls]
+    # squashed from run 1's original baseline, not this run's fresh HEAD
+    assert ("git", "reset", "--soft", "BASE") in calls2
+    # run 1's carried-over change was part of the security review evidence
+    assert any("carried = 1" in c["prompt"] for c in runner2.calls)
+
+
+def test_worktree_merge_conflict_is_cleaned_up_and_retried(tmp_path):
+    class _ConflictOnce(DispatchCommandRunner):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.merges = 0
+
+        def run(self, command, *, cwd=None, timeout=None):
+            if "merge --squash" in " ".join(command):
+                self.merges += 1
+                if self.merges == 1:
+                    self.calls.append((tuple(command), cwd))
+                    return CommandResult(list(command), 1, "", "CONFLICT (content): a.py")
+            return super().run(command, cwd=cwd, timeout=timeout)
+
+    cmd = _ConflictOnce(rev_shas=["BASE", "TIP"])
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _worktree_engine(tmp_path, runner, cmd, max_task_attempts=2)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert outcome.task_results[0].attempts == 2
+    calls = [c for c, _ in cmd.calls]
+    assert ("git", "reset", "--hard") in calls  # the conflicted merge was discarded
+    assert any(
+        "does not merge cleanly" in c["prompt"]
+        for c in runner.calls
+        if "Implement" in c["prompt"]
+    )
+
+
+def test_specialist_failure_degrades_gracefully():
+    # the security agent never produces usable JSON -> stage fails, run survives
+    mapping = engine_responses()
+    mapping["application security engineer"] = "not json at all"
+    runner = ScriptedRunner(by_system_prompt=mapping)
+    engine = _engine(runner, config=EngineConfig(json_retries=0))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.tasks_complete is True
+    assert outcome.security is None  # no verdict...
+    assert outcome.committed is False  # ...fails closed at commit time
+
+
+def test_backlog_reuses_epic_and_stories_across_runs():
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    engine1 = _engine(
+        ScriptedRunner(by_system_prompt=engine_responses()), workspace=ws, backlog_store=store
+    )
+    run(engine1.deliver(_request()))
+    engine2 = _engine(
+        ScriptedRunner(by_system_prompt=engine_responses()), workspace=ws, backlog_store=store
+    )
+    run(engine2.deliver(_request()))
+    backlog = store.load()
+    assert len(backlog.epics) == 1  # rerun reused the epic
+    assert len(backlog.stories) == 1  # and the story
+    assert backlog.stories[0].status is ItemStatus.DONE

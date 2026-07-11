@@ -13,9 +13,13 @@ Where :class:`~dev_team.workflow.DevelopmentWorkflow` *simulates* a run, the
   concurrently, but apply → review → test → accept happens under a lock (a
   merge queue), and a failed attempt is rolled back so the workspace only ever
   accumulates work that passed its gates.
-- **Nothing is committed until security approves.** Task work lands in the
-  workspace as it passes gates; the git commit happens once, at the end, and
-  only when the security review did not block.
+- **Accepted work is banked immediately.** Each task that passes its gates is
+  committed as a ``wip(dev-team)`` commit on the delivery branch, so a later
+  task's rollback (a hard reset) can never destroy it, and a crashed or
+  over-budget run leaves committed work a resume can build on.
+- **The feature commit waits for security.** The WIP commits collapse (soft
+  reset to the delivery baseline) into a single curated feature commit at the
+  end, and only when the security review did not block.
 - **A blown budget stops the run, not the world.** Budget exhaustion fails
   remaining work gracefully and still returns a full (partial) outcome with
   trace, cost, and checkpoint intact — a later run resumes from the checkpoint.
@@ -38,11 +42,12 @@ from .agents import (
     SREAgent,
     TechnicalWriterAgent,
 )
-from .approval import ApprovalGate, AutoApprover
+from .approval import ApprovalGate, ApprovalRequest, AutoApprover
 from .backlog import BacklogStore, ItemStatus
 from .budget import Budget, BudgetExceededError
 from .changes import ChangeApplier
 from .context import build_repo_context
+from .errors import DevTeamError
 from .events import AgentEvent, Listener, emit
 from .failures import new_failures, parse_failed_tests
 from .execution import (
@@ -70,6 +75,7 @@ from .models import (
     FeatureRequest,
     FileChange,
     Implementation,
+    Plan,
     ReliabilityReport,
     Review,
     ReviewComment,
@@ -186,6 +192,7 @@ class DeliveryOutcome:
     branch: Optional[str] = None
     baseline: Optional[DoDReport] = None
     halted_reason: Optional[str] = None
+    scorecard: Dict[str, int] = field(default_factory=dict)
 
     @property
     def tasks_complete(self) -> bool:
@@ -304,6 +311,47 @@ def _branch_slug(title: str) -> str:
     return cleaned[:40] or "feature"
 
 
+def _plan_to_dict(plan: Plan) -> Dict:
+    """Serialise a plan for the checkpoint (identity fields only)."""
+
+    return {
+        "summary": plan.summary,
+        "tasks": [
+            {
+                "id": t.id,
+                "title": t.title,
+                "description": t.description,
+                "acceptance_criteria": list(t.acceptance_criteria),
+                "dependencies": list(t.dependencies),
+            }
+            for t in plan.tasks
+        ],
+    }
+
+
+def _plan_from_dict(data: Dict) -> Plan:
+    """Rebuild a checkpointed plan so a resume works the *same* tasks.
+
+    Regenerating the plan on resume would gamble on the model reproducing
+    every task byte-for-byte — the fingerprint match would almost always
+    fail and the "resume" would redo everything.
+    """
+
+    return Plan(
+        summary=str(data.get("summary", "")),
+        tasks=[
+            Task(
+                id=str(t.get("id", "")),
+                title=str(t.get("title", "")),
+                description=str(t.get("description", "")),
+                acceptance_criteria=[str(c) for c in t.get("acceptance_criteria", [])],
+                dependencies=[str(d) for d in t.get("dependencies", [])],
+            )
+            for t in data.get("tasks", [])
+        ],
+    )
+
+
 class DeliveryEngine:
     """Delivers a feature for real, with gates, concurrency, and observability."""
 
@@ -381,12 +429,21 @@ class DeliveryEngine:
             )
         else:
             self.definition_of_done = None
-        self.backlog_store = backlog_store
+        # A real workspace gets a persistent backlog by default; without one
+        # the "persistent backlog the engine records every run into" would be
+        # wired to nothing.
+        self.backlog_store = backlog_store or (
+            BacklogStore(self.workspace) if self.workdir is not None else None
+        )
         self.memory = memory or ProjectMemory(self.workspace)
         self.checkpoints = checkpoints or (
             CheckpointStore(self.workspace) if self.config.resume else None
         )
         self._integration_lock = asyncio.Lock()
+        # git stash is one stack shared by every worktree of a repo; without
+        # serialising push/pop pairs, concurrent fail-to-pass checks pop each
+        # other's stashes and restore implementations into the wrong worktree.
+        self._stash_lock = asyncio.Lock()
         self._checkpoint: Optional[RunCheckpoint] = None
         self._budget_exhausted = False
         self._branch: Optional[str] = None
@@ -429,8 +486,13 @@ class DeliveryEngine:
         self._event("start", f"Delivering: {request.title}")
         self._budget_exhausted = False
         self._branch = None
+        self._baseline_sha = None
 
-        if self.agentic:
+        if self.agentic or (self.workdir is not None and self._can_commit):
+            # Described-mode deliveries to a real directory need the same
+            # safeguards as agentic ones — dirty-tree halt, dedicated delivery
+            # branch, baseline commit — or the run would sweep pre-existing
+            # uncommitted work into a commit on whatever branch is checked out.
             halted = self._prepare_git_baseline(request)
             if halted is not None:
                 self.tracer.end(run_span, "halted")
@@ -481,44 +543,78 @@ class DeliveryEngine:
 
         repo_ctx = build_repo_context(self.workspace)
         snapshot_memory = self.memory.load()
+        # Continue ADR numbering where earlier runs stopped, so the persisted
+        # decision log never collides ids.
+        self.blackboard.seed_decision_ids(
+            len((snapshot_memory or {}).get("decisions", []))
+        )
+
+        self._checkpoint = (
+            self.checkpoints.load(request.title) if self.checkpoints is not None else None
+        )
+        resuming = self._checkpoint is not None and bool(self._checkpoint.done_task_ids)
+        if resuming and self._checkpoint.baseline_sha and self._baseline_sha is not None:
+            # Squash from the interrupted run's baseline so the final feature
+            # commit spans that run's banked work too.
+            self._baseline_sha = self._checkpoint.baseline_sha
+
         context_parts = [
             part
             for part in (_prior_context(snapshot_memory), repo_ctx.render() or None)
             if part
         ]
         prior = "\n\n".join(context_parts) if context_parts else None
-        plan = await self.manager.create_plan(request, prior_context=prior)
-        issues = lint_plan(plan)
-        if issues:
-            # One INVEST-lint revision pass: a plan QA can't verify or the
-            # scheduler can't order wastes every downstream agent's budget.
-            self._scorecard["plan_lint_issues"] += len(issues)
-            self._event("plan-lint", f"Plan failed lint ({len(issues)} issue(s)); revising")
-            plan = await self.manager.create_plan(
-                request,
-                prior_context=prior,
-                revision_feedback="\n".join(f"- {i}" for i in issues),
-            )
-            remaining = lint_plan(plan)
-            if remaining:
+        try:
+            if resuming and self._checkpoint.plan is not None:
+                plan = _plan_from_dict(self._checkpoint.plan)
                 self._event(
-                    "plan-lint",
-                    f"Plan still has {len(remaining)} lint issue(s); proceeding anyway",
-                    detail="; ".join(remaining[:5]),
+                    "resumed",
+                    "Reusing the checkpointed plan from the interrupted run",
                 )
-        self.blackboard.post_artifact("plan", "plan", plan.summary)
-        self._event("planned", "Plan ready", detail=f"{len(plan.tasks)} task(s)")
+            else:
+                plan = await self.manager.create_plan(request, prior_context=prior)
+                issues = lint_plan(plan)
+                if issues:
+                    # One INVEST-lint revision pass: a plan QA can't verify or the
+                    # scheduler can't order wastes every downstream agent's budget.
+                    self._scorecard["plan_lint_issues"] += len(issues)
+                    self._event(
+                        "plan-lint", f"Plan failed lint ({len(issues)} issue(s)); revising"
+                    )
+                    plan = await self.manager.create_plan(
+                        request,
+                        prior_context=prior,
+                        revision_feedback="\n".join(f"- {i}" for i in issues),
+                    )
+                    remaining = lint_plan(plan)
+                    if remaining:
+                        self._event(
+                            "plan-lint",
+                            f"Plan still has {len(remaining)} lint issue(s); proceeding anyway",
+                            detail="; ".join(remaining[:5]),
+                        )
+                self._dedupe_task_ids(plan.tasks)
+            self.blackboard.post_artifact("plan", "plan", plan.summary)
+            self._event("planned", "Plan ready", detail=f"{len(plan.tasks)} task(s)")
 
-        prior_decisions = [
-            f"{d.get('title')}: {d.get('decision')}"
-            for d in (snapshot_memory or {}).get("decisions", [])
-        ]
-        design = await self.architect.design(
-            request,
-            plan,
-            repo_context=repo_ctx.render() or None,
-            prior_decisions=prior_decisions or None,
-        )
+            prior_decisions = [
+                f"{d.get('title')}: {d.get('decision')}"
+                for d in (snapshot_memory or {}).get("decisions", [])
+            ]
+            design = await self.architect.design(
+                request,
+                plan,
+                repo_context=repo_ctx.render() or None,
+                prior_decisions=prior_decisions or None,
+            )
+        except BudgetExceededError:
+            self.tracer.end(run_span, "halted")
+            return self._halted(request, "budget exhausted before any task work began")
+        except DevTeamError as exc:
+            # A run that dies during planning/design must still return an
+            # outcome (with trace and cost) rather than unwind the caller.
+            self.tracer.end(run_span, "halted")
+            return self._halted(request, f"planning failed: {exc}")
         self.blackboard.record_decision(
             title=f"Architecture for {request.title}",
             context=request.description,
@@ -527,11 +623,13 @@ class DeliveryEngine:
         )
         self._event("designed", "Design ready")
 
+        if self._checkpoint is not None:
+            if not self._checkpoint.baseline_sha:
+                self._checkpoint.baseline_sha = self._baseline_sha
+            self._checkpoint.plan = _plan_to_dict(plan)
+
         backlog, stories = self._register_backlog(request, plan.tasks)
 
-        self._checkpoint = (
-            self.checkpoints.load(request.title) if self.checkpoints is not None else None
-        )
         resumed: List[str] = []
         results: Dict[str, TaskResult] = {}
         pending: List[Task] = []
@@ -618,9 +716,10 @@ class DeliveryEngine:
             resumed_task_ids=resumed,
             branch=self._branch,
             baseline=baseline,
+            scorecard=dict(self._scorecard),
         )
         if outcome.success and self.checkpoints is not None:
-            self.checkpoints.clear()
+            self.checkpoints.clear(request.title)
         verdict = "succeeded" if outcome.success else "with issues"
         self._event("done", f"Delivery finished {verdict}", detail=f"${outcome.cost_usd:.4f}")
         return outcome
@@ -628,37 +727,61 @@ class DeliveryEngine:
     # -- run preparation -------------------------------------------------------
 
     def _prepare_git_baseline(self, request: FeatureRequest) -> Optional[DeliveryOutcome]:
-        """Get the repo ready for agentic work; return a halted outcome if unsafe.
+        """Get the repo ready for delivery work; return a halted outcome if unsafe.
 
         Ensures a repo exists, refuses to run over uncommitted work (unless
-        explicitly allowed), authors a minimal .gitignore on repos that lack
-        one, switches to a dedicated delivery branch, and commits the baseline
-        that failed attempts roll back to.
+        explicitly allowed), makes sure ``.dev_team/`` is git-ignored, switches
+        to a dedicated delivery branch, and commits the baseline the delivery
+        squashes onto (and that failed attempts roll back to).
         """
 
         self.git.ensure_repo()
-        if self.git.has_changes() and not self.config.allow_dirty_baseline:
+        # The engine's own bookkeeping never counts as the *user's* dirt.
+        dirty = [
+            p for p in self.git.changed_files() if not p.startswith(_INTERNAL_PREFIX)
+        ]
+        if dirty and not self.config.allow_dirty_baseline:
             return self._halted(
                 request,
                 "the working tree has uncommitted changes; commit or stash them "
                 "first, or set allow_dirty_baseline=True to sweep them into a "
                 "baseline commit on the delivery branch",
             )
-        if self.config.write_gitignore and not self.workspace.exists(".gitignore"):
-            self.workspace.write_text(".gitignore", _DEFAULT_GITIGNORE)
+        self._ensure_gitignore()
         if self.config.use_branch:
             self._branch = self.config.branch or f"dev-team/{_branch_slug(request.title)}"
             self.git.switch_to(self._branch)
         if self.git.has_changes():
             self.git.add_all()
             self.git.commit("chore(dev-team): baseline before delivery")
-        if self._use_worktrees:
-            # Worktrees branch from HEAD, so one must exist; and the final
-            # squash needs the exact sha the delivery started from.
-            if not self.git.has_commits():
-                self.git.commit("chore(dev-team): init", allow_empty=True)
-            self._baseline_sha = self.git.rev_parse("HEAD")
+        # WIP commits and the final squash both need a baseline commit to
+        # exist and its exact sha. An unresolvable sha (e.g. a stubbed runner)
+        # disables baseline tracking rather than corrupting it.
+        if not self.git.has_commits():
+            self.git.commit("chore(dev-team): init", allow_empty=True)
+        self._baseline_sha = self.git.rev_parse("HEAD") or None
         return None
+
+    def _ensure_gitignore(self) -> None:
+        """Make sure ``.dev_team/`` is ignored, whoever authored .gitignore.
+
+        Rollbacks run ``git clean -fd``; if the bookkeeping directory is not
+        ignored, every rollback deletes the checkpoint and memory files
+        mid-run, and the leftovers read as a dirty tree on the next run.
+        """
+
+        if not self.config.write_gitignore:
+            return
+        if not self.workspace.exists(".gitignore"):
+            self.workspace.write_text(".gitignore", _DEFAULT_GITIGNORE)
+            return
+        existing = self.workspace.read_text(".gitignore")
+        if ".dev_team" not in existing:
+            separator = "" if existing.endswith("\n") else "\n"
+            self.workspace.write_text(
+                ".gitignore",
+                f"{existing}{separator}# dev-team internal bookkeeping\n.dev_team/\n",
+            )
 
     def _resolve_gates(self) -> None:
         """Build the Definition of Done from the workspace when not configured."""
@@ -738,13 +861,22 @@ class DeliveryEngine:
         )
 
     async def _specialist(self, coro):
-        """Run a post-task specialist stage, degrading gracefully on budget."""
+        """Run a post-task specialist stage, degrading gracefully on failure.
+
+        A specialist that cannot produce a verdict (budget, persistent SDK or
+        parse failure) yields ``None`` instead of unwinding a run whose task
+        work already succeeded — and a missing security verdict already fails
+        closed at commit time.
+        """
 
         try:
             return await coro
         except BudgetExceededError:
             self._budget_exhausted = True
             self._event("budget", "Budget exhausted; skipping remaining specialist stages")
+            return None
+        except DevTeamError as exc:
+            self._event("specialist", "Specialist stage failed", detail=str(exc))
             return None
 
     def _on_scheduled(self, result: ScheduledResult) -> None:
@@ -791,6 +923,8 @@ class DeliveryEngine:
                     done, review, test_report, feedback = await self._integrate(
                         task, implementation, span
                     )
+                    if done:
+                        self._commit_wip(task)
             else:
                 implementation = await self.engineer.implement(
                     task,
@@ -807,6 +941,8 @@ class DeliveryEngine:
                     done, review, test_report, feedback = await self._integrate(
                         task, implementation, span
                     )
+                    if done:
+                        self._commit_wip(task)
 
             if done:
                 task.status = TaskStatus.DONE
@@ -829,6 +965,10 @@ class DeliveryEngine:
         wt_path = f"{self.workdir}/.dev_team/worktrees/{task.id.lower()}"
         task_branch = f"{self._branch or 'dev-team'}-task-{task.id.lower()}"
         async with self._integration_lock:  # worktree creation mutates .git
+            # A crashed run can leave the worktree and branch behind; clear
+            # them so the rerun's task doesn't fail on arrival.
+            self.git.worktree_remove(wt_path)
+            self.git.worktree_prune()
             self.git.worktree_add(wt_path, task_branch)
         arena_ws = LocalWorkspace(wt_path)
         arena_git = GitRepo(self.command_runner, cwd=wt_path)
@@ -897,7 +1037,30 @@ class DeliveryEngine:
             ]
             arena_git.add_paths(paths)
             arena_git.commit(f"wip(dev-team): {task.id} attempt", allow_empty=True)
-            self.git.merge_squash(task_branch)
+            try:
+                self.git.merge_squash(task_branch)
+            except GitError as exc:
+                # A conflicted squash-merge leaves unmerged index entries that
+                # block every later merge (and could ship conflict markers in
+                # the feature commit). Clean up and hand it to the engineer.
+                self.git.discard_changes()
+                task.status = TaskStatus.CHANGES_REQUESTED
+                return False, Review(
+                    approved=False,
+                    summary=(
+                        f"integration failed: {task.id} does not merge cleanly "
+                        "onto the delivery branch"
+                    ),
+                    comments=[
+                        ReviewComment(
+                            severity=Severity.MAJOR,
+                            message=(
+                                "Rework the change against the current state of "
+                                f"the delivery branch: {exc}"
+                            ),
+                        )
+                    ],
+                )
             dod = await asyncio.to_thread(
                 self.definition_of_done.evaluate, self._gate_context(task)
             )
@@ -952,6 +1115,7 @@ class DeliveryEngine:
                 file_contents=contents,
                 diff=diff,
                 static_findings=static_findings,
+                workspace_root=cwd if cwd is not None else self.workdir,
             )
             if not review.approved:
                 self._scorecard["review_rejections"] = (
@@ -964,7 +1128,10 @@ class DeliveryEngine:
 
             if self.config.qa_tests:
                 suite = await self.qa.author_tests(
-                    task, implementation, file_contents=contents
+                    task,
+                    implementation,
+                    file_contents=contents,
+                    workspace_root=cwd if cwd is not None else self.workdir,
                 )
                 if snapshot is not None:
                     for change in suite.files:
@@ -1078,14 +1245,22 @@ class DeliveryEngine:
             return False
 
         if self.agentic:
-            if not repo.stash_push(impl_paths):
-                return False
-            try:
-                dod = await asyncio.to_thread(
-                    self.definition_of_done.evaluate, self._gate_context(cwd=cwd)
-                )
-            finally:
-                repo.stash_pop()
+            # The stash stack is shared by every worktree of the repo, so the
+            # push/pop pair is serialised across concurrent tasks.
+            async with self._stash_lock:
+                if not repo.stash_push(impl_paths):
+                    self._event(
+                        "fail-to-pass",
+                        "Fail-to-pass check skipped: the implementation could "
+                        "not be shelved (stash denied or failed)",
+                    )
+                    return False
+                try:
+                    dod = await asyncio.to_thread(
+                        self.definition_of_done.evaluate, self._gate_context(cwd=cwd)
+                    )
+                finally:
+                    repo.stash_pop()
         else:
             # impl_paths were filtered on existence, so every current read works.
             current = {p: ws.read_text(p) for p in impl_paths}
@@ -1180,12 +1355,58 @@ class DeliveryEngine:
         self._checkpoint.mark_done(task.id, task_fingerprint(task.title, task.description))
         self.checkpoints.save(self._checkpoint)
 
+    def _commit_wip(self, task: Task) -> None:
+        """Bank an accepted task as a WIP commit on the delivery branch.
+
+        Rollback is a hard reset to HEAD: without banking each accepted task,
+        a later task's failed attempt would wipe earlier tasks' gated work,
+        and a crashed or over-budget run would leave nothing (and a dirty
+        tree) for a resume to build on. The WIP commits collapse into the one
+        curated feature commit at the end. Only active when a git baseline
+        was prepared.
+        """
+
+        if self._baseline_sha is None:
+            return
+        paths = [
+            p for p in self.git.changed_files() if not p.startswith(_INTERNAL_PREFIX)
+        ]
+        self.git.add_paths(paths)
+        self.git.commit(f"wip(dev-team): {task.id}", allow_empty=True)
+
+    def _dedupe_task_ids(self, tasks: List[Task]) -> None:
+        """Rename duplicate task ids so scheduling stays unambiguous.
+
+        The scheduler keys status by id; duplicates would abort the whole run
+        after the planning spend. Dependencies keep pointing at the first
+        occurrence of the original id.
+        """
+
+        seen = set()
+        for task in tasks:
+            if task.id in seen:
+                base, n = task.id, 2
+                while f"{base}-{n}" in seen:
+                    n += 1
+                renamed = f"{base}-{n}"
+                self._event(
+                    "plan-lint", f"Renamed duplicate task id {base} to {renamed}"
+                )
+                task.id = renamed
+            seen.add(task.id)
+
     # -- post-task stages ----------------------------------------------------
 
     def _aggregate_implementation(
         self, request: FeatureRequest, task_results: List[TaskResult]
     ) -> Implementation:
-        """The whole feature's change set as one implementation."""
+        """The whole feature's change set as one implementation.
+
+        Checkpoint-resumed tasks carry no in-memory implementation, so the
+        aggregate is reconciled against git: every product path changed since
+        the delivery baseline is included, whichever run changed it. Without
+        this, resumed work would be committed *unseen* by the security review.
+        """
 
         files = [
             change
@@ -1193,11 +1414,33 @@ class DeliveryEngine:
             if tr.implementation is not None
             for change in tr.implementation.files
         ]
+        if self._baseline_sha is not None:
+            known = {c.path for c in files}
+            for path in self._delivery_changed_paths():
+                if path not in known:
+                    files.append(
+                        FileChange(
+                            path=path,
+                            change_type=ChangeType.MODIFY,
+                            summary="(change detected via git, e.g. from a resumed run)",
+                        )
+                    )
         return Implementation(
             task_id="FEATURE",
             summary=f"All changes for {request.title}",
             files=files,
         )
+
+    def _delivery_changed_paths(self) -> List[str]:
+        """Every product path changed since the delivery baseline.
+
+        Committed (WIP commits) and uncommitted changes both count.
+        """
+
+        paths = set(self.git.diff_names(self._baseline_sha)) | set(
+            self.git.changed_files()
+        )
+        return sorted(p for p in paths if not p.startswith(_INTERNAL_PREFIX))
 
     async def _security_review(
         self,
@@ -1223,6 +1466,7 @@ class DeliveryEngine:
             aggregate,
             file_contents=self._contents(aggregate),
             scanner_output=scanner_output,
+            workspace_root=self.workdir,
         )
         self.blackboard.post_artifact("security", "FEATURE", report.summary)
         return report
@@ -1269,6 +1513,7 @@ class DeliveryEngine:
             file_contents=self._contents(aggregate),
             deployment=deployment,
             gate_summary=gate_summary,
+            workspace_root=self.workdir,
         )
 
     async def _write_documentation(
@@ -1317,14 +1562,24 @@ class DeliveryEngine:
             # as a block: nothing unvetted gets committed.
             self._event("commit", "Skipping commit: no security approval for the release")
             return False
+        decision = self.approval.review(
+            ApprovalRequest(
+                action=f"commit feature: {request.title}",
+                detail=f"{len(done)} task(s): {', '.join(done)}",
+                risk="medium",
+            )
+        )
+        if not decision.approved:
+            self._event("commit", "Skipping commit: approval denied", detail=decision.reason)
+            return False
         try:
-            if self._use_worktrees:
+            if self._baseline_sha is not None:
                 # Accepted tasks already live as WIP commits on the delivery
                 # branch; collapse them into the single feature commit, and
                 # pick up post-task artifacts (docs, deployment files) that
-                # were written after the last merge.
+                # were written after the last accepted task.
                 head = self.git.rev_parse("HEAD")
-                if not self._baseline_sha or head == self._baseline_sha:
+                if head == self._baseline_sha:
                     return False
                 self.git.reset_soft(self._baseline_sha)
                 extras = [
@@ -1354,16 +1609,26 @@ class DeliveryEngine:
         return True
 
     def _register_backlog(self, request: FeatureRequest, tasks: List[Task]):
-        """Mirror the plan into the persistent backlog, if one is configured."""
+        """Mirror the plan into the persistent backlog, if one is configured.
+
+        Reruns and resumes of the same feature update the existing epic and
+        stories instead of minting duplicates on every run.
+        """
 
         if self.backlog_store is None:
             return None, {}
         backlog = self.backlog_store.load()
-        epic = backlog.add_epic(request.title, request.description)
-        stories = {
-            task.id: backlog.add_story(task.title, task.description, epic_id=epic.id)
-            for task in tasks
-        }
+        epic = next((e for e in backlog.epics if e.title == request.title), None)
+        if epic is None:
+            epic = backlog.add_epic(request.title, request.description)
+        existing = {s.title: s for s in backlog.stories_for_epic(epic.id)}
+        stories = {}
+        for task in tasks:
+            story = existing.get(task.title)
+            if story is None:
+                story = backlog.add_story(task.title, task.description, epic_id=epic.id)
+            story.status = ItemStatus.IN_PROGRESS
+            stories[task.id] = story
         self.backlog_store.save(backlog)
         return backlog, stories
 

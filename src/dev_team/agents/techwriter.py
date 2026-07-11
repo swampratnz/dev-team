@@ -12,7 +12,7 @@ from typing import Mapping, Optional, Sequence, Tuple
 
 from .. import parsing
 from ..models import Design, Documentation, FeatureRequest, Implementation
-from .base import BaseAgent
+from .base import UNTRUSTED_CONTENT_NOTE, BaseAgent
 from .reviewer import render_changed_files
 
 _SYSTEM = """\
@@ -29,7 +29,7 @@ class TechnicalWriterAgent(BaseAgent):
 
     role = "technical-writer"
     stage = "documentation"
-    system_prompt = _SYSTEM
+    system_prompt = _SYSTEM + UNTRUSTED_CONTENT_NOTE
 
     async def write_docs(
         self,

@@ -5,6 +5,12 @@ it: record which tests were already failing before any work started, then
 gate each task only on **newly** failing tests. Attribution is best-effort —
 when the output format isn't recognised, callers fall back to whole-gate
 pass/fail semantics rather than guessing.
+
+Known limitation: go and cargo failures are keyed on the bare test name
+(their output carries no reliable file/package identity on the ``FAIL``
+line), so a *new* failing test that shares a name with a baseline failure in
+another package is misread as inherited. Pytest identities include the file
+path and do not collide this way.
 """
 
 from __future__ import annotations

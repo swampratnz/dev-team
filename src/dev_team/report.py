@@ -109,6 +109,7 @@ def delivery_to_dict(outcome: "DeliveryOutcome") -> Dict[str, Any]:
         "branch": outcome.branch,
         "halted_reason": outcome.halted_reason,
         "baseline_green": outcome.baseline.passed if outcome.baseline else None,
+        "scorecard": dict(outcome.scorecard),
     }
 
 
@@ -145,6 +146,9 @@ def render_delivery_summary(outcome: "DeliveryOutcome") -> str:
         state = "ready" if outcome.reliability.production_ready else "NOT READY"
         lines.append(f"Reliability: {state}")
     lines.append(f"Committed: {'yes' if outcome.committed else 'no'}")
+    if outcome.scorecard:
+        counts = ", ".join(f"{k}={v}" for k, v in sorted(outcome.scorecard.items()))
+        lines.append(f"Scorecard: {counts}")
     if outcome.budget_exhausted:
         lines.append("Budget: EXHAUSTED (run stopped early; resume to continue)")
     if outcome.resumed_task_ids:

@@ -57,6 +57,25 @@ def test_security_agent_without_files():
     assert "(no files reported)" in runner.calls[0]["prompt"]
 
 
+def test_security_agent_read_only_tools_and_fenced_scanner_output():
+    runner = _runner({"approved": True, "summary": "ok", "findings": []})
+    agent = SecurityEngineerAgent(runner)
+    impl = Implementation(task_id="T1", summary="s", files=[])
+    run(
+        agent.review(
+            _task(),
+            impl,
+            scanner_output="bandit: eval() used",
+            workspace_root="/ws",
+        )
+    )
+    call = runner.calls[0]
+    assert tuple(call["allowed_tools"]) == ("Read", "Grep", "Glob")
+    assert call["cwd"] == "/ws"
+    assert "<scanner-output>\nbandit: eval() used\n</scanner-output>" in call["prompt"]
+    assert "untrusted data under review" in call["system_prompt"]
+
+
 def test_technical_writer_produces_doc_files():
     payload = {
         "summary": "docs",
@@ -134,3 +153,20 @@ def test_sre_agent_without_stack():
     agent = SREAgent(runner)
     run(agent.assess(FeatureRequest(title="F", description="d"), Design(overview="o")))
     assert "unspecified" in runner.calls[0]["prompt"]
+
+
+def test_sre_agent_read_only_tools_and_workspace_root():
+    runner = _runner(
+        {"production_ready": True, "summary": "ok", "slos": [], "risks": [], "runbook": []}
+    )
+    agent = SREAgent(runner)
+    run(
+        agent.assess(
+            FeatureRequest(title="F", description="d"),
+            Design(overview="o"),
+            workspace_root="/ws",
+        )
+    )
+    call = runner.calls[0]
+    assert tuple(call["allowed_tools"]) == ("Read", "Grep", "Glob")
+    assert call["cwd"] == "/ws"

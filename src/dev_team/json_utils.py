@@ -1,7 +1,10 @@
 """Robust JSON extraction from language-model output.
 
-Models often wrap JSON in prose or Markdown code fences. These helpers pull the
-first well-formed JSON object or array out of such text.
+Models often wrap JSON in prose or Markdown code fences, and agentic
+transcripts frequently narrate (including prose fragments like ``[1]``)
+before the final answer. These helpers therefore prefer the LAST well-formed
+JSON object in the text, falling back to the last array; bare scalars never
+qualify.
 """
 
 from __future__ import annotations
@@ -12,6 +15,8 @@ from typing import Any
 from .errors import JSONExtractionError
 
 _OPENERS = {"{": "}", "[": "]"}
+
+_MISSING = object()
 
 
 def _find_balanced(text: str, start: int) -> int:
@@ -47,32 +52,39 @@ def _find_balanced(text: str, start: int) -> int:
     return -1
 
 
-def _iter_candidates(text: str) -> Any:
-    """Yield candidate JSON substrings from ``text`` in priority order."""
-
-    stripped = text.strip()
-    # 1. The whole thing might already be valid JSON.
-    yield stripped
-    # 2. Any balanced object/array starting at each opener character.
-    for index, char in enumerate(text):
-        if char in _OPENERS:
-            end = _find_balanced(text, index)
-            if end != -1:
-                yield text[index:end]
-
-
 def extract_json(text: str) -> Any:
-    """Extract and parse the first valid JSON value found in ``text``.
+    """Extract and parse the best JSON value found in ``text``.
+
+    Scans for top-level balanced JSON values (skipping past each parsed value
+    so nested objects are not considered on their own) and returns the last
+    parseable object, or — when no object is present — the last parseable
+    array.
 
     Raises:
         JSONExtractionError: If no valid JSON object or array is present.
     """
 
-    for candidate in _iter_candidates(text):
-        if not candidate:
-            continue
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
+    last_object: Any = _MISSING
+    last_array: Any = _MISSING
+    index = 0
+    while index < len(text):
+        if text[index] in _OPENERS:
+            end = _find_balanced(text, index)
+            if end != -1:
+                try:
+                    value = json.loads(text[index:end])
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(value, dict):
+                        last_object = value
+                    else:
+                        last_array = value
+                    index = end
+                    continue
+        index += 1
+    if last_object is not _MISSING:
+        return last_object
+    if last_array is not _MISSING:
+        return last_array
     raise JSONExtractionError(text)

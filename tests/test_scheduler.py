@@ -95,3 +95,11 @@ def test_worker_exception_fails_task_not_run():
     errors = {r.task_id: r.error for r in results}
     assert "RuntimeError: boom" in errors["T1"]
     assert errors["T2"] is None
+
+
+def test_duplicate_task_ids_are_rejected():
+    async def worker(task):  # pragma: no cover - never reached
+        return True
+
+    with pytest.raises(ValueError, match="duplicate task id"):
+        run(schedule([_task("T1"), _task("T1")], worker))

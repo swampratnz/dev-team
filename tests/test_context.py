@@ -45,3 +45,20 @@ def test_context_caps_tree_and_truncates_manifests():
 def test_context_detects_test_files_outside_tests_dir():
     ctx = build_repo_context(InMemoryWorkspace({"src/test_x.py": "x"}))
     assert ctx.test_paths == ["src"]
+
+
+def test_context_reports_actual_containing_directory():
+    ctx = build_repo_context(InMemoryWorkspace({"src/pkg/test_utils.py": "x"}))
+    assert ctx.test_paths == ["src/pkg"]
+
+
+def test_context_reports_root_for_top_level_test_file():
+    ctx = build_repo_context(InMemoryWorkspace({"test_x.py": "x"}))
+    assert ctx.test_paths == ["."]
+
+
+def test_context_fences_manifest_heads():
+    ctx = build_repo_context(InMemoryWorkspace({"README.md": "# Svc"}))
+    rendered = ctx.render()
+    assert '<manifest-content name="README.md">' in rendered
+    assert "</manifest-content>" in rendered

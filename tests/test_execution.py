@@ -151,3 +151,26 @@ def test_dry_run_command_runner_is_honest():
     assert result.ok
     assert "not executed" in result.stdout
     assert runner.calls == [["pytest", "-q"]]
+
+
+def test_subprocess_runner_timeout_keeps_partial_output_usable():
+    import sys
+
+    runner = SubprocessCommandRunner()
+    result = runner.run(
+        [sys.executable, "-c", "import time; print('partial', flush=True); time.sleep(30)"],
+        timeout=1.0,
+    )
+    assert result.exit_code == EXIT_TIMEOUT
+    assert "partial" in result.stdout
+    # TimeoutExpired carries bytes; output must still be a string join
+    assert "command timed out" in result.output
+
+
+def test_local_workspace_write_is_atomic_and_leaves_no_staging_file(tmp_path):
+    ws = LocalWorkspace(str(tmp_path))
+    ws.write_text("data.json", '{"ok": true}')
+    ws.write_text("data.json", '{"ok": false}')
+    assert ws.read_text("data.json") == '{"ok": false}'
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".dev-team-tmp")]
+    assert leftovers == []

@@ -13,7 +13,7 @@ from typing import Optional, Sequence
 
 from .. import parsing
 from ..models import Design, FeatureRequest, Plan
-from .base import BaseAgent
+from .base import UNTRUSTED_CONTENT_NOTE, BaseAgent
 
 _SYSTEM = """\
 You are a pragmatic software architect. You turn a plan into a concise technical
@@ -36,7 +36,7 @@ class ArchitectAgent(BaseAgent):
 
     role = "architect"
     stage = "design"
-    system_prompt = _SYSTEM
+    system_prompt = _SYSTEM + UNTRUSTED_CONTENT_NOTE
 
     async def design(
         self,
@@ -57,7 +57,8 @@ class ArchitectAgent(BaseAgent):
             f"- {task.id}: {task.title}" for task in plan.tasks
         ) or "- (no tasks)"
         existing = (
-            f"\nExisting codebase (design must fit into it):\n{repo_context}\n"
+            "\nExisting codebase (design must fit into it):\n"
+            f"<repo-context>\n{repo_context}\n</repo-context>\n"
             if repo_context
             else ""
         )
