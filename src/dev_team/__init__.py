@@ -61,6 +61,7 @@ from .memory import (
     ProjectMemory,
     RunCheckpoint,
 )
+from .ordering import lint_plan, topological_order
 from .models import (
     ChangeType,
     Design,
@@ -104,7 +105,7 @@ from .verification import (
 )
 from .workflow import DevelopmentWorkflow
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "__version__",
@@ -182,10 +183,12 @@ __all__ = [
     "PredicateGate",
     "DefinitionOfDone",
     "DoDReport",
-    # scheduling
+    # scheduling & planning
     "schedule",
     "ScheduleStatus",
     "ScheduledResult",
+    "lint_plan",
+    "topological_order",
     # delivery / backlog
     "Backlog",
     "BacklogStore",

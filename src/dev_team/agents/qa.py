@@ -77,6 +77,11 @@ Author automated tests for this implementation. The tests will be written into
 the workspace and executed for real, so they must be complete, runnable files
 that validate the acceptance criteria against the code shown below.
 
+The bar: your tests must FAIL if this implementation were removed or broken —
+they will be checked against the pre-change code, and a suite that still
+passes without the implementation is rejected as vacuous. Assert on concrete
+behaviour (inputs and outputs), never just that code imports or runs.
+
 Task {task.id}: {task.title}
 Acceptance criteria:
 {criteria}

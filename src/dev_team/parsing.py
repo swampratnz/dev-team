@@ -146,6 +146,8 @@ def design_from_dict(data: Any) -> Design:
         components=components,
         tech_stack=as_str_list(data, "tech_stack"),
         risks=as_str_list(data, "risks"),
+        alternatives=as_str_list(data, "alternatives"),
+        rationale=as_str(data, "rationale"),
     )
 
 

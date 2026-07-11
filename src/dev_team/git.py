@@ -138,6 +138,20 @@ class GitRepo:
 
         self._git("branch", "-D", name, check=False)
 
+    def stash_push(self, paths: List[str]) -> bool:
+        """Temporarily shelve changes to ``paths`` (untracked included).
+
+        Returns whether anything was actually stashed; callers must only
+        ``stash_pop`` when it was.
+        """
+
+        return self._git("stash", "push", "-u", "--", *paths, check=False).ok
+
+    def stash_pop(self) -> None:
+        """Restore the most recently stashed changes (best effort)."""
+
+        self._git("stash", "pop", check=False)
+
     def merge_squash(self, branch: str) -> None:
         """Stage ``branch``'s changes onto the current branch without committing."""
 

@@ -261,3 +261,14 @@ def test_security_blocking_finding_forces_rejection():
     }
     report = parsing.security_report_from_dict(data)
     assert report.approved is False
+
+
+def test_design_alternatives_and_rationale():
+    data = {
+        "overview": "o",
+        "alternatives": ["queue-based — too complex for the load"],
+        "rationale": "simplest thing that meets the SLO",
+    }
+    design = parsing.design_from_dict(data)
+    assert design.alternatives == ["queue-based — too complex for the load"]
+    assert design.rationale == "simplest thing that meets the SLO"

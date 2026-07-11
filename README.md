@@ -36,6 +36,16 @@ QA, security, docs, reliability, and deployment.
 - ✅ **Adapts to the project** — the verify command is auto-detected from the
   workspace's manifests (npm / cargo / go / pytest), with optional
   `setup_command` provisioning and per-gate timeouts.
+- ✅ **Benchmark-grounded agents** (see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)) —
+  QA is held to SWT-bench's fail-to-pass bar (a suite that still passes with
+  the implementation reverted is rejected as vacuous); the reviewer works to a
+  comment budget and triages linter output; security triages a SAST scan and
+  must cite evidence for blocking findings; the architect weighs alternatives
+  against prior ADRs; plans are INVEST-linted with a revision pass; the
+  writer and DevOps ship real files (docs, Dockerfile, CI) in the feature
+  commit; the SRE runs a launch-checklist review over the delivered code. A
+  per-run scorecard tracks rejections and lint issues so agent quality is a
+  measured trend.
 - ✅ **Governed and resumable** — cost budgets stop the run gracefully,
   checkpoints let a later run resume where a crashed or over-budget run
   stopped, and every agent call is traced and metered.

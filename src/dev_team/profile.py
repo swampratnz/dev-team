@@ -27,6 +27,7 @@ class ProjectProfile:
     kind: str
     verify_command: Tuple[str, ...]
     setup_command: Optional[Tuple[str, ...]] = None
+    security_scan_command: Optional[Tuple[str, ...]] = None
     reason: str = ""
 
 
@@ -45,6 +46,7 @@ def detect_project(workspace: Workspace) -> ProjectProfile:
             kind="node",
             verify_command=("npm", "test"),
             setup_command=("npm", "install"),
+            security_scan_command=("npm", "audit", "--audit-level=high"),
             reason="package.json at workspace root",
         )
     if "Cargo.toml" in files:
@@ -67,6 +69,7 @@ def detect_project(workspace: Workspace) -> ProjectProfile:
             kind="python",
             verify_command=_FALLBACK,
             setup_command=setup,
+            security_scan_command=("bandit", "-r", ".", "-q", "-x", "./tests,./.dev_team"),
             reason=f"{marker[0]} at workspace root",
         )
     return ProjectProfile(
