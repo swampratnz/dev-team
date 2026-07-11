@@ -8,7 +8,7 @@ import importlib
 def test_version_exposed():
     import dev_team
 
-    assert dev_team.__version__ == "0.4.0"
+    assert dev_team.__version__ == "0.5.0"
     assert "DevTeam" in dev_team.__all__
     assert "DeliveryEngine" in dev_team.__all__
 

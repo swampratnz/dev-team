@@ -11,7 +11,7 @@ outcome on hard evidence (run success, expected files present, cost).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from .engine import DeliveryEngine, DeliveryOutcome
 from .models import FeatureRequest
@@ -22,11 +22,17 @@ EngineFactory = Callable[["EvalCase"], DeliveryEngine]
 
 @dataclass
 class EvalCase:
-    """One benchmark scenario the team must deliver."""
+    """One benchmark scenario the team must deliver.
+
+    ``check_commands`` are executed in the delivered workspace after the run
+    — behavioural assertions (e.g. ``("python", "-c", "from app import add")``)
+    that must exit zero for the case to pass.
+    """
 
     name: str
     request: FeatureRequest
     expected_files: Sequence[str] = ()
+    check_commands: Sequence[Sequence[str]] = ()
     require_success: bool = True
 
 
@@ -86,8 +92,17 @@ class EvalReport:
         return "\n".join(lines)
 
 
-def score(case: EvalCase, outcome: DeliveryOutcome) -> EvalResult:
-    """Score ``outcome`` against ``case``'s expectations."""
+def score(
+    case: EvalCase,
+    outcome: DeliveryOutcome,
+    *,
+    engine: Optional[DeliveryEngine] = None,
+) -> EvalResult:
+    """Score ``outcome`` against ``case``'s expectations.
+
+    When ``engine`` is provided, the case's ``check_commands`` are executed in
+    the delivered workspace through the engine's (guarded) command runner.
+    """
 
     failures: List[str] = []
     if case.require_success and not outcome.success:
@@ -95,6 +110,13 @@ def score(case: EvalCase, outcome: DeliveryOutcome) -> EvalResult:
     for path in case.expected_files:
         if path not in outcome.workspace_files:
             failures.append(f"expected file missing: {path}")
+    if engine is not None:
+        for command in case.check_commands:
+            result = engine.command_runner.run(list(command), cwd=engine.workdir)
+            if not result.ok:
+                failures.append(
+                    f"check failed ({result.exit_code}): {' '.join(command)}"
+                )
     return EvalResult(case=case, outcome=outcome, failures=failures)
 
 
@@ -108,5 +130,5 @@ async def evaluate(
     for case in cases:
         engine = engine_factory(case)
         outcome = await engine.deliver(case.request)
-        report.results.append(score(case, outcome))
+        report.results.append(score(case, outcome, engine=engine))
     return report

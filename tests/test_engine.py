@@ -986,3 +986,274 @@ def test_branch_slug():
     assert _branch_slug("Add OAuth 2.0 login!") == "add-oauth-2-0-login"
     assert _branch_slug("???") == "feature"
     assert len(_branch_slug("x" * 100)) <= 40
+
+
+# --- v0.5: attribution, context, retrospective, worktrees -------------------
+
+
+class DispatchCommandRunner:
+    """Routes pytest results by call order/cwd; records every call with cwd."""
+
+    def __init__(self, pytest_results=None, worktree_pytest_ok=True, rev_shas=None):
+        self.pytest = list(pytest_results or [])
+        self.worktree_pytest_ok = worktree_pytest_ok
+        self.rev = list(rev_shas or [])
+        self.calls = []
+
+    def run(self, command, *, cwd=None, timeout=None):
+        args = list(command)
+        self.calls.append((tuple(args), cwd))
+        joined = " ".join(args)
+        if "rev-parse --verify" in joined:
+            return CommandResult(args, 0, "ok", "")
+        if args[:2] == ["git", "rev-parse"] and args[-1] == "HEAD" and self.rev:
+            sha = self.rev.pop(0) if len(self.rev) > 1 else self.rev[0]
+            return CommandResult(args, 0, sha, "")
+        # match the verify program itself, not a path that merely contains
+        # "pytest" (pytest's own tmp_path does: /tmp/pytest-of-root/...)
+        if args and args[0] == "pytest":
+            if cwd and "/worktrees/" in str(cwd):
+                code = 0 if self.worktree_pytest_ok else 1
+                return CommandResult(args, code, "", "")
+            if self.pytest:
+                return self.pytest.pop(0) if len(self.pytest) > 1 else self.pytest[0]
+        return CommandResult(args, 0, "", "")
+
+
+def _legacy_red(output="FAILED tests/test_legacy.py::test_broken - assert False"):
+    return CommandResult(["pytest"], 1, output, "")
+
+
+def test_tolerated_baseline_accepts_inherited_failures_only():
+    ws = InMemoryWorkspace({"src/app.py": "x = 1"})
+    cmd = DispatchCommandRunner(pytest_results=[_legacy_red()])
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(require_green_baseline=False),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.halted_reason is None
+    assert outcome.success is True  # failing test is inherited, not ours
+    report = outcome.task_results[0].test_report
+    assert report.passed is True
+    assert "pre-existing" in report.summary
+
+
+def test_tolerated_baseline_still_catches_new_failures():
+    ws = InMemoryWorkspace({"src/app.py": "x = 1"})
+    baseline = _legacy_red()
+    with_new = CommandResult(
+        ["pytest"],
+        1,
+        "FAILED tests/test_legacy.py::test_broken - assert False\n"
+        "FAILED tests/test_new.py::test_added - boom",
+        "",
+    )
+    cmd = DispatchCommandRunner(pytest_results=[baseline, with_new])
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(require_green_baseline=False, max_task_attempts=1),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is False
+    assert outcome.task_results[0].task.status is TaskStatus.FAILED
+
+
+def test_tolerance_disabled_fails_on_inherited_breakage():
+    ws = InMemoryWorkspace({"src/app.py": "x = 1"})
+    cmd = DispatchCommandRunner(pytest_results=[_legacy_red()])
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(
+            require_green_baseline=False,
+            tolerate_baseline_failures=False,
+            max_task_attempts=1,
+        ),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is False
+
+
+def test_unattributable_baseline_gives_no_tolerance():
+    ws = InMemoryWorkspace({"Makefile": "all:"})
+    red = CommandResult(["pytest"], 1, "make: *** [all] Error 2", "")
+    cmd = DispatchCommandRunner(pytest_results=[red])
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(require_green_baseline=False, max_task_attempts=1),
+    )
+    outcome = run(engine.deliver(_request()))
+    # output can't be attributed, so gate failures are never excused
+    assert outcome.success is False
+
+
+def test_brownfield_context_reaches_planner_and_architect():
+    ws = InMemoryWorkspace(
+        {"README.md": "# Legacy Service", "src/app.py": "x = 1"}
+    )
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws)
+    run(engine.deliver(_request()))
+    pm_prompt = runner.calls[0]["prompt"]
+    assert "workspace contains" in pm_prompt
+    assert "# Legacy Service" in pm_prompt
+    architect_prompt = next(
+        c["prompt"] for c in runner.calls if "software architect" in (c["system_prompt"] or "")
+    )
+    assert "Existing codebase" in architect_prompt
+    assert "src/app.py" in architect_prompt
+
+
+def test_retrospective_persists_and_feeds_next_run():
+    ws = InMemoryWorkspace()
+    runner = ScriptedRunner(by_system_prompt=engine_responses(review=False))
+    engine = _engine(runner, workspace=ws, config=EngineConfig(max_task_attempts=1))
+    first = run(engine.deliver(_request()))
+    assert first.success is False
+
+    runner2 = ScriptedRunner(by_system_prompt=engine_responses())
+    engine2 = _engine(runner2, workspace=ws)
+    run(engine2.deliver(_request()))
+    pm_prompt = runner2.calls[0]["prompt"]
+    assert "last run:" in pm_prompt
+    assert "failed after 1 attempt" in pm_prompt
+
+
+def test_retrospective_notes_hard_won_tasks():
+    from dev_team.engine import _retrospective
+    from dev_team.models import SecurityReport, Task, TaskResult, TaskStatus
+
+    done = Task(id="T1", title="a", description="", status=TaskStatus.DONE)
+    notes = _retrospective(
+        [TaskResult(task=done, attempts=3)],
+        SecurityReport(approved=False, summary="sqli"),
+    )
+    assert any("needed 3 attempts" in n for n in notes)
+    assert any("security blocked" in n for n in notes)
+
+
+# --- worktree mode ----------------------------------------------------------
+
+
+def _worktree_engine(tmp_path, runner, cmd, **config_kwargs):
+    return _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=cmd,
+        config=EngineConfig(worktrees=True, **config_kwargs),
+    )
+
+
+def test_worktrees_require_agentic():
+    with pytest.raises(ValueError):
+        DeliveryEngine(
+            ScriptedRunner([]),
+            workspace=InMemoryWorkspace(),
+            command_runner=FakeCommandRunner(),
+            config=EngineConfig(worktrees=True),
+        )
+
+
+def test_worktree_happy_path(tmp_path):
+    cmd = DispatchCommandRunner(rev_shas=["BASE", "TIP"])
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _worktree_engine(tmp_path, runner, cmd)
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.committed is True
+    wt_path = f"{engine.workdir}/.dev_team/worktrees/t1"
+    calls = [c for c, _ in cmd.calls]
+    assert ("git", "worktree", "add", "-b", "dev-team/login-task-t1", wt_path) in calls
+    assert ("git", "merge", "--squash", "dev-team/login-task-t1") in calls
+    # WIP commits collapsed into one feature commit at the baseline sha
+    assert ("git", "reset", "--soft", "BASE") in calls
+    assert any(c[:2] == ("git", "commit") and "Login (T1)" in c[-1] for c in calls)
+    # worktree cleaned up afterwards
+    assert ("git", "worktree", "remove", "--force", wt_path) in calls
+    assert ("git", "branch", "-D", "dev-team/login-task-t1") in calls
+    # the engineer worked inside the worktree, not the main checkout
+    eng_call = next(
+        c for c in runner.calls if "in the current working directory" in c["prompt"]
+    )
+    assert eng_call["cwd"] == wt_path
+
+
+def test_worktree_merge_gate_failure_retries(tmp_path):
+    # task gates pass in the worktree, but the merged state fails once
+    cmd = DispatchCommandRunner(
+        pytest_results=[CommandResult(["pytest"], 1, "FAILED t.py::x - boom", ""),
+                        CommandResult(["pytest"], 0, "ok", "")],
+        rev_shas=["BASE", "TIP"],
+    )
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _worktree_engine(tmp_path, runner, cmd, max_task_attempts=2)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert outcome.task_results[0].attempts == 2
+    # the failed merge was discarded on the delivery branch
+    calls = [c for c, _ in cmd.calls]
+    assert ("git", "reset", "--hard") in calls
+
+
+def test_worktree_no_commit_without_baseline_sha(tmp_path):
+    cmd = DispatchCommandRunner()  # rev-parse returns nothing -> no baseline sha
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _worktree_engine(tmp_path, runner, cmd)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.tasks_complete is True
+    assert outcome.committed is False
+
+
+def test_worktree_review_reject_then_approve(tmp_path):
+    mapping = {
+        "product manager": [json_response(__plan())],
+        "software architect": [json_response(__design())],
+        "senior software engineer": [
+            json_response({"summary": "impl", "files": [], "notes": ""})
+        ],
+        "code reviewer": [json_response(__review(False)), json_response(__review(True))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    cmd = DispatchCommandRunner(rev_shas=["BASE", "TIP"])
+    engine = _worktree_engine(tmp_path, KeyedQueueRunner(mapping), cmd, max_task_attempts=2)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert outcome.task_results[0].attempts == 2
+
+
+def test_worktree_task_exhausts_attempts(tmp_path):
+    cmd = DispatchCommandRunner(rev_shas=["BASE"])
+    runner = ScriptedRunner(by_system_prompt=engine_responses(review=False))
+    engine = _worktree_engine(tmp_path, runner, cmd, max_task_attempts=1)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is False
+    assert outcome.task_results[0].task.status is TaskStatus.FAILED
+    # the worktree is cleaned up even on failure
+    calls = [c for c, _ in cmd.calls]
+    assert any(c[:3] == ("git", "worktree", "remove") for c in calls)
+
+
+def test_worktree_creates_initial_commit_on_empty_repo(tmp_path):
+    cmd = FakeCommandRunner()
+    cmd.add_rule("rev-parse --verify", CommandResult(["git"], 1, "", "no HEAD"))
+    engine = _worktree_engine(tmp_path, ScriptedRunner([]), cmd)
+    halted = engine._prepare_git_baseline(_request())
+    assert halted is None
+    assert ["git", "commit", "--allow-empty", "-m", "chore(dev-team): init"] in cmd.calls

@@ -42,11 +42,14 @@ from .approval import ApprovalGate, AutoApprover
 from .backlog import BacklogStore, ItemStatus
 from .budget import Budget, BudgetExceededError
 from .changes import ChangeApplier
+from .context import build_repo_context
 from .events import AgentEvent, Listener, emit
+from .failures import new_failures, parse_failed_tests
 from .execution import (
     CommandRunner,
     DryRunCommandRunner,
     InMemoryWorkspace,
+    LocalWorkspace,
     SubprocessCommandRunner,
     Workspace,
 )
@@ -107,6 +110,14 @@ class EngineConfig:
     - ``allow_dirty_baseline``: by default a dirty working tree halts the run
       instead of being silently swept into a baseline commit.
     - ``engineer_tools``: override the agentic engineer's tool allowlist.
+    - ``worktrees``: give each task its own git worktree so implementation
+      *and* gate runs proceed in parallel; tasks are squash-merged into the
+      delivery branch one at a time (with a full gate check on the merged
+      state), and the accumulated WIP commits collapse into one feature
+      commit after security approval. Requires agentic mode.
+    - ``tolerate_baseline_failures``: when a red baseline is tolerated
+      (``require_green_baseline=False``), record the failing test identities
+      and gate tasks only on *newly* failing tests.
     """
 
     model: Optional[str] = None
@@ -122,12 +133,14 @@ class EngineConfig:
     escalation_model: Optional[str] = None
     resume: bool = True
     require_green_baseline: bool = True
+    tolerate_baseline_failures: bool = True
     branch: Optional[str] = None
     use_branch: bool = True
     allow_dirty_baseline: bool = False
     write_gitignore: bool = True
     gate_timeout_seconds: Optional[float] = 1800.0
     engineer_tools: Optional[Sequence[str]] = None
+    worktrees: bool = False
 
     def __post_init__(self) -> None:
         if self.max_task_attempts < 1:
@@ -222,9 +235,35 @@ def _prior_context(snapshot: Optional[dict]) -> Optional[str]:
     artifacts = snapshot.get("artifacts", [])
     if artifacts:
         lines.append(f"- {len(artifacts)} artifact(s) were produced by earlier runs")
+    # Retrospective notes: what went wrong last time, so the plan avoids it.
+    for note in (snapshot.get("entries", {}).get("retrospective") or [])[-5:]:
+        lines.append(f"- last run: {note}")
     if not lines:
         return None
     return "\n".join(lines)
+
+
+def _retrospective(
+    task_results: List[TaskResult],
+    security: Optional[SecurityReport],
+) -> List[str]:
+    """Distil what went wrong (or was hard) into notes for the next run."""
+
+    notes: List[str] = []
+    for tr in task_results:
+        if not tr.succeeded:
+            detail = ""
+            if tr.review is not None and not tr.review.approved:
+                detail = f": {tr.review.summary}"
+            notes.append(
+                f"task {tr.task.id} ({tr.task.title}) failed after "
+                f"{tr.attempts} attempt(s){detail}"
+            )
+        elif tr.attempts > 1:
+            notes.append(f"task {tr.task.id} needed {tr.attempts} attempts to pass")
+    if security is not None and not security.approved:
+        notes.append(f"security blocked the release: {security.summary}")
+    return notes
 
 
 # A snapshot maps path -> prior content, or None when the file did not exist.
@@ -313,6 +352,9 @@ class DeliveryEngine:
         )
         if self.agentic and self.workdir is None:
             raise ValueError("agentic mode requires a workspace with a real root directory")
+        if self.config.worktrees and not self.agentic:
+            raise ValueError("worktrees require agentic mode (a workspace with a real root)")
+        self._use_worktrees = self.config.worktrees
 
         self.change_applier = ChangeApplier(self.workspace)
         # Gate resolution: an injected DoD wins; an explicit verify_command
@@ -335,6 +377,8 @@ class DeliveryEngine:
         self._checkpoint: Optional[RunCheckpoint] = None
         self._budget_exhausted = False
         self._branch: Optional[str] = None
+        self._baseline_failures = None
+        self._baseline_sha: Optional[str] = None
 
         def make(cls):
             wrapped = InstrumentedRunner(
@@ -390,22 +434,43 @@ class DeliveryEngine:
 
         self._resolve_gates()
 
+        self._baseline_failures = None
         baseline = self._check_baseline()
-        if baseline is not None and not baseline.passed and self.config.require_green_baseline:
-            self.tracer.end(run_span, "halted")
-            return self._halted(
-                request,
-                "baseline quality gates are already failing — fix the existing "
-                f"breakage first or set require_green_baseline=False ({baseline.summary()})",
-                baseline=baseline,
-            )
+        if baseline is not None and not baseline.passed:
+            if self.config.require_green_baseline:
+                self.tracer.end(run_span, "halted")
+                return self._halted(
+                    request,
+                    "baseline quality gates are already failing — fix the existing "
+                    f"breakage first or set require_green_baseline=False "
+                    f"({baseline.summary()})",
+                    baseline=baseline,
+                )
+            if self.config.tolerate_baseline_failures:
+                self._baseline_failures = parse_failed_tests(
+                    "\n".join(g.detail for g in baseline.failed_gates)
+                )
+                if self._baseline_failures is not None:
+                    self._event(
+                        "baseline",
+                        f"Tolerating {len(self._baseline_failures)} pre-existing "
+                        "failing test(s); tasks are gated on new failures only",
+                    )
 
-        prior = _prior_context(self.memory.load())
+        repo_ctx = build_repo_context(self.workspace)
+        context_parts = [
+            part
+            for part in (_prior_context(self.memory.load()), repo_ctx.render() or None)
+            if part
+        ]
+        prior = "\n\n".join(context_parts) if context_parts else None
         plan = await self.manager.create_plan(request, prior_context=prior)
         self.blackboard.post_artifact("plan", "plan", plan.summary)
         self._event("planned", "Plan ready", detail=f"{len(plan.tasks)} task(s)")
 
-        design = await self.architect.design(request, plan)
+        design = await self.architect.design(
+            request, plan, repo_context=repo_ctx.render() or None
+        )
         self.blackboard.record_decision(
             title=f"Architecture for {request.title}",
             context=request.description,
@@ -471,6 +536,9 @@ class DeliveryEngine:
 
         committed = self._commit_if_approved(request, task_results, security)
         self._finalise_backlog(backlog, stories, task_results)
+        notes = _retrospective(task_results, security)
+        if notes:
+            self.blackboard.put("retrospective", notes)
         self.memory.save(self.blackboard)
 
         self.tracer.end(run_span)
@@ -528,6 +596,12 @@ class DeliveryEngine:
         if self.git.has_changes():
             self.git.add_all()
             self.git.commit("chore(dev-team): baseline before delivery")
+        if self._use_worktrees:
+            # Worktrees branch from HEAD, so one must exist; and the final
+            # squash needs the exact sha the delivery started from.
+            if not self.git.has_commits():
+                self.git.commit("chore(dev-team): init", allow_empty=True)
+            self._baseline_sha = self.git.rev_parse("HEAD")
         return None
 
     def _resolve_gates(self) -> None:
@@ -546,12 +620,14 @@ class DeliveryEngine:
             detail=f"verify: {' '.join(profile.verify_command)} ({profile.reason})",
         )
 
-    def _gate_context(self, task: Optional[Task] = None) -> GateContext:
+    def _gate_context(
+        self, task: Optional[Task] = None, *, cwd: Optional[str] = None
+    ) -> GateContext:
         return GateContext(
             runner=self.command_runner,
             workspace=self.workspace,
             task=task,
-            cwd=self.workdir,
+            cwd=cwd if cwd is not None else self.workdir,
             timeout=self.config.gate_timeout_seconds,
         )
 
@@ -616,7 +692,17 @@ class DeliveryEngine:
 
     # -- task development ----------------------------------------------------
 
+    def _attempt_model(self, attempts: int) -> Optional[str]:
+        """The model for this attempt (escalation on the final one)."""
+
+        if attempts == self.config.max_task_attempts:
+            return self.config.escalation_model
+        return None
+
     async def _develop_task(self, task: Task, design: Design) -> TaskResult:
+        if self._use_worktrees:
+            return await self._develop_task_in_worktree(task, design)
+
         feedback: Optional[Review] = None
         implementation: Optional[Implementation] = None
         review: Optional[Review] = None
@@ -625,11 +711,7 @@ class DeliveryEngine:
 
         while attempts < self.config.max_task_attempts:
             attempts += 1
-            model = (
-                self.config.escalation_model
-                if attempts == self.config.max_task_attempts
-                else None
-            )
+            model = self._attempt_model(attempts)
             task.status = TaskStatus.IN_PROGRESS
             span = self.tracer.start("task", task.id, attempt=str(attempts))
 
@@ -674,19 +756,118 @@ class DeliveryEngine:
         task.status = TaskStatus.FAILED
         return TaskResult(task, attempts, implementation, review, test_report)
 
+    async def _develop_task_in_worktree(self, task: Task, design: Design) -> TaskResult:
+        """Develop ``task`` in its own git worktree, merging only when green.
+
+        Implementation, review, and gate runs all happen inside the task's
+        worktree — in parallel with other tasks. Only the squash-merge into
+        the delivery branch (plus a full gate check on the merged state) is
+        serialised.
+        """
+
+        wt_path = f"{self.workdir}/.dev_team/worktrees/{task.id.lower()}"
+        task_branch = f"{self._branch or 'dev-team'}-task-{task.id.lower()}"
+        async with self._integration_lock:  # worktree creation mutates .git
+            self.git.worktree_add(wt_path, task_branch)
+        arena_ws = LocalWorkspace(wt_path)
+        arena_git = GitRepo(self.command_runner, cwd=wt_path)
+
+        feedback: Optional[Review] = None
+        implementation: Optional[Implementation] = None
+        review: Optional[Review] = None
+        test_report: Optional[TestReport] = None
+        attempts = 0
+        try:
+            while attempts < self.config.max_task_attempts:
+                attempts += 1
+                task.status = TaskStatus.IN_PROGRESS
+                span = self.tracer.start("task", task.id, attempt=str(attempts))
+
+                implementation = await self.engineer.implement_in_place(
+                    task,
+                    design,
+                    feedback,
+                    cwd=wt_path,
+                    model=self._attempt_model(attempts),
+                    tools=self.config.engineer_tools,
+                )
+                done, review, test_report, feedback = await self._integrate(
+                    task,
+                    implementation,
+                    span,
+                    workspace=arena_ws,
+                    git=arena_git,
+                    cwd=wt_path,
+                )
+                if not done:
+                    continue
+
+                merged, merge_feedback = await self._merge_task(task, arena_git, task_branch)
+                if merged:
+                    task.status = TaskStatus.DONE
+                    self._record_progress(task)
+                    self.tracer.end(span, "done")
+                    return TaskResult(task, attempts, implementation, review, test_report)
+                feedback = merge_feedback
+                self.tracer.end(span, "merge-gates-failed")
+
+            task.status = TaskStatus.FAILED
+            return TaskResult(task, attempts, implementation, review, test_report)
+        finally:
+            async with self._integration_lock:
+                self.git.worktree_remove(wt_path)
+                self.git.delete_branch(task_branch)
+
+    async def _merge_task(
+        self, task: Task, arena_git: GitRepo, task_branch: str
+    ) -> Tuple[bool, Optional[Review]]:
+        """Squash-merge a green task into the delivery branch, gate, and accept.
+
+        The merged state is re-verified: two tasks that each pass alone can
+        still conflict, and that must surface here, not in production. On
+        failure the merge is discarded and the engineer gets the gate output.
+        """
+
+        async with self._integration_lock:
+            paths = [
+                p
+                for p in arena_git.changed_files()
+                if not p.startswith(_INTERNAL_PREFIX)
+            ]
+            arena_git.add_paths(paths)
+            arena_git.commit(f"wip(dev-team): {task.id} attempt", allow_empty=True)
+            self.git.merge_squash(task_branch)
+            dod = await asyncio.to_thread(
+                self.definition_of_done.evaluate, self._gate_context(task)
+            )
+            if dod.passed or self._inherited_failures_only(dod):
+                self.git.commit(f"wip(dev-team): {task.id}", allow_empty=True)
+                return True, None
+            self.git.discard_changes()
+            task.status = TaskStatus.CHANGES_REQUESTED
+            return False, _review_from_dod(dod)
+
     async def _integrate(
         self,
         task: Task,
         implementation: Implementation,
         span,
+        *,
+        workspace: Optional[Workspace] = None,
+        git: Optional[GitRepo] = None,
+        cwd: Optional[str] = None,
     ) -> Tuple[bool, Optional[Review], Optional[TestReport], Optional[Review]]:
         """Apply, review, test, and accept (or roll back) one attempt.
 
-        Returns ``(done, review, test_report, feedback)``. Runs under the
-        integration lock: the workspace only ever contains either gated work
-        or the current attempt, never two attempts interleaved.
+        Returns ``(done, review, test_report, feedback)``. By default it works
+        against the engine's own workspace under the integration lock; in
+        worktree mode the caller passes a per-task arena (workspace/git/cwd),
+        and no lock is needed because the arena is task-private.
         """
 
+        ws = workspace if workspace is not None else self.workspace
+        repo = git if git is not None else self.git
+        applier = ChangeApplier(ws)
         snapshot: Optional[_Snapshot] = None
         diff: Optional[str] = None
         try:
@@ -694,12 +875,12 @@ class DeliveryEngine:
                 # The diff, not the engineer's self-report, defines the change:
                 # any touched file the engineer forgot to list still gets
                 # reviewed (and none of it can sneak into the commit unseen).
-                self._merge_unreported_changes(implementation)
-                diff = self.git.diff()
+                self._merge_unreported_changes(implementation, repo)
+                diff = repo.diff()
             else:
                 snapshot = self._snapshot(implementation)
-                self.change_applier.apply(implementation)
-            contents = self._contents(implementation)
+                applier.apply(implementation)
+            contents = self._contents(implementation, ws)
             self.blackboard.post_artifact("implementation", task.id, implementation.summary)
 
             task.status = TaskStatus.IN_REVIEW
@@ -707,7 +888,7 @@ class DeliveryEngine:
                 task, implementation, file_contents=contents, diff=diff
             )
             if not review.approved:
-                self._rollback(snapshot)
+                self._rollback(snapshot, repo)
                 task.status = TaskStatus.CHANGES_REQUESTED
                 self.tracer.end(span, "changes-requested")
                 return False, review, None, review
@@ -720,36 +901,63 @@ class DeliveryEngine:
                     for change in suite.files:
                         if change.path and change.path not in snapshot:
                             snapshot[change.path] = (
-                                self.workspace.read_text(change.path)
-                                if self.workspace.exists(change.path)
+                                ws.read_text(change.path)
+                                if ws.exists(change.path)
                                 else None
                             )
-                self.change_applier.apply(suite)
+                applier.apply(suite)
                 self.blackboard.post_artifact("tests", task.id, suite.summary)
 
             task.status = TaskStatus.TESTING
             dod = await asyncio.to_thread(
-                self.definition_of_done.evaluate, self._gate_context(task)
+                self.definition_of_done.evaluate, self._gate_context(task, cwd=cwd)
             )
             test_report = _dod_to_test_report(dod)
             if not dod.passed:
-                self._rollback(snapshot)
-                task.status = TaskStatus.CHANGES_REQUESTED
-                self.tracer.end(span, "gates-failed")
-                return False, review, test_report, _review_from_dod(dod)
+                if self._inherited_failures_only(dod):
+                    self._event(
+                        "gates",
+                        f"{task.id}: all failing tests pre-date this delivery; accepting",
+                    )
+                    test_report = TestReport(
+                        passed=True,
+                        coverage=0.0,
+                        summary=f"{dod.summary()} (all failures are pre-existing "
+                        "baseline failures)",
+                    )
+                else:
+                    self._rollback(snapshot, repo)
+                    task.status = TaskStatus.CHANGES_REQUESTED
+                    self.tracer.end(span, "gates-failed")
+                    return False, review, test_report, _review_from_dod(dod)
 
             return True, review, test_report, None
         except Exception:
             # An attempt that dies mid-integration (budget, agent error) must
             # not leave unreviewed changes in the workspace.
-            self._rollback(snapshot)
+            self._rollback(snapshot, repo)
             raise
 
-    def _merge_unreported_changes(self, implementation: Implementation) -> None:
+    def _inherited_failures_only(self, dod: DoDReport) -> bool:
+        """Whether every failing test in ``dod`` was already failing at baseline.
+
+        Requires attribution on both sides: an unparseable output can never be
+        claimed as inherited.
+        """
+
+        if self._baseline_failures is None:
+            return False
+        current = parse_failed_tests("\n".join(g.detail for g in dod.failed_gates))
+        fresh = new_failures(current, self._baseline_failures)
+        return fresh is not None and not fresh
+
+    def _merge_unreported_changes(
+        self, implementation: Implementation, git: GitRepo
+    ) -> None:
         """Append files git saw change that the engineer did not report."""
 
         reported = {c.path for c in implementation.files}
-        for path in self.git.changed_files():
+        for path in git.changed_files():
             if path.startswith(_INTERNAL_PREFIX) or path in reported:
                 continue
             implementation.files.append(
@@ -773,11 +981,11 @@ class DeliveryEngine:
                 )
         return snapshot
 
-    def _rollback(self, snapshot: Optional[_Snapshot]) -> None:
+    def _rollback(self, snapshot: Optional[_Snapshot], git: Optional[GitRepo] = None) -> None:
         """Undo a failed attempt so only gated work remains in the workspace."""
 
         if self.agentic:
-            self.git.discard_changes()
+            (git if git is not None else self.git).discard_changes()
             return
         for path, content in (snapshot or {}).items():
             if content is None:
@@ -785,13 +993,16 @@ class DeliveryEngine:
             else:
                 self.workspace.write_text(path, content)
 
-    def _contents(self, implementation: Implementation) -> Dict[str, str]:
+    def _contents(
+        self, implementation: Implementation, workspace: Optional[Workspace] = None
+    ) -> Dict[str, str]:
         """Read the current workspace content of the attempt's files."""
 
+        ws = workspace if workspace is not None else self.workspace
         contents: Dict[str, str] = {}
         for change in implementation.files:
-            if change.path and self.workspace.exists(change.path):
-                contents[change.path] = self.workspace.read_text(change.path)
+            if change.path and ws.exists(change.path):
+                contents[change.path] = ws.read_text(change.path)
         return contents
 
     def _record_progress(self, task: Task) -> None:
@@ -844,18 +1055,27 @@ class DeliveryEngine:
             self._event("commit", "Skipping commit: no security approval for the release")
             return False
         try:
-            self.git.ensure_repo()
-            # Stage a curated change set, never `add -A`: the engine's own
-            # bookkeeping must not ship in the feature commit.
-            paths = [
-                p
-                for p in self.git.changed_files()
-                if not p.startswith(_INTERNAL_PREFIX)
-            ]
-            if not paths:
-                return False
-            self.git.add_paths(paths)
-            self.git.commit(f"{request.title} ({', '.join(done)})")
+            if self._use_worktrees:
+                # Accepted tasks already live as WIP commits on the delivery
+                # branch; collapse them into the single feature commit.
+                head = self.git.rev_parse("HEAD")
+                if not self._baseline_sha or head == self._baseline_sha:
+                    return False
+                self.git.reset_soft(self._baseline_sha)
+                self.git.commit(f"{request.title} ({', '.join(done)})")
+            else:
+                self.git.ensure_repo()
+                # Stage a curated change set, never `add -A`: the engine's own
+                # bookkeeping must not ship in the feature commit.
+                paths = [
+                    p
+                    for p in self.git.changed_files()
+                    if not p.startswith(_INTERNAL_PREFIX)
+                ]
+                if not paths:
+                    return False
+                self.git.add_paths(paths)
+                self.git.commit(f"{request.title} ({', '.join(done)})")
         except GitError as exc:
             self._event("commit", "Commit failed", detail=str(exc))
             return False

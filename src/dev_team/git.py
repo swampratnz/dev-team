@@ -105,10 +105,48 @@ class GitRepo:
         if paths:
             self._git("add", "--", *paths)
 
-    def commit(self, message: str) -> None:
+    def commit(self, message: str, *, allow_empty: bool = False) -> None:
         """Commit staged changes with ``message``."""
 
-        self._git("commit", "-m", message)
+        args = ["commit", "-m", message]
+        if allow_empty:
+            args.insert(1, "--allow-empty")
+        self._git(*args)
+
+    def has_commits(self) -> bool:
+        """Whether the repository has at least one commit."""
+
+        return self._git("rev-parse", "--verify", "HEAD", check=False).ok
+
+    def rev_parse(self, ref: str = "HEAD") -> str:
+        """Resolve ``ref`` to a commit sha (empty string on failure)."""
+
+        return self._git("rev-parse", ref, check=False).stdout.strip()
+
+    def worktree_add(self, path: str, branch: str) -> None:
+        """Create a new worktree at ``path`` on a fresh ``branch`` from HEAD."""
+
+        self._git("worktree", "add", "-b", branch, path)
+
+    def worktree_remove(self, path: str) -> None:
+        """Remove the worktree at ``path`` (best effort)."""
+
+        self._git("worktree", "remove", "--force", path, check=False)
+
+    def delete_branch(self, name: str) -> None:
+        """Delete branch ``name`` (best effort)."""
+
+        self._git("branch", "-D", name, check=False)
+
+    def merge_squash(self, branch: str) -> None:
+        """Stage ``branch``'s changes onto the current branch without committing."""
+
+        self._git("merge", "--squash", branch)
+
+    def reset_soft(self, ref: str) -> None:
+        """Move the branch tip to ``ref`` keeping all changes staged."""
+
+        self._git("reset", "--soft", ref)
 
     def has_changes(self) -> bool:
         """Whether the working tree has uncommitted changes."""

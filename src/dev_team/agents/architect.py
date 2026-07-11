@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from .. import parsing
 from ..models import Design, FeatureRequest, Plan
 from .base import BaseAgent
@@ -19,12 +21,27 @@ class ArchitectAgent(BaseAgent):
     stage = "design"
     system_prompt = _SYSTEM
 
-    async def design(self, request: FeatureRequest, plan: Plan) -> Design:
-        """Produce a technical design for ``request`` given ``plan``."""
+    async def design(
+        self,
+        request: FeatureRequest,
+        plan: Plan,
+        *,
+        repo_context: Optional[str] = None,
+    ) -> Design:
+        """Produce a technical design for ``request`` given ``plan``.
+
+        ``repo_context`` describes the existing codebase so the design extends
+        what is actually there rather than an imagined system.
+        """
 
         task_lines = "\n".join(
             f"- {task.id}: {task.title}" for task in plan.tasks
         ) or "- (no tasks)"
+        existing = (
+            f"\nExisting codebase (design must fit into it):\n{repo_context}\n"
+            if repo_context
+            else ""
+        )
         prompt = f"""\
 Design the technical solution for this feature.
 
@@ -34,7 +51,7 @@ Description:
 
 Planned tasks:
 {task_lines}
-
+{existing}
 Respond with JSON of the form:
 {{
   "overview": "high level approach",
