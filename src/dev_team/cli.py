@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import shlex
 import sys
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Mapping, Optional
 
 from . import __version__
 from .budget import Budget
@@ -25,6 +27,47 @@ from .report import (
 )
 from .sdk import AgentRunner
 from .team import DevTeam
+
+
+# Any one of these satisfies the credential preflight. The Claude CLI (which
+# the Agent SDK spawns) resolves them itself; dev-team only checks presence so
+# a missing credential fails fast with guidance instead of opaquely mid-run.
+CREDENTIAL_ENV_VARS = (
+    "CLAUDE_CODE_OAUTH_TOKEN",  # Claude subscription token from `claude setup-token`
+    "ANTHROPIC_API_KEY",  # Claude API key (pay-as-you-go)
+    "ANTHROPIC_AUTH_TOKEN",  # custom bearer token, e.g. an LLM gateway
+    "CLAUDE_CODE_USE_BEDROCK",  # AWS Bedrock
+    "CLAUDE_CODE_USE_VERTEX",  # Google Vertex AI
+)
+
+_MISSING_CREDENTIALS = """\
+no Claude credentials found. The agents run via the Claude Code CLI, which
+needs one of:
+  - CLAUDE_CODE_OAUTH_TOKEN  a Claude subscription (Pro/Max) token; generate
+                             one with `claude setup-token`
+  - ANTHROPIC_API_KEY        a Claude API key (pay-as-you-go)
+  - a stored login           run `claude` once interactively and log in
+(ANTHROPIC_AUTH_TOKEN, CLAUDE_CODE_USE_BEDROCK, and CLAUDE_CODE_USE_VERTEX
+are also honoured for gateway/Bedrock/Vertex setups.)"""
+
+
+def ensure_credentials(
+    environ: Optional[Mapping[str, str]] = None, home: Optional[Path] = None
+) -> None:
+    """Fail fast when the Claude CLI would find no credentials.
+
+    Accepts any of :data:`CREDENTIAL_ENV_VARS` in ``environ`` (default
+    ``os.environ``) or a stored interactive login at
+    ``~/.claude/.credentials.json``. Raises :class:`DevTeamError` otherwise.
+    """
+
+    env = os.environ if environ is None else environ
+    if any(env.get(name) for name in CREDENTIAL_ENV_VARS):
+        return
+    credentials_file = (home or Path.home()) / ".claude" / ".credentials.json"
+    if credentials_file.is_file():
+        return
+    raise DevTeamError(_MISSING_CREDENTIALS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -177,6 +220,11 @@ def _run(argv: Optional[List[str]], runner: Optional[AgentRunner]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _reject_deliver_only_flags(parser, args)
+
+    if runner is None:
+        # Only the real SDK runner needs credentials; an injected runner
+        # (tests, embedding) brings its own transport.
+        ensure_credentials()
 
     config = TeamConfig(
         model=args.model,
