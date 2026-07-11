@@ -8,10 +8,14 @@ testable without spawning the Claude CLI or making network calls.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Protocol, Sequence, runtime_checkable
 
-from claude_agent_sdk import ClaudeAgentOptions, query
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKError, query
+
+# A single agent turn that takes longer than this has hung, not thought hard.
+DEFAULT_TIMEOUT_SECONDS = 600.0
 
 
 @dataclass
@@ -64,13 +68,19 @@ def build_options(
     cwd: Optional[str],
     max_turns: Optional[int],
 ) -> ClaudeAgentOptions:
-    """Assemble :class:`ClaudeAgentOptions`, omitting unset values."""
+    """Assemble :class:`ClaudeAgentOptions`, omitting unset values.
 
-    kwargs: dict[str, Any] = {"permission_mode": permission_mode}
+    ``allowed_tools`` is always set: ``None`` means an explicit *empty*
+    allowlist, never "no restriction" — an agent gets exactly the tools its
+    caller granted it.
+    """
+
+    kwargs: dict[str, Any] = {
+        "permission_mode": permission_mode,
+        "allowed_tools": list(allowed_tools) if allowed_tools is not None else [],
+    }
     if system_prompt is not None:
         kwargs["system_prompt"] = system_prompt
-    if allowed_tools is not None:
-        kwargs["allowed_tools"] = list(allowed_tools)
     if model is not None:
         kwargs["model"] = model
     if cwd is not None:
@@ -107,12 +117,17 @@ class ClaudeAgentRunner:
         cwd: Default working directory the agent operates in (a per-call
             ``cwd`` overrides it).
         max_turns: Optional cap on the number of SDK turns.
+        timeout_seconds: Per-call wall-clock budget. A call that exceeds it
+            (or raises an SDK/OS error) returns an error :class:`AgentResult`
+            instead of raising, so callers' retry logic covers transient
+            failures; :class:`asyncio.CancelledError` always propagates.
     """
 
     default_model: Optional[str] = None
     permission_mode: str = "acceptEdits"
     cwd: Optional[str] = None
     max_turns: Optional[int] = None
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     _last_options: Optional[ClaudeAgentOptions] = field(
         default=None, repr=False, compare=False
     )
@@ -135,7 +150,18 @@ class ClaudeAgentRunner:
             max_turns=self.max_turns,
         )
         self._last_options = options
+        try:
+            return await asyncio.wait_for(
+                self._consume(prompt, options, model), timeout=self.timeout_seconds
+            )
+        except (ClaudeSDKError, OSError, UnicodeDecodeError, TimeoutError) as exc:
+            return AgentResult(
+                text=f"{type(exc).__name__}: {exc}", is_error=True
+            )
 
+    async def _consume(
+        self, prompt: str, options: ClaudeAgentOptions, model: Optional[str]
+    ) -> AgentResult:
         texts: List[str] = []
         cost = 0.0
         num_turns = 0

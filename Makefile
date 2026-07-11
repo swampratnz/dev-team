@@ -4,6 +4,7 @@ help:
 	@echo "Targets:"
 	@echo "  install   Install the package with test extras"
 	@echo "  test      Run the test suite (100% coverage gate)"
+	@echo "  lint      Run ruff over the source and tests"
 	@echo "  coverage  Run tests and write an HTML coverage report"
 	@echo "  clean     Remove caches and build artifacts"
 
@@ -13,6 +14,9 @@ install:
 
 test:
 	pytest
+
+lint:
+	ruff check .
 
 coverage:
 	pytest --cov-report=html

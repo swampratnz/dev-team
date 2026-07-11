@@ -18,7 +18,7 @@ from ..models import (
     Implementation,
     ReliabilityReport,
 )
-from .base import BaseAgent
+from .base import READ_ONLY_TOOLS, UNTRUSTED_CONTENT_NOTE, BaseAgent
 from .reviewer import render_changed_files
 
 _SYSTEM = """\
@@ -40,7 +40,7 @@ class SREAgent(BaseAgent):
 
     role = "sre"
     stage = "reliability"
-    system_prompt = _SYSTEM
+    system_prompt = _SYSTEM + UNTRUSTED_CONTENT_NOTE
 
     async def assess(
         self,
@@ -51,8 +51,12 @@ class SREAgent(BaseAgent):
         file_contents: Optional[Mapping[str, str]] = None,
         deployment: Optional[DeploymentPlan] = None,
         gate_summary: Optional[str] = None,
+        workspace_root: Optional[str] = None,
     ) -> ReliabilityReport:
-        """Assess production readiness against the delivered evidence."""
+        """Assess production readiness against the delivered evidence.
+
+        ``workspace_root`` is where the read-only evidence tools operate.
+        """
 
         stack = ", ".join(design.tech_stack) or "unspecified"
         code = (
@@ -88,5 +92,7 @@ Respond with JSON of the form:
   "risks": ["failure mode grounded in the code shown"],
   "runbook": ["concrete operator step"]
 }}"""
-        data = await self.ask_json(prompt)
+        data = await self.ask_json(
+            prompt, allowed_tools=READ_ONLY_TOOLS, cwd=workspace_root
+        )
         return parsing.reliability_from_dict(data)

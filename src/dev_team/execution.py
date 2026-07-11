@@ -140,9 +140,14 @@ class LocalWorkspace:
         return target.read_text()
 
     def write_text(self, path: str, content: str) -> None:
+        # Write-then-rename so a crash mid-write can never leave a truncated
+        # file — checkpoints and memory are written on this path, and a
+        # half-written checkpoint would brick the resume it exists for.
         target = self._path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        staging = target.with_name(target.name + ".dev-team-tmp")
+        staging.write_text(content)
+        staging.replace(target)
 
     def exists(self, path: str) -> bool:
         return self._path(path).exists()
@@ -232,14 +237,18 @@ class SubprocessCommandRunner:
                 cwd=cwd or self.cwd,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=timeout if timeout is not None else self.timeout,
             )
         except FileNotFoundError as exc:
             return CommandResult(args, EXIT_NOT_FOUND, "", str(exc))
         except subprocess.TimeoutExpired as exc:
-            return CommandResult(
-                args, EXIT_TIMEOUT, exc.stdout or "", "command timed out"
-            )
+            # TimeoutExpired carries *bytes* even under text=True; decoding
+            # here keeps CommandResult.output usable instead of raising.
+            partial = exc.stdout or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", errors="replace")
+            return CommandResult(args, EXIT_TIMEOUT, partial, "command timed out")
         return CommandResult(args, proc.returncode, proc.stdout, proc.stderr)
 
 

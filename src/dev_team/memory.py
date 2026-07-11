@@ -43,6 +43,7 @@ class Blackboard:
         self._entries: Dict[str, Any] = {}
         self.artifacts: List[Artifact] = []
         self.decisions: List[DecisionRecord] = []
+        self._decision_seq = 0
 
     # -- key/value working memory --
     def put(self, key: str, value: Any) -> None:
@@ -79,6 +80,15 @@ class Blackboard:
         return [a for a in self.artifacts if a.kind == kind]
 
     # -- decisions (ADRs) --
+    def seed_decision_ids(self, count: int) -> None:
+        """Continue ADR numbering after ``count`` decisions from earlier runs.
+
+        Without this every run restarts at ``ADR-001`` and the persisted
+        decision log fills with colliding ids.
+        """
+
+        self._decision_seq = max(self._decision_seq, count)
+
     def record_decision(
         self,
         title: str,
@@ -88,8 +98,9 @@ class Blackboard:
     ) -> DecisionRecord:
         """Append a decision record with an auto-assigned id."""
 
+        self._decision_seq += 1
         record = DecisionRecord(
-            id=f"ADR-{len(self.decisions) + 1:03d}",
+            id=f"ADR-{self._decision_seq:03d}",
             title=title,
             context=context,
             decision=decision,
@@ -108,7 +119,7 @@ class Blackboard:
         }
 
 
-_CHECKPOINT_PATH = ".dev_team/checkpoint.json"
+_CHECKPOINT_DIR = ".dev_team"
 
 
 def task_fingerprint(title: str, description: str) -> str:
@@ -125,11 +136,19 @@ def task_fingerprint(title: str, description: str) -> str:
 
 @dataclass
 class RunCheckpoint:
-    """Durable progress of an in-flight delivery run."""
+    """Durable progress of an in-flight delivery run.
+
+    Beyond task completion it carries the run's *plan* (so a resume works the
+    same tasks instead of gambling on a regenerated plan reproducing them
+    byte-for-byte) and the git ``baseline_sha`` the delivery started from (so
+    the final squashed feature commit spans the original run's work too).
+    """
 
     feature_title: str
     done_task_ids: List[str] = field(default_factory=list)
     fingerprints: Dict[str, str] = field(default_factory=dict)
+    baseline_sha: Optional[str] = None
+    plan: Optional[Dict[str, Any]] = None
 
     def mark_done(self, task_id: str, fingerprint: str) -> None:
         """Record a completed task with its content fingerprint."""
@@ -152,10 +171,15 @@ class CheckpointStore:
 
     The delivery engine records each task as it completes; a later run for the
     same feature skips tasks already done instead of re-paying for them.
+    Checkpoints are stored one file per feature, so starting a different
+    feature never clobbers an interrupted run's progress.
     """
 
     workspace: Workspace
-    path: str = _CHECKPOINT_PATH
+    directory: str = _CHECKPOINT_DIR
+
+    def _path_for(self, feature_title: str) -> str:
+        return f"{self.directory}/checkpoint-{task_fingerprint(feature_title, '')}.json"
 
     def save(self, checkpoint: RunCheckpoint) -> None:
         """Write ``checkpoint`` to the workspace as JSON."""
@@ -164,55 +188,108 @@ class CheckpointStore:
             "feature_title": checkpoint.feature_title,
             "done_task_ids": list(checkpoint.done_task_ids),
             "fingerprints": dict(checkpoint.fingerprints),
+            "baseline_sha": checkpoint.baseline_sha,
+            "plan": checkpoint.plan,
         }
-        self.workspace.write_text(self.path, json.dumps(payload, indent=2))
+        self.workspace.write_text(
+            self._path_for(checkpoint.feature_title), json.dumps(payload, indent=2)
+        )
 
     def load(self, feature_title: str) -> RunCheckpoint:
         """Load the checkpoint for ``feature_title``, or an empty one.
 
         A stored checkpoint for a *different* feature is ignored — resuming
         someone else's progress would silently skip real work. Checkpoints
-        without fingerprints (older format) never match, which is the safe
-        direction: work is redone rather than wrongly skipped.
+        without fingerprints (older format) never match, and a corrupt file
+        (e.g. truncated by a crash predating atomic writes) reads as no
+        checkpoint — both are the safe direction: work is redone rather than
+        wrongly skipped, and a resume never dies on a traceback.
         """
 
-        if not self.workspace.exists(self.path):
+        path = self._path_for(feature_title)
+        if not self.workspace.exists(path):
             return RunCheckpoint(feature_title=feature_title)
-        data = json.loads(self.workspace.read_text(self.path))
-        if data.get("feature_title") != feature_title:
+        try:
+            data = json.loads(self.workspace.read_text(path))
+        except ValueError:
             return RunCheckpoint(feature_title=feature_title)
+        if not isinstance(data, dict) or data.get("feature_title") != feature_title:
+            return RunCheckpoint(feature_title=feature_title)
+        plan = data.get("plan")
         return RunCheckpoint(
             feature_title=feature_title,
             done_task_ids=[str(t) for t in data.get("done_task_ids", [])],
             fingerprints={
                 str(k): str(v) for k, v in data.get("fingerprints", {}).items()
             },
+            baseline_sha=(
+                str(data["baseline_sha"]) if data.get("baseline_sha") else None
+            ),
+            plan=plan if isinstance(plan, dict) else None,
         )
 
-    def clear(self) -> None:
-        """Remove any stored checkpoint (called after a fully successful run)."""
+    def clear(self, feature_title: str) -> None:
+        """Remove the stored checkpoint for ``feature_title``."""
 
-        self.workspace.delete(self.path)
+        self.workspace.delete(self._path_for(feature_title))
 
 
 _MEMORY_PATH = ".dev_team/memory.json"
 
+# Bounded history: memory must not grow without limit across runs.
+_MAX_DECISIONS = 50
+_MAX_RETRO_NOTES = 20
+
 
 @dataclass
 class ProjectMemory:
-    """Persists a durable summary of a run to the workspace."""
+    """Persists a durable summary of runs to the workspace.
+
+    ``save`` *merges* the run into what is already stored — decisions (ADRs)
+    and retrospective notes accumulate across runs (bounded) instead of each
+    run erasing the one before, which is what makes the memory genuinely
+    cross-run rather than a one-run horizon.
+    """
 
     workspace: Workspace
     path: str = _MEMORY_PATH
 
     def save(self, blackboard: Blackboard) -> None:
-        """Write the blackboard snapshot to the workspace as JSON."""
+        """Merge the blackboard snapshot into the stored memory."""
 
-        self.workspace.write_text(self.path, json.dumps(blackboard.snapshot(), indent=2))
+        prior = self.load() or {}
+        snapshot = blackboard.snapshot()
+
+        seen: set = set()
+        decisions: List[Dict[str, Any]] = []
+        for record in list(prior.get("decisions") or []) + snapshot["decisions"]:
+            if record.get("id") in seen:
+                continue
+            seen.add(record.get("id"))
+            decisions.append(record)
+
+        prior_entries = prior.get("entries") or {}
+        retro = list(prior_entries.get("retrospective") or []) + list(
+            snapshot["entries"].get("retrospective") or []
+        )
+        if retro:
+            snapshot["entries"]["retrospective"] = retro[-_MAX_RETRO_NOTES:]
+
+        payload = {
+            "entries": snapshot["entries"],
+            "artifacts": snapshot["artifacts"],
+            "decisions": decisions[-_MAX_DECISIONS:],
+            "runs": int(prior.get("runs", 0)) + 1,
+        }
+        self.workspace.write_text(self.path, json.dumps(payload, indent=2))
 
     def load(self) -> Optional[Dict[str, Any]]:
-        """Load a previously saved snapshot, or ``None`` if absent."""
+        """Load the stored memory, or ``None`` if absent or unreadable."""
 
         if not self.workspace.exists(self.path):
             return None
-        return json.loads(self.workspace.read_text(self.path))
+        try:
+            data = json.loads(self.workspace.read_text(self.path))
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None

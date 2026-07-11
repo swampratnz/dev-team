@@ -2,17 +2,20 @@
 
 `dev-team` targets modern Ubuntu LTS (22.04 / 24.04). It is a Python
 application built on the Claude Agent SDK, which in turn shells out to the
-Claude Code CLI, so a deployment host needs Python, Node.js (for the CLI), and
-a configured `ANTHROPIC_API_KEY`.
+Claude Code CLI, so a deployment host needs Python, git (delivery runs commit
+their work), Node.js (for the CLI), and a configured `ANTHROPIC_API_KEY`.
 
 ## 1. Prerequisites
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip nodejs npm
+sudo apt-get install -y python3 python3-venv python3-pip git nodejs npm
 # The Agent SDK drives the Claude Code CLI:
 sudo npm install -g @anthropic-ai/claude-code
 ```
+
+`git` is required at runtime for `--deliver`: the delivery engine manages the
+workspace's branches, commits, and per-task worktrees by shelling out to it.
 
 Provide credentials via the environment (never commit them):
 

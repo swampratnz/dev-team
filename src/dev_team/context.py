@@ -56,7 +56,9 @@ class RepoContext:
         if self.test_paths:
             lines.append(f"Tests live under: {', '.join(self.test_paths)}")
         for name, head in self.manifest_heads.items():
-            lines.append(f"\n--- {name} (beginning) ---\n{head}")
+            lines.append(
+                f'\n<manifest-content name="{name}">\n{head}\n</manifest-content>'
+            )
         return "\n".join(lines)
 
 
@@ -77,14 +79,14 @@ def build_repo_context(
             if len(head) < len(content):
                 head += "\n... (truncated)"
             heads[name] = head
-    test_dirs = sorted(
-        {
-            path.split("/")[0]
-            for path in files
-            if path.split("/")[0] in ("tests", "test")
-            or path.rsplit("/", 1)[-1].startswith("test_")
-        }
-    )
+    test_locations = set()
+    for path in files:
+        root = path.split("/")[0]
+        if root in ("tests", "test"):
+            test_locations.add(root)
+        if path.rsplit("/", 1)[-1].startswith("test_"):
+            test_locations.add(path.rsplit("/", 1)[0] if "/" in path else ".")
+    test_dirs = sorted(test_locations)
     return RepoContext(
         files=files[:max_tree_entries],
         total_files=len(files),

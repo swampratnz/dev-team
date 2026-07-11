@@ -47,13 +47,21 @@ class InstrumentedRunner:
         span = None
         if self.tracer is not None:
             span = self.tracer.start("agent", self.role)
-        result = await self.inner.run(
-            prompt,
-            system_prompt=system_prompt,
-            allowed_tools=allowed_tools,
-            model=model,
-            cwd=cwd,
-        )
+        try:
+            result = await self.inner.run(
+                prompt,
+                system_prompt=system_prompt,
+                allowed_tools=allowed_tools,
+                model=model,
+                cwd=cwd,
+            )
+        except BaseException:
+            # A raising call must not leave its trace span open forever. Its
+            # cost is unknowable here (the SDK surfaces usage only on
+            # results), so nothing is recorded against the budget.
+            if self.tracer is not None:
+                self.tracer.end(span, "exception")
+            raise
         if self.tracer is not None:
             self.tracer.end(span, "error" if result.is_error else "ok")
         if self.budget is not None:

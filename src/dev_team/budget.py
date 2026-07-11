@@ -80,7 +80,15 @@ class UsageMeter:
 
 @dataclass
 class Budget:
-    """An optional spending ceiling backed by a :class:`UsageMeter`."""
+    """An optional spending ceiling backed by a :class:`UsageMeter`.
+
+    Enforcement is check-before / record-after: a call is refused once the
+    ceiling is reached, but a call already in flight completes and its full
+    cost is recorded. With concurrent agents the overshoot bound is therefore
+    the cost of every in-flight call, not zero — treat ``limit_usd`` as a
+    stop-line the run halts at gracefully, not a hard cap that can interrupt
+    an agent mid-call.
+    """
 
     limit_usd: Optional[float] = None
     meter: UsageMeter = field(default_factory=UsageMeter)

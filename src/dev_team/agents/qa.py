@@ -12,7 +12,7 @@ from typing import Mapping, Optional
 
 from .. import parsing
 from ..models import Implementation, Task, TestReport
-from .base import BaseAgent
+from .base import READ_ONLY_TOOLS, UNTRUSTED_CONTENT_NOTE, BaseAgent
 from .reviewer import render_changed_files
 
 _SYSTEM = """\
@@ -28,14 +28,25 @@ class QAAgent(BaseAgent):
 
     role = "qa"
     stage = "testing"
-    system_prompt = _SYSTEM
+    system_prompt = _SYSTEM + UNTRUSTED_CONTENT_NOTE
 
-    async def test(self, task: Task, implementation: Implementation) -> TestReport:
-        """Author and evaluate tests for ``implementation``."""
+    async def test(
+        self,
+        task: Task,
+        implementation: Implementation,
+        *,
+        file_contents: Optional[Mapping[str, str]] = None,
+    ) -> TestReport:
+        """Author and evaluate tests for ``implementation``.
+
+        The prompt carries the implementation's actual file contents, so the
+        report is grounded in the code rather than the engineer's summary.
+        """
 
         criteria = "\n".join(
             f"- {c}" for c in task.acceptance_criteria
         ) or "- (none specified)"
+        files = render_changed_files(implementation, file_contents)
         prompt = f"""\
 Design and evaluate tests for this implementation.
 
@@ -43,6 +54,9 @@ Task {task.id}: {task.title}
 Acceptance criteria:
 {criteria}
 Implementation summary: {implementation.summary}
+
+Changed files (with content):
+{files}
 
 Respond with JSON of the form:
 {{
@@ -60,12 +74,14 @@ Respond with JSON of the form:
         implementation: Implementation,
         *,
         file_contents: Optional[Mapping[str, str]] = None,
+        workspace_root: Optional[str] = None,
     ) -> Implementation:
         """Write executable test files for ``implementation``.
 
         Returns an :class:`Implementation` whose files are the test files to
         materialise into the workspace; the Definition-of-Done gates then run
-        them for real.
+        them for real. ``workspace_root`` is where the read-only evidence
+        tools operate.
         """
 
         criteria = "\n".join(
@@ -97,5 +113,7 @@ Respond with JSON of the form:
   ],
   "notes": ""
 }}"""
-        data = await self.ask_json(prompt)
+        data = await self.ask_json(
+            prompt, allowed_tools=READ_ONLY_TOOLS, cwd=workspace_root
+        )
         return parsing.implementation_from_dict(data, task.id)

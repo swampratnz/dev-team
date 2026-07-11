@@ -13,7 +13,7 @@ from typing import Optional
 
 from .. import parsing
 from ..models import FeatureRequest, Plan
-from .base import BaseAgent
+from .base import UNTRUSTED_CONTENT_NOTE, BaseAgent
 
 _SYSTEM = """\
 You are an experienced product manager and delivery lead. You break feature
@@ -30,7 +30,7 @@ class ProductManagerAgent(BaseAgent):
 
     role = "product-manager"
     stage = "planning"
-    system_prompt = _SYSTEM
+    system_prompt = _SYSTEM + UNTRUSTED_CONTENT_NOTE
 
     async def create_plan(
         self,
@@ -53,7 +53,8 @@ class ProductManagerAgent(BaseAgent):
             else "- none"
         )
         memory = (
-            f"\nContext from previous runs on this workspace:\n{prior_context}\n"
+            "\nContext from previous runs on this workspace:\n"
+            f"<prior-context>\n{prior_context}\n</prior-context>\n"
             if prior_context
             else ""
         )
@@ -73,7 +74,8 @@ Description:
 Constraints:
 {constraints}
 {memory}{revision}
-Respond with JSON of the form:
+Respond with JSON of the form (dependencies may only reference the ids of
+other tasks in the same plan):
 {{
   "summary": "one paragraph plan summary",
   "tasks": [
@@ -82,7 +84,14 @@ Respond with JSON of the form:
       "title": "short title",
       "description": "what to build",
       "acceptance_criteria": ["objectively verifiable criterion"],
-      "dependencies": ["T0"]
+      "dependencies": []
+    }},
+    {{
+      "id": "T2",
+      "title": "short title",
+      "description": "what to build",
+      "acceptance_criteria": ["objectively verifiable criterion"],
+      "dependencies": ["T1"]
     }}
   ]
 }}"""

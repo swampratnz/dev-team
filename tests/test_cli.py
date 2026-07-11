@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from helpers import happy_responses, json_response, plan_dict, design_dict, impl_dict
 from helpers import review_dict, deploy_dict
 
+from dev_team import __version__
 from dev_team.cli import build_parser, main
 from dev_team.testing import ScriptedRunner
 
@@ -16,6 +19,14 @@ def test_build_parser_parses_constraints():
     args = parser.parse_args(["Title", "Desc", "-c", "one", "-c", "two"])
     assert args.title == "Title"
     assert args.constraints == ["one", "two"]
+
+
+def test_version_flag_prints_version(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version"])
+    out = capsys.readouterr().out
+    assert excinfo.value.code == 0
+    assert f"dev-team {__version__}" in out
 
 
 def test_main_text_output_success(capsys):
@@ -35,12 +46,23 @@ def test_main_json_output(capsys):
     assert payload["success"] is True
 
 
-def test_main_verbose_prints_events(capsys):
+def test_main_verbose_prints_events_to_stderr(capsys):
     runner = ScriptedRunner(happy_responses(1))
     code = main(["Login", "Add login", "--verbose"], runner=runner)
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert code == 0
-    assert "[workflow/" in out
+    assert "[workflow/" in captured.err
+    assert "[workflow/" not in captured.out
+
+
+def test_main_json_verbose_keeps_stdout_parseable(capsys):
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(["Login", "Add login", "--json", "--verbose"], runner=runner)
+    captured = capsys.readouterr()
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["success"] is True
+    assert "[workflow/" in captured.err
 
 
 def test_main_failure_exit_code(capsys):
@@ -56,11 +78,46 @@ def test_main_failure_exit_code(capsys):
     assert "INCOMPLETE" in out
 
 
-def test_main_invalid_config_returns_error(capsys):
+def test_main_invalid_config_returns_error_on_stderr(capsys):
     code = main(["Login", "Add login", "--max-attempts", "0"], runner=ScriptedRunner([]))
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert code == 2
-    assert "error:" in out
+    assert "error:" in captured.err
+    assert captured.out == ""
+
+
+def test_main_deliver_only_flag_without_deliver_exits_2(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--budget-usd", "5"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--budget-usd" in err
+    assert "--deliver" in err
+
+
+def test_main_deliver_only_flags_all_reported(capsys):
+    argv = [
+        "Login", "Add login",
+        "--workspace", "elsewhere",
+        "--verify-command", "pytest",
+        "--setup-command", "pip install -e .",
+        "--branch", "custom",
+        "--allow-dirty-baseline",
+        "--proceed-on-red-baseline",
+        "--budget-usd", "5",
+        "--max-concurrency", "2",
+        "--no-commit",
+    ]
+    with pytest.raises(SystemExit) as excinfo:
+        main(argv, runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    for flag in (
+        "--workspace", "--verify-command", "--setup-command", "--branch",
+        "--allow-dirty-baseline", "--proceed-on-red-baseline",
+        "--budget-usd", "--max-concurrency", "--no-commit",
+    ):
+        assert flag in err
 
 
 # --- real delivery mode -----------------------------------------------------

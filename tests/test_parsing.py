@@ -56,6 +56,29 @@ def test_as_enum():
     assert parsing.as_enum(TaskStatus, 123, TaskStatus.PENDING) is TaskStatus.PENDING
 
 
+def test_as_severity_known_values():
+    assert parsing.as_severity("critical") is Severity.CRITICAL
+    assert parsing.as_severity(" MAJOR ") is Severity.MAJOR
+    assert parsing.as_severity("minor") is Severity.MINOR
+    assert parsing.as_severity("info") is Severity.INFO
+
+
+def test_as_severity_synonyms():
+    assert parsing.as_severity("blocker") is Severity.CRITICAL
+    assert parsing.as_severity("High") is Severity.MAJOR
+    assert parsing.as_severity("medium") is Severity.MINOR
+    assert parsing.as_severity("low") is Severity.INFO
+
+
+def test_as_severity_fails_closed_on_unknown():
+    assert parsing.as_severity("catastrophic") is Severity.MAJOR
+    assert parsing.as_severity(5) is Severity.MAJOR
+
+
+def test_as_severity_missing_stays_informational():
+    assert parsing.as_severity(None) is Severity.INFO
+
+
 def test_as_obj_list():
     assert parsing.as_obj_list({"k": [{"a": 1}, "x", {"b": 2}]}, "k") == [
         {"a": 1},
@@ -251,6 +274,32 @@ def test_review_blocking_comment_forces_rejection():
     }
     review = parsing.review_from_dict(data)
     assert review.approved is False
+
+
+def test_review_unknown_severity_blocks_approval():
+    data = {
+        "approved": True,
+        "summary": "lgtm",
+        "comments": [{"severity": "high", "message": "auth bypass"}],
+    }
+    review = parsing.review_from_dict(data)
+    assert review.comments[0].severity is Severity.MAJOR
+    assert review.approved is False
+
+
+def test_security_unknown_severity_blocks_release():
+    data = {
+        "approved": True,
+        "summary": "fine",
+        "findings": [
+            {"severity": "blocker", "category": "authz", "description": "d"},
+            {"severity": "sev1", "category": "misc", "description": "d"},
+        ],
+    }
+    report = parsing.security_report_from_dict(data)
+    assert report.findings[0].severity is Severity.CRITICAL
+    assert report.findings[1].severity is Severity.MAJOR
+    assert report.approved is False
 
 
 def test_security_blocking_finding_forces_rejection():

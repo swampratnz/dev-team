@@ -6,8 +6,10 @@ import argparse
 import asyncio
 import json
 import shlex
+import sys
 from typing import List, Optional
 
+from . import __version__
 from .budget import Budget
 from .config import TeamConfig
 from .engine import EngineConfig
@@ -31,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dev-team",
         description="Run a multi-agent software development team on a feature.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument("title", help="Short title of the feature to build.")
     parser.add_argument(
@@ -108,7 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         metavar="USD",
-        help="Cost ceiling for the run; the run stops gracefully when reached.",
+        help="Cost ceiling for the run; the run stops gracefully when reached "
+        "(with --deliver).",
     )
     parser.add_argument(
         "--max-concurrency",
@@ -135,9 +143,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _reject_deliver_only_flags(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Error out (exit code 2) on deliver-only flags passed without --deliver.
+
+    These flags only affect the delivery engine; silently ignoring them in
+    simulation mode would let e.g. ``--budget-usd`` go unenforced.
+    """
+
+    if args.deliver:
+        return
+    passed = [
+        flag
+        for flag, is_set in (
+            ("--workspace", args.workspace != parser.get_default("workspace")),
+            ("--verify-command", args.verify_command is not None),
+            ("--setup-command", args.setup_command is not None),
+            ("--branch", args.branch is not None),
+            ("--allow-dirty-baseline", args.allow_dirty_baseline),
+            ("--proceed-on-red-baseline", args.proceed_on_red_baseline),
+            ("--budget-usd", args.budget_usd is not None),
+            ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
+            ("--no-commit", args.no_commit),
+        )
+        if is_set
+    ]
+    if passed:
+        parser.error(f"{', '.join(passed)}: only valid with --deliver")
+
+
 def _run(argv: Optional[List[str]], runner: Optional[AgentRunner]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _reject_deliver_only_flags(parser, args)
 
     config = TeamConfig(
         model=args.model,
@@ -147,8 +186,10 @@ def _run(argv: Optional[List[str]], runner: Optional[AgentRunner]) -> int:
 
     listener = None
     if args.verbose:
+        # Progress goes to stderr so stdout stays a clean result document
+        # (text summary or JSON), safe to pipe into e.g. ``jq``.
         def listener(event: AgentEvent) -> None:  # noqa: E306
-            print(str(event))
+            print(str(event), file=sys.stderr)
 
     team = DevTeam(runner, config=config, listener=listener)
 
@@ -212,7 +253,7 @@ def main(argv: Optional[List[str]] = None, runner: Optional[AgentRunner] = None)
     try:
         return _run(argv, runner)
     except (DevTeamError, ValueError) as exc:
-        print(f"error: {exc}")
+        print(f"error: {exc}", file=sys.stderr)
         return 2
 
 

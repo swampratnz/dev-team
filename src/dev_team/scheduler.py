@@ -51,13 +51,19 @@ async def schedule(
 
     Raises:
         DependencyCycleError: If remaining tasks can never become ready.
-        ValueError: If ``max_concurrency`` is less than 1.
+        ValueError: If ``max_concurrency`` is less than 1, or two tasks share
+            an id (dependencies would be ambiguous and status bookkeeping
+            would silently drop one of them).
     """
 
     if max_concurrency < 1:
         raise ValueError("max_concurrency must be at least 1")
 
-    by_id = {t.id: t for t in tasks}
+    by_id: Dict[str, Task] = {}
+    for t in tasks:
+        if t.id in by_id:
+            raise ValueError(f"duplicate task id in plan: {t.id!r}")
+        by_id[t.id] = t
     deps: Dict[str, List[str]] = {
         t.id: [d for d in t.dependencies if d in by_id and d != t.id] for t in tasks
     }

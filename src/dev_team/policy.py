@@ -13,7 +13,7 @@ the whole workspace inside an isolated container or VM as well.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 from .approval import ApprovalGate, ApprovalRequest, AutoApprover
 from .execution import CommandResult, CommandRunner
@@ -39,11 +39,13 @@ class SideEffectPolicy:
             is in this set are allowed.
         denied_substrings: Any command whose joined form contains one of these
             is denied outright.
-        approval_commands: Commands are allowed only after approval when any
-            argv token (or the basename of argv[0]) equals one of these
-            words (e.g. ``push``, ``deploy``, ``rm``). Token equality — not
-            substring matching — so ``rm`` gates ``rm -rf x`` and
-            ``git push`` without tripping on e.g. ``format`` or ``brm``.
+        approval_commands: Commands are allowed only after approval when the
+            *command position* — the basename of argv[0] or the subcommand in
+            argv[1] — equals one of these words (e.g. ``push``, ``deploy``,
+            ``rm``). Position matters, not mere token presence: ``rm -rf x``
+            and ``git push`` are gated, while ``git stash push`` (push as an
+            argument to stash, run internally by the fail-to-pass check) and a
+            file argument that happens to be called ``deploy`` are not.
     """
 
     allowed_programs: Sequence[str] = field(default_factory=tuple)
@@ -65,7 +67,9 @@ class SideEffectPolicy:
         if self.allowed_programs and args[0] not in self.allowed_programs:
             return PolicyVerdict(False, f"program not allow-listed: {args[0]!r}")
 
-        tokens = set(args) | {args[0].rsplit("/", 1)[-1]}
+        tokens = {args[0].rsplit("/", 1)[-1]}
+        if len(args) > 1:
+            tokens.add(args[1])
         for risky in self.approval_commands:
             if risky in tokens:
                 return PolicyVerdict(

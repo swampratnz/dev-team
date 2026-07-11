@@ -17,12 +17,14 @@ QA, security, docs, reliability, and deployment.
   codes, never from self-report.
 - ✅ **Real, gated execution** — gates and git run in the *workspace root*;
   integration is serialised like a merge queue; failed attempts are rolled
-  back; nothing is committed until security approves.
+  back, while each *accepted* task is banked as a `wip(dev-team)` commit on
+  the delivery branch (so a later rollback can never destroy gated work);
+  the curated feature commit happens only after security approves.
 - ✅ **Behaves like a professional in your repo** — refuses to start on a red
   baseline (inherited breakage never gets blamed on the engineer) or over
   uncommitted work, does everything on a dedicated `dev-team/<feature>`
-  branch, authors a `.gitignore`, and stages a curated change set (never
-  `git add -A` into the feature commit).
+  branch, authors (or extends) a `.gitignore`, and stages a curated change
+  set (never `git add -A` into the feature commit).
 - ✅ **Works on legacy suites** — a tolerated red baseline records the failing
   test identities and gates each task only on *newly* failing tests
   (pytest/go/cargo output attribution).
@@ -46,9 +48,12 @@ QA, security, docs, reliability, and deployment.
   commit; the SRE runs a launch-checklist review over the delivered code. A
   per-run scorecard tracks rejections and lint issues so agent quality is a
   measured trend.
-- ✅ **Governed and resumable** — cost budgets stop the run gracefully,
-  checkpoints let a later run resume where a crashed or over-budget run
-  stopped, and every agent call is traced and metered.
+- ✅ **Governed and resumable** — cost budgets stop the run gracefully (a
+  stop-line: in-flight calls complete, so concurrent agents can overshoot by
+  the cost of the calls in flight), checkpoints let a later run resume where
+  a crashed or over-budget run stopped — reusing the checkpointed plan and
+  squashing the banked work into the eventual feature commit — and every
+  agent call is traced and metered.
 - ✅ **Measurable** — an eval harness (`dev_team.evals`) scores the team on
   fixed benchmark cases so prompt/orchestration changes are judged by numbers.
 - ✅ **100% test coverage** (branch coverage) of the orchestration code,
@@ -69,8 +74,8 @@ see [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is still deliberately out.
 
 | Engine | Entry point | What it does |
 |--------|-------------|--------------|
-| **Simulation** | `DevTeam.develop` / `DevelopmentWorkflow` | Fast, side-effect-free walk through the lifecycle — agents *describe* the work as structured data. |
-| **Real delivery** | `DevTeam.deliver` / `DeliveryEngine` | *Does* the work: the engineer works agentically in the workspace (or describes changes that are materialised for it), QA authors executable tests, gates run via a `CommandRunner` rooted at the workspace, independent tasks are implemented concurrently and integrated serially, and budget, tracing, memory, checkpoints, approvals, and specialist review thread through the run. Commits happen once, after security approval. |
+| **Simulation** | `DevTeam.develop` / `DevelopmentWorkflow` | Fast, side-effect-free walk through the lifecycle — agents *describe* the work as structured data. Its reports (including QA's pass/fail) are self-described, nothing executes, and only six of the nine roles run — security, SRE, and docs are delivery-engine stages. |
+| **Real delivery** | `DevTeam.deliver` / `DeliveryEngine` | *Does* the work: the engineer works agentically in the workspace (or describes changes that are materialised for it), QA authors executable tests, gates run via a `CommandRunner` rooted at the workspace, independent tasks are implemented concurrently (described mode, or agentic with `worktrees=True`; single-workspace agentic attempts serialise) and integrated serially, and budget, tracing, memory, checkpoints, approvals, and specialist review thread through the run. Accepted tasks are banked as WIP commits on the delivery branch; the single curated feature commit happens after security approval. |
 
 The delivery engine picks its mode from the workspace: a `LocalWorkspace`
 (real directory) enables **agentic mode** — the engineer reads and edits files
@@ -105,10 +110,12 @@ fake implementation:
 - **Execution** — `Workspace` (in-memory / local) and `CommandRunner`
   (subprocess / dry-run / fake); `ChangeApplier` writes described changes for
   real; in agentic mode the engineer writes files itself via SDK tools.
-- **Quality gates** — `Gate` / `DefinitionOfDone` run tests, coverage, lint,
-  type-check, and security scans from *actual* exit codes in the *workspace
-  root*, driving a self-repair loop until green. QA authors the executable
-  tests the gates run.
+- **Quality gates** — `Gate` / `DefinitionOfDone` run the project's verify
+  command (plus any gates you compose — `CommandGate`, `CoverageGate`) from
+  *actual* exit codes in the *workspace root*, driving a self-repair loop
+  until green; a configured `lint_command` / `security_scan_command` is run
+  and its output triaged by the reviewer / security agent. QA authors the
+  executable tests the gates run.
 - **Orchestration** — a dependency-aware, concurrent `schedule`; parallel
   implementation with serialised, rollback-on-failure integration (a merge
   queue). Per-role model routing and a stronger `escalation_model` for a
@@ -150,7 +157,7 @@ FeatureRequest
      │  Gates ─▶ run tests/lint/... for real ── fail ────┘back  │
      │       │ green                                            │
      │       ▼                                                  │
-     │  Task DONE (checkpointed)                                │
+     │  Task DONE (banked as a WIP commit + checkpointed)       │
      └─────────────────────────────────────────────────────────┘
      │
      ▼
@@ -160,7 +167,7 @@ FeatureRequest
  TechWriter / SRE / DevOps ─▶ docs, readiness, deployment plan
      │
      ▼
- git commit (once, only if security approved) ─▶ DeliveryOutcome
+ git commit (WIP commits squashed once, only if security approved) ─▶ DeliveryOutcome
 ```
 
 A task is retried up to `max_task_attempts` times whenever review or the gates
@@ -168,8 +175,10 @@ reject it; the failed attempt is rolled back and the engineer receives the
 feedback (including real gate output) on the next attempt — optionally on a
 stronger `escalation_model` for the final try. If it never passes, the task is
 marked `FAILED`, dependants cascade-skip, and the run reports incomplete. A
-blown budget or crash leaves a checkpoint; re-running the same feature resumes
-from it.
+blown budget or crash leaves a checkpoint (and the accepted work banked as WIP
+commits); re-running the same feature reuses the checkpointed plan, skips the
+tasks already done, and squashes old and new work into one feature commit from
+the original baseline.
 
 ## Architecture
 
@@ -318,18 +327,29 @@ An `InMemoryWorkspace` (the default) gives a dry run: described changes, a
 ### Evals
 
 ```python
-from dev_team import EvalCase, FeatureRequest, evaluate
+import asyncio
+from dev_team import DevTeam, EvalCase, FeatureRequest, LocalWorkspace, evaluate
 
+team = DevTeam()
 cases = [
     EvalCase(
         name="health-endpoint",
         request=FeatureRequest("Health endpoint", "Add /health returning 200"),
         expected_files=["src/app.py", "tests/test_health.py"],
+        max_cost_usd=2.0,   # overspending fails the case
     ),
 ]
-report = await evaluate(lambda case: team.make_engine(workspace=...), cases)
+
+def make_engine(case: EvalCase):
+    return team.make_engine(workspace=LocalWorkspace(f"./evals/{case.name}"))
+
+report = asyncio.run(evaluate(make_engine, cases))
 print(report.render())   # Evals: 1/1 passed (100%), total cost $0.8412
 ```
+
+Behavioural `check_commands` only count when they really execute: on a
+dry-run (in-memory) workspace they are scored as failures rather than
+silently passing.
 
 Run the eval suite before and after changing prompts, roles, or orchestration —
 if the pass rate or cost regresses, so did the team.
@@ -338,10 +358,16 @@ if the pass rate or cost regresses, so did the team.
 
 The delivery engine executes agent-authored code (that is what running the
 tests means). `SideEffectPolicy` and `ApprovalGate` are defence-in-depth, not
-containment: for unattended or untrusted runs, put the whole process in a
-sandboxed container/VM with no credentials and restricted network. The SDK
-permission mode defaults to `acceptEdits` with per-call `allowed_tools`
-allowlists; `bypassPermissions` is opt-in.
+containment: they guard the commands the *engine* runs (gates, git, scans, the
+final commit), while the agentic engineer's own tool use is governed only by
+the SDK permission layer — `acceptEdits` with a per-call `allowed_tools`
+allowlist (write/run tools for the engineer, read-only `Read`/`Grep`/`Glob`
+rooted at the workspace for the reviewing roles, none for text-only roles);
+`bypassPermissions` is opt-in. Workspace file content is fenced as
+data-not-instructions in prompts, which mitigates but does not eliminate
+prompt injection from the code under review. For unattended or untrusted
+runs, put the whole process in a sandboxed container/VM with no credentials
+and restricted network.
 
 ### Bring your own runner
 

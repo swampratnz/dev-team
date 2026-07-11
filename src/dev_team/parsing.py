@@ -92,6 +92,35 @@ def as_enum(enum_cls: Type[E], value: Any, default: E) -> E:
     return default
 
 
+# Severities models commonly emit that are not literal enum values. Anything
+# not recognised at all maps to MAJOR: a gate that cannot understand a
+# finding's severity must fail closed (block), never wave it through.
+_SEVERITY_SYNONYMS = {
+    "blocker": Severity.CRITICAL,
+    "high": Severity.MAJOR,
+    "medium": Severity.MINOR,
+    "low": Severity.INFO,
+}
+
+
+def as_severity(value: Any) -> Severity:
+    """Parse a severity value, failing closed on anything unrecognised.
+
+    A missing severity (``None``) stays informational — the model raised no
+    alarm — but a severity it *did* set and we cannot interpret blocks.
+    """
+
+    if value is None:
+        return Severity.INFO
+    if isinstance(value, str):
+        text = value.strip().lower()
+        try:
+            return Severity(text)
+        except ValueError:
+            return _SEVERITY_SYNONYMS.get(text, Severity.MAJOR)
+    return Severity.MAJOR
+
+
 def as_obj_list(data: dict, key: str) -> List[dict]:
     """Return ``data[key]`` as a list of dictionaries."""
 
@@ -180,7 +209,7 @@ def review_from_dict(data: Any) -> Review:
     data = as_dict(data)
     comments = [
         ReviewComment(
-            severity=as_enum(Severity, item.get("severity"), Severity.INFO),
+            severity=as_severity(item.get("severity")),
             message=as_str(item, "message"),
             path=as_str(item, "path") or None,
         )
@@ -236,7 +265,7 @@ def security_report_from_dict(data: Any) -> SecurityReport:
     data = as_dict(data)
     findings = [
         SecurityFinding(
-            severity=as_enum(Severity, item.get("severity"), Severity.INFO),
+            severity=as_severity(item.get("severity")),
             category=as_str(item, "category") or "general",
             description=as_str(item, "description"),
             remediation=as_str(item, "remediation"),

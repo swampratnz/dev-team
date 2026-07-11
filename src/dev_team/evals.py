@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence
 
 from .engine import DeliveryEngine, DeliveryOutcome
+from .execution import DryRunCommandRunner
 from .models import FeatureRequest
 
 # A factory builds a fresh, isolated engine per case (own workspace, budget).
@@ -26,7 +27,8 @@ class EvalCase:
 
     ``check_commands`` are executed in the delivered workspace after the run
     — behavioural assertions (e.g. ``("python", "-c", "from app import add")``)
-    that must exit zero for the case to pass.
+    that must exit zero for the case to pass. ``max_cost_usd`` makes cost part
+    of the score: a case that delivers but overspends fails.
     """
 
     name: str
@@ -34,6 +36,7 @@ class EvalCase:
     expected_files: Sequence[str] = ()
     check_commands: Sequence[Sequence[str]] = ()
     require_success: bool = True
+    max_cost_usd: Optional[float] = None
 
 
 @dataclass
@@ -110,8 +113,24 @@ def score(
     for path in case.expected_files:
         if path not in outcome.workspace_files:
             failures.append(f"expected file missing: {path}")
+    if case.max_cost_usd is not None and outcome.cost_usd > case.max_cost_usd:
+        failures.append(
+            f"cost ${outcome.cost_usd:.4f} exceeded the case budget "
+            f"${case.max_cost_usd:.4f}"
+        )
     if engine is not None:
+        # A dry-run runner exits 0 without executing anything; letting that
+        # count as a passing behavioural check would silently inflate the
+        # pass rate, so it is scored as a failure instead.
+        dry_run = isinstance(
+            getattr(engine.command_runner, "inner", None), DryRunCommandRunner
+        )
         for command in case.check_commands:
+            if dry_run:
+                failures.append(
+                    f"check not executed (dry-run workspace): {' '.join(command)}"
+                )
+                continue
             result = engine.command_runner.run(list(command), cwd=engine.workdir)
             if not result.ok:
                 failures.append(

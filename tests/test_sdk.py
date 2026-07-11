@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+from claude_agent_sdk import ProcessError
 from helpers import run
 
 from dev_team import sdk
@@ -71,6 +75,8 @@ def test_build_options_minimal():
     )
     assert options.permission_mode == "bypassPermissions"
     assert options.system_prompt is None
+    # None means an explicit empty allowlist, never "no restriction".
+    assert options.allowed_tools == []
 
 
 def test_build_options_full():
@@ -140,3 +146,47 @@ def test_runner_minimal_flow(monkeypatch):
 
 def test_scripted_runner_satisfies_protocol():
     assert isinstance(ScriptedRunner(["x"]), AgentRunner)
+
+
+def test_runner_maps_sdk_errors_to_error_result(monkeypatch):
+    async def boom(*, prompt, options):  # noqa: ANN001
+        raise ProcessError("CLI exploded", exit_code=1)
+        yield  # makes this an async generator, like the real query
+
+    monkeypatch.setattr(sdk, "query", boom)
+
+    runner = ClaudeAgentRunner()
+    result = run(runner.run("prompt"))
+    assert result.is_error is True
+    assert "ProcessError" in result.text
+
+
+def test_runner_times_out_to_error_result(monkeypatch):
+    async def slow(*, prompt, options):  # noqa: ANN001
+        await asyncio.sleep(30)
+        yield Assistant([Block("late")])
+
+    monkeypatch.setattr(sdk, "query", slow)
+
+    runner = ClaudeAgentRunner(timeout_seconds=0.01)
+    result = run(runner.run("prompt"))
+    assert result.is_error is True
+    assert "TimeoutError" in result.text
+
+
+def test_runner_never_swallows_cancellation(monkeypatch):
+    async def slow(*, prompt, options):  # noqa: ANN001
+        await asyncio.sleep(30)
+        yield Assistant([Block("late")])
+
+    monkeypatch.setattr(sdk, "query", slow)
+
+    async def scenario():
+        runner = ClaudeAgentRunner()
+        task = asyncio.ensure_future(runner.run("prompt"))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        await task
+
+    with pytest.raises(asyncio.CancelledError):
+        run(scenario())

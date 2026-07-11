@@ -46,3 +46,35 @@ def test_works_without_budget_or_tracer():
     runner = InstrumentedRunner(inner, "pm")
     result = run(runner.run("p", model="m", allowed_tools=["Read"]))
     assert result.text == "ok"
+
+
+def test_exception_closes_span_and_records_nothing():
+    class BoomRunner:
+        async def run(self, prompt, **kwargs):
+            raise RuntimeError("boom")
+
+    budget = Budget()
+    tracer = Tracer(clock=_Clock())
+    runner = InstrumentedRunner(BoomRunner(), "engineer", budget=budget, tracer=tracer)
+    try:
+        run(runner.run("p"))
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the raise is the point
+        raise AssertionError("expected RuntimeError")
+    assert tracer.spans[0].status == "exception"
+    assert budget.meter.call_count == 0
+
+
+def test_exception_without_tracer_still_propagates():
+    class BoomRunner:
+        async def run(self, prompt, **kwargs):
+            raise RuntimeError("boom")
+
+    runner = InstrumentedRunner(BoomRunner(), "engineer")
+    try:
+        run(runner.run("p"))
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the raise is the point
+        raise AssertionError("expected RuntimeError")

@@ -7,6 +7,7 @@ repository required.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -20,13 +21,19 @@ class GitError(DevTeamError):
 
 @dataclass
 class GitRepo:
-    """Run git operations in a working directory via a command runner."""
+    """Run git operations in a working directory via a command runner.
+
+    Every command carries ``timeout`` so a wedged git (a hung commit hook, a
+    GPG prompt on a headless box) fails the operation instead of freezing the
+    whole run.
+    """
 
     runner: CommandRunner
     cwd: Optional[str] = None
+    timeout: Optional[float] = 120.0
 
     def _git(self, *args: str, check: bool = True):
-        result = self.runner.run(["git", *args], cwd=self.cwd)
+        result = self.runner.run(["git", *args], cwd=self.cwd, timeout=self.timeout)
         if check and not result.ok:
             raise GitError(
                 f"git {' '.join(args)} failed ({result.exit_code}): {result.output}"
@@ -44,14 +51,27 @@ class GitRepo:
         result = self._git("rev-parse", "--is-inside-work-tree", check=False)
         return result.ok and result.stdout.strip() == "true"
 
+    def toplevel(self) -> str:
+        """Return the repository's top-level directory (empty on failure)."""
+
+        return self._git("rev-parse", "--show-toplevel", check=False).stdout.strip()
+
     def ensure_repo(self) -> None:
         """Initialise a repository (with a usable identity) if none exists.
+
+        Being *inside* a work tree is not enough: a workspace nested in some
+        larger repository would silently adopt the enclosing repo, and every
+        branch switch, baseline commit, and rollback would act repo-wide. A
+        repo is only reused when its top level is the working directory
+        itself; otherwise a fresh one is initialised there.
 
         A missing ``user.name``/``user.email`` makes ``git commit`` fail on a
         fresh machine, so a local identity is set when absent.
         """
 
-        if not self.is_repo():
+        top = self.toplevel()
+        here = os.path.realpath(self.cwd) if self.cwd else os.path.realpath(os.getcwd())
+        if not self.is_repo() or (top and os.path.realpath(top) != here):
             self.init()
         for key, value in (("user.name", "dev-team"), ("user.email", "dev-team@localhost")):
             if not self._git("config", key, check=False).stdout.strip():
@@ -61,6 +81,12 @@ class GitRepo:
         """Return the combined staged and unstaged diff against HEAD."""
 
         return self._git("diff", "HEAD", check=False).stdout
+
+    def diff_names(self, ref: str) -> List[str]:
+        """Return the tracked paths that differ between ``ref`` and the tree."""
+
+        out = self._git("diff", "--name-only", ref, check=False).stdout
+        return [line.strip() for line in out.splitlines() if line.strip()]
 
     def discard_changes(self) -> None:
         """Hard-reset tracked files and remove untracked ones.
@@ -119,19 +145,34 @@ class GitRepo:
         return self._git("rev-parse", "--verify", "HEAD", check=False).ok
 
     def rev_parse(self, ref: str = "HEAD") -> str:
-        """Resolve ``ref`` to a commit sha (empty string on failure)."""
+        """Resolve ``ref`` to a commit sha (empty string on failure).
 
-        return self._git("rev-parse", ref, check=False).stdout.strip()
+        ``--verify --quiet`` matters: a bare ``rev-parse BADREF`` echoes the
+        ref name to stdout while failing, which would hand callers a bogus
+        "sha".
+        """
+
+        result = self._git("rev-parse", "--verify", "--quiet", ref, check=False)
+        return result.stdout.strip() if result.ok else ""
 
     def worktree_add(self, path: str, branch: str) -> None:
-        """Create a new worktree at ``path`` on a fresh ``branch`` from HEAD."""
+        """Create a new worktree at ``path`` on ``branch``, reset to HEAD.
 
-        self._git("worktree", "add", "-b", branch, path)
+        ``-B`` (not ``-b``) so a stale branch left behind by a crashed run is
+        reset and reused instead of failing the task on rerun.
+        """
+
+        self._git("worktree", "add", "-B", branch, path)
 
     def worktree_remove(self, path: str) -> None:
         """Remove the worktree at ``path`` (best effort)."""
 
         self._git("worktree", "remove", "--force", path, check=False)
+
+    def worktree_prune(self) -> None:
+        """Drop stale worktree registrations (best effort)."""
+
+        self._git("worktree", "prune", check=False)
 
     def delete_branch(self, name: str) -> None:
         """Delete branch ``name`` (best effort)."""

@@ -107,3 +107,27 @@ def test_check_commands_run_in_workspace():
     assert any("check failed" in f for f in report.results[0].failures)
     # the passing check produced no failure entry
     assert len(report.results[0].failures) == 1
+
+
+def test_case_cost_budget_is_scored():
+    from dev_team.sdk import AgentResult
+
+    engine = _factory()(None)
+    outcome = run(engine.deliver(FeatureRequest(title="F", description="d")))
+    outcome.budget.meter.record("engineer", AgentResult(text="", cost_usd=2.0))
+    result = score(_case("pricey", max_cost_usd=1.0), outcome)
+    assert any("exceeded the case budget" in f for f in result.failures)
+
+
+def test_check_commands_fail_honestly_on_dry_run():
+    engine = DeliveryEngine(
+        ScriptedRunner(by_system_prompt=engine_responses()),
+        workspace=InMemoryWorkspace(),
+        budget=Budget(),
+        tracer=Tracer(clock=_Clock()),
+        config=EngineConfig(max_task_attempts=1, fail_to_pass_check=False),
+    )
+    outcome = run(engine.deliver(FeatureRequest(title="F", description="d")))
+    case = _case("behavioural", check_commands=(("python", "-c", "pass"),))
+    result = score(case, outcome, engine=engine)
+    assert any("not executed (dry-run workspace)" in f for f in result.failures)

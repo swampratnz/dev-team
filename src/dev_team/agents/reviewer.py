@@ -10,7 +10,7 @@ from typing import Mapping, Optional
 
 from .. import parsing
 from ..models import Implementation, Review, Task
-from .base import BaseAgent
+from .base import READ_ONLY_TOOLS, UNTRUSTED_CONTENT_NOTE, BaseAgent
 
 _SYSTEM = """\
 You are a meticulous code reviewer. You judge whether an implementation meets
@@ -46,7 +46,10 @@ def render_diff(diff: Optional[str], *, limit: int = DIFF_CHARS) -> str:
     body = diff[:limit]
     if len(body) < len(diff):
         body += "\n... (diff truncated)"
-    return f"\nGit diff of the change (what actually changed):\n{body}\n"
+    return (
+        "\nGit diff of the change (what actually changed):\n"
+        f"<diff-content>\n{body}\n</diff-content>\n"
+    )
 
 
 def render_changed_files(
@@ -56,7 +59,12 @@ def render_changed_files(
     per_file_chars: int = PER_FILE_CHARS,
     total_chars: int = TOTAL_CHARS,
 ) -> str:
-    """Render the changed files, with real content where available."""
+    """Render the changed files, with real content where available.
+
+    Bodies are fenced as untrusted data, and anything the budget cuts or
+    omits is explicitly marked — a reviewer must never mistake an unseen
+    file for an empty one.
+    """
 
     if not implementation.files:
         return "- (no files reported)"
@@ -65,15 +73,20 @@ def render_changed_files(
     for change in implementation.files:
         lines.append(f"--- {change.change_type.value} {change.path}: {change.summary}")
         body = (contents or {}).get(change.path, change.content)
-        if not body or budget <= 0:
+        if not body:
+            continue
+        if budget <= 0:
+            lines.append("(content omitted: prompt budget exhausted)")
             continue
         snippet = body[:per_file_chars]
         if len(snippet) > budget:
             snippet = snippet[:budget]
+        budget -= len(snippet)
         if len(snippet) < len(body):
             snippet += "\n... (truncated)"
-        budget -= len(snippet)
-        lines.append(snippet)
+        lines.append(
+            f'<file-content path="{change.path}">\n{snippet}\n</file-content>'
+        )
     return "\n".join(lines)
 
 
@@ -82,7 +95,7 @@ class ReviewerAgent(BaseAgent):
 
     role = "reviewer"
     stage = "review"
-    system_prompt = _SYSTEM.format(budget=COMMENT_BUDGET)
+    system_prompt = _SYSTEM.format(budget=COMMENT_BUDGET) + UNTRUSTED_CONTENT_NOTE
 
     async def review(
         self,
@@ -92,6 +105,7 @@ class ReviewerAgent(BaseAgent):
         file_contents: Optional[Mapping[str, str]] = None,
         diff: Optional[str] = None,
         static_findings: Optional[str] = None,
+        workspace_root: Optional[str] = None,
     ) -> Review:
         """Review ``implementation`` against ``task``.
 
@@ -101,6 +115,7 @@ class ReviewerAgent(BaseAgent):
         matters when a modified file is large. ``static_findings`` is linter/
         type-checker output — the reviewer triages it rather than re-deriving
         it, and spends its own judgment on what tools cannot see.
+        ``workspace_root`` is where the read-only evidence tools operate.
         """
 
         criteria = "\n".join(
@@ -109,7 +124,7 @@ class ReviewerAgent(BaseAgent):
         files = render_changed_files(implementation, file_contents)
         analysis = (
             "\nStatic analysis output (triage: escalate what matters, ignore noise):\n"
-            f"{static_findings[:4000]}\n"
+            f"<static-analysis>\n{static_findings[:4000]}\n</static-analysis>\n"
             if static_findings
             else ""
         )
@@ -132,5 +147,7 @@ Respond with JSON of the form:
   "summary": "overall verdict",
   "comments": [{{"severity": "major", "path": "src/x.py", "message": "..."}}]
 }}"""
-        data = await self.ask_json(prompt)
+        data = await self.ask_json(
+            prompt, allowed_tools=READ_ONLY_TOOLS, cwd=workspace_root
+        )
         return parsing.review_from_dict(data)

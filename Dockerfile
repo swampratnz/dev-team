@@ -5,10 +5,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Python 3 and Node.js (the Agent SDK drives the Claude Code CLI).
+# Python 3, git (the delivery engine commits via git), and Node.js (the
+# Agent SDK drives the Claude Code CLI).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-pip nodejs npm ca-certificates \
+        python3 python3-venv python3-pip git nodejs npm ca-certificates \
     && npm install -g @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/*
 
