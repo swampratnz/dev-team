@@ -47,6 +47,8 @@ from .conventions import (
     ConventionsStore,
     detect_convention_sources,
 )
+from .dashboard import DashboardServer, collect_state
+from .eventlog import EventLog, compose, read_events
 from .deadcode import DeadCodeFinding, DeadCodeReport, detect_dead_code
 from .depscan import (
     Dependency,
@@ -268,6 +270,12 @@ __all__ = [
     "build_repo_context",
     "parse_failed_tests",
     "new_failures",
+    # dashboard & event journal
+    "DashboardServer",
+    "collect_state",
+    "EventLog",
+    "read_events",
+    "compose",
     # repository sources
     "RepoRef",
     "SourceError",

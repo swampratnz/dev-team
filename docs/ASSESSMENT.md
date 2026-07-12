@@ -6,9 +6,11 @@ project — and get back a **cited, phased audit report** instead of a code
 change. Assessment is **read-only by construction**: no delivery branch, no
 baseline commit, no quality gates, no `.dev_team/` bookkeeping. The auditing
 agents get read-only tools (`Read`/`Grep`/`Glob`) rooted at the workspace,
-and the only write the run makes is the report itself. (One opt-in
-exception: `--build-probe` runs the project's own build for a ground-truth
-buildability verdict — see below.)
+and the audit's writes are limited to its own outputs: the report, the
+conventions profile, and (from the CLI) the `.dev_team/events.jsonl`
+progress journal the dashboard reads. The code under audit is never
+touched. (One opt-in exception: `--build-probe` runs the project's own
+build for a ground-truth buildability verdict — see below.)
 
 ```bash
 dev-team --assess --workspace /path/to/legacy-repo \

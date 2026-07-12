@@ -110,6 +110,12 @@ QA, security, docs, reliability, and deployment.
   `--env-file` overrides). The token never touches the URL, argv,
   `.git/config`, or the environment of any command the agents run — it is
   handed to git per-command and stripped from the process environment.
+- ✅ **Watchable** — `dev-team --dashboard` serves a local web dashboard over
+  the workspace: one card per agent (current stage, what it last worked on),
+  a live activity feed, recent runs, the backlog with story-point progress,
+  cross-run memory, and the assessment reports. Runs journal their events to
+  `.dev_team/events.jsonl`, so the dashboard is a separate read-only process
+  you leave open (see [`docs/DASHBOARD.md`](docs/DASHBOARD.md)).
 - ✅ **Ubuntu-ready** — packaged for deployment as a container or systemd unit.
 
 The capability set was chosen from a structured research pass across seven
@@ -278,6 +284,8 @@ Key modules:
   attribution (pytest/go/cargo/VSTest/xUnit).
 - `sources.py` — `--repo`: GitHub refs resolved and cloned into the
   workspace, PAT-authenticated from an env file with strict token hygiene.
+- `eventlog.py` / `dashboard.py` — the per-workspace event journal and the
+  read-only web dashboard served over it (see `docs/DASHBOARD.md`).
 - `memory.py` / `backlog.py` — blackboard, ADRs, cross-run memory,
   checkpoints, persistent backlog.
 - `budget.py` / `trace.py` / `approval.py` / `policy.py` / `instrument.py` —
@@ -391,6 +399,13 @@ dev-team --assess --workspace /path/to/legacy-repo --build-probe \
 dev-team "Fix the SVG endpoint" "..." --deliver --workspace /path/to/repo \
     --remote-verify-trigger "az pipelines run --name Build" \
     --remote-verify-status "az pipelines runs show --id 123 --query succeeded"
+```
+
+Watch the team from a browser — a separate, read-only process over the same
+workspace ([`docs/DASHBOARD.md`](docs/DASHBOARD.md)):
+
+```bash
+dev-team --dashboard --workspace ./build     # http://127.0.0.1:8737/
 ```
 
 Exit codes: `0` success, `1` completed with failed tasks, `2` invalid input
