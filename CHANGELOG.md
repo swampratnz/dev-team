@@ -43,6 +43,13 @@ sections below are reconstructed from the repository history.
   surfacing as an opaque CLI error mid-run. `DEPLOYMENT.md` is now a full
   Ubuntu server install guide covering both auth options, and the systemd
   unit and Docker examples document the subscription token.
+- **`DEPLOYMENT.md` hardening from a real bare-metal install**: prerequisites
+  now include `python-is-python3` (a minimal Ubuntu server ships only
+  `python3`, but auto-detected verify/gate commands and agent-authored tests
+  call bare `python`, so a task is wrongly reported failed without it), and the
+  systemd section warns that `EnvironmentFile` — unlike a shell `source` — does
+  not strip an inline `#` comment, so a `KEY=value  # note` on the credential
+  line corrupts the token into a confusing `401 Invalid bearer token`.
 
 #### Delivery engine
 - **Accepted work is banked**: every task that passes its gates is committed

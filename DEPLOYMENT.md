@@ -10,10 +10,17 @@ subscription token** from `claude setup-token` or a **Claude API key**.
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip git nodejs npm
+sudo apt-get install -y python3 python3-venv python3-pip python-is-python3 git nodejs npm
 # The Agent SDK drives the Claude Code CLI:
 sudo npm install -g @anthropic-ai/claude-code
 ```
+
+`python-is-python3` provides a bare `python` command. A minimal Ubuntu server
+ships only `python3`, but delivery **gate/verify commands** (auto-detected from
+the workspace, e.g. `python -m pytest`) and **agent-authored tests** routinely
+invoke plain `python` — without it those gates fail with "command not found",
+so tasks are wrongly reported as failed. (If you prefer not to install it
+system-wide, ensure `python` otherwise resolves for the `devteam` user.)
 
 `git` is required at runtime for `--deliver`: the delivery engine manages the
 workspace's branches, commits, and per-task worktrees by shelling out to it.
@@ -153,6 +160,13 @@ sudo systemctl daemon-reload
 sudo systemctl start dev-team@health.service
 journalctl -u dev-team@health.service -f
 ```
+
+> **Env-file gotcha:** keep every value on its own line with **no trailing `#`
+> comment**. Unlike a shell `source`, systemd's `EnvironmentFile` does **not**
+> strip an inline comment — `CLAUDE_CODE_OAUTH_TOKEN=sk-ant-...  # my token`
+> makes the comment part of the token, and the run fails with a confusing
+> `401 Invalid bearer token` at the first Claude call. Put comments on their
+> own lines.
 
 To run it on a schedule, pair the service with a systemd timer
 (`dev-team@health.timer`).
