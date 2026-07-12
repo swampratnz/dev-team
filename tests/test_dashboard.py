@@ -14,6 +14,7 @@ from dev_team.conventions import ConventionsProfile, ConventionsStore
 from dev_team.dashboard import (
     DASHBOARD_HTML,
     DashboardServer,
+    agent_history,
     collect_state,
 )
 from dev_team.eventlog import EventLog
@@ -151,6 +152,61 @@ def test_memory_state_filters_non_dict_decisions():
     assert memory["retrospectives"] == []
 
 
+# --- agent history -----------------------------------------------------------------
+
+
+def test_agent_history_filters_by_role_oldest_first():
+    ws = InMemoryWorkspace()
+    _journal(
+        ws,
+        AgentEvent("engineer", "implement", "first", "attempt 1", "Sam"),
+        AgentEvent("qa", "test", "someone else's event"),
+        AgentEvent("engineer", "review", "second"),
+        run="deliver-1",
+    )
+    history = agent_history(ws, "engineer")
+    assert [h["message"] for h in history] == ["first", "second"]
+    # only the timeline fields survive, oldest first
+    assert history[0] == {
+        "ts": 1.0,
+        "run": "deliver-1",
+        "stage": "implement",
+        "message": "first",
+        "detail": "attempt 1",
+    }
+
+
+def test_agent_history_groups_multiple_runs_in_order():
+    ws = InMemoryWorkspace()
+    _journal(ws, AgentEvent("engineer", "implement", "old"), run="deliver-old")
+    _journal(ws, AgentEvent("engineer", "review", "new"), run="deliver-new")
+    assert [h["run"] for h in agent_history(ws, "engineer")] == [
+        "deliver-old",
+        "deliver-new",
+    ]
+
+
+def test_agent_history_caps_at_the_last_hundred():
+    ws = InMemoryWorkspace()
+    _journal(
+        ws,
+        *[AgentEvent("engineer", "step", f"m{i}") for i in range(120)],
+        run="big",
+    )
+    history = agent_history(ws, "engineer")
+    assert len(history) == 100
+    # the newest survive; oldest-first means m119 is last
+    assert history[0]["message"] == "m20"
+    assert history[-1]["message"] == "m119"
+
+
+def test_agent_history_empty_for_unknown_or_absent_role():
+    ws = InMemoryWorkspace()
+    _journal(ws, AgentEvent("engineer", "implement", "building"))
+    assert agent_history(ws, "nobody") == []
+    assert agent_history(ws, "") == []
+
+
 # --- the HTTP server ----------------------------------------------------------------
 
 
@@ -193,6 +249,25 @@ def test_server_serves_known_reports_only(server):
             _get(server, bad)
         assert excinfo.value.code == 404
         excinfo.value.close()  # HTTPError carries the response socket
+
+
+def test_server_serves_agent_history_json(server):
+    headers, body = _get(server, "/api/agent?role=engineer")
+    assert headers["Content-Type"].startswith("application/json")
+    data = json.loads(body)
+    assert data["role"] == "engineer"
+    assert data["name"] == DEFAULT_CAST["engineer"].name
+    assert [h["message"] for h in data["history"]] == ["building"]
+    assert set(data["history"][0]) == {"ts", "run", "stage", "message", "detail"}
+
+
+def test_server_agent_history_unknown_and_absent_role(server):
+    # An unknown role is a 200 with an empty timeline, never an error.
+    _, body = _get(server, "/api/agent?role=ghost")
+    assert json.loads(body) == {"role": "ghost", "name": "ghost", "history": []}
+    # A missing role parameter degrades to the empty case too.
+    _, body = _get(server, "/api/agent")
+    assert json.loads(body) == {"role": "", "name": "", "history": []}
 
 
 def test_server_url_names_host_and_port(server):
