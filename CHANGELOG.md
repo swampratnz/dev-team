@@ -5,6 +5,31 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Assessment
+- **`rebuild` is a first-class classification**: the recommendation phase's
+  fixed vocabulary now distinguishes an incremental `strangler-rewrite`
+  from a big-bang `rebuild` (build a replacement from scratch; the old
+  system is a requirements document, not a foundation), and the prompt
+  defines every option so the choice is deliberate.
+- **Opt-in build probe** (`--build-probe` / `AssessConfig.build_probe`):
+  the detected profile's setup/verify commands are actually executed —
+  exit codes and output tails feed the buildability auditor as ground
+  truth and land in the report appendix and `--json` (`build_probe`).
+  Commands stop at the first failure; profiles with no locally runnable
+  commands (legacy .NET Framework) skip with a recorded reason. Off by
+  default: it runs the repository's own build (arbitrary code) and
+  mutates the working tree the way any build does.
+- **Lockfile parsing for the OSV scan**: exact resolved versions from
+  `package-lock.json` (v1–v3), `poetry.lock`, `Cargo.lock` (workspace
+  crates skipped), and NuGet `packages.lock.json` (`Project` references
+  skipped) join the manifest pins, so range-specified projects still get
+  a live vulnerability scan instead of the model-knowledge fallback.
+- **Audit blind spots**: the report appendix and `--json` (`blind_spots`)
+  deterministically name the top-level directories no phase finding (nor
+  dead-code probe) cited — a sampled audit can no longer read as a
+  complete one. Evidence citations count whether agents return a string
+  or a list of paths.
+
 ## [0.7.0] — Legacy-repo analysis: dead code, live CVEs, conventions, remote CI
 
 ### Assessment

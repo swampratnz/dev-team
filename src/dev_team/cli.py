@@ -209,6 +209,14 @@ def build_parser() -> argparse.ArgumentParser:
         "(with --assess).",
     )
     parser.add_argument(
+        "--build-probe",
+        action="store_true",
+        help="Actually run the detected setup/verify commands so the "
+        "buildability verdict rests on real exit codes (with --assess). "
+        "This executes the repository's own build — arbitrary code — so "
+        "only use it on trusted repos or inside a sandbox.",
+    )
+    parser.add_argument(
         "--workspace",
         default="./build",
         metavar="DIR",
@@ -326,6 +334,7 @@ def _validate_args(
             ("--no-osv-scan", args.no_osv_scan),
             ("--backlog", args.backlog),
             ("--no-conventions", args.no_conventions),
+            ("--build-probe", args.build_probe),
         ]
         passed = [flag for flag, is_set in assess_only if is_set]
         if passed:
@@ -447,6 +456,8 @@ async def _assess(team: DevTeam, args) -> int:
         config_kwargs["update_backlog"] = True
     if args.no_conventions:
         config_kwargs["save_conventions"] = False
+    if args.build_probe:
+        config_kwargs["build_probe"] = True
     outcome = await team.assess(
         workspace=LocalWorkspace(args.workspace),
         budget=Budget(limit_usd=args.budget_usd),

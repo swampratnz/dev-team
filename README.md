@@ -70,18 +70,26 @@ QA, security, docs, reliability, and deployment.
 - ✅ **Audits what it didn't build** — `--assess` turns the team loose on an
   existing repo (legacy .NET monolith included: solution-aware profiles,
   VSTest/xUnit failure parsing) and produces a phased, path-cited assessment
-  — buildability, dependency/secret/data risk, test reality, and a
-  classification with a sequenced remediation plan — without mutating the
-  repo (see [`docs/ASSESSMENT.md`](docs/ASSESSMENT.md)).
+  — buildability, dependency/secret/data risk, test reality, and a verdict
+  from a fixed vocabulary (revive-in-place, dependency-surgery,
+  strangler-rewrite, rebuild-from-scratch, archive) with a sequenced
+  remediation plan — without mutating the repo. Opt-in `--build-probe` runs
+  the project's own setup/verify commands so buildability rests on real exit
+  codes, and the report names its **audit blind spots** (top-level
+  directories no finding cited) so a sampled audit can't read as a complete
+  one (see [`docs/ASSESSMENT.md`](docs/ASSESSMENT.md)).
 - ✅ **Finds dead code deterministically** — exact probes, no model guessing:
   sources no legacy MSBuild project compiles, projects no solution includes,
   and directories dormant for a year while the repo stayed active. Vendored
   noise is excluded by default (`--exclude` to customise) and
   `--component-fanout` deep-dives each sub-project in parallel.
-- ✅ **Scans dependencies live** — exact pins parsed from `packages.config`,
-  `package.json`, `requirements.txt`, and `Cargo.toml` are checked against
-  OSV.dev in one batch call (graceful offline fallback, `--no-osv-scan` to
-  opt out), so CVE findings cite advisories, not recollections.
+- ✅ **Scans dependencies live** — exact pins parsed from the manifests
+  (`packages.config`, `package.json`, `requirements.txt`, `Cargo.toml`) and
+  the lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`, NuGet
+  `packages.lock.json`) are checked against OSV.dev in one batch call
+  (graceful offline fallback, `--no-osv-scan` to opt out), so CVE findings
+  cite advisories, not recollections — and range-specified projects still
+  get their resolved versions scanned.
 - ✅ **Learns the house style and follows it** — assessment captures a cited
   conventions profile (naming, layout, test patterns, plus `.editorconfig` /
   ReSharper `.DotSettings` / linter configs), persists it, and every later
@@ -256,16 +264,26 @@ Key modules:
   gating).
 - `execution.py` / `verification.py` / `changes.py` / `git.py` — workspaces,
   command runners, executable gates, change application, git porcelain.
+- `profile.py` / `context.py` / `failures.py` — project-type detection (the
+  auto-detected verify/setup/scan commands, including legacy .NET), the
+  deterministic repo map fed to planners, and red-baseline test-failure
+  attribution (pytest/go/cargo/VSTest/xUnit).
 - `memory.py` / `backlog.py` — blackboard, ADRs, cross-run memory,
   checkpoints, persistent backlog.
-- `budget.py` / `trace.py` / `approval.py` / `policy.py` — governance.
+- `budget.py` / `trace.py` / `approval.py` / `policy.py` / `instrument.py` —
+  governance; `InstrumentedRunner` meters and traces every agent call.
 - `interaction.py` / `persona.py` / `chat.py` — human-in-the-loop questions
   and approvals, the named-agent roster, and the conversational front door.
 - `scheduler.py` / `ordering.py` — dependency-aware concurrency and ordering.
 - `json_utils.py` / `parsing.py` — robust extraction of structured data from
   model output (with contract enforcement: blocking findings force rejection).
-- `assessment.py` — the read-only audit engine (see `docs/ASSESSMENT.md`).
+- `assessment.py` — the read-only audit engine (see `docs/ASSESSMENT.md`),
+  with its deterministic companions: `deadcode.py` (exact dead-code probes),
+  `depscan.py` (live OSV.dev dependency scanning), and `conventions.py`
+  (house-style capture and injection into later deliveries).
 - `evals.py` — the benchmark harness.
+- `events.py` / `report.py` / `errors.py` — progress events, result
+  rendering, and the exception hierarchy.
 - `team.py` — the `DevTeam` facade; `cli.py` — the `dev-team` command.
 
 ## Installation
@@ -343,6 +361,11 @@ dev-team --assess --workspace /path/to/legacy-repo \
 dev-team --assess --workspace /path/to/legacy-repo \
     --component-fanout --backlog --exclude 'Libraries/*' --exclude '*/bin/*' \
     "Full audit" "dead code, upgrade candidates, house conventions"
+
+# ground the buildability verdict in real exit codes (runs the repo's own
+# build — trusted repos or a sandbox only)
+dev-team --assess --workspace /path/to/legacy-repo --build-probe \
+    "Buildability" "can this actually restore and test today?"
 
 # deliver against a repo whose build only runs in remote CI
 dev-team "Fix the SVG endpoint" "..." --deliver --workspace /path/to/repo \

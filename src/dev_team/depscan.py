@@ -3,11 +3,15 @@
 The risk phase's CVE claims otherwise come from model knowledge — plausible,
 stale, and unverifiable. This module is the deterministic counterpart: exact
 pins are parsed straight out of the manifests (NuGet ``packages.config``,
-``package.json``, ``requirements.txt``, ``Cargo.toml``) and checked against
+``package.json``, ``requirements.txt``, ``Cargo.toml``) *and* the lockfiles
+(``package-lock.json``, ``poetry.lock``, ``Cargo.lock``, NuGet
+``packages.lock.json``) and checked against
 the OSV.dev batch API, which covers every major
-ecosystem through one endpoint. No network (or a failed query) degrades
-gracefully: the parsed inventory still feeds the report, annotated that the
-live scan was unavailable.
+ecosystem through one endpoint. Lockfiles matter on range-specified projects:
+a ``package.json`` full of ``^`` ranges yields nothing scannable, but its
+lockfile pins every resolved version exactly. No network (or a failed query)
+degrades gracefully: the parsed inventory still feeds the report, annotated
+that the live scan was unavailable.
 """
 
 from __future__ import annotations
@@ -71,7 +75,7 @@ class DependencyScan:
             return ""
         lines = [
             f"Dependency scan: {len(self.dependencies)} exactly-pinned "
-            "dependencies parsed from manifests."
+            "dependencies parsed from manifests and lockfiles."
         ]
         if self.queried:
             lines.append(
@@ -203,16 +207,141 @@ def parse_cargo_toml(text: str, manifest: str) -> List[Dependency]:
     return deps
 
 
+def parse_package_lock(text: str, manifest: str) -> List[Dependency]:
+    """npm ``package-lock.json``: exact resolved versions (v1, v2, and v3).
+
+    v2/v3 lockfiles carry a flat ``packages`` map keyed by install path; v1
+    lockfiles nest a ``dependencies`` tree. Both pin exactly, so every entry
+    is scannable — this is what rescues range-specified ``package.json``
+    projects from the model-knowledge fallback.
+    """
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    deps: List[Dependency] = []
+    packages = data.get("packages")
+    if isinstance(packages, dict):
+        for path, info in sorted(packages.items()):
+            # "" is the project itself; link entries point at workspace dirs.
+            if not path or not isinstance(info, dict) or info.get("link"):
+                continue
+            version = info.get("version")
+            name = info.get("name") or path.rpartition("node_modules/")[2]
+            if name and isinstance(version, str) and version:
+                deps.append(Dependency(name, version, "npm", manifest))
+        return deps
+
+    def walk(entries: Dict) -> None:
+        for name, info in sorted(entries.items()):
+            if not isinstance(info, dict):
+                continue
+            version = info.get("version")
+            if isinstance(version, str) and version:
+                deps.append(Dependency(name, version, "npm", manifest))
+            nested = info.get("dependencies")
+            if isinstance(nested, dict):
+                walk(nested)
+
+    entries = data.get("dependencies")
+    if isinstance(entries, dict):
+        walk(entries)
+    return deps
+
+
+def parse_poetry_lock(text: str, manifest: str) -> List[Dependency]:
+    """Poetry ``poetry.lock``: every ``[[package]]`` is an exact pin."""
+
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return []
+    entries = data.get("package")
+    if not isinstance(entries, list):
+        return []
+    deps = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name, version = entry.get("name"), entry.get("version")
+        if name and version:
+            deps.append(Dependency(str(name), str(version), "PyPI", manifest))
+    return deps
+
+
+def parse_cargo_lock(text: str, manifest: str) -> List[Dependency]:
+    """Cargo ``Cargo.lock``: exact pins for every external ``[[package]]``.
+
+    The workspace's own crates appear in the lockfile too, distinguishable by
+    their missing ``source`` — scanning the project against OSV as if it were
+    its own dependency would only produce noise, so those are skipped.
+    """
+
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return []
+    entries = data.get("package")
+    if not isinstance(entries, list):
+        return []
+    deps = []
+    for entry in entries:
+        if not isinstance(entry, dict) or "source" not in entry:
+            continue
+        name, version = entry.get("name"), entry.get("version")
+        if name and version:
+            deps.append(Dependency(str(name), str(version), "crates.io", manifest))
+    return deps
+
+
+def parse_packages_lock_json(text: str, manifest: str) -> List[Dependency]:
+    """NuGet ``packages.lock.json``: ``resolved`` versions per framework.
+
+    ``type: Project`` entries are references to sibling projects in the same
+    solution, not packages — skipped.
+    """
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    frameworks = data.get("dependencies")
+    if not isinstance(frameworks, dict):
+        return []
+    deps = []
+    for _, entries in sorted(frameworks.items()):
+        if not isinstance(entries, dict):
+            continue
+        for name, info in sorted(entries.items()):
+            if not isinstance(info, dict):
+                continue
+            if str(info.get("type", "")).lower() == "project":
+                continue
+            version = info.get("resolved")
+            if isinstance(version, str) and version:
+                deps.append(Dependency(name, version, "NuGet", manifest))
+    return deps
+
+
 _PARSERS = {
     "packages.config": parse_packages_config,
     "package.json": parse_package_json,
     "requirements.txt": parse_requirements_txt,
     "Cargo.toml": parse_cargo_toml,
+    "package-lock.json": parse_package_lock,
+    "poetry.lock": parse_poetry_lock,
+    "Cargo.lock": parse_cargo_lock,
+    "packages.lock.json": parse_packages_lock_json,
 }
 
 
 def collect_dependencies(workspace: Workspace) -> List[Dependency]:
-    """Parse every recognised manifest in the workspace, deduplicated."""
+    """Parse every recognised manifest and lockfile, deduplicated."""
 
     seen = set()
     deps: List[Dependency] = []

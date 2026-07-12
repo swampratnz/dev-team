@@ -598,6 +598,24 @@ def test_main_assess_new_flags_reach_config(tmp_path, capsys):
     assert not (repo / ".dev_team" / "conventions.json").exists()
 
 
+def test_main_assess_build_probe_reaches_config(tmp_path, capsys):
+    from test_assessment import assess_responses
+
+    repo = _dotnet_repo(tmp_path)
+    # legacy NuGet restore ⇒ dotnet-framework profile ⇒ the probe has no
+    # locally runnable commands, so the CLI path stays hermetic.
+    (repo / "packages.config").write_text("<packages/>")
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(
+        ["--assess", "--workspace", str(repo), "--build-probe", "--json"],
+        runner=runner,
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["build_probe"]["requested"] is True
+    assert "no locally runnable" in payload["build_probe"]["skipped_reason"]
+
+
 def test_assess_only_flags_rejected_outside_assess():
     for flag in (
         ["--exclude", "junk/*"],
@@ -606,6 +624,7 @@ def test_assess_only_flags_rejected_outside_assess():
         ["--no-osv-scan"],
         ["--backlog"],
         ["--no-conventions"],
+        ["--build-probe"],
     ):
         with pytest.raises(SystemExit) as excinfo:
             main(["Login", "Add login", *flag], runner=ScriptedRunner([]))
