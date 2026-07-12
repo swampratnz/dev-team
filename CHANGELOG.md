@@ -5,6 +5,23 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Dashboard
+- **`dev-team --dashboard` serves a local web dashboard over the
+  workspace** (`docs/DASHBOARD.md`): one card per agent with its current
+  stage and last activity, a live feed, recent runs, the backlog with
+  story-point progress and status chips, cross-run memory (retrospectives,
+  ADRs), captured conventions, and in-place viewing of assessment reports.
+  Stdlib-only (`http.server`), read-only over the workspace, self-contained
+  page (no external assets), localhost by default (`--port` / `--host` to
+  widen — it is unauthenticated, so only on trusted networks). A JSON API
+  (`/api/state`, `/api/report`) backs the page and is usable by other
+  tooling.
+- **Runs journal their progress**: every `--deliver`/`--assess` run appends
+  timestamped events (role, stage, message, persona, run id) to
+  `.dev_team/events.jsonl` — bounded, corruption-tolerant — which is what
+  the dashboard reads. Library users get the same via `EventLog` composed
+  into the engine `listener`.
+
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /
   SSH / `file://` URLs): the ref is cloned into the workspace — per-repo

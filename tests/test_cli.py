@@ -800,3 +800,105 @@ def test_main_repo_finds_user_level_env_file_without_flags(
     assert code == 0
     assert captured["token"] == "configured-once"
     assert f"env file: {config}" in capsys.readouterr().err
+
+
+# --- dashboard --------------------------------------------------------------------
+
+
+class _FakeDashboardServer:
+    instances = []
+
+    def __init__(self, workspace, *, host, port):
+        self.workspace, self.host, self.port = workspace, host, port
+        self.interrupted = False
+        self.shut_down = False
+        _FakeDashboardServer.instances.append(self)
+
+    @property
+    def url(self):
+        return f"http://{self.host}:{self.port}/"
+
+    def serve_forever(self):
+        if self.interrupted:
+            raise KeyboardInterrupt
+
+    def shutdown(self):
+        self.shut_down = True
+
+
+def test_main_dashboard_serves_workspace(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    code = main(
+        ["--dashboard", "--workspace", str(tmp_path), "--port", "9000",
+         "--host", "0.0.0.0"],
+        runner=ScriptedRunner([]),
+    )
+    assert code == 0
+    (server,) = _FakeDashboardServer.instances
+    assert (server.host, server.port) == ("0.0.0.0", 9000)
+    assert str(server.workspace.root) == str(tmp_path)
+    assert server.shut_down is True
+    assert "http://0.0.0.0:9000/" in capsys.readouterr().err
+
+
+def test_main_dashboard_defaults_and_ctrl_c(tmp_path, monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+
+    original_init = _FakeDashboardServer.__init__
+
+    def interrupting_init(self, workspace, *, host, port):
+        original_init(self, workspace, host=host, port=port)
+        self.interrupted = True
+
+    monkeypatch.setattr(_FakeDashboardServer, "__init__", interrupting_init)
+    code = main(["--dashboard", "--workspace", str(tmp_path)], runner=None)
+    assert code == 0  # KeyboardInterrupt is a clean stop, and no credentials needed
+    (server,) = _FakeDashboardServer.instances
+    assert (server.host, server.port) == ("127.0.0.1", 8737)
+    assert server.shut_down is True
+
+
+def test_main_dashboard_flag_validation():
+    for argv in (
+        ["--dashboard", "--assess"],
+        ["--dashboard", "--deliver", "T", "D"],
+        ["--dashboard", "--chat"],
+        ["T", "D", "--port", "9000"],
+        ["T", "D", "--host", "0.0.0.0"],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main(argv, runner=ScriptedRunner([]))
+        assert excinfo.value.code == 2
+
+
+def test_main_deliver_journals_events_for_the_dashboard(tmp_path):
+    from helpers import engine_responses
+
+    from dev_team.eventlog import EVENTS_PATH
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(_deliver_args(tmp_path), runner=runner)
+    assert code == 0
+    journal = (tmp_path / EVENTS_PATH).read_text().splitlines()
+    records = [json.loads(line) for line in journal]
+    assert records, "delivery left no event journal"
+    assert all(r["run"].startswith("deliver-") for r in records)
+    assert {"engineer", "reviewer"} <= {r["role"] for r in records}
+
+
+def test_main_assess_journals_events_for_the_dashboard(tmp_path):
+    from test_assessment import assess_responses
+
+    from dev_team.eventlog import EVENTS_PATH
+
+    repo = _dotnet_repo(tmp_path)
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(["--assess", "--workspace", str(repo)], runner=runner)
+    assert code == 0
+    records = [
+        json.loads(line)
+        for line in (repo / EVENTS_PATH).read_text().splitlines()
+    ]
+    assert any(r["run"].startswith("assess-") for r in records)

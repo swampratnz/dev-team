@@ -8,6 +8,7 @@ import json
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import List, Mapping, Optional
 
@@ -16,8 +17,10 @@ from .assessment import AssessConfig, outcome_to_dict
 from .budget import Budget
 from .chat import ChatSession, chat_system_prompt
 from .config import TeamConfig
+from .dashboard import DashboardServer
 from .engine import EngineConfig
 from .errors import DevTeamError
+from .eventlog import EventLog, compose
 from .events import AgentEvent
 from .execution import LocalWorkspace, SubprocessCommandRunner
 from .interaction import ChannelApprovalGate, ConsoleChannel
@@ -164,6 +167,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit the --workspace repository read-only (inventory, "
         "buildability, risk, tests/docs, recommendation) and write a cited "
         "markdown report. Optional description argument scopes the audit.",
+    )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Serve a local web dashboard over the --workspace: each "
+        "agent's last activity, recent runs, the backlog, cross-run memory, "
+        "and assessment reports. Read-only; runs happily alongside "
+        "--deliver/--assess runs on the same workspace.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port for --dashboard (default 8737).",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        metavar="ADDR",
+        help="Bind address for --dashboard (default 127.0.0.1). The "
+        "dashboard has no authentication and can read any file the "
+        "workspace holds — only widen this on a trusted network.",
     )
     parser.add_argument(
         "--report",
@@ -338,6 +363,15 @@ def _validate_args(
         parser.error("--chat and --assess are mutually exclusive")
     if args.assess and args.deliver:
         parser.error("--assess is read-only; it cannot be combined with --deliver")
+    if args.dashboard and (args.assess or args.deliver or args.chat):
+        parser.error(
+            "--dashboard is a viewer; run it as its own process alongside "
+            "--assess/--deliver/--chat runs"
+        )
+    if args.port is not None and not args.dashboard:
+        parser.error("--port: only valid with --dashboard")
+    if args.host is not None and not args.dashboard:
+        parser.error("--host: only valid with --dashboard")
     if args.report is not None and not args.assess:
         parser.error("--report: only valid with --assess")
     if args.chat:
@@ -346,7 +380,7 @@ def _validate_args(
                          "the title/description arguments")
         if args.json:
             parser.error("--json: not available with --chat (stdout is the conversation)")
-    elif not args.assess:
+    elif not (args.assess or args.dashboard):
         if args.title is None or args.description is None:
             parser.error("title and description are required (or use --chat)")
     if args.roster is not None and args.no_personas:
@@ -399,9 +433,10 @@ def _reject_deliver_only_flags(
         ("--remote-verify-trigger", args.remote_verify_trigger is not None),
     ]
     if not args.assess:
+        checks += [("--budget-usd", args.budget_usd is not None)]
+    if not (args.assess or args.dashboard):
         checks += [
             ("--workspace", args.workspace != parser.get_default("workspace")),
-            ("--budget-usd", args.budget_usd is not None),
         ]
     passed = [flag for flag, is_set in checks if is_set]
     if passed:
@@ -562,6 +597,28 @@ def _materialise_repo(args, default_workspace: str) -> None:
     )
 
 
+def _serve_dashboard(args) -> int:
+    """Serve the workspace dashboard until interrupted; returns exit code."""
+
+    server = DashboardServer(
+        LocalWorkspace(args.workspace),
+        host=args.host if args.host is not None else "127.0.0.1",
+        port=args.port if args.port is not None else 8737,
+    )
+    print(
+        f"dev-team dashboard for {args.workspace} at {server.url} "
+        "(Ctrl-C to stop)",
+        file=sys.stderr,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    return 0
+
+
 def _run(
     argv: Optional[List[str]],
     runner: Optional[AgentRunner],
@@ -570,6 +627,10 @@ def _run(
     parser = build_parser()
     args = parser.parse_args(argv)
     _validate_args(parser, args)
+
+    if args.dashboard:
+        # A read-only viewer: no agents run, so no Claude credentials needed.
+        return _serve_dashboard(args)
 
     if runner is None:
         # Only the real SDK runner needs credentials; an injected runner
@@ -585,12 +646,23 @@ def _run(
         min_coverage=args.min_coverage,
     )
 
-    listener = None
+    printer = None
     if args.verbose:
         # Progress goes to stderr so stdout stays a clean result document
         # (text summary or JSON), safe to pipe into e.g. ``jq``.
-        def listener(event: AgentEvent) -> None:  # noqa: E306
+        def printer(event: AgentEvent) -> None:  # noqa: E306
             print(str(event), file=sys.stderr)
+
+    event_log = None
+    if args.deliver or args.assess:
+        # Journal progress into the workspace so `dev-team --dashboard`
+        # (a separate process) can show what every agent is doing.
+        mode = "deliver" if args.deliver else "assess"
+        event_log = EventLog(
+            LocalWorkspace(args.workspace),
+            run=f"{mode}-{time.strftime('%Y%m%d-%H%M%S')}",
+        )
+    listener = compose(printer, event_log)
 
     team = DevTeam(
         runner,
