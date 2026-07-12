@@ -150,6 +150,10 @@ sudo mkdir -p /etc/dev-team
 sudo tee /etc/dev-team/health.env >/dev/null <<'EOF'
 CLAUDE_CODE_OAUTH_TOKEN=<token from claude setup-token>
 # ...or instead: ANTHROPIC_API_KEY=sk-ant-...
+# For --repo against private GitHub repositories (fine-grained PAT,
+# read-only Contents). dev-team also reads it from a file passed as
+# --env-file, which keeps it out of the process environment entirely:
+# GITHUB_TOKEN=github_pat_...
 DEV_TEAM_TITLE=Health endpoint
 DEV_TEAM_DESCRIPTION=Add a /health endpoint that returns 200 OK
 DEV_TEAM_ARGS=--json
@@ -185,6 +189,12 @@ runs from a web UI or chat bot instead, see
   root-owned `*.env` files (`chmod 600`), not in the unit or the repo. A
   subscription token is a credential for your whole Claude account — treat it
   like a password and regenerate it (`claude setup-token`) if exposed.
+- For `--repo`, prefer passing the GitHub token via `--env-file FILE` over
+  exporting it: dev-team reads the file itself, hands the credential to git
+  per-command, and never places it in the process environment — so gates,
+  build probes, and the code under audit cannot read it. Use a fine-grained
+  PAT with read-only **Contents** permission scoped to the repositories you
+  actually audit, not a classic `repo`-scope token.
 - The agents run the Claude CLI in `acceptEdits` mode by default, with tools
   granted per call via `allowed_tools`. `bypassPermissions` is opt-in via
   `TeamConfig`; only enable it inside a sandboxed container/VM.

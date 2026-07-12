@@ -9,10 +9,11 @@ and its tests — never need to touch a real filesystem or spawn processes.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Protocol, Sequence, runtime_checkable
+from typing import Dict, List, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from .errors import DevTeamError
 
@@ -206,8 +207,14 @@ class CommandRunner(Protocol):
         *,
         cwd: Optional[str] = None,
         timeout: Optional[float] = None,
+        env: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
-        """Execute ``command`` and return a :class:`CommandResult`."""
+        """Execute ``command`` and return a :class:`CommandResult`.
+
+        ``env`` entries are laid *over* the inherited environment for this
+        one command — the mechanism callers use to hand a secret (e.g. a git
+        credential) to a single subprocess without exporting it process-wide.
+        """
         ...
 
 
@@ -229,6 +236,7 @@ class SubprocessCommandRunner:
         *,
         cwd: Optional[str] = None,
         timeout: Optional[float] = None,
+        env: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
         args = list(command)
         try:
@@ -239,6 +247,7 @@ class SubprocessCommandRunner:
                 text=True,
                 errors="replace",
                 timeout=timeout if timeout is not None else self.timeout,
+                env=None if env is None else {**os.environ, **env},
             )
         except FileNotFoundError as exc:
             return CommandResult(args, EXIT_NOT_FOUND, "", str(exc))
@@ -270,6 +279,7 @@ class DryRunCommandRunner:
         *,
         cwd: Optional[str] = None,
         timeout: Optional[float] = None,
+        env: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
         args = list(command)
         self.calls.append(args)
@@ -288,6 +298,7 @@ class FakeCommandRunner:
     rules: List[tuple] = field(default_factory=list)
     default_exit_code: int = 0
     calls: List[List[str]] = field(default_factory=list)
+    envs: List[Optional[Mapping[str, str]]] = field(default_factory=list)
 
     def add_rule(self, match: str, result: CommandResult) -> "FakeCommandRunner":
         """Register ``result`` for commands containing ``match``."""
@@ -301,9 +312,11 @@ class FakeCommandRunner:
         *,
         cwd: Optional[str] = None,
         timeout: Optional[float] = None,
+        env: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
         args = list(command)
         self.calls.append(args)
+        self.envs.append(env)
         joined = " ".join(args)
         for match, result in self.rules:
             if match in joined:

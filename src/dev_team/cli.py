@@ -19,7 +19,7 @@ from .config import TeamConfig
 from .engine import EngineConfig
 from .errors import DevTeamError
 from .events import AgentEvent
-from .execution import LocalWorkspace
+from .execution import LocalWorkspace, SubprocessCommandRunner
 from .interaction import ChannelApprovalGate, ConsoleChannel
 from .models import FeatureRequest
 from .persona import Roster
@@ -30,6 +30,7 @@ from .report import (
     result_to_dict,
 )
 from .sdk import AgentRunner, ChatBackend, ClaudeChatBackend
+from .sources import clone_or_update, parse_repo, resolve_github_token
 from .team import DevTeam
 
 # Any one of these satisfies the credential preflight. The Claude CLI (which
@@ -223,6 +224,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory the delivery engine works in (with --deliver).",
     )
     parser.add_argument(
+        "--repo",
+        default=None,
+        metavar="OWNER/NAME",
+        help="Clone this GitHub repository (owner/name or a git URL) and use "
+        "the clone as the workspace (with --assess or --deliver). Private "
+        "repositories authenticate with a GITHUB_TOKEN/GH_TOKEN read from "
+        "--env-file (or ./.env, or the process environment). An existing "
+        "clone is fast-forwarded instead of re-cloned.",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=None,
+        metavar="FILE",
+        help="KEY=VALUE file holding GITHUB_TOKEN/GH_TOKEN for --repo "
+        "(default: ./.env when present). The token stays out of the "
+        "process environment, so commands the agents run never see it.",
+    )
+    parser.add_argument(
         "--verify-command",
         default=None,
         metavar="CMD",
@@ -324,6 +343,10 @@ def _validate_args(
             parser.error("title and description are required (or use --chat)")
     if args.roster is not None and args.no_personas:
         parser.error("--roster and --no-personas are mutually exclusive")
+    if args.repo is not None and not (args.assess or args.deliver or args.chat):
+        parser.error("--repo: only valid with --assess or --deliver")
+    if args.env_file is not None and args.repo is None:
+        parser.error("--env-file: only valid with --repo")
     if args.remote_verify_trigger is not None and args.remote_verify_status is None:
         parser.error("--remote-verify-trigger requires --remote-verify-status")
     if not args.assess:
@@ -507,6 +530,29 @@ async def _chat(
     return await session.run()
 
 
+def _materialise_repo(args, default_workspace: str) -> None:
+    """Clone (or update) ``--repo`` and point ``--workspace`` at the result.
+
+    The token is resolved from ``--env-file`` (default: ``./.env`` when
+    present) or, failing that, taken *out of* the process environment — the
+    engines' subprocesses must never inherit it. An explicit ``--workspace``
+    is the clone destination; otherwise each repository gets its own
+    directory under the default workspace root.
+    """
+
+    ref = parse_repo(args.repo)
+    env_file = args.env_file
+    if env_file is None and Path(".env").is_file():
+        env_file = ".env"
+    token = resolve_github_token(env_file)
+    if args.workspace == default_workspace:
+        args.workspace = str(Path(default_workspace) / ref.workspace_name)
+    print(f"fetching {ref.slug} into {args.workspace}", file=sys.stderr)
+    clone_or_update(
+        ref, args.workspace, runner=SubprocessCommandRunner(), token=token
+    )
+
+
 def _run(
     argv: Optional[List[str]],
     runner: Optional[AgentRunner],
@@ -520,6 +566,9 @@ def _run(
         # Only the real SDK runner needs credentials; an injected runner
         # (tests, embedding) brings its own transport.
         ensure_credentials()
+
+    if args.repo is not None:
+        _materialise_repo(args, parser.get_default("workspace"))
 
     config = TeamConfig(
         model=args.model,

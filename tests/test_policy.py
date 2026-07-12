@@ -68,3 +68,10 @@ def test_guarded_runner_approval_denied():
     assert result.exit_code == EXIT_DENIED
     assert "approval denied" in result.stderr
     assert inner.calls == []  # inner never ran
+
+
+def test_guarded_runner_passes_env_through():
+    inner = FakeCommandRunner()
+    guarded = GuardedCommandRunner(inner)
+    guarded.run(["git", "clone", "x"], env={"GIT_TERMINAL_PROMPT": "0"})
+    assert inner.envs == [{"GIT_TERMINAL_PROMPT": "0"}]

@@ -134,6 +134,14 @@ from .policy import GuardedCommandRunner, PolicyVerdict, SideEffectPolicy
 from .profile import ProjectProfile, detect_project
 from .scheduler import ScheduledResult, ScheduleStatus, schedule
 from .sdk import AgentResult, AgentRunner, ClaudeAgentRunner
+from .sources import (
+    RepoRef,
+    SourceError,
+    clone_or_update,
+    load_env_file,
+    parse_repo,
+    resolve_github_token,
+)
 from .team import DevTeam, build_workflow
 from .trace import Tracer, TraceSpan
 from .verification import (
@@ -259,6 +267,13 @@ __all__ = [
     "build_repo_context",
     "parse_failed_tests",
     "new_failures",
+    # repository sources
+    "RepoRef",
+    "SourceError",
+    "parse_repo",
+    "clone_or_update",
+    "load_env_file",
+    "resolve_github_token",
     # verification
     "Gate",
     "GateContext",
