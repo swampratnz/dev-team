@@ -22,13 +22,52 @@ _FALLBACK: Tuple[str, ...] = ("pytest", "-q")
 
 @dataclass(frozen=True)
 class ProjectProfile:
-    """What the workspace looks like and how to build/verify it."""
+    """What the workspace looks like and how to build/verify it.
+
+    ``verify_command`` is ``None`` when the stack was recognised but cannot
+    be built or tested on this machine (``locally_runnable`` is then False):
+    the delivery engine degrades to evidence-based review or a remote CI
+    gate instead of failing every task on a command that can never work.
+    """
 
     kind: str
-    verify_command: Tuple[str, ...]
+    verify_command: Optional[Tuple[str, ...]]
     setup_command: Optional[Tuple[str, ...]] = None
     security_scan_command: Optional[Tuple[str, ...]] = None
     reason: str = ""
+    locally_runnable: bool = True
+
+
+# Markers of old-style MSBuild project XML, which the cross-platform `dotnet`
+# CLI cannot restore, build, or test on any OS.
+_LEGACY_CSPROJ_MARKERS = ("<TargetFrameworkVersion>", "ToolsVersion=")
+
+# How many project files to sample for legacy markers before concluding.
+_LEGACY_CSPROJ_SAMPLE = 5
+
+
+def _legacy_dotnet_reason(workspace: Workspace, files: set) -> Optional[str]:
+    """Why the workspace looks like legacy .NET Framework, or ``None``.
+
+    ``packages.config`` anywhere in the tree means legacy NuGet restore;
+    old-style project XML (``ToolsVersion``/``TargetFrameworkVersion``) means
+    the project predates the SDK-style format. Either way ``dotnet test``
+    fails before running a single test.
+    """
+
+    for path in sorted(files):
+        if path == "packages.config" or path.endswith("/packages.config"):
+            return f"{path} (legacy NuGet restore)"
+    csprojs = sorted(f for f in files if f.endswith(".csproj"))
+    for path in csprojs[:_LEGACY_CSPROJ_SAMPLE]:
+        try:
+            head = workspace.read_text(path)[:4_000]
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        for marker in _LEGACY_CSPROJ_MARKERS:
+            if marker in head:
+                return f"{marker.strip('<>=')} in {path}"
+    return None
 
 
 def detect_project(workspace: Workspace) -> ProjectProfile:
@@ -51,6 +90,16 @@ def detect_project(workspace: Workspace) -> ProjectProfile:
         and (f.endswith(".sln") or f.endswith(".csproj") or f == "global.json")
     )
     if dotnet_markers:
+        legacy = _legacy_dotnet_reason(workspace, files)
+        if legacy is not None:
+            # .NET Framework: buildable only by MSBuild on Windows. No local
+            # command can verify it, so none is proposed.
+            return ProjectProfile(
+                kind="dotnet-framework",
+                verify_command=None,
+                reason=f"{dotnet_markers[0]} at workspace root; {legacy}",
+                locally_runnable=False,
+            )
         return ProjectProfile(
             kind="dotnet",
             verify_command=("dotnet", "test"),

@@ -47,6 +47,7 @@ from .backlog import BacklogStore, ItemStatus
 from .budget import Budget, BudgetExceededError
 from .changes import ChangeApplier
 from .context import build_repo_context
+from .conventions import ConventionsStore
 from .errors import DevTeamError
 from .events import AgentEvent, Listener, emit
 from .failures import new_failures, parse_failed_tests
@@ -99,7 +100,14 @@ from .profile import detect_project
 from .scheduler import ScheduledResult, schedule
 from .sdk import AgentRunner
 from .trace import Tracer
-from .verification import CommandGate, DefinitionOfDone, GateContext, DoDReport
+from .verification import (
+    CommandGate,
+    DefinitionOfDone,
+    DoDReport,
+    GateContext,
+    PredicateGate,
+    RemoteCIGate,
+)
 
 # Internal bookkeeping lives under this prefix and is not part of the product.
 _INTERNAL_PREFIX = ".dev_team/"
@@ -140,7 +148,14 @@ class EngineConfig:
     - ``fail_to_pass_check``: after gates pass, re-run them with the
       implementation reverted; if the tests still pass they never exercised
       the change, and the attempt is rejected as vacuous (SWT-bench logic).
-      Skipped for dry runs.
+      Skipped for dry runs, and whenever verification is remote or degraded
+      (re-running those "gates" on reverted code proves nothing).
+    - ``remote_verify_status`` / ``remote_verify_trigger``: delegate
+      verification to an external CI system (see
+      :class:`~dev_team.verification.RemoteCIGate`) — the escape hatch for
+      repositories whose build only runs remotely (e.g. legacy .NET
+      Framework on a Windows pipeline). ``status_command`` is polled until
+      it exits zero; the optional trigger kicks the remote run off first.
     """
 
     model: Optional[str] = None
@@ -167,6 +182,10 @@ class EngineConfig:
     lint_command: Optional[Sequence[str]] = None
     security_scan_command: Optional[Sequence[str]] = None
     fail_to_pass_check: bool = True
+    remote_verify_status: Optional[Sequence[str]] = None
+    remote_verify_trigger: Optional[Sequence[str]] = None
+    remote_verify_max_polls: int = 30
+    remote_verify_interval_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         if self.max_task_attempts < 1:
@@ -175,6 +194,15 @@ class EngineConfig:
             raise ValueError("max_concurrency must be at least 1")
         if self.json_retries < 0:
             raise ValueError("json_retries must be non-negative")
+        if self.remote_verify_max_polls < 1:
+            raise ValueError("remote_verify_max_polls must be at least 1")
+        if self.remote_verify_interval_seconds < 0:
+            raise ValueError("remote_verify_interval_seconds must be non-negative")
+        if self.remote_verify_trigger is not None and self.remote_verify_status is None:
+            raise ValueError(
+                "remote_verify_trigger requires remote_verify_status "
+                "(a trigger with nothing to poll can never pass)"
+            )
 
 
 @dataclass
@@ -429,15 +457,24 @@ class DeliveryEngine:
         self._use_worktrees = self.config.worktrees
 
         self.change_applier = ChangeApplier(self.workspace)
+        # Whether the gates genuinely exercise the change on this machine.
+        # Remote CI and degraded (evidence-only) verification both set this
+        # False, which disables the fail-to-pass check: re-running such
+        # "gates" against reverted code proves nothing about the tests.
+        self._local_verification = True
         # Gate resolution: an injected DoD wins; an explicit verify_command
-        # builds one; otherwise the command is auto-detected from the
-        # workspace at deliver time (after setup, when manifests exist).
+        # builds one; a configured remote CI verification comes next;
+        # otherwise the command is auto-detected from the workspace at
+        # deliver time (after setup, when manifests exist).
         if definition_of_done is not None:
             self.definition_of_done: Optional[DefinitionOfDone] = definition_of_done
         elif self.config.verify_command is not None:
             self.definition_of_done = DefinitionOfDone(
                 [CommandGate("tests", self.config.verify_command)]
             )
+        elif self.config.remote_verify_status is not None:
+            self.definition_of_done = DefinitionOfDone([self._remote_ci_gate()])
+            self._local_verification = False
         else:
             self.definition_of_done = None
         # A real workspace gets a persistent backlog by default; without one
@@ -461,6 +498,7 @@ class DeliveryEngine:
         self._baseline_failures = None
         self._baseline_sha: Optional[str] = None
         self._profile = None
+        self._conventions: Optional[str] = None
         self._scorecard: Dict[str, int] = {}
 
         def make(cls):
@@ -555,6 +593,15 @@ class DeliveryEngine:
 
         repo_ctx = build_repo_context(self.workspace)
         snapshot_memory = self.memory.load()
+        # A stored conventions profile (captured by an assessment run) makes
+        # "follows the house style" part of implementation and review.
+        stored_conventions = ConventionsStore(self.workspace).load()
+        self._conventions = stored_conventions.render() if stored_conventions else None
+        if self._conventions:
+            self._event(
+                "conventions",
+                "House conventions profile loaded; engineer and reviewer will follow it",
+            )
         # Continue ADR numbering where earlier runs stopped, so the persisted
         # decision log never collides ids.
         self.blackboard.seed_decision_ids(
@@ -810,14 +857,56 @@ class DeliveryEngine:
         if self.definition_of_done is not None:
             return
         profile = self._profile or detect_project(self.workspace)
+        self.blackboard.put("project_profile", profile.kind)
+        if profile.verify_command is None:
+            # The stack was recognised but cannot build or test on this
+            # machine (e.g. legacy .NET Framework). Running any local command
+            # would fail every task for reasons no engineer can fix, so
+            # verification degrades to an always-pass marker gate: review,
+            # security, and static findings become the quality bar, and the
+            # fail-to-pass check is disabled as meaningless.
+            self._local_verification = False
+            self.definition_of_done = DefinitionOfDone(
+                [
+                    PredicateGate(
+                        "verification-unavailable",
+                        lambda _ctx: True,
+                        detail=(
+                            f"{profile.kind} is not locally runnable "
+                            f"({profile.reason}); relying on evidence-based "
+                            "review — configure remote_verify_status to gate "
+                            "on your real CI instead"
+                        ),
+                    )
+                ]
+            )
+            self._event(
+                "gates",
+                f"Auto-detected {profile.kind} project — no local verify command",
+                detail=(
+                    f"{profile.reason}; verification degraded to evidence-based "
+                    "review (set remote_verify_status to gate on real CI)"
+                ),
+            )
+            return
         self.definition_of_done = DefinitionOfDone(
             [CommandGate("tests", profile.verify_command)]
         )
-        self.blackboard.put("project_profile", profile.kind)
         self._event(
             "gates",
             f"Auto-detected {profile.kind} project",
             detail=f"verify: {' '.join(profile.verify_command)} ({profile.reason})",
+        )
+
+    def _remote_ci_gate(self) -> RemoteCIGate:
+        """The configured external-CI gate (requires remote_verify_status)."""
+
+        return RemoteCIGate(
+            "remote-ci",
+            self.config.remote_verify_status,
+            trigger_command=self.config.remote_verify_trigger,
+            max_polls=self.config.remote_verify_max_polls,
+            poll_interval_seconds=self.config.remote_verify_interval_seconds,
         )
 
     def _gate_context(
@@ -1026,6 +1115,7 @@ class DeliveryEngine:
                         design,
                         feedback,
                         cwd=str(self.workdir),
+                        conventions=self._conventions,
                         model=model,
                         tools=self.config.engineer_tools,
                     )
@@ -1044,6 +1134,7 @@ class DeliveryEngine:
                         for f in self.workspace.list_files()
                         if not f.startswith(_INTERNAL_PREFIX)
                     ],
+                    conventions=self._conventions,
                     model=model,
                 )
                 async with self._integration_lock:
@@ -1103,6 +1194,7 @@ class DeliveryEngine:
                     design,
                     feedback,
                     cwd=wt_path,
+                    conventions=self._conventions,
                     model=self._attempt_model(attempts),
                     tools=self.config.engineer_tools,
                 )
@@ -1229,6 +1321,7 @@ class DeliveryEngine:
                 file_contents=contents,
                 diff=diff,
                 static_findings=static_findings,
+                conventions=self._conventions,
                 workspace_root=cwd if cwd is not None else self.workdir,
             )
             if not review.approved:
@@ -1349,6 +1442,10 @@ class DeliveryEngine:
         """
 
         if not self.config.fail_to_pass_check or not self.config.qa_tests:
+            return False
+        if not self._local_verification:
+            # Remote or degraded gates don't run the tests here; re-evaluating
+            # them against reverted code cannot tell vacuous from real.
             return False
         if isinstance(self.command_runner.inner, DryRunCommandRunner):
             return False
