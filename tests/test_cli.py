@@ -688,3 +688,90 @@ def test_deliver_remote_verify_builds_remote_gate(tmp_path, monkeypatch):
         config=config,
     )
     assert isinstance(engine.definition_of_done.gates[0], RemoteCIGate)
+
+
+# --- --repo / --env-file ----------------------------------------------------------
+
+
+def _fake_clone_writing_dotnet(captured):
+    from pathlib import Path
+
+    def fake_clone(ref, dest, *, runner, token=None, timeout=None):
+        captured.update(slug=ref.slug, dest=dest, token=token)
+        target = Path(dest)
+        (target / "src" / "Api").mkdir(parents=True, exist_ok=True)
+        (target / "MyApp.sln").write_text("Microsoft Visual Studio Solution File")
+        (target / "src" / "Api" / "Api.csproj").write_text("<Project/>")
+        return dest
+
+    return fake_clone
+
+
+def test_main_repo_clones_with_env_file_token_then_assesses(
+    tmp_path, monkeypatch, capsys
+):
+    from pathlib import Path
+
+    from test_assessment import assess_responses
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    (tmp_path / ".env").write_text("GITHUB_TOKEN=file-token\n")
+    captured = {}
+    monkeypatch.setattr(
+        "dev_team.cli.clone_or_update", _fake_clone_writing_dotnet(captured)
+    )
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(["--assess", "--repo", "acme/mono", "--json"], runner=runner)
+    assert code == 0
+    assert captured["slug"] == "acme/mono"
+    assert captured["dest"] == str(Path("./build") / "acme__mono")
+    assert captured["token"] == "file-token"
+    assert "fetching acme/mono" in capsys.readouterr().err
+
+
+def test_main_repo_explicit_workspace_and_process_env_fallback(
+    tmp_path, monkeypatch, capsys
+):
+    import os
+
+    from test_assessment import assess_responses
+
+    monkeypatch.chdir(tmp_path)  # no .env here
+    monkeypatch.setenv("GITHUB_TOKEN", "proc-token")
+    captured = {}
+    monkeypatch.setattr(
+        "dev_team.cli.clone_or_update", _fake_clone_writing_dotnet(captured)
+    )
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(
+        [
+            "--assess", "--repo", "acme/mono",
+            "--workspace", str(tmp_path / "here"), "--json",
+        ],
+        runner=runner,
+    )
+    assert code == 0
+    assert captured["dest"] == str(tmp_path / "here")
+    assert captured["token"] == "proc-token"
+    # the token was consumed out of the environment the engines inherit
+    assert "GITHUB_TOKEN" not in os.environ
+
+
+def test_main_repo_requires_assess_deliver_or_chat():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--repo", "acme/mono"], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+
+
+def test_main_env_file_requires_repo():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--assess", "--env-file", ".env"], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+
+
+def test_main_repo_invalid_ref_fails_cleanly(capsys):
+    code = main(["--assess", "--repo", "%%%"], runner=ScriptedRunner([]))
+    assert code == 2
+    assert "unrecognised repository reference" in capsys.readouterr().err

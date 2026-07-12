@@ -174,3 +174,30 @@ def test_local_workspace_write_is_atomic_and_leaves_no_staging_file(tmp_path):
     assert ws.read_text("data.json") == '{"ok": false}'
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".dev-team-tmp")]
     assert leftovers == []
+
+
+def test_subprocess_env_overlays_inherited_environment():
+    import os
+    import sys
+
+    from dev_team.execution import SubprocessCommandRunner
+
+    runner = SubprocessCommandRunner()
+    code = "import os; print(os.environ['DT_EXTRA'], 'PATH' in os.environ)"
+    result = runner.run(
+        [sys.executable, "-c", code], env={"DT_EXTRA": "overlay-value"}
+    )
+    assert result.ok
+    assert result.stdout.strip() == "overlay-value True"
+    assert "DT_EXTRA" not in os.environ  # the overlay never leaks back
+
+
+def test_dry_run_and_fake_runner_accept_env():
+    from dev_team.execution import DryRunCommandRunner, FakeCommandRunner
+
+    dry = DryRunCommandRunner()
+    assert dry.run(["x"], env={"A": "1"}).ok
+    fake = FakeCommandRunner()
+    fake.run(["x"], env={"A": "1"})
+    fake.run(["y"])
+    assert fake.envs == [{"A": "1"}, None]

@@ -102,6 +102,13 @@ QA, security, docs, reliability, and deployment.
   locally (legacy .NET Framework) degrade to evidence-based review instead
   of failing every task, or gate on your real pipeline via
   `--remote-verify-trigger` / `--remote-verify-status`.
+- ✅ **Fetches the repo itself** — `--repo owner/name` clones (or
+  fast-forwards) the target straight from GitHub and uses the clone as the
+  workspace; private repositories authenticate with a `GITHUB_TOKEN` read
+  from an env file (`--env-file`, or `./.env`). The token never touches the
+  URL, argv, `.git/config`, or the environment of any command the agents
+  run — it is handed to git per-command and stripped from the process
+  environment.
 - ✅ **Ubuntu-ready** — packaged for deployment as a container or systemd unit.
 
 The capability set was chosen from a structured research pass across seven
@@ -268,6 +275,8 @@ Key modules:
   auto-detected verify/setup/scan commands, including legacy .NET), the
   deterministic repo map fed to planners, and red-baseline test-failure
   attribution (pytest/go/cargo/VSTest/xUnit).
+- `sources.py` — `--repo`: GitHub refs resolved and cloned into the
+  workspace, PAT-authenticated from an env file with strict token hygiene.
 - `memory.py` / `backlog.py` — blackboard, ADRs, cross-run memory,
   checkpoints, persistent backlog.
 - `budget.py` / `trace.py` / `approval.py` / `policy.py` / `instrument.py` —
@@ -355,6 +364,13 @@ Audit an existing repository (read-only; writes only the report):
 dev-team --assess --workspace /path/to/legacy-repo \
     --report audit/assessment.md \
     "Legacy monolith" "dormant 2-3 years, frontend + backend" --budget-usd 10
+
+# no local checkout? point at GitHub and let it clone (private repos read
+# GITHUB_TOKEN from --env-file or ./.env; the token never reaches the
+# commands the agents execute)
+echo 'GITHUB_TOKEN=github_pat_...' > ~/.config/dev-team.env && chmod 600 ~/.config/dev-team.env
+dev-team --assess --repo acme/legacy-monolith --env-file ~/.config/dev-team.env \
+    "Legacy monolith" "assess upgrade paths vs rebuild"
 
 # a deep audit of a monolith: per-component fan-out, findings into the
 # backlog for later delivery runs, extra excludes for vendored noise

@@ -13,7 +13,7 @@ the whole workspace inside an isolated container or VM as well.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from .approval import ApprovalGate, ApprovalRequest, AutoApprover
 from .execution import CommandResult, CommandRunner
@@ -93,6 +93,7 @@ class GuardedCommandRunner:
         *,
         cwd: Optional[str] = None,
         timeout: Optional[float] = None,
+        env: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
         args = list(command)
         verdict = self.policy.evaluate(args)
@@ -106,4 +107,8 @@ class GuardedCommandRunner:
                 return CommandResult(
                     args, EXIT_DENIED, "", f"approval denied: {decision.reason}"
                 )
+        if env is not None:
+            return self.inner.run(args, cwd=cwd, timeout=timeout, env=env)
+        # Omit env entirely when unused so pre-env CommandRunner
+        # implementations (user-supplied doubles included) keep working.
         return self.inner.run(args, cwd=cwd, timeout=timeout)

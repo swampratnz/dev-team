@@ -5,6 +5,27 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Sources
+- **`--repo owner/name` fetches the repository itself** (also full HTTPS /
+  SSH / `file://` URLs): the ref is cloned into the workspace — per-repo
+  directory under `./build/` by default, or exactly `--workspace` — and an
+  existing clone of the same remote is fast-forwarded instead of re-cloned
+  (anything else at the destination is refused, and local changes fail the
+  update loudly rather than being overwritten). Valid with `--assess`,
+  `--deliver`, and `--chat`.
+- **PAT auth with strict token hygiene**: `GITHUB_TOKEN`/`GH_TOKEN` is read
+  from an env file (`--env-file FILE`, or `./.env` when present) or, failing
+  that, taken *out of* the process environment. git receives the credential
+  through per-command `GIT_CONFIG_*` variables (an `http.extraheader`
+  basic-auth header) — never the URL — so nothing token-shaped lands in
+  argv, `.git/config`, process listings, or the environment of any command
+  the engines execute (gates, build probes, delivered code). Clone errors
+  are scrubbed and a 404 explains that GitHub hides unauthorized private
+  repositories.
+- `CommandRunner.run()` grew an optional `env` overlay for exactly this
+  kind of single-command secret; `GuardedCommandRunner` forwards it only
+  when set, so pre-existing custom runners keep working.
+
 ### Assessment
 - **`rebuild` is a first-class classification**: the recommendation phase's
   fixed vocabulary now distinguishes an incremental `strangler-rewrite`
