@@ -167,6 +167,48 @@ def build_parser() -> argparse.ArgumentParser:
         "(with --assess; default: audit/assessment.md).",
     )
     parser.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        dest="exclude_globs",
+        metavar="GLOB",
+        help="Exclude paths matching this glob from the assessment "
+        "(repeatable; replaces the built-in vendored/build-output defaults).",
+    )
+    parser.add_argument(
+        "--max-tree-entries",
+        type=int,
+        default=None,
+        metavar="N",
+        help="How many file-tree entries the assessment evidence may list "
+        "(with --assess; default 400).",
+    )
+    parser.add_argument(
+        "--component-fanout",
+        action="store_true",
+        help="Deep-dive each detected sub-project with its own parallel "
+        "audit (with --assess).",
+    )
+    parser.add_argument(
+        "--no-osv-scan",
+        action="store_true",
+        help="Skip the live OSV.dev vulnerability scan of pinned "
+        "dependencies (with --assess).",
+    )
+    parser.add_argument(
+        "--backlog",
+        action="store_true",
+        help="Convert assessment findings into stories in the persistent "
+        "backlog (.dev_team/backlog.json) so delivery runs can work them "
+        "off (with --assess).",
+    )
+    parser.add_argument(
+        "--no-conventions",
+        action="store_true",
+        help="Do not persist the captured house-conventions profile "
+        "(with --assess).",
+    )
+    parser.add_argument(
         "--workspace",
         default="./build",
         metavar="DIR",
@@ -185,6 +227,21 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="CMD",
         help="Command run once in the workspace before delivery starts, "
         "e.g. 'npm install' (with --deliver).",
+    )
+    parser.add_argument(
+        "--remote-verify-status",
+        default=None,
+        metavar="CMD",
+        help="Delegate verification to an external CI system: this command "
+        "is polled until it exits zero, e.g. a pipeline status check "
+        "(with --deliver). For stacks that cannot build locally.",
+    )
+    parser.add_argument(
+        "--remote-verify-trigger",
+        default=None,
+        metavar="CMD",
+        help="Command that kicks off the remote CI run before polling "
+        "--remote-verify-status (with --deliver).",
     )
     parser.add_argument(
         "--branch",
@@ -259,6 +316,20 @@ def _validate_args(
             parser.error("title and description are required (or use --chat)")
     if args.roster is not None and args.no_personas:
         parser.error("--roster and --no-personas are mutually exclusive")
+    if args.remote_verify_trigger is not None and args.remote_verify_status is None:
+        parser.error("--remote-verify-trigger requires --remote-verify-status")
+    if not args.assess:
+        assess_only = [
+            ("--exclude", args.exclude_globs is not None),
+            ("--max-tree-entries", args.max_tree_entries is not None),
+            ("--component-fanout", args.component_fanout),
+            ("--no-osv-scan", args.no_osv_scan),
+            ("--backlog", args.backlog),
+            ("--no-conventions", args.no_conventions),
+        ]
+        passed = [flag for flag, is_set in assess_only if is_set]
+        if passed:
+            parser.error(f"{', '.join(passed)}: only valid with --assess")
     _reject_deliver_only_flags(parser, args)
 
 
@@ -284,6 +355,8 @@ def _reject_deliver_only_flags(
         ("--proceed-on-red-baseline", args.proceed_on_red_baseline),
         ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
         ("--no-commit", args.no_commit),
+        ("--remote-verify-status", args.remote_verify_status is not None),
+        ("--remote-verify-trigger", args.remote_verify_trigger is not None),
     ]
     if not args.assess:
         checks += [
@@ -320,6 +393,16 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         branch=args.branch,
         allow_dirty_baseline=args.allow_dirty_baseline,
         require_green_baseline=not args.proceed_on_red_baseline,
+        remote_verify_status=(
+            tuple(shlex.split(args.remote_verify_status))
+            if args.remote_verify_status
+            else None
+        ),
+        remote_verify_trigger=(
+            tuple(shlex.split(args.remote_verify_trigger))
+            if args.remote_verify_trigger
+            else None
+        ),
     )
 
 
@@ -352,6 +435,18 @@ async def _assess(team: DevTeam, args) -> int:
     config_kwargs = {"model": args.model, "focus": " — ".join(focus_parts) or None}
     if args.report is not None:
         config_kwargs["report_path"] = args.report
+    if args.exclude_globs is not None:
+        config_kwargs["exclude_globs"] = tuple(args.exclude_globs)
+    if args.max_tree_entries is not None:
+        config_kwargs["max_tree_entries"] = args.max_tree_entries
+    if args.component_fanout:
+        config_kwargs["component_fanout"] = True
+    if args.no_osv_scan:
+        config_kwargs["osv_scan"] = False
+    if args.backlog:
+        config_kwargs["update_backlog"] = True
+    if args.no_conventions:
+        config_kwargs["save_conventions"] = False
     outcome = await team.assess(
         workspace=LocalWorkspace(args.workspace),
         budget=Budget(limit_usd=args.budget_usd),

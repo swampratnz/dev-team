@@ -30,11 +30,24 @@ from .agents import (
     TechnicalWriterAgent,
 )
 from .agents.base import READ_ONLY_TOOLS
+from .backlog import Backlog, BacklogStore, Story
 from .budget import Budget, BudgetExceededError
-from .context import build_repo_context
+from .context import build_repo_context, path_excluded
+from .conventions import (
+    ConventionsProfile,
+    ConventionsStore,
+    detect_convention_sources,
+)
+from .deadcode import DeadCodeReport, detect_dead_code
+from .depscan import DependencyScan, Fetch, scan_dependencies
 from .errors import AgentResponseError
 from .events import AgentEvent, Listener, emit
-from .execution import InMemoryWorkspace, Workspace
+from .execution import (
+    CommandRunner,
+    InMemoryWorkspace,
+    SubprocessCommandRunner,
+    Workspace,
+)
 from .instrument import InstrumentedRunner
 from .interaction import (
     Choice,
@@ -49,6 +62,36 @@ from .trace import Tracer
 
 # Assessments read more of the tree than feature planning does.
 _TREE_ENTRIES = 400
+
+#: Noise no audit should spend its tree budget on: vendored dependencies and
+#: build output, at the root or nested, plus compiled binaries.
+DEFAULT_EXCLUDE_GLOBS: Sequence[str] = (
+    "node_modules/*",
+    "*/node_modules/*",
+    "packages/*",
+    "*/packages/*",
+    "bin/*",
+    "*/bin/*",
+    "obj/*",
+    "*/obj/*",
+    "vendor/*",
+    "*/vendor/*",
+    "dist/*",
+    "*/dist/*",
+    "target/*",
+    "*/target/*",
+    "*.dll",
+    "*.exe",
+    "*.pdb",
+)
+
+#: Manifest names that mark a sub-project (component) for the fan-out.
+_COMPONENT_MANIFESTS = frozenset(
+    {"package.json", "Cargo.toml", "go.mod", "pyproject.toml"}
+)
+
+#: Enrichment phases: their failure degrades the report, not the audit.
+_ADVISORY_PHASES = frozenset({"conventions", "components"})
 
 CLASSIFICATIONS = (
     "revive-in-place",
@@ -150,6 +193,39 @@ JSON shape:
   "documentation": [{{"claim": "...", "evidence": "..."}}]}}
 """ + _DISCIPLINE
 
+_CONVENTIONS_PROMPT = """\
+Repository audit side-phase: HOUSE CONVENTIONS. Identify the coding style
+future work on this repository must follow: naming conventions, file and
+project organisation, test framework and test naming patterns, error
+handling, logging, and structural patterns (dependency injection, layering).
+Read representative source files rather than guessing. Machine-readable
+style configuration files detected: {sources}.
+
+<repo-context>
+{evidence}
+</repo-context>
+{focus}
+JSON shape:
+{{"summary": "a one-paragraph style portrait of this codebase",
+  "conventions": [{{"aspect": "naming|layout|tests|errors|logging|patterns|other",
+                    "convention": "...", "evidence": "..."}}]}}
+""" + _DISCIPLINE
+
+_COMPONENT_PROMPT = """\
+Repository audit component deep-dive. Component: {name} (directory
+`{path}`, detected from `{manifest}`). Audit ONLY this component: its
+purpose, internal structure, quality hot-spots, suspicious or dead-looking
+areas, and how it couples to the rest of the repository.
+
+<repo-context>
+{evidence}
+</repo-context>
+{focus}
+JSON shape:
+{{"summary": "...",
+  "findings": [{{"claim": "...", "evidence": "path or where you looked"}}]}}
+""" + _DISCIPLINE
+
 _RECOMMENDATION_PROMPT = """\
 Phase 5 of a repository audit: RECOMMENDATION. Based on the phase findings
 below, classify the repository and give a sequenced remediation plan with an
@@ -187,6 +263,7 @@ _REQUIRED_KEYS: Mapping[str, Sequence[str]] = {
     "buildability": ("summary", "verdict", "blockers"),
     "risk": ("summary", "dependencies"),
     "coverage": ("summary", "tests"),
+    "conventions": ("summary", "conventions"),
     "recommendation": ("summary", "classification", "highest_risk", "plan"),
 }
 
@@ -202,6 +279,23 @@ class AssessConfig:
         report_path: Workspace-relative path the markdown report is written
             to; ``None`` skips writing (the report is still returned).
         json_retries: Corrective retries for malformed agent JSON.
+        exclude_globs: Paths matching any glob are invisible to the audit
+            (tree, statistics, component detection). Defaults keep vendored
+            dependencies and build output from eating the tree budget.
+        max_tree_entries: How many tree entries the evidence block may list.
+        component_fanout: Audit each detected sub-project with its own
+            parallel deep-dive after inventory.
+        max_components: Cap on parallel component deep-dives.
+        osv_scan: Query OSV.dev about exactly-pinned dependencies parsed
+            from manifests (degrades gracefully offline).
+        save_conventions: Persist the captured house-conventions profile to
+            ``.dev_team/conventions.json`` so later delivery runs follow it.
+            This and the report are the assessment's only writes.
+        update_backlog: Convert findings into stories in the persistent
+            backlog (``.dev_team/backlog.json``) so delivery runs can work
+            them off. Off by default: it writes to the workspace.
+        dormancy_days: Age gap (directory last commit vs repo head) beyond
+            which the dead-code probe calls a directory dormant.
     """
 
     model: Optional[str] = None
@@ -209,6 +303,14 @@ class AssessConfig:
     focus: Optional[str] = None
     report_path: Optional[str] = "audit/assessment.md"
     json_retries: int = 1
+    exclude_globs: Sequence[str] = DEFAULT_EXCLUDE_GLOBS
+    max_tree_entries: int = _TREE_ENTRIES
+    component_fanout: bool = False
+    max_components: int = 12
+    osv_scan: bool = True
+    save_conventions: bool = True
+    update_backlog: bool = False
+    dormancy_days: int = 365
 
 
 @dataclass
@@ -239,12 +341,16 @@ class InventoryStats:
         return "\n".join(lines)
 
 
-def inventory_stats(workspace: Workspace) -> InventoryStats:
+def inventory_stats(
+    workspace: Workspace, *, exclude_globs: Sequence[str] = ()
+) -> InventoryStats:
     """Count files, lines, and extensions — exactly, without a model."""
 
     stats = InventoryStats()
     for path in workspace.list_files():
         if path.startswith(".dev_team/") or path.startswith(".git/"):
+            continue
+        if path_excluded(path, exclude_globs):
             continue
         stats.total_files += 1
         top = path.split("/", 1)[0] if "/" in path else "(root)"
@@ -258,6 +364,49 @@ def inventory_stats(workspace: Workspace) -> InventoryStats:
             continue
         stats.loc_by_top[top] = stats.loc_by_top.get(top, 0) + loc
     return stats
+
+
+@dataclass(frozen=True)
+class Component:
+    """A sub-project detected from a manifest somewhere in the tree."""
+
+    name: str
+    path: str
+    manifest: str
+
+
+def detect_components(
+    workspace: Workspace, exclude_globs: Sequence[str] = ()
+) -> List[Component]:
+    """Sub-projects found by their manifests, one per directory, sorted."""
+
+    components: Dict[str, Component] = {}
+    for file in sorted(workspace.list_files()):
+        if file.startswith(".dev_team/") or path_excluded(file, exclude_globs):
+            continue
+        name = file.rsplit("/", 1)[-1]
+        if name not in _COMPONENT_MANIFESTS and not name.endswith(".csproj"):
+            continue
+        directory = file.rsplit("/", 1)[0] if "/" in file else ""
+        if directory in components:
+            continue
+        display = directory.rsplit("/", 1)[-1] if directory else "(root)"
+        components[directory] = Component(name=display, path=directory, manifest=file)
+    return list(components.values())
+
+
+def _components_block(components: Sequence[Component]) -> str:
+    """Deterministic component listing for the evidence block."""
+
+    if not components:
+        return ""
+    lines = [f"Detected components ({len(components)}):"]
+    for component in components[:30]:
+        location = component.path or "(root)"
+        lines.append(f"- {location} — manifest: {component.manifest}")
+    if len(components) > 30:
+        lines.append(f"- ... and {len(components) - 30} more")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -288,12 +437,25 @@ class AssessmentOutcome:
     tracer: Tracer
     focus: Optional[str] = None
     aborted: bool = False
+    dead_code: DeadCodeReport = field(default_factory=DeadCodeReport)
+    dependency_scan: DependencyScan = field(default_factory=DependencyScan)
+    detected_components: List[Component] = field(default_factory=list)
+    conventions: Optional[ConventionsProfile] = None
+    backlog_stories: List[str] = field(default_factory=list)
 
     @property
     def success(self) -> bool:
-        """True when nothing failed: no abort and every phase produced data."""
+        """True when nothing failed: no abort and every core phase produced data.
 
-        return not self.aborted and all(p.ok for p in self.phases.values())
+        Advisory phases (conventions, component deep-dives) enrich the report;
+        their failure is recorded in it but does not void the audit verdict.
+        """
+
+        return not self.aborted and all(
+            result.ok
+            for name, result in self.phases.items()
+            if name not in _ADVISORY_PHASES
+        )
 
     @property
     def classification(self) -> Optional[str]:
@@ -340,6 +502,8 @@ class AssessmentEngine:
         listener: Optional[Listener] = None,
         roster: Optional[Roster] = None,
         interaction: Optional[InteractionChannel] = None,
+        command_runner: Optional[CommandRunner] = None,
+        osv_fetch: Optional[Fetch] = None,
     ) -> None:
         self.workspace: Workspace = workspace or InMemoryWorkspace()
         self.config = config or AssessConfig()
@@ -350,6 +514,11 @@ class AssessmentEngine:
         self.interaction = interaction
         root = getattr(self.workspace, "root", None)
         self.workdir: Optional[str] = str(root) if root is not None else None
+        # Read-only git queries (dead-code dormancy) need a real directory.
+        self.command_runner = command_runner or (
+            SubprocessCommandRunner() if self.workdir is not None else None
+        )
+        self._osv_fetch = osv_fetch
 
         def make(cls):
             wrapped = InstrumentedRunner(
@@ -444,10 +613,47 @@ class AssessmentEngine:
 
         run_span = self.tracer.start("assessment", "assess")
         self._event("start", "Assessing the repository")
+        excludes = self.config.exclude_globs
         profile = detect_project(self.workspace)
-        stats = inventory_stats(self.workspace)
-        ctx = build_repo_context(self.workspace, max_tree_entries=_TREE_ENTRIES)
-        evidence = "\n\n".join(part for part in (ctx.render(), stats.render()) if part)
+        stats = inventory_stats(self.workspace, exclude_globs=excludes)
+        dead_code = detect_dead_code(
+            self.workspace,
+            runner=self.command_runner,
+            workdir=self.workdir,
+            dormancy_days=self.config.dormancy_days,
+        )
+        if dead_code.findings:
+            self._event(
+                "dead-code",
+                f"Dead-code probes: {len(dead_code.findings)} finding(s)",
+            )
+        scan = scan_dependencies(
+            self.workspace, fetch=self._osv_fetch, enabled=self.config.osv_scan
+        )
+        if scan.queried:
+            self._event(
+                "dependencies",
+                f"OSV scan: {len(scan.vulnerabilities)} vulnerability record(s) "
+                f"across {len(scan.dependencies)} pinned dependencies",
+            )
+        components = detect_components(self.workspace, excludes)
+        convention_sources = detect_convention_sources(self.workspace)
+        ctx = build_repo_context(
+            self.workspace,
+            max_tree_entries=self.config.max_tree_entries,
+            exclude_globs=excludes,
+        )
+        evidence = "\n\n".join(
+            part
+            for part in (
+                ctx.render(),
+                stats.render(),
+                _components_block(components),
+                dead_code.render(),
+                scan.render(),
+            )
+            if part
+        )
         focus = self.config.focus
 
         phases: Dict[str, PhaseResult] = {}
@@ -461,7 +667,15 @@ class AssessmentEngine:
         focus, aborted = await self._check_scope(phases["inventory"], focus)
         if aborted:
             outcome = self._outcome(
-                profile, stats, phases, "", focus=focus, aborted=True
+                profile,
+                stats,
+                phases,
+                "",
+                focus=focus,
+                aborted=True,
+                dead_code=dead_code,
+                dependency_scan=scan,
+                detected_components=components,
             )
             self.tracer.end(run_span, "aborted")
             return outcome
@@ -491,11 +705,27 @@ class AssessmentEngine:
                 ),
             ),
         }
-        results = await asyncio.gather(
-            *(self._phase(name, agent, prompt) for name, (agent, prompt) in deep.items())
+        tasks = [
+            self._phase(name, agent, prompt) for name, (agent, prompt) in deep.items()
+        ]
+        tasks.append(
+            self._phase(
+                "conventions",
+                self.architect,
+                _CONVENTIONS_PROMPT.format(
+                    sources=", ".join(convention_sources) or "(none found)",
+                    evidence=evidence,
+                    focus=focus_block,
+                ),
+            )
         )
+        if self.config.component_fanout and components:
+            tasks.append(self._component_phase(components, evidence, focus_block))
+        results = await asyncio.gather(*tasks)
         for result in results:
             phases[result.phase] = result
+
+        conventions_profile = self._persist_conventions(phases, convention_sources)
 
         findings = _render_findings_for_prompt(phases)
         phases["recommendation"] = await self._phase(
@@ -505,14 +735,114 @@ class AssessmentEngine:
         )
 
         executive = await self._executive_summary(phases)
-        outcome = self._outcome(profile, stats, phases, executive, focus=focus)
+        outcome = self._outcome(
+            profile,
+            stats,
+            phases,
+            executive,
+            focus=focus,
+            dead_code=dead_code,
+            dependency_scan=scan,
+            detected_components=components,
+            conventions=conventions_profile,
+        )
         if self.config.report_path is not None:
             self.workspace.write_text(self.config.report_path, outcome.report_markdown)
             self._event("report", f"Report written to {self.config.report_path}")
+        if self.config.update_backlog:
+            self._update_backlog(outcome)
         verdict = outcome.classification or "unclassified"
         self.tracer.end(run_span)
         self._event("done", f"Assessment finished: {verdict}", detail=f"${outcome.cost_usd:.4f}")
         return outcome
+
+    async def _component_phase(
+        self, components: Sequence[Component], evidence: str, focus_block: str
+    ) -> PhaseResult:
+        """Parallel per-component deep-dives merged into one phase result."""
+
+        capped = list(components[: self.config.max_components])
+        self._event("components", f"Deep-diving {len(capped)} component(s) in parallel")
+
+        async def audit(component: Component) -> Dict:
+            span = self.tracer.start(
+                "assessment", f"component:{component.path or '(root)'}"
+            )
+            prompt = _COMPONENT_PROMPT.format(
+                name=component.name,
+                path=component.path or ".",
+                manifest=component.manifest,
+                evidence=evidence,
+                focus=focus_block,
+            )
+            entry: Dict = {"name": component.name, "path": component.path or "(root)"}
+            try:
+                data = await self.architect.ask_json(
+                    prompt, allowed_tools=READ_ONLY_TOOLS, cwd=self.workdir
+                )
+            except BudgetExceededError:
+                self.tracer.end(span, "budget")
+                entry["error"] = "budget exhausted"
+                return entry
+            except AgentResponseError as exc:
+                self.tracer.end(span, "error")
+                entry["error"] = str(exc)
+                return entry
+            self.tracer.end(span, "done")
+            entry["summary"] = str(data.get("summary", ""))
+            entry["findings"] = [
+                item for item in data.get("findings", []) if isinstance(item, dict)
+            ]
+            return entry
+
+        audited = await asyncio.gather(*(audit(c) for c in capped))
+        skipped = len(components) - len(capped)
+        summary = f"{len(capped)} component(s) audited in parallel"
+        if skipped:
+            summary += (
+                f"; {skipped} skipped (max_components={self.config.max_components})"
+            )
+        return PhaseResult(
+            phase="components",
+            role="architect",
+            data={"summary": summary, "components": list(audited)},
+        )
+
+    def _persist_conventions(
+        self, phases: Dict[str, PhaseResult], sources: List[str]
+    ) -> Optional[ConventionsProfile]:
+        """Build the conventions profile and save it for delivery runs."""
+
+        result = phases.get("conventions")
+        if result is None or not result.ok:
+            return None
+        profile = ConventionsProfile.from_dict(
+            {
+                "summary": result.data.get("summary", ""),
+                "conventions": result.data.get("conventions", []),
+                "sources": sources,
+            }
+        )
+        if profile.empty:
+            return None
+        if self.config.save_conventions:
+            store = ConventionsStore(self.workspace)
+            store.save(profile)
+            self._event("conventions", f"House conventions saved to {store.path}")
+        return profile
+
+    def _update_backlog(self, outcome: AssessmentOutcome) -> None:
+        """Mirror the findings into the persistent backlog as stories."""
+
+        store = BacklogStore(self.workspace)
+        backlog = store.load()
+        stories = outcome_to_backlog(outcome, backlog)
+        if stories:
+            store.save(backlog)
+        outcome.backlog_stories = [s.title for s in stories]
+        self._event(
+            "backlog", f"{len(stories)} remediation story(ies) added to the backlog"
+        )
 
     async def _executive_summary(self, phases: Dict[str, PhaseResult]) -> str:
         """The writer's summary; degrades to the recommendation's summary."""
@@ -539,6 +869,10 @@ class AssessmentEngine:
         *,
         focus: Optional[str],
         aborted: bool = False,
+        dead_code: Optional[DeadCodeReport] = None,
+        dependency_scan: Optional[DependencyScan] = None,
+        detected_components: Optional[List[Component]] = None,
+        conventions: Optional[ConventionsProfile] = None,
     ) -> AssessmentOutcome:
         outcome = AssessmentOutcome(
             profile=profile,
@@ -551,6 +885,10 @@ class AssessmentEngine:
             tracer=self.tracer,
             focus=focus,
             aborted=aborted,
+            dead_code=dead_code or DeadCodeReport(),
+            dependency_scan=dependency_scan or DependencyScan(),
+            detected_components=list(detected_components or []),
+            conventions=conventions,
         )
         outcome.report_markdown = render_report(outcome)
         return outcome
@@ -583,8 +921,116 @@ def outcome_to_dict(outcome: AssessmentOutcome) -> Dict:
             "files_by_extension": dict(outcome.stats.files_by_extension),
             "unreadable_files": outcome.stats.unreadable_files,
         },
+        "dead_code": outcome.dead_code.to_dict(),
+        "dependency_scan": outcome.dependency_scan.to_dict(),
+        "detected_components": [vars(c) for c in outcome.detected_components],
+        "conventions": (
+            outcome.conventions.to_dict() if outcome.conventions is not None else None
+        ),
+        "backlog_stories": list(outcome.backlog_stories),
         "report_markdown": outcome.report_markdown,
     }
+
+
+def _effort_points(effort: str) -> int:
+    """Map a free-text effort estimate onto story points, conservatively."""
+
+    text = effort.lower()
+    if "month" in text:
+        return 13
+    if "week" in text:
+        return 8
+    if "day" in text:
+        return 3
+    return 2
+
+
+def outcome_to_backlog(outcome: AssessmentOutcome, backlog: Backlog) -> List[Story]:
+    """Convert assessment findings into backlog stories a delivery can work.
+
+    This is the bridge from "audited" to "remediated": remediation-plan steps,
+    build blockers, must-fix dependencies, hardcoded secrets, dead-code probe
+    hits, and live vulnerability records each become a story under one
+    "Assessment remediation" epic. Stories deduplicate by title, so re-running
+    an assessment refreshes the backlog instead of flooding it.
+    """
+
+    epic_title = "Assessment remediation"
+    epic = next((e for e in backlog.epics if e.title == epic_title), None)
+    if epic is None:
+        epic = backlog.add_epic(
+            epic_title,
+            f"From repository assessment (classification: "
+            f"{outcome.classification or 'unclassified'})",
+        )
+    existing = {s.title for s in backlog.stories}
+    added: List[Story] = []
+
+    def add(title: str, description: str, estimate: int = 2) -> None:
+        title = title[:200]
+        if title in existing:
+            return
+        existing.add(title)
+        added.append(
+            backlog.add_story(title, description, estimate=estimate, epic_id=epic.id)
+        )
+
+    recommendation = outcome.phases.get("recommendation")
+    if recommendation is not None and recommendation.ok:
+        for step in recommendation.data.get("plan", []):
+            if not isinstance(step, dict):
+                continue
+            name = str(step.get("step", "")).strip()
+            if name:
+                add(
+                    name,
+                    str(step.get("detail", "")),
+                    _effort_points(str(step.get("effort", ""))),
+                )
+    buildability = outcome.phases.get("buildability")
+    if buildability is not None and buildability.ok:
+        for blocker in buildability.data.get("blockers", []):
+            if not isinstance(blocker, dict):
+                continue
+            if blocker.get("category") != "must-fix-to-build":
+                continue
+            claim = str(blocker.get("claim", "")).strip()
+            if claim:
+                add(
+                    f"Fix build blocker: {claim}",
+                    f"Evidence: {blocker.get('evidence', '')}",
+                    3,
+                )
+    risk = outcome.phases.get("risk")
+    if risk is not None and risk.ok:
+        for dep in risk.data.get("dependencies", []):
+            if isinstance(dep, dict) and dep.get("action") == "must-fix":
+                add(
+                    f"Upgrade or replace dependency {dep.get('name', '?')}",
+                    f"{dep.get('version', '')} {dep.get('status', '')} "
+                    f"(evidence: {dep.get('evidence', '')})".strip(),
+                    3,
+                )
+        for secret in risk.data.get("secrets", []):
+            if isinstance(secret, dict) and secret.get("claim"):
+                add(
+                    f"Remove hardcoded secret: {secret['claim']}",
+                    f"Evidence: {secret.get('evidence', '')}",
+                    1,
+                )
+    by_probe: Dict[str, List[str]] = {}
+    for finding in outcome.dead_code.findings:
+        by_probe.setdefault(finding.probe, []).append(finding.path)
+    for probe, paths in sorted(by_probe.items()):
+        listed = ", ".join(paths[:20]) + (" …" if len(paths) > 20 else "")
+        add(f"Remove dead code ({probe}: {len(paths)} path(s))", listed, 3)
+    for vulnerability in outcome.dependency_scan.vulnerabilities:
+        dep = vulnerability.dependency
+        add(
+            f"Patch {dep.name} {dep.version}: {vulnerability.id}",
+            f"{vulnerability.url} (manifest: {dep.manifest})",
+        )
+    return added
 
 
 def _render_findings_for_prompt(phases: Dict[str, PhaseResult]) -> str:
@@ -733,11 +1179,56 @@ def render_report(outcome: AssessmentOutcome) -> str:
                     lines += ["", f"### {heading}", ""]
                     _cited(lines, items, "claim")
 
+    conventions = outcome.phases.get("conventions")
+    if conventions is not None:
+        lines += ["", "## House conventions", ""]
+        if not conventions.ok:
+            lines.append(f"_Phase failed ({conventions.role}): {conventions.error}_")
+        summary = conventions.data.get("summary")
+        if summary:
+            lines.append(str(summary))
+        items = _items(conventions.data, "conventions")
+        if items:
+            lines.append("")
+            _cited(lines, items, "aspect", "convention")
+        if outcome.conventions is not None and outcome.conventions.sources:
+            lines += [
+                "",
+                "Machine-readable style configs: "
+                + ", ".join(f"`{s}`" for s in outcome.conventions.sources),
+            ]
+
+    component_phase = outcome.phases.get("components")
+    if component_phase is not None and component_phase.data:
+        lines += ["", "## Component deep-dives", ""]
+        lines.append(str(component_phase.data.get("summary", "")))
+        for entry in _items(component_phase.data, "components"):
+            lines += ["", f"### {entry.get('name', '?')} (`{entry.get('path', '?')}`)", ""]
+            if entry.get("error"):
+                lines.append(f"_Deep-dive failed: {entry['error']}_")
+                continue
+            if entry.get("summary"):
+                lines.append(str(entry["summary"]))
+            findings = [f for f in entry.get("findings", []) if isinstance(f, dict)]
+            if findings:
+                lines.append("")
+                _cited(lines, findings, "claim")
+
     lines += ["", "## Appendix — deterministic inventory", ""]
     lines.append(outcome.stats.render())
+    for block in (outcome.dead_code.render(), outcome.dependency_scan.render()):
+        if block:
+            lines += ["", block]
     lines.append("")
-    lines.append(
-        f"_Cost: ${outcome.cost_usd:.4f}. Dependency/CVE observations come from "
-        "model knowledge, not a live vulnerability scan._"
-    )
+    if outcome.dependency_scan.queried:
+        lines.append(
+            f"_Cost: ${outcome.cost_usd:.4f}. Dependency findings include a live "
+            "OSV.dev vulnerability scan of the exactly-pinned dependencies; other "
+            "CVE/EOL observations come from model knowledge._"
+        )
+    else:
+        lines.append(
+            f"_Cost: ${outcome.cost_usd:.4f}. Dependency/CVE observations come from "
+            "model knowledge, not a live vulnerability scan._"
+        )
     return "\n".join(lines)

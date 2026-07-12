@@ -8,10 +8,17 @@ from helpers import run
 from dev_team.assessment import (
     AssessConfig,
     AssessmentEngine,
+    AssessmentOutcome,
+    Component,
     InventoryStats,
     PhaseResult,
+    _components_block,
+    _effort_points,
+    detect_components,
     inventory_stats,
+    outcome_to_backlog,
     outcome_to_dict,
+    render_report,
     scope_question,
 )
 from dev_team.budget import Budget
@@ -99,11 +106,27 @@ def recommendation_dict(classification="dependency-surgery"):
     }
 
 
+def conventions_dict():
+    return {
+        "conventions": [
+            {
+                "aspect": "naming",
+                "convention": "PascalCase public members",
+                "evidence": "src/Api/Program.cs",
+            }
+        ],
+    }
+
+
 def assess_responses(**overrides):
-    """Keyed responses for every auditing role (override per test)."""
+    """Keyed responses for every auditing role (override per test).
+
+    The architect serves both the inventory and conventions phases (they are
+    keyed by role), so its payload carries both phases' required keys.
+    """
 
     payloads = {
-        "software architect": inventory_dict(),
+        "software architect": {**inventory_dict(), **conventions_dict()},
         "DevOps engineer": buildability_dict(),
         "application security engineer": risk_dict(),
         "quality assurance engineer": coverage_dict(),
@@ -180,6 +203,7 @@ def test_assess_happy_path_produces_cited_report():
     assert outcome.profile.kind == "dotnet"
     assert set(outcome.phases) == {
         "inventory", "buildability", "risk", "coverage", "recommendation",
+        "conventions",
     }
     report = outcome.report_markdown
     assert "# Repository assessment" in report
@@ -210,7 +234,8 @@ def test_assess_is_read_only_apart_from_report():
     engine = _engine(runner, workspace=ws)
     run(engine.assess())
     after = set(ws.list_files())
-    assert after - before == {"audit/assessment.md"}  # no .dev_team/, no edits
+    # The report and the conventions profile are the only sanctioned writes.
+    assert after - before == {"audit/assessment.md", ".dev_team/conventions.json"}
 
 
 def test_assess_agents_get_read_only_tools():
@@ -525,3 +550,433 @@ def test_cited_handles_items_without_fields():
     lines = []
     _cited(lines, [{"evidence": "a.cs"}, {}], "claim")
     assert lines == ["- (unspecified) (evidence: a.cs)", "- (unspecified)"]
+
+
+# --- excludes, components, dead code, dependency scan ---------------------------
+
+
+def test_inventory_stats_applies_exclude_globs():
+    ws = InMemoryWorkspace(
+        {
+            "src/App.cs": "a\nb",
+            "packages/Moq/Moq.dll": "binary",
+            "App/bin/Debug/App.exe": "binary",
+        }
+    )
+    stats = inventory_stats(ws, exclude_globs=("packages/*", "*/bin/*"))
+    assert stats.total_files == 1
+    assert stats.loc_by_top == {"src": 2}
+
+
+def test_detect_components_and_block():
+    ws = InMemoryWorkspace(
+        {
+            "package.json": "{}",
+            "src/Api/Api.csproj": "<Project />",
+            "src/Api/packages.config": "<packages />",
+            "web/package.json": "{}",
+            "vendored/dep/package.json": "{}",
+        }
+    )
+    components = detect_components(ws, exclude_globs=("vendored/*",))
+    assert [(c.name, c.path, c.manifest) for c in components] == [
+        ("(root)", "", "package.json"),
+        ("Api", "src/Api", "src/Api/Api.csproj"),
+        ("web", "web", "web/package.json"),
+    ]
+    block = _components_block(components)
+    assert "Detected components (3):" in block
+    assert "- src/Api — manifest: src/Api/Api.csproj" in block
+    assert "- (root) — manifest: package.json" in block
+    assert _components_block([]) == ""
+
+
+def test_components_block_caps_listing():
+    components = [
+        Component(name=f"c{i}", path=f"c{i}", manifest=f"c{i}/package.json")
+        for i in range(35)
+    ]
+    block = _components_block(components)
+    assert "... and 5 more" in block
+
+
+_DEAD_WORKSPACE = {
+    "MyApp.sln": 'Project("{G}") = "Api", "src\\Api\\Api.csproj", "{G2}"\nEndProject',
+    "src/Api/Api.csproj": (
+        '<Project ToolsVersion="12.0"><ItemGroup>'
+        '<Compile Include="Program.cs" /></ItemGroup></Project>'
+    ),
+    "src/Api/Program.cs": "class P {}",
+    "src/Api/Orphan.cs": "class O {}",
+    "src/Api/packages.config": (
+        '<packages><package id="Newtonsoft.Json" version="9.0.1" /></packages>'
+    ),
+    "README.md": "# MyApp",
+}
+
+
+def _vuln_fetch(payload):
+    results = []
+    for query in payload["queries"]:
+        if query["package"]["name"] == "Newtonsoft.Json":
+            results.append({"vulns": [{"id": "GHSA-5crp-9r3c-p9vr"}]})
+        else:
+            results.append({})
+    return {"results": results}
+
+
+def test_assess_integrates_dead_code_and_osv_scan():
+    events = []
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(
+        runner,
+        workspace=InMemoryWorkspace(dict(_DEAD_WORKSPACE)),
+        listener=events.append,
+        osv_fetch=_vuln_fetch,
+    )
+    outcome = run(engine.assess())
+    assert outcome.success is True
+    assert [f.path for f in outcome.dead_code.findings] == ["src/Api/Orphan.cs"]
+    assert [v.id for v in outcome.dependency_scan.vulnerabilities] == [
+        "GHSA-5crp-9r3c-p9vr"
+    ]
+    report = outcome.report_markdown
+    assert "src/Api/Orphan.cs" in report
+    assert "GHSA-5crp-9r3c-p9vr" in report
+    assert "live" in report and "OSV.dev" in report
+    stages = [e.stage for e in events]
+    assert "dead-code" in stages and "dependencies" in stages
+    data = outcome_to_dict(outcome)
+    assert data["dead_code"]["findings"][0]["path"] == "src/Api/Orphan.cs"
+    assert data["dependency_scan"]["vulnerabilities"][0]["id"] == "GHSA-5crp-9r3c-p9vr"
+    assert data["conventions"]["conventions"]
+    assert data["detected_components"]
+    assert data["backlog_stories"] == []
+
+
+def test_assess_can_disable_osv_scan():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(
+        runner,
+        workspace=InMemoryWorkspace(dict(_DEAD_WORKSPACE)),
+        config=AssessConfig(osv_scan=False),
+    )
+    outcome = run(engine.assess())
+    assert outcome.dependency_scan.queried is False
+    assert "model knowledge, not a live vulnerability scan" in outcome.report_markdown
+
+
+# --- component fan-out -----------------------------------------------------------
+
+
+def test_component_fanout_deep_dives_each_component():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(
+        runner, config=AssessConfig(component_fanout=True, max_components=12)
+    )
+    outcome = run(engine.assess())
+    assert outcome.success is True
+    result = outcome.phases["components"]
+    assert result.ok
+    entries = result.data["components"]
+    assert {e["path"] for e in entries} == {"src/Api", "web"}
+    assert all(e["findings"] for e in entries)
+    assert "Component deep-dives" in outcome.report_markdown
+    assert "### Api (`src/Api`)" in outcome.report_markdown
+
+
+def test_component_fanout_caps_and_reports_skips():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(
+        runner, config=AssessConfig(component_fanout=True, max_components=1)
+    )
+    outcome = run(engine.assess())
+    summary = outcome.phases["components"].data["summary"]
+    assert "1 component(s) audited" in summary
+    assert "1 skipped (max_components=1)" in summary
+
+
+def test_component_fanout_records_agent_failures():
+    from dev_team.budget import BudgetExceededError
+
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(
+        runner, config=AssessConfig(component_fanout=True, json_retries=0)
+    )
+    real = engine.architect.ask_json
+    calls = {"n": 0}
+
+    async def sabotaged(prompt, **kwargs):
+        if "component deep-dive" in prompt:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise BudgetExceededError(5.0, 5.0)
+            from dev_team.errors import AgentResponseError
+
+            raise AgentResponseError("architect", "not json")
+        return await real(prompt, **kwargs)
+
+    engine.architect.ask_json = sabotaged
+    outcome = run(engine.assess())
+    entries = outcome.phases["components"].data["components"]
+    errors = sorted(e["error"] for e in entries)
+    assert any("budget exhausted" in e for e in errors)
+    assert any("unusable response" in e for e in errors)
+    assert outcome.success is True  # advisory phase failures don't void the audit
+    assert "_Deep-dive failed:" in outcome.report_markdown
+
+
+# --- backlog bridge --------------------------------------------------------------
+
+
+def _bare_outcome(phases=None, **overrides):
+    from dev_team.profile import ProjectProfile
+    from dev_team.trace import Tracer
+
+    defaults = dict(
+        profile=ProjectProfile(kind="dotnet-framework", verify_command=None),
+        stats=InventoryStats(),
+        phases=phases or {},
+        executive_summary="",
+        report_markdown="",
+        report_path=None,
+        budget=Budget(),
+        tracer=Tracer(),
+    )
+    defaults.update(overrides)
+    return AssessmentOutcome(**defaults)
+
+
+def test_effort_points_mapping():
+    assert _effort_points("about 2 months") == 13
+    assert _effort_points("1 week") == 8
+    assert _effort_points("3 days") == 3
+    assert _effort_points("a few hours") == 2
+    assert _effort_points("") == 2
+
+
+def test_outcome_to_backlog_converts_findings_to_stories():
+    from dev_team.backlog import Backlog
+    from dev_team.deadcode import DeadCodeFinding, DeadCodeReport
+    from dev_team.depscan import Dependency, DependencyScan, Vulnerability
+
+    phases = {
+        "recommendation": PhaseResult(
+            phase="recommendation",
+            role="product-manager",
+            data={
+                "classification": "dependency-surgery",
+                "plan": [
+                    {"step": "Pin build chain", "effort": "2 days", "detail": "CI"},
+                    {"step": "", "effort": "1 week"},
+                    "junk",
+                ],
+            },
+        ),
+        "buildability": PhaseResult(
+            phase="buildability",
+            role="devops",
+            data={
+                "blockers": [
+                    {"claim": "needs Windows", "category": "must-fix-to-build",
+                     "evidence": "App.csproj"},
+                    {"claim": "old npm", "category": "will-bite-later"},
+                    {"claim": "", "category": "must-fix-to-build"},
+                    "junk",
+                ]
+            },
+        ),
+        "risk": PhaseResult(
+            phase="risk",
+            role="security-engineer",
+            data={
+                "dependencies": [
+                    {"name": "Moq", "action": "must-fix", "version": "4.2"},
+                    {"name": "xunit", "action": "ok"},
+                    "junk",
+                ],
+                "secrets": [
+                    {"claim": "license committed", "evidence": "Aspose.lic"},
+                    {"claim": ""},
+                    "junk",
+                ],
+            },
+        ),
+    }
+    dead = DeadCodeReport(
+        findings=[
+            DeadCodeFinding("unreferenced-sources", f"App/Dead{i}.cs", "unused")
+            for i in range(25)
+        ]
+        + [DeadCodeFinding("orphaned-projects", "Old/Old.csproj", "orphan")],
+        probes_run=["unreferenced-sources", "orphaned-projects"],
+    )
+    dep = Dependency("Moq", "4.2.1409.1722", "NuGet", "App/packages.config")
+    scan = DependencyScan(
+        dependencies=[dep],
+        vulnerabilities=[Vulnerability("GHSA-1", dep)],
+        queried=True,
+    )
+    outcome = _bare_outcome(phases=phases, dead_code=dead, dependency_scan=scan)
+
+    backlog = Backlog()
+    stories = outcome_to_backlog(outcome, backlog)
+    titles = [s.title for s in stories]
+    assert titles == [
+        "Pin build chain",
+        "Fix build blocker: needs Windows",
+        "Upgrade or replace dependency Moq",
+        "Remove hardcoded secret: license committed",
+        "Remove dead code (orphaned-projects: 1 path(s))",
+        "Remove dead code (unreferenced-sources: 25 path(s))",
+        "Patch Moq 4.2.1409.1722: GHSA-1",
+    ]
+    assert backlog.epics[0].title == "Assessment remediation"
+    assert "dependency-surgery" in backlog.epics[0].description
+    by_title = {s.title: s for s in stories}
+    assert by_title["Pin build chain"].estimate == 3
+    assert by_title["Remove hardcoded secret: license committed"].estimate == 1
+    assert " …" in by_title["Remove dead code (unreferenced-sources: 25 path(s))"].description
+
+    # Re-running dedupes by title and reuses the epic.
+    again = outcome_to_backlog(outcome, backlog)
+    assert again == []
+    assert len(backlog.epics) == 1
+
+
+def test_outcome_to_backlog_skips_failed_phases():
+    from dev_team.backlog import Backlog
+
+    phases = {
+        "recommendation": PhaseResult(
+            phase="recommendation", role="pm", error="budget", data={"plan": [{"step": "X"}]}
+        ),
+        "buildability": PhaseResult(
+            phase="buildability", role="devops", error="bad json",
+            data={"blockers": [{"claim": "Y", "category": "must-fix-to-build"}]},
+        ),
+    }
+    assert outcome_to_backlog(_bare_outcome(phases=phases), Backlog()) == []
+
+
+def test_assess_update_backlog_persists_stories():
+    events = []
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    ws = InMemoryWorkspace(dict(_DEAD_WORKSPACE))
+    engine = _engine(
+        runner,
+        workspace=ws,
+        config=AssessConfig(update_backlog=True),
+        listener=events.append,
+        osv_fetch=_vuln_fetch,
+    )
+    outcome = run(engine.assess())
+    assert outcome.backlog_stories
+    assert ".dev_team/backlog.json" in ws.list_files()
+    assert any(e.stage == "backlog" for e in events)
+
+    from dev_team.backlog import BacklogStore
+
+    stored = BacklogStore(ws).load()
+    assert {s.title for s in stored.stories} >= set(outcome.backlog_stories)
+
+
+def test_update_backlog_without_stories_writes_nothing():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    ws = InMemoryWorkspace({"README.md": "# empty"})
+    engine = _engine(runner, workspace=ws)
+    outcome = _bare_outcome()
+    engine._update_backlog(outcome)
+    assert outcome.backlog_stories == []
+    assert ".dev_team/backlog.json" not in ws.list_files()
+
+
+# --- conventions capture ----------------------------------------------------------
+
+
+def test_assess_persists_conventions_profile():
+    from dev_team.conventions import ConventionsStore
+
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    ws = _workspace()
+    ws.write_text(".editorconfig", "root = true")
+    engine = _engine(runner, workspace=ws)
+    outcome = run(engine.assess())
+    assert outcome.conventions is not None
+    assert outcome.conventions.sources == [".editorconfig"]
+    stored = ConventionsStore(ws).load()
+    assert stored is not None
+    assert stored.conventions[0]["aspect"] == "naming"
+    assert "House conventions" in outcome.report_markdown
+    assert "`.editorconfig`" in outcome.report_markdown
+
+
+def test_persist_conventions_skips_missing_failed_or_empty():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(runner)
+    assert engine._persist_conventions({}, []) is None
+    failed = {"conventions": PhaseResult(phase="conventions", role="architect", error="x")}
+    assert engine._persist_conventions(failed, []) is None
+    empty = {
+        "conventions": PhaseResult(
+            phase="conventions", role="architect",
+            data={"summary": "", "conventions": []},
+        )
+    }
+    assert engine._persist_conventions(empty, []) is None
+
+
+def test_persist_conventions_can_be_disabled():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    ws = _workspace()
+    engine = _engine(runner, workspace=ws, config=AssessConfig(save_conventions=False))
+    outcome = run(engine.assess())
+    assert outcome.conventions is not None
+    assert ".dev_team/conventions.json" not in ws.list_files()
+
+
+def test_report_renders_failed_conventions_phase():
+    phases = {
+        "conventions": PhaseResult(
+            phase="conventions", role="architect", error="ran out of budget"
+        )
+    }
+    report = render_report(_bare_outcome(phases=phases))
+    assert "## House conventions" in report
+    assert "_Phase failed (architect): ran out of budget_" in report
+
+
+def test_detect_components_one_per_directory():
+    ws = InMemoryWorkspace({"dual/package.json": "{}", "dual/pyproject.toml": ""})
+    components = detect_components(ws)
+    assert len(components) == 1
+    assert components[0].manifest == "dual/package.json"
+
+
+def test_assess_with_no_dead_code_emits_no_event():
+    events = []
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(
+        runner,
+        workspace=InMemoryWorkspace({"pyproject.toml": "", "src/app.py": "x = 1"}),
+        listener=events.append,
+    )
+    outcome = run(engine.assess())
+    assert outcome.dead_code.findings == []
+    assert not any(e.stage == "dead-code" for e in events)
+
+
+def test_report_renders_component_entry_without_summary_or_findings():
+    phases = {
+        "components": PhaseResult(
+            phase="components",
+            role="architect",
+            data={
+                "summary": "1 component(s) audited in parallel",
+                "components": [{"name": "web", "path": "web", "summary": "", "findings": []}],
+            },
+        )
+    }
+    report = render_report(_bare_outcome(phases=phases))
+    assert "### web (`web`)" in report
+    assert "_Deep-dive failed" not in report

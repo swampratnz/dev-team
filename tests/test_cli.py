@@ -566,3 +566,106 @@ def test_main_assess_allows_workspace_and_budget(tmp_path):
         ["--assess", "--workspace", str(repo), "--budget-usd", "10"], runner=runner
     )
     assert code == 0
+
+
+def test_main_assess_new_flags_reach_config(tmp_path, capsys):
+    from test_assessment import assess_responses
+
+    repo = _dotnet_repo(tmp_path)
+    (repo / "junk").mkdir()
+    (repo / "junk" / "vendored.cs").write_text("class V {}")
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(
+        [
+            "--assess", "--workspace", str(repo),
+            "--exclude", "junk/*",
+            "--max-tree-entries", "50",
+            "--component-fanout",
+            "--no-osv-scan",
+            "--backlog",
+            "--no-conventions",
+            "--json",
+        ],
+        runner=runner,
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert "junk/vendored.cs" not in json.dumps(payload["stats"])
+    assert payload["dependency_scan"]["error"] == "scan disabled"
+    assert "components" in payload["phases"]
+    assert payload["backlog_stories"]
+    assert (repo / ".dev_team" / "backlog.json").exists()
+    assert not (repo / ".dev_team" / "conventions.json").exists()
+
+
+def test_assess_only_flags_rejected_outside_assess():
+    for flag in (
+        ["--exclude", "junk/*"],
+        ["--max-tree-entries", "50"],
+        ["--component-fanout"],
+        ["--no-osv-scan"],
+        ["--backlog"],
+        ["--no-conventions"],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main(["Login", "Add login", *flag], runner=ScriptedRunner([]))
+        assert excinfo.value.code == 2
+
+
+def test_remote_verify_flags_require_deliver_and_status():
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["Login", "Add login", "--remote-verify-status", "ci status"],
+            runner=ScriptedRunner([]),
+        )
+    assert excinfo.value.code == 2
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "Login", "Add login", "--deliver",
+                "--remote-verify-trigger", "ci run",
+            ],
+            runner=ScriptedRunner([]),
+        )
+    assert excinfo.value.code == 2
+
+
+def test_deliver_remote_verify_builds_remote_gate(tmp_path, monkeypatch):
+    import dev_team.cli as cli_module
+    from dev_team.verification import RemoteCIGate
+
+    captured = {}
+
+    class _FakeTeam:
+        def __init__(self, *a, **k):
+            self.interaction = None
+            self.roster = None
+
+        async def deliver(self, request, **kwargs):
+            captured["config"] = kwargs["config"]
+            raise SystemExit(0)
+
+    monkeypatch.setattr(cli_module, "DevTeam", _FakeTeam)
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "Fix", "Fix the thing", "--deliver",
+                "--workspace", str(tmp_path),
+                "--remote-verify-status", "az pipelines runs show --status",
+                "--remote-verify-trigger", "az pipelines run",
+            ],
+            runner=ScriptedRunner([]),
+        )
+    config = captured["config"]
+    assert config.remote_verify_status == ("az", "pipelines", "runs", "show", "--status")
+    assert config.remote_verify_trigger == ("az", "pipelines", "run")
+    from dev_team.engine import DeliveryEngine
+    from dev_team.execution import FakeCommandRunner, InMemoryWorkspace
+
+    engine = DeliveryEngine(
+        ScriptedRunner([]),
+        workspace=InMemoryWorkspace(),
+        command_runner=FakeCommandRunner(),
+        config=config,
+    )
+    assert isinstance(engine.definition_of_done.gates[0], RemoteCIGate)
