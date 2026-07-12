@@ -256,16 +256,26 @@ Key modules:
   gating).
 - `execution.py` / `verification.py` / `changes.py` / `git.py` — workspaces,
   command runners, executable gates, change application, git porcelain.
+- `profile.py` / `context.py` / `failures.py` — project-type detection (the
+  auto-detected verify/setup/scan commands, including legacy .NET), the
+  deterministic repo map fed to planners, and red-baseline test-failure
+  attribution (pytest/go/cargo/VSTest/xUnit).
 - `memory.py` / `backlog.py` — blackboard, ADRs, cross-run memory,
   checkpoints, persistent backlog.
-- `budget.py` / `trace.py` / `approval.py` / `policy.py` — governance.
+- `budget.py` / `trace.py` / `approval.py` / `policy.py` / `instrument.py` —
+  governance; `InstrumentedRunner` meters and traces every agent call.
 - `interaction.py` / `persona.py` / `chat.py` — human-in-the-loop questions
   and approvals, the named-agent roster, and the conversational front door.
 - `scheduler.py` / `ordering.py` — dependency-aware concurrency and ordering.
 - `json_utils.py` / `parsing.py` — robust extraction of structured data from
   model output (with contract enforcement: blocking findings force rejection).
-- `assessment.py` — the read-only audit engine (see `docs/ASSESSMENT.md`).
+- `assessment.py` — the read-only audit engine (see `docs/ASSESSMENT.md`),
+  with its deterministic companions: `deadcode.py` (exact dead-code probes),
+  `depscan.py` (live OSV.dev dependency scanning), and `conventions.py`
+  (house-style capture and injection into later deliveries).
 - `evals.py` — the benchmark harness.
+- `events.py` / `report.py` / `errors.py` — progress events, result
+  rendering, and the exception hierarchy.
 - `team.py` — the `DevTeam` facade; `cli.py` — the `dev-team` command.
 
 ## Installation
