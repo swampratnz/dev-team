@@ -26,6 +26,7 @@ from dev_team.dispatch import (
     ValidationError,
     _default_materialise,
 )
+from dev_team.eventlog import read_events
 from dev_team.execution import InMemoryWorkspace, LocalWorkspace
 from dev_team.testing import ScriptedRunner
 
@@ -195,6 +196,63 @@ def test_worker_marks_a_failing_job_failed():
         assert record.cost_usd == 0.0
     finally:
         disp.stop()
+
+
+def test_run_job_mirrors_events_and_report_into_the_dashboard_workspace():
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_assess_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec.id = "assess-dash"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    # Events are journalled to the shared dashboard workspace under the same
+    # run id, so the standing --dashboard process shows this job as its own run.
+    mirrored = read_events(dash)
+    assert mirrored, "dispatched job events should reach the dashboard workspace"
+    assert all(e["run"] == "assess-dash" for e in mirrored)
+    # The assess report is mirrored under a per-job audit/<id>/ path.
+    assert dash.exists("audit/assess-dash/assessment.md")
+    assert dash.read_text("audit/assess-dash/assessment.md")
+
+
+def test_run_job_deliver_mirrors_events_but_writes_no_report():
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_deliver_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d"}
+    )
+    spec.id = "deliver-dash"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert read_events(dash), "deliver events should still reach the dashboard"
+    # A delivery outcome has no report_markdown, so nothing is written to audit/.
+    assert not any(p.startswith("audit/") for p in dash.list_files())
+
+
+def test_mirror_report_is_a_noop_without_a_dashboard_workspace():
+    # No dashboard configured → returns immediately, touches nothing.
+    Dispatcher(token="x")._mirror_report("job-x", object())
+
+
+def test_mirror_report_skips_an_outcome_with_no_report():
+    # Defensive guard: an assess outcome that produced no report markdown must
+    # not write an empty file into the dashboard's Reports panel.
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+
+    class _NoReport:
+        report_markdown = ""
+
+    disp._mirror_report("job-x", _NoReport())
+    assert not any(p.startswith("audit/") for p in dash.list_files())
 
 
 def test_worker_is_single_flight_and_ordered():

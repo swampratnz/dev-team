@@ -880,8 +880,9 @@ def test_main_dashboard_flag_validation():
 class _FakeDispatchServer:
     instances = []
 
-    def __init__(self, token, *, host, port, runner=None):
+    def __init__(self, token, *, host, port, runner=None, dashboard_workspace=None):
         self.token, self.host, self.port, self.runner = token, host, port, runner
+        self.dashboard_workspace = dashboard_workspace
         self.interrupted = False
         self.shut_down = False
         _FakeDispatchServer.instances.append(self)
@@ -922,8 +923,9 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
 
     original_init = _FakeDispatchServer.__init__
 
-    def interrupting_init(self, token, *, host, port, runner=None):
-        original_init(self, token, host=host, port=port, runner=runner)
+    def interrupting_init(self, token, *, host, port, runner=None, dashboard_workspace=None):
+        original_init(self, token, host=host, port=port, runner=runner,
+                      dashboard_workspace=dashboard_workspace)
         self.interrupted = True
 
     monkeypatch.setattr(_FakeDispatchServer, "__init__", interrupting_init)
@@ -931,6 +933,7 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
     assert code == 0  # KeyboardInterrupt is a clean stop
     (server,) = _FakeDispatchServer.instances
     assert (server.host, server.port) == ("127.0.0.1", 8738)
+    assert server.dashboard_workspace is None  # not requested → not wired
     assert server.shut_down is True
 
 
@@ -939,6 +942,31 @@ def test_main_dispatch_requires_token(monkeypatch, capsys):
     code = main(["--dispatch"], runner=ScriptedRunner([]))
     assert code == 2
     assert "DEV_TEAM_DISPATCH_TOKEN" in capsys.readouterr().err
+
+
+def test_main_dispatch_dashboard_workspace_is_wired(monkeypatch, tmp_path):
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    dash = tmp_path / "shared-workspace"
+    code = main(
+        ["--dispatch", "--dashboard-workspace", str(dash)],
+        runner=ScriptedRunner([]),
+    )
+    assert code == 0
+    (server,) = _FakeDispatchServer.instances
+    from dev_team.execution import LocalWorkspace
+
+    assert isinstance(server.dashboard_workspace, LocalWorkspace)
+    assert str(server.dashboard_workspace.root) == str(dash)
+
+
+def test_main_dashboard_workspace_requires_dispatch():
+    # --dashboard-workspace is meaningless without --dispatch → argparse error.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--dashboard", "--dashboard-workspace", "/tmp/x", "--workspace", "."],
+             runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
 
 
 def test_main_dispatch_flag_validation():
