@@ -123,6 +123,18 @@ def test_subprocess_timeout(monkeypatch):
     assert "timed out" in result.stderr
 
 
+def test_subprocess_timeout_decodes_bytes_partial_output(monkeypatch):
+    # TimeoutExpired.stdout arrives as bytes on some platforms even under
+    # text=True; force that shape so the decode branch is covered everywhere.
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="x", timeout=0.1, output=b"partial bytes")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    result = SubprocessCommandRunner().run(["x"], timeout=0.1)
+    assert result.exit_code == EXIT_TIMEOUT
+    assert result.stdout == "partial bytes"
+
+
 # --- FakeCommandRunner --------------------------------------------------
 
 

@@ -249,7 +249,7 @@ def test_clone_and_update_a_real_repository(tmp_path):
     upstream.add_paths(["README.md"])
     upstream.commit("initial")
 
-    ref = parse_repo(f"file://{source}")
+    ref = parse_repo(f"file://{source.as_posix()}")  # forward slashes on every OS
     runner = SubprocessCommandRunner()
     dest = str(tmp_path / "work" / ref.workspace_name)
     assert clone_or_update(ref, dest, runner=runner) == dest
@@ -312,6 +312,7 @@ def test_default_env_file_xdg_default_is_home_config(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows spells HOME this way
     target = tmp_path / ".config" / "dev-team" / "dev-team.env"
     target.parent.mkdir(parents=True)
     target.write_text("GITHUB_TOKEN=home-config\n")

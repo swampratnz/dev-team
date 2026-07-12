@@ -18,6 +18,7 @@ from .budget import Budget
 from .chat import ChatSession, chat_system_prompt
 from .config import TeamConfig
 from .dashboard import DashboardServer
+from .dispatch import DispatchServer
 from .engine import EngineConfig
 from .errors import DevTeamError
 from .eventlog import EventLog, compose
@@ -177,18 +178,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--deliver/--assess runs on the same workspace.",
     )
     parser.add_argument(
+        "--dispatch",
+        action="store_true",
+        help="Serve an authenticated HTTP dispatch service: an external "
+        "caller can submit assess/deliver jobs against a repository, poll "
+        "status, and fetch results. Jobs run one at a time (single-flight). "
+        "The bearer token is read from the DEV_TEAM_DISPATCH_TOKEN "
+        "environment variable; bind to a trusted (e.g. tailnet) address.",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help="Port for --dashboard (default 8737).",
+        help="Port for --dashboard (default 8737) or --dispatch (default 8738).",
     )
     parser.add_argument(
         "--host",
         default=None,
         metavar="ADDR",
-        help="Bind address for --dashboard (default 127.0.0.1). The "
-        "dashboard has no authentication and can read any file the "
-        "workspace holds — only widen this on a trusted network.",
+        help="Bind address for --dashboard or --dispatch (default 127.0.0.1). "
+        "The dashboard has no authentication and can read any file the "
+        "workspace holds; the dispatch service authenticates but runs agent "
+        "code — only widen this on a trusted network.",
     )
     parser.add_argument(
         "--report",
@@ -368,10 +379,15 @@ def _validate_args(
             "--dashboard is a viewer; run it as its own process alongside "
             "--assess/--deliver/--chat runs"
         )
-    if args.port is not None and not args.dashboard:
-        parser.error("--port: only valid with --dashboard")
-    if args.host is not None and not args.dashboard:
-        parser.error("--host: only valid with --dashboard")
+    if args.dispatch and (args.assess or args.deliver or args.chat or args.dashboard):
+        parser.error(
+            "--dispatch is a standalone service; run it as its own process, "
+            "not alongside --assess/--deliver/--chat/--dashboard"
+        )
+    if args.port is not None and not (args.dashboard or args.dispatch):
+        parser.error("--port: only valid with --dashboard or --dispatch")
+    if args.host is not None and not (args.dashboard or args.dispatch):
+        parser.error("--host: only valid with --dashboard or --dispatch")
     if args.report is not None and not args.assess:
         parser.error("--report: only valid with --assess")
     if args.chat:
@@ -380,7 +396,7 @@ def _validate_args(
                          "the title/description arguments")
         if args.json:
             parser.error("--json: not available with --chat (stdout is the conversation)")
-    elif not (args.assess or args.dashboard):
+    elif not (args.assess or args.dashboard or args.dispatch):
         if args.title is None or args.description is None:
             parser.error("title and description are required (or use --chat)")
     if args.roster is not None and args.no_personas:
@@ -619,6 +635,44 @@ def _serve_dashboard(args) -> int:
     return 0
 
 
+#: Environment variable holding the dispatch service's bearer token.
+DISPATCH_TOKEN_ENV = "DEV_TEAM_DISPATCH_TOKEN"
+
+
+def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
+    """Serve the authenticated HTTP dispatch service until interrupted.
+
+    The bearer token comes from :data:`DISPATCH_TOKEN_ENV`; a missing/empty
+    token is a hard error (the service must never run unauthenticated). The
+    default bind is localhost — the systemd unit widens it to the tailnet IP.
+    """
+
+    token = os.environ.get(DISPATCH_TOKEN_ENV, "")
+    if not token:
+        raise DevTeamError(
+            f"--dispatch requires a bearer token in ${DISPATCH_TOKEN_ENV}; "
+            "set it in the environment (or the service's EnvironmentFile) and "
+            "share it only with the authorised caller"
+        )
+    server = DispatchServer(
+        token,
+        host=args.host if args.host is not None else "127.0.0.1",
+        port=args.port if args.port is not None else 8738,
+        runner=runner,
+    )
+    print(
+        f"dev-team dispatch service at {server.url} (Ctrl-C to stop)",
+        file=sys.stderr,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    return 0
+
+
 def _run(
     argv: Optional[List[str]],
     runner: Optional[AgentRunner],
@@ -636,6 +690,11 @@ def _run(
         # Only the real SDK runner needs credentials; an injected runner
         # (tests, embedding) brings its own transport.
         ensure_credentials()
+
+    if args.dispatch:
+        # This process runs real agents for submitted jobs, so credentials are
+        # required (checked above unless a runner was injected).
+        return _serve_dispatch(args, runner)
 
     if args.repo is not None:
         _materialise_repo(args, parser.get_default("workspace"))

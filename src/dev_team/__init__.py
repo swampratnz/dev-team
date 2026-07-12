@@ -48,6 +48,7 @@ from .conventions import (
     detect_convention_sources,
 )
 from .dashboard import DashboardServer, collect_state
+from .dispatch import Dispatcher, DispatchServer, JobRecord, JobSpec
 from .eventlog import EventLog, compose, read_events
 from .deadcode import DeadCodeFinding, DeadCodeReport, detect_dead_code
 from .depscan import (
@@ -276,6 +277,11 @@ __all__ = [
     "EventLog",
     "read_events",
     "compose",
+    # dispatch service
+    "DispatchServer",
+    "Dispatcher",
+    "JobSpec",
+    "JobRecord",
     # repository sources
     "RepoRef",
     "SourceError",
