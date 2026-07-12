@@ -5,10 +5,12 @@ from __future__ import annotations
 from helpers import run
 
 from dev_team.budget import Budget
+from dev_team.execution import InMemoryWorkspace
 from dev_team.instrument import InstrumentedRunner
 from dev_team.sdk import AgentResult
 from dev_team.testing import ScriptedRunner
 from dev_team.trace import Tracer
+from dev_team.transcripts import TranscriptRecorder, list_transcripts, read_transcript
 
 
 class _Clock:
@@ -78,3 +80,60 @@ def test_exception_without_tracer_still_propagates():
         pass
     else:  # pragma: no cover - the raise is the point
         raise AssertionError("expected RuntimeError")
+
+
+# --- transcript recording ----------------------------------------------------
+
+
+def test_records_transcript_on_success():
+    inner = ScriptedRunner([AgentResult(text="hello", cost_usd=0.4)])
+    ws = InMemoryWorkspace()
+    recorder = TranscriptRecorder(ws, run="deliver-1", clock=lambda: 7.0)
+    runner = InstrumentedRunner(inner, "engineer", transcript_recorder=recorder)
+    run(runner.run("do it", system_prompt="be an engineer"))
+    record = read_transcript(ws, "deliver-1", "engineer", 1)
+    assert record["prompt"] == "do it"
+    assert record["system_prompt"] == "be an engineer"
+    assert record["response"] == "hello"
+    assert record["cost_usd"] == 0.4
+
+
+def test_records_transcript_on_error_result():
+    # An error RESULT (not a raise) is still recorded so failures are auditable.
+    inner = ScriptedRunner([AgentResult(text="boom", is_error=True)])
+    ws = InMemoryWorkspace()
+    recorder = TranscriptRecorder(ws, run="deliver-1")
+    runner = InstrumentedRunner(inner, "qa", transcript_recorder=recorder)
+    run(runner.run("p"))
+    record = read_transcript(ws, "deliver-1", "qa", 1)
+    assert record["is_error"] is True
+
+
+def test_does_not_record_on_raising_call():
+    class BoomRunner:
+        async def run(self, prompt, **kwargs):
+            raise RuntimeError("boom")
+
+    ws = InMemoryWorkspace()
+    recorder = TranscriptRecorder(ws, run="deliver-1")
+    runner = InstrumentedRunner(BoomRunner(), "engineer", transcript_recorder=recorder)
+    try:
+        run(runner.run("p"))
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the raise is the point
+        raise AssertionError("expected RuntimeError")
+    # no result to record, so nothing was written
+    assert list_transcripts(ws, "deliver-1", "engineer") == []
+
+
+def test_transcript_write_failure_never_breaks_the_run():
+    class BoomRecorder:
+        def record(self, **kwargs):
+            raise OSError("disk full")
+
+    inner = ScriptedRunner([AgentResult(text="ok")])
+    runner = InstrumentedRunner(inner, "engineer", transcript_recorder=BoomRecorder())
+    # a recording failure is swallowed; the call still returns its result
+    result = run(runner.run("p"))
+    assert result.text == "ok"

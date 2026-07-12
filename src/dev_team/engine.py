@@ -100,6 +100,7 @@ from .profile import detect_project
 from .scheduler import ScheduledResult, schedule
 from .sdk import AgentRunner
 from .trace import Tracer
+from .transcripts import TranscriptRecorder
 from .verification import (
     CommandGate,
     DefinitionOfDone,
@@ -410,6 +411,7 @@ class DeliveryEngine:
         listener: Optional[Listener] = None,
         roster: Optional[Roster] = None,
         interaction: Optional[InteractionChannel] = None,
+        transcript_recorder: Optional[TranscriptRecorder] = None,
     ) -> None:
         self.config = config or EngineConfig()
         self.workspace: Workspace = workspace or InMemoryWorkspace()
@@ -420,6 +422,7 @@ class DeliveryEngine:
         self.listener = listener
         self.roster = roster if roster is not None else Roster.default()
         self.interaction = interaction
+        self.transcript_recorder = transcript_recorder
 
         # Everything side-effecting is rooted at the workspace, never at the
         # orchestrator's own working directory.
@@ -503,7 +506,11 @@ class DeliveryEngine:
 
         def make(cls):
             wrapped = InstrumentedRunner(
-                runner, cls.role, budget=self.budget, tracer=self.tracer
+                runner,
+                cls.role,
+                budget=self.budget,
+                tracer=self.tracer,
+                transcript_recorder=self.transcript_recorder,
             )
             return cls(
                 wrapped,

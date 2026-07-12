@@ -880,9 +880,11 @@ def test_main_dashboard_flag_validation():
 class _FakeDispatchServer:
     instances = []
 
-    def __init__(self, token, *, host, port, runner=None, dashboard_workspace=None):
+    def __init__(self, token, *, host, port, runner=None, dashboard_workspace=None,
+                 record_transcripts=False):
         self.token, self.host, self.port, self.runner = token, host, port, runner
         self.dashboard_workspace = dashboard_workspace
+        self.record_transcripts = record_transcripts
         self.interrupted = False
         self.shut_down = False
         _FakeDispatchServer.instances.append(self)
@@ -923,9 +925,11 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
 
     original_init = _FakeDispatchServer.__init__
 
-    def interrupting_init(self, token, *, host, port, runner=None, dashboard_workspace=None):
+    def interrupting_init(self, token, *, host, port, runner=None,
+                          dashboard_workspace=None, record_transcripts=False):
         original_init(self, token, host=host, port=port, runner=runner,
-                      dashboard_workspace=dashboard_workspace)
+                      dashboard_workspace=dashboard_workspace,
+                      record_transcripts=record_transcripts)
         self.interrupted = True
 
     monkeypatch.setattr(_FakeDispatchServer, "__init__", interrupting_init)
@@ -934,7 +938,36 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
     (server,) = _FakeDispatchServer.instances
     assert (server.host, server.port) == ("127.0.0.1", 8738)
     assert server.dashboard_workspace is None  # not requested → not wired
+    assert server.record_transcripts is False  # off by default
     assert server.shut_down is True
+
+
+def test_main_dispatch_record_transcripts_flag(monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    monkeypatch.delenv("DEV_TEAM_RECORD_TRANSCRIPTS", raising=False)
+    assert main(["--dispatch", "--record-transcripts"], runner=ScriptedRunner([])) == 0
+    (server,) = _FakeDispatchServer.instances
+    assert server.record_transcripts is True
+
+
+def test_main_dispatch_record_transcripts_env(monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    monkeypatch.setenv("DEV_TEAM_RECORD_TRANSCRIPTS", "TRUE")  # case-insensitive
+    assert main(["--dispatch"], runner=ScriptedRunner([])) == 0
+    (server,) = _FakeDispatchServer.instances
+    assert server.record_transcripts is True
+
+
+def test_main_record_transcripts_requires_a_run_mode():
+    # Meaningless without --assess/--deliver/--dispatch → argparse error.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--record-transcripts", "--dashboard", "--workspace", "."],
+             runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
 
 
 def test_main_dispatch_requires_token(monkeypatch, capsys):
@@ -994,6 +1027,50 @@ def test_main_deliver_journals_events_for_the_dashboard(tmp_path):
     assert records, "delivery left no event journal"
     assert all(r["run"].startswith("deliver-") for r in records)
     assert {"engineer", "reviewer"} <= {r["role"] for r in records}
+
+
+def test_main_deliver_records_transcripts_under_the_events_run_id(tmp_path):
+    from helpers import engine_responses
+
+    from dev_team.eventlog import EVENTS_PATH
+    from dev_team.execution import LocalWorkspace
+    from dev_team.transcripts import list_transcripts
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(_deliver_args(tmp_path, "--record-transcripts"), runner=runner)
+    assert code == 0
+    # the recorder shares the SAME run id as the event journal
+    records = [json.loads(line) for line in (tmp_path / EVENTS_PATH).read_text().splitlines()]
+    run_id = records[0]["run"]
+    ws = LocalWorkspace(str(tmp_path), excluded_dirs=frozenset())
+    assert list_transcripts(ws, run_id, "engineer")
+
+
+def test_main_deliver_records_no_transcripts_by_default(tmp_path):
+    from helpers import engine_responses
+
+    from dev_team.transcripts import TRANSCRIPTS_DIR
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    assert main(_deliver_args(tmp_path), runner=runner) == 0
+    assert not (tmp_path / TRANSCRIPTS_DIR).exists()
+
+
+def test_main_assess_records_transcripts(tmp_path):
+    from test_assessment import assess_responses
+
+    from dev_team.eventlog import EVENTS_PATH
+    from dev_team.execution import LocalWorkspace
+    from dev_team.transcripts import list_transcripts
+
+    repo = _dotnet_repo(tmp_path)
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(["--assess", "--workspace", str(repo), "--record-transcripts"], runner=runner)
+    assert code == 0
+    records = [json.loads(line) for line in (repo / EVENTS_PATH).read_text().splitlines()]
+    run_id = records[0]["run"]
+    ws = LocalWorkspace(str(repo), excluded_dirs=frozenset())
+    assert list_transcripts(ws, run_id, "architect")
 
 
 def test_main_assess_journals_events_for_the_dashboard(tmp_path):

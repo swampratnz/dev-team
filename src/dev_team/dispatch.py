@@ -61,6 +61,7 @@ from .sources import (
     resolve_github_token,
 )
 from .team import DevTeam
+from .transcripts import TranscriptRecorder
 
 #: Default port for the dispatch service (the dashboard keeps 8737).
 DEFAULT_PORT = 8738
@@ -154,12 +155,16 @@ class Dispatcher:
         jobs_root: str = DEFAULT_JOBS_ROOT,
         queue_cap: int = DEFAULT_QUEUE_CAP,
         dashboard_workspace: Optional[Workspace] = None,
+        record_transcripts: bool = False,
     ) -> None:
         self.token = token
         self._runner = runner
         self._materialise = materialise or _default_materialise
         self._clock = clock
         self._jobs_root = jobs_root
+        # Off by default: capturing raw agent I/O is opt-in (the operator
+        # enables it via --record-transcripts or DEV_TEAM_RECORD_TRANSCRIPTS).
+        self._record_transcripts = record_transcripts
         # Optional shared workspace the standing `--dashboard` process watches:
         # when set, every job ALSO journals its events here (same run id, so it
         # shows as its own run/agent-cards on the dashboard) and an assess run
@@ -347,11 +352,19 @@ class Dispatcher:
             interaction=None,
         )
         budget = Budget(limit_usd=spec.budget_usd)
+        # When enabled, transcripts land where the dashboard can read them: the
+        # shared dashboard workspace when configured (same place its events are
+        # mirrored), else the job's own workspace. Same run id as the events.
+        kwargs: Dict[str, Any] = {}
+        if self._record_transcripts:
+            target = self._dashboard_workspace or workspace
+            kwargs["transcript_recorder"] = TranscriptRecorder(target, run=spec.id)
         if spec.mode == "assess":
             outcome = await team.assess(
                 workspace=workspace,
                 budget=budget,
                 config=AssessConfig(),
+                **kwargs,
             )
             self._mirror_report(spec.id, outcome)
         else:
@@ -360,6 +373,7 @@ class Dispatcher:
                 workspace=workspace,
                 budget=budget,
                 config=EngineConfig(commit=True),
+                **kwargs,
             )
         return outcome, outcome.cost_usd
 
@@ -573,6 +587,7 @@ class DispatchServer:
         jobs_root: str = DEFAULT_JOBS_ROOT,
         queue_cap: int = DEFAULT_QUEUE_CAP,
         dashboard_workspace: Optional[Workspace] = None,
+        record_transcripts: bool = False,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -582,6 +597,7 @@ class DispatchServer:
             jobs_root=jobs_root,
             queue_cap=queue_cap,
             dashboard_workspace=dashboard_workspace,
+            record_transcripts=record_transcripts,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()

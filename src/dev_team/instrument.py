@@ -14,6 +14,7 @@ from typing import Optional, Sequence
 from .budget import Budget
 from .sdk import AgentResult, AgentRunner
 from .trace import Tracer
+from .transcripts import TranscriptRecorder
 
 
 @dataclass
@@ -25,12 +26,17 @@ class InstrumentedRunner:
         role: Role label used for budget attribution and trace naming.
         budget: Optional budget to record usage against (may raise if exceeded).
         tracer: Optional tracer to record a span per call.
+        transcript_recorder: Optional recorder that captures the raw
+            system-prompt/prompt/response of each call to disk (off by
+            default). Recording is best-effort: a write failure is swallowed
+            so it can never break a run.
     """
 
     inner: AgentRunner
     role: str
     budget: Optional[Budget] = None
     tracer: Optional[Tracer] = None
+    transcript_recorder: Optional[TranscriptRecorder] = None
 
     async def run(
         self,
@@ -66,4 +72,23 @@ class InstrumentedRunner:
             self.tracer.end(span, "error" if result.is_error else "ok")
         if self.budget is not None:
             self.budget.record(self.role, result)
+        # Capture the raw I/O on both the success and the error-result paths
+        # (the raising path returned above, so it has no result to record).
+        if self.transcript_recorder is not None:
+            self._record(system_prompt, prompt, result)
         return result
+
+    def _record(
+        self, system_prompt: Optional[str], prompt: str, result: AgentResult
+    ) -> None:
+        """Best-effort transcript write; a failure must never break a run."""
+
+        try:
+            self.transcript_recorder.record(
+                role=self.role,
+                system_prompt=system_prompt,
+                prompt=prompt,
+                result=result,
+            )
+        except Exception:  # noqa: BLE001 - recording is forgiving, like the eventlog
+            pass

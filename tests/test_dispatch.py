@@ -237,6 +237,57 @@ def test_run_job_deliver_mirrors_events_but_writes_no_report():
     assert not any(p.startswith("audit/") for p in dash.list_files())
 
 
+def test_run_job_records_transcripts_into_the_dashboard_workspace():
+    from dev_team.transcripts import list_transcripts
+
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_assess_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+        record_transcripts=True,
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec.id = "assess-tx"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    # transcripts land in the shared dashboard workspace, keyed by the job id
+    assert list_transcripts(dash, "assess-tx", "architect")
+
+
+def test_run_job_records_transcripts_into_job_workspace_without_dashboard():
+    from dev_team.transcripts import list_transcripts
+
+    job_ws = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_assess_runner(),
+        materialise=lambda spec, dest: job_ws,
+        record_transcripts=True,
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec.id = "assess-solo"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    # with no dashboard workspace, transcripts fall back to the job's own
+    assert list_transcripts(job_ws, "assess-solo", "architect")
+
+
+def test_run_job_does_not_record_transcripts_by_default():
+    from dev_team.transcripts import list_transcripts
+
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_assess_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec.id = "assess-off"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert list_transcripts(dash, "assess-off", "architect") == []
+
+
 def test_mirror_report_is_a_noop_without_a_dashboard_workspace():
     # No dashboard configured → returns immediately, touches nothing.
     Dispatcher(token="x")._mirror_report("job-x", object())

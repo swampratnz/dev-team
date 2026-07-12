@@ -117,6 +117,19 @@ def test_deliver_happy_path():
     assert ws.exists(".dev_team/memory.json")
 
 
+def test_deliver_records_transcripts_when_recorder_is_set():
+    from dev_team.transcripts import TranscriptRecorder, list_transcripts
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    tx = InMemoryWorkspace()
+    recorder = TranscriptRecorder(tx, run="deliver-x")
+    engine = _engine(runner, transcript_recorder=recorder)
+    run(engine.deliver(_request()))
+    # each agent that ran left a captured transcript under its role/run
+    assert list_transcripts(tx, "deliver-x", "engineer")
+    assert list_transcripts(tx, "deliver-x", "product-manager")
+
+
 def test_deliver_reviewer_sees_actual_file_content():
     runner = ScriptedRunner(by_system_prompt=engine_responses())
     engine = _engine(runner)

@@ -204,6 +204,18 @@ def test_inventory_stats_render_empty():
 # --- happy path ------------------------------------------------------------------
 
 
+def test_assess_records_transcripts_when_recorder_is_set():
+    from dev_team.transcripts import TranscriptRecorder, list_transcripts
+
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    tx = InMemoryWorkspace()
+    recorder = TranscriptRecorder(tx, run="assess-x")
+    engine = _engine(runner, transcript_recorder=recorder)
+    run(engine.assess())
+    # the audit's agents each left a captured transcript under their role/run
+    assert list_transcripts(tx, "assess-x", "architect")
+
+
 def test_assess_happy_path_produces_cited_report():
     runner = ScriptedRunner(by_system_prompt=assess_responses())
     ws = _workspace()

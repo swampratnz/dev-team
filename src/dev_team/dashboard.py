@@ -29,6 +29,7 @@ from .eventlog import read_events
 from .execution import Workspace
 from .memory import ProjectMemory
 from .persona import DEFAULT_CAST
+from .transcripts import list_transcripts, read_transcript
 
 #: Engine-level event roles that are not agents (they feed the feed, not cards).
 _ENGINE_ROLES = frozenset({"workflow", "delivery", "assessment", "chat"})
@@ -227,6 +228,10 @@ def _make_handler(workspace: Workspace) -> type:
                 self._report(parts.query)
             elif parts.path == "/api/agent":
                 self._agent(parts.query)
+            elif parts.path == "/api/transcripts":
+                self._transcripts(parts.query)
+            elif parts.path == "/api/transcript":
+                self._transcript(parts.query)
             else:
                 self._send(404, "text/plain", "not found")
 
@@ -251,6 +256,38 @@ def _make_handler(workspace: Workspace) -> type:
                 "history": agent_history(workspace, role),
             }
             self._send(200, "application/json", json.dumps(payload))
+
+        # -- transcripts: a SENSITIVE surface -------------------------------
+        # These two routes serve the raw system-prompt/prompt/response of each
+        # agent call, which can include repository content (and any secrets in
+        # it). Access is tailnet-only for now (no dashboard auth yet); an auth
+        # layer is meant to wrap exactly these routes later. The read helpers
+        # sanitise every query param and gate on workspace membership (the
+        # traversal guard), mirroring /api/report.
+
+        def _transcripts(self, query: str) -> None:
+            # A list is never an error: an empty list means "none recorded /
+            # recording disabled", which the UI renders as a muted hint.
+            params = parse_qs(query)
+            run = params.get("run", [""])[0]
+            role = params.get("role", [""])[0]
+            payload = {
+                "run": run,
+                "role": role,
+                "transcripts": list_transcripts(workspace, run, role),
+            }
+            self._send(200, "application/json", json.dumps(payload))
+
+        def _transcript(self, query: str) -> None:
+            params = parse_qs(query)
+            run = params.get("run", [""])[0]
+            role = params.get("role", [""])[0]
+            seq = params.get("seq", [""])[0]
+            record = read_transcript(workspace, run, role, seq)
+            if record is None:
+                self._send(404, "text/plain", "unknown transcript")
+                return
+            self._send(200, "application/json", json.dumps(record))
 
     return Handler
 
@@ -536,6 +573,16 @@ details[open] summary .preview { display: none; }
 .tl .when { margin-left: auto; color: var(--ink-3); font-size: 12px; white-space: nowrap; }
 .tl .msg { margin-top: 5px; color: var(--ink); overflow-wrap: anywhere; }
 .tl .detail { margin-top: 3px; color: var(--ink-3); font-size: 12px; overflow-wrap: anywhere; }
+
+details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
+.tx-body { padding: 4px 0 6px; }
+.tx-field { margin: 8px 0; }
+.tx-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+            color: var(--ink-3); font-weight: 600; margin-bottom: 4px; }
+.tx-pre { background: var(--inset); border: 1px solid var(--line-soft); border-radius: 8px;
+          padding: 10px 12px; max-height: 300px; overflow: auto; white-space: pre-wrap;
+          overflow-wrap: anywhere; font-size: 12px; color: var(--ink-2);
+          font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
 
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
@@ -948,21 +995,107 @@ function renderHistory(data) {
   return out.join("");
 }
 
-function openAgent(role) {
+// The distinct run ids this agent appears in, oldest-first (transcripts are
+// keyed by run+role, so we fetch one group per run present in the history).
+function distinctRuns(data) {
+  const items = (data && data.history) || [];
+  const seen = [];
+  for (const e of items) if (e.run && !seen.includes(e.run)) seen.push(e.run);
+  return seen;
+}
+
+// One labelled, scrollable, monospace <pre>. SECURITY: transcript text is raw
+// repo-derived content, so every field is escaped through esc() before it
+// touches innerHTML — a prompt/response containing <script> or </pre> renders
+// inert as literal text. null fields (e.g. no system prompt) are omitted.
+function txField(label, text) {
+  if (text == null) return "";
+  return `<div class="tx-field"><div class="tx-label">${esc(label)}</div>`
+    + `<pre class="tx-pre">${esc(text)}</pre></div>`;
+}
+
+// Render the "Transcripts (N)" subsection from per-run metadata groups. Each
+// call is a collapsible showing seq/cost/time; the body loads on expand.
+function renderTranscripts(role, groups) {
+  let total = 0;
+  for (const g of groups) total += ((g && g.transcripts) || []).length;
+  const out = [`<div class="tl-run">Transcripts (${total})</div>`];
+  if (!total) {
+    out.push('<p class="muted">No transcripts recorded for this run '
+      + '(enable with --record-transcripts / DEV_TEAM_RECORD_TRANSCRIPTS).</p>');
+    return out.join("");
+  }
+  for (const g of groups) {
+    const list = (g && g.transcripts) || [];
+    if (!list.length) continue;
+    if (groups.length > 1) out.push(`<div class="tl-run">run <code>${esc(g.run)}</code></div>`);
+    for (const t of list) {
+      const cost = (typeof t.cost_usd === "number") ? "$" + t.cost_usd.toFixed(4) : "";
+      const bits = ["#" + esc(t.seq), cost && esc(cost), t.is_error ? "error" : "",
+                    esc(absTime(t.ts))].filter(Boolean).join(" \\u00b7 ");
+      out.push(`<details class="tx" data-run="${esc(g.run)}" data-role="${esc(role)}" data-seq="${esc(t.seq)}">`
+        + `<summary>${bits}<span class="preview">${esc(t.prompt_preview)}</span></summary>`
+        + '<div class="tx-body"><p class="muted">loading\\u2026</p></div></details>');
+    }
+  }
+  return out.join("");
+}
+
+// Fetch and render one transcript's full I/O, once, when its <details> opens.
+async function fillTranscript(d) {
+  if (d.dataset.loaded) return;
+  d.dataset.loaded = "1";
+  const body = d.querySelector(".tx-body");
+  try {
+    const res = await fetch("/api/transcript?run=" + encodeURIComponent(d.dataset.run)
+      + "&role=" + encodeURIComponent(d.dataset.role)
+      + "&seq=" + encodeURIComponent(d.dataset.seq));
+    if (!res.ok) throw new Error(String(res.status));
+    const t = await res.json();
+    body.innerHTML = txField("System prompt", t.system_prompt)
+      + txField("Prompt", t.prompt) + txField("Response", t.response);
+  } catch (err) {
+    d.dataset.loaded = "";
+    body.innerHTML = '<p class="muted">failed to load transcript</p>';
+  }
+}
+
+async function loadTranscripts(role, runs) {
+  const box = $("agent-transcripts");
+  if (!box) return;
+  try {
+    const groups = await Promise.all(runs.map(run =>
+      fetch("/api/transcripts?run=" + encodeURIComponent(run)
+            + "&role=" + encodeURIComponent(role))
+        .then(r => { if (!r.ok) throw new Error(String(r.status)); return r.json(); })));
+    box.innerHTML = renderTranscripts(role, groups);
+    box.querySelectorAll("details.tx").forEach(d =>
+      d.addEventListener("toggle", () => { if (d.open) fillTranscript(d); }));
+  } catch (err) {
+    box.innerHTML = '<div class="tl-run">Transcripts</div>'
+      + '<p class="muted">failed to load transcripts</p>';
+  }
+}
+
+async function openAgent(role) {
   $("agent-title").textContent = role;
   $("agent-body").innerHTML = '<p class="muted">loading\\u2026</p>';
   $("agent-overlay").hidden = false;
   $("agent-close").focus();
-  fetch("/api/agent?role=" + encodeURIComponent(role))
-    .then(res => { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
-    .then(data => {
-      const label = (data.name && data.name !== data.role)
-        ? data.name + " (" + data.role + ")" : (data.role || role);
-      $("agent-title").textContent = label;
-      $("agent-title").title = label;
-      $("agent-body").innerHTML = renderHistory(data);
-    })
-    .catch(() => { $("agent-body").innerHTML = '<p class="muted">failed to load history</p>'; });
+  try {
+    const res = await fetch("/api/agent?role=" + encodeURIComponent(role));
+    if (!res.ok) throw new Error(String(res.status));
+    const data = await res.json();
+    const label = (data.name && data.name !== data.role)
+      ? data.name + " (" + data.role + ")" : (data.role || role);
+    $("agent-title").textContent = label;
+    $("agent-title").title = label;
+    $("agent-body").innerHTML = renderHistory(data)
+      + '<div id="agent-transcripts"><p class="muted">loading transcripts\\u2026</p></div>';
+    loadTranscripts(data.role || role, distinctRuns(data));
+  } catch (err) {
+    $("agent-body").innerHTML = '<p class="muted">failed to load history</p>';
+  }
 }
 
 function closeAgent() { $("agent-overlay").hidden = true; }
