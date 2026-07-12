@@ -17,8 +17,11 @@ and a per-run quality scorecard. v0.7 opened the loop to humans: named
 personas, interactive plan review / failure escalation / approvals over an
 `InteractionChannel`, a chat front door on a persistent session, and a
 `QueueChannel` integration surface for external UIs (see
-`docs/INTERACTION.md`). The items below are the known, deliberately deferred
-capabilities, roughly in priority order.
+`docs/INTERACTION.md`). It also added a third engine — read-only repository
+assessment with cited, phased audit reports (see `docs/ASSESSMENT.md`) — and
+.NET project support (profiles, manifests, VSTest/xUnit attribution). The
+items below are the known, deliberately deferred capabilities, roughly in
+priority order.
 
 ## 1. Container-level sandboxing
 

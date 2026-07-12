@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Mapping, Optional
 
 from . import __version__
+from .assessment import AssessConfig, outcome_to_dict
 from .budget import Budget
 from .chat import ChatSession, chat_system_prompt
 from .config import TeamConfig
@@ -152,6 +153,20 @@ def build_parser() -> argparse.ArgumentParser:
         "instead of the side-effect-free simulation.",
     )
     parser.add_argument(
+        "--assess",
+        action="store_true",
+        help="Audit the --workspace repository read-only (inventory, "
+        "buildability, risk, tests/docs, recommendation) and write a cited "
+        "markdown report. Optional description argument scopes the audit.",
+    )
+    parser.add_argument(
+        "--report",
+        default=None,
+        metavar="FILE",
+        help="Workspace-relative path for the assessment report "
+        "(with --assess; default: audit/assessment.md).",
+    )
+    parser.add_argument(
         "--workspace",
         default="./build",
         metavar="DIR",
@@ -227,13 +242,19 @@ def _validate_args(
 ) -> None:
     """Reject argument combinations that would silently misbehave."""
 
+    if args.chat and args.assess:
+        parser.error("--chat and --assess are mutually exclusive")
+    if args.assess and args.deliver:
+        parser.error("--assess is read-only; it cannot be combined with --deliver")
+    if args.report is not None and not args.assess:
+        parser.error("--report: only valid with --assess")
     if args.chat:
         if args.title is not None or args.description is not None:
             parser.error("--chat shapes the feature in conversation; omit "
                          "the title/description arguments")
         if args.json:
             parser.error("--json: not available with --chat (stdout is the conversation)")
-    else:
+    elif not args.assess:
         if args.title is None or args.description is None:
             parser.error("title and description are required (or use --chat)")
     if args.roster is not None and args.no_personas:
@@ -248,26 +269,28 @@ def _reject_deliver_only_flags(
 
     These flags only affect the delivery engine; silently ignoring them in
     simulation mode would let e.g. ``--budget-usd`` go unenforced. A chat
-    session may end in ``/deliver``, so chat mode accepts them too.
+    session may end in ``/deliver``, so chat mode accepts them too, and an
+    assessment shares the flags that scope any real-workspace run
+    (``--workspace``, ``--budget-usd``).
     """
 
     if args.deliver or args.chat:
         return
-    passed = [
-        flag
-        for flag, is_set in (
-            ("--workspace", args.workspace != parser.get_default("workspace")),
-            ("--verify-command", args.verify_command is not None),
-            ("--setup-command", args.setup_command is not None),
-            ("--branch", args.branch is not None),
-            ("--allow-dirty-baseline", args.allow_dirty_baseline),
-            ("--proceed-on-red-baseline", args.proceed_on_red_baseline),
-            ("--budget-usd", args.budget_usd is not None),
-            ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
-            ("--no-commit", args.no_commit),
-        )
-        if is_set
+    checks = [
+        ("--verify-command", args.verify_command is not None),
+        ("--setup-command", args.setup_command is not None),
+        ("--branch", args.branch is not None),
+        ("--allow-dirty-baseline", args.allow_dirty_baseline),
+        ("--proceed-on-red-baseline", args.proceed_on_red_baseline),
+        ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
+        ("--no-commit", args.no_commit),
     ]
+    if not args.assess:
+        checks += [
+            ("--workspace", args.workspace != parser.get_default("workspace")),
+            ("--budget-usd", args.budget_usd is not None),
+        ]
+    passed = [flag for flag, is_set in checks if is_set]
     if passed:
         parser.error(f"{', '.join(passed)}: only valid with --deliver")
 
@@ -319,6 +342,25 @@ async def _deliver(team: DevTeam, request: FeatureRequest, args) -> int:
         print(json.dumps(delivery_to_dict(outcome), indent=2))
     else:
         print(render_delivery_summary(outcome))
+    return 0 if outcome.success else 1
+
+
+async def _assess(team: DevTeam, args) -> int:
+    """Run a read-only repository assessment; returns the exit code."""
+
+    focus_parts = [p for p in (args.title, args.description) if p]
+    config_kwargs = {"model": args.model, "focus": " — ".join(focus_parts) or None}
+    if args.report is not None:
+        config_kwargs["report_path"] = args.report
+    outcome = await team.assess(
+        workspace=LocalWorkspace(args.workspace),
+        budget=Budget(limit_usd=args.budget_usd),
+        config=AssessConfig(**config_kwargs),
+    )
+    if args.json:
+        print(json.dumps(outcome_to_dict(outcome), indent=2))
+    else:
+        print(outcome.report_markdown)
     return 0 if outcome.success else 1
 
 
@@ -396,6 +438,8 @@ def _run(
 
     if args.chat:
         return asyncio.run(_chat(team, args, chat_backend))
+    if args.assess:
+        return asyncio.run(_assess(team, args))
 
     request = FeatureRequest(
         title=args.title,

@@ -27,7 +27,7 @@ QA, security, docs, reliability, and deployment.
   set (never `git add -A` into the feature commit).
 - ✅ **Works on legacy suites** — a tolerated red baseline records the failing
   test identities and gates each task only on *newly* failing tests
-  (pytest/go/cargo output attribution).
+  (pytest/go/cargo/VSTest/xUnit output attribution).
 - ✅ **Knows the codebase** — a deterministic repo map (tree, manifest heads,
   test layout) feeds the planner and architect on brownfield runs, and a
   retrospective of what failed last time feeds the next run's plan.
@@ -36,7 +36,7 @@ QA, security, docs, reliability, and deployment.
   squash-merge into the delivery branch one at a time with a full gate check
   on the merged state.
 - ✅ **Adapts to the project** — the verify command is auto-detected from the
-  workspace's manifests (npm / cargo / go / pytest), with optional
+  workspace's manifests (dotnet / npm / cargo / go / pytest), with optional
   `setup_command` provisioning and per-gate timeouts.
 - ✅ **Benchmark-grounded agents** (see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)) —
   QA is held to SWT-bench's fail-to-pass bar (a suite that still passes with
@@ -67,6 +67,12 @@ QA, security, docs, reliability, and deployment.
   starts; every agent has a configurable name/persona; and a `QueueChannel`
   lets you drive runs from your own UI (see
   [`docs/INTERACTION.md`](docs/INTERACTION.md)).
+- ✅ **Audits what it didn't build** — `--assess` turns the team loose on an
+  existing repo (legacy .NET monolith included: solution-aware profiles,
+  VSTest/xUnit failure parsing) and produces a phased, path-cited assessment
+  — buildability, dependency/secret/data risk, test reality, and a
+  classification with a sequenced remediation plan — without mutating the
+  repo (see [`docs/ASSESSMENT.md`](docs/ASSESSMENT.md)).
 - ✅ **Ubuntu-ready** — packaged for deployment as a container or systemd unit.
 
 The capability set was chosen from a structured research pass across seven
@@ -79,11 +85,12 @@ interactively.
 
 ---
 
-## Two engines
+## Three engines
 
 | Engine | Entry point | What it does |
 |--------|-------------|--------------|
 | **Simulation** | `DevTeam.develop` / `DevelopmentWorkflow` | Fast, side-effect-free walk through the lifecycle — agents *describe* the work as structured data. Its reports (including QA's pass/fail) are self-described, nothing executes, and only six of the nine roles run — security, SRE, and docs are delivery-engine stages. |
+| **Assessment** | `DevTeam.assess` / `AssessmentEngine` | Audits an *existing* repository read-only — inventory, buildability, risk, tests/docs, and a classification with a remediation plan — into one cited markdown report. No branch, no gates, no commits; see [`docs/ASSESSMENT.md`](docs/ASSESSMENT.md). |
 | **Real delivery** | `DevTeam.deliver` / `DeliveryEngine` | *Does* the work: the engineer works agentically in the workspace (or describes changes that are materialised for it), QA authors executable tests, gates run via a `CommandRunner` rooted at the workspace, independent tasks are implemented concurrently (described mode, or agentic with `worktrees=True`; single-workspace agentic attempts serialise) and integrated serially, and budget, tracing, memory, checkpoints, approvals, and specialist review thread through the run. Accepted tasks are banked as WIP commits on the delivery branch; the single curated feature commit happens after security approval. |
 
 The delivery engine picks its mode from the workspace: a `LocalWorkspace`
@@ -236,6 +243,7 @@ Key modules:
 - `scheduler.py` / `ordering.py` — dependency-aware concurrency and ordering.
 - `json_utils.py` / `parsing.py` — robust extraction of structured data from
   model output (with contract enforcement: blocking findings force rejection).
+- `assessment.py` — the read-only audit engine (see `docs/ASSESSMENT.md`).
 - `evals.py` — the benchmark harness.
 - `team.py` — the `DevTeam` facade; `cli.py` — the `dev-team` command.
 
@@ -301,6 +309,14 @@ Agent names come from the default cast; rename them with `--roster FILE` or
 disable with `--no-personas`. [`docs/INTERACTION.md`](docs/INTERACTION.md)
 walks through all of it, including driving runs from your own UI via
 `QueueChannel`.
+
+Audit an existing repository (read-only; writes only the report):
+
+```bash
+dev-team --assess --workspace /path/to/legacy-repo \
+    --report audit/assessment.md \
+    "Legacy monolith" "dormant 2-3 years, frontend + backend" --budget-usd 10
+```
 
 Exit codes: `0` success, `1` completed with failed tasks, `2` invalid input
 (including an interactive abort at plan review).

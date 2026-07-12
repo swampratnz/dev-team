@@ -41,6 +41,26 @@ def detect_project(workspace: Workspace) -> ProjectProfile:
 
     files = set(workspace.list_files())
 
+    # .NET is checked before node: a full-stack .NET monolith commonly keeps
+    # a package.json at the root for frontend assets, but the solution file
+    # is what defines how the repo builds and tests.
+    dotnet_markers = sorted(
+        f
+        for f in files
+        if "/" not in f
+        and (f.endswith(".sln") or f.endswith(".csproj") or f == "global.json")
+    )
+    if dotnet_markers:
+        return ProjectProfile(
+            kind="dotnet",
+            verify_command=("dotnet", "test"),
+            setup_command=("dotnet", "restore"),
+            security_scan_command=(
+                "dotnet", "list", "package", "--vulnerable", "--include-transitive",
+            ),
+            reason=f"{dotnet_markers[0]} at workspace root",
+        )
+
     if "package.json" in files:
         return ProjectProfile(
             kind="node",

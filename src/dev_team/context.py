@@ -23,6 +23,9 @@ _MANIFESTS = (
     "go.mod",
     "requirements.txt",
     "setup.py",
+    "global.json",
+    "packages.config",
+    "Directory.Build.props",
 )
 
 MAX_TREE_ENTRIES = 150
