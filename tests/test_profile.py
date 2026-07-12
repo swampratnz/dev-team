@@ -52,3 +52,32 @@ def test_detect_unknown_falls_back_to_pytest():
 def test_node_wins_over_python_markers():
     profile = detect_project(_ws("package.json", "pyproject.toml"))
     assert profile.kind == "node"
+
+
+def test_detect_dotnet_solution():
+    profile = detect_project(_ws("MyApp.sln", "src/MyApp/MyApp.csproj"))
+    assert profile.kind == "dotnet"
+    assert profile.verify_command == ("dotnet", "test")
+    assert profile.setup_command == ("dotnet", "restore")
+    assert profile.security_scan_command[0:3] == ("dotnet", "list", "package")
+    assert "MyApp.sln" in profile.reason
+
+
+def test_detect_dotnet_root_csproj():
+    profile = detect_project(_ws("Tool.csproj"))
+    assert profile.kind == "dotnet"
+
+
+def test_detect_dotnet_global_json():
+    profile = detect_project(_ws("global.json"))
+    assert profile.kind == "dotnet"
+
+
+def test_dotnet_wins_over_node_for_fullstack_monolith():
+    profile = detect_project(_ws("MyApp.sln", "package.json"))
+    assert profile.kind == "dotnet"
+
+
+def test_nested_csproj_alone_is_not_dotnet_root():
+    profile = detect_project(_ws("src/MyApp/MyApp.csproj", "package.json"))
+    assert profile.kind == "node"

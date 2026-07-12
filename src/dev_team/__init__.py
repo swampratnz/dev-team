@@ -24,6 +24,16 @@ from .approval import (
     DenyAll,
     PolicyApprovalGate,
 )
+from .assessment import (
+    AssessConfig,
+    AssessmentEngine,
+    AssessmentOutcome,
+    InventoryStats,
+    PhaseResult,
+    inventory_stats,
+    outcome_to_dict,
+    render_report,
+)
 from .backlog import Backlog, BacklogStore, Epic, Iteration, ItemStatus, Story
 from .budget import Budget, BudgetExceededError, UsageMeter, UsageRecord
 from .changes import AppliedChange, ApplyResult, ChangeApplier
@@ -129,6 +139,14 @@ __all__ = [
     "DeliveryOutcome",
     "EngineConfig",
     "TeamConfig",
+    "AssessmentEngine",
+    "AssessmentOutcome",
+    "AssessConfig",
+    "PhaseResult",
+    "InventoryStats",
+    "inventory_stats",
+    "outcome_to_dict",
+    "render_report",
     # sdk boundary
     "AgentEvent",
     "AgentResult",

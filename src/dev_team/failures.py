@@ -10,7 +10,9 @@ Known limitation: go and cargo failures are keyed on the bare test name
 (their output carries no reliable file/package identity on the ``FAIL``
 line), so a *new* failing test that shares a name with a baseline failure in
 another package is misread as inherited. Pytest identities include the file
-path and do not collide this way.
+path and do not collide this way; .NET identities are fully qualified
+(Namespace.Class.Method) but parameterised display names containing spaces
+are truncated at the first space.
 """
 
 from __future__ import annotations
@@ -25,6 +27,13 @@ _PYTEST = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 _GO = re.compile(r"^--- FAIL: (\S+)", re.MULTILINE)
 # cargo:   "test module::name ... FAILED"
 _CARGO = re.compile(r"^test (\S+) \.\.\. FAILED", re.MULTILINE)
+# dotnet test (VSTest console): "  Failed Namespace.Class.Method [23 ms]".
+# The captured name must contain a dot so restore/build noise like
+# "Failed to restore ..." (captures "to") and the "Failed!" summary line
+# never read as test identities.
+_DOTNET_VSTEST = re.compile(r"^\s*Failed\s+(\S*\.\S+)", re.MULTILINE)
+# xUnit console runner: "    Namespace.Class.Method [FAIL]"
+_DOTNET_XUNIT = re.compile(r"^\s*(\S*\.\S+) \[FAIL\]", re.MULTILINE)
 
 
 def parse_failed_tests(output: str) -> Optional[FrozenSet[str]]:
@@ -38,7 +47,7 @@ def parse_failed_tests(output: str) -> Optional[FrozenSet[str]]:
     if not output:
         return None
     found = set()
-    for pattern in (_PYTEST, _GO, _CARGO):
+    for pattern in (_PYTEST, _GO, _CARGO, _DOTNET_VSTEST, _DOTNET_XUNIT):
         found.update(match.rstrip(" -") for match in pattern.findall(output))
     if not found:
         return None

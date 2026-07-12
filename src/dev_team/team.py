@@ -12,6 +12,7 @@ from .agents import (
     QAAgent,
     ReviewerAgent,
 )
+from .assessment import AssessmentEngine, AssessmentOutcome
 from .config import TeamConfig
 from .engine import DeliveryEngine, DeliveryOutcome
 from .events import Listener
@@ -129,3 +130,20 @@ class DevTeam:
         """Run the real delivery engine for ``request``."""
 
         return await self.make_engine(**kwargs).deliver(request)
+
+    def make_assessor(self, **kwargs) -> AssessmentEngine:
+        """Build an :class:`AssessmentEngine` for a read-only repository audit.
+
+        Keyword arguments are forwarded to :class:`AssessmentEngine` (e.g.
+        ``workspace``, ``config``, ``budget``, ``tracer``).
+        """
+
+        kwargs.setdefault("listener", self.listener)
+        kwargs.setdefault("roster", self.roster)
+        kwargs.setdefault("interaction", self.interaction)
+        return AssessmentEngine(self.runner, **kwargs)
+
+    async def assess(self, **kwargs) -> AssessmentOutcome:
+        """Audit a repository read-only and return the assessment."""
+
+        return await self.make_assessor(**kwargs).assess()

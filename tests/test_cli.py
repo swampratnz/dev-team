@@ -451,3 +451,118 @@ def test_main_chat_builds_real_backend_lazily(monkeypatch, capsys):
     code = main(["--chat"], runner=ScriptedRunner([]))
     assert code == 0
     assert "chatting with Priya" in capsys.readouterr().out
+
+
+# --- assess mode ----------------------------------------------------------------
+
+
+def _dotnet_repo(tmp_path):
+    (tmp_path / "MyApp.sln").write_text("Microsoft Visual Studio Solution File")
+    src = tmp_path / "src" / "Api"
+    src.mkdir(parents=True)
+    (src / "Api.csproj").write_text("<Project/>")
+    return tmp_path
+
+
+def test_main_assess_writes_report_and_prints_markdown(tmp_path, capsys):
+    from test_assessment import assess_responses
+
+    repo = _dotnet_repo(tmp_path)
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(["--assess", "--workspace", str(repo)], runner=runner)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "# Repository assessment" in captured.out
+    assert "**Classification: dependency-surgery**" in captured.out
+    assert (repo / "audit" / "assessment.md").exists()
+
+
+def test_main_assess_json_output(tmp_path, capsys):
+    from test_assessment import assess_responses
+
+    repo = _dotnet_repo(tmp_path)
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(["--assess", "--workspace", str(repo), "--json"], runner=runner)
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["classification"] == "dependency-surgery"
+    assert payload["profile"]["kind"] == "dotnet"
+
+
+def test_main_assess_custom_report_path_and_focus(tmp_path, capsys):
+    from test_assessment import assess_responses
+
+    repo = _dotnet_repo(tmp_path)
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(
+        [
+            "--assess", "--workspace", str(repo),
+            "--report", "audit/2026-07-12_01_legacy-assessment.md",
+            "Legacy monolith", "dormant 2-3 years, frontend + backend",
+        ],
+        runner=runner,
+    )
+    assert code == 0
+    assert (repo / "audit" / "2026-07-12_01_legacy-assessment.md").exists()
+    focus_calls = [c for c in runner.calls if "dormant 2-3 years" in c["prompt"]]
+    assert focus_calls, "the description scoped the audit prompts"
+    out = capsys.readouterr().out
+    assert "Legacy monolith — dormant 2-3 years" in out
+
+
+def test_main_assess_failure_exit_code(tmp_path, capsys):
+    from test_assessment import assess_responses, recommendation_dict
+
+    repo = _dotnet_repo(tmp_path)
+    responses = assess_responses(
+        **{"product manager": recommendation_dict(classification="nonsense")}
+    )
+    runner = ScriptedRunner(by_system_prompt=responses)
+    code = main(["--assess", "--workspace", str(repo)], runner=runner)
+    assert code == 1
+
+
+def test_main_assess_interactive_scope_prompt(monkeypatch, tmp_path, capsys):
+    import io as _io
+
+    from test_assessment import assess_responses
+
+    monkeypatch.setattr("sys.stdin", _io.StringIO("continue\n"))
+    repo = _dotnet_repo(tmp_path)
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(["--assess", "--workspace", str(repo), "--interactive"], runner=runner)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "Adjust the audit scope" in captured.err
+
+
+def test_main_assess_rejects_chat_and_deliver(capsys):
+    for combo in (["--assess", "--chat"], ["--assess", "--deliver", "T", "D"]):
+        with pytest.raises(SystemExit) as excinfo:
+            main(combo, runner=ScriptedRunner([]))
+        assert excinfo.value.code == 2
+
+
+def test_main_report_requires_assess(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["T", "D", "--report", "x.md"], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "--report" in capsys.readouterr().err
+
+
+def test_main_assess_rejects_deliver_only_flags(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--assess", "--branch", "x"], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "--branch" in capsys.readouterr().err
+
+
+def test_main_assess_allows_workspace_and_budget(tmp_path):
+    from test_assessment import assess_responses
+
+    repo = _dotnet_repo(tmp_path)
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(
+        ["--assess", "--workspace", str(repo), "--budget-usd", "10"], runner=runner
+    )
+    assert code == 0
