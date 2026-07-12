@@ -5,6 +5,28 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Assessment & .NET
+- **A third engine audits existing repositories** (`--assess` /
+  `DevTeam.assess`): read-only by construction (no branch, no gates, no
+  commits, no bookkeeping; auditors get `Read`/`Grep`/`Glob` rooted at the
+  workspace), five phases across the cast — inventory (architect),
+  buildability without running installs (DevOps), dependency/secret/data/
+  external-service risk (security), test & doc reality (QA), and a fixed-
+  vocabulary classification (revive-in-place / dependency-surgery /
+  strangler-rewrite / archive) with a sequenced remediation plan and the
+  single highest-risk item (product manager). Deep phases run in parallel;
+  every claim carries a file-path citation; a deterministic LOC/extension
+  inventory anchors the prompts; failed phases degrade into the report
+  instead of unwinding the run; `--interactive` adds a post-inventory scope
+  pause (narrow or abort). Output is one cited markdown report (default
+  `audit/assessment.md`, the run's only write) or `--json`. See
+  `docs/ASSESSMENT.md`.
+- **.NET support**: root `.sln`/`.csproj`/`global.json` resolve to a
+  `dotnet` profile (`dotnet test`/`restore`, vulnerable-package scan) that
+  wins over `package.json` so full-stack monoliths resolve to their
+  solution; repo context reads .NET manifests; baseline attribution parses
+  VSTest and xUnit failure output.
+
 ### Interactivity & personas
 
 #### Interactive runs
