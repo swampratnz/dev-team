@@ -13,13 +13,19 @@ read-only tools (`Read`/`Grep`/`Glob`) rooted at the workspace so claims come
 from the actual files, and every phase's contract demands a file-path
 citation per claim — ambiguity is stated, not guessed away. The only write is
 the report itself, and only when a ``report_path`` is configured.
+
+One opt-in exception: :class:`AssessConfig.build_probe` executes the detected
+profile's setup/verify commands so buildability rests on real exit codes.
+That runs the repository's own build — arbitrary code, with a build's usual
+side effects on the working tree — which is why it is off by default.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, Iterator, List, Mapping, Optional, Sequence
 
 from .agents import (
     ArchitectAgent,
@@ -97,6 +103,7 @@ CLASSIFICATIONS = (
     "revive-in-place",
     "dependency-surgery",
     "strangler-rewrite",
+    "rebuild",
     "archive",
 )
 
@@ -135,7 +142,10 @@ Phase 2 of a repository audit: BUILDABILITY. Determine whether this project
 could build today. Check lockfiles, pinned dependency resolvability, runtime
 version requirements (SDK versions, target frameworks, Node/Python versions),
 and build tooling. Do NOT run installs or builds — report what would likely
-break and why. The detected project profile is: {profile}.
+break and why. If the repo-context includes build-probe results (the
+project's own commands executed for real), treat their exit codes and output
+as ground truth over static inference. The detected project profile is:
+{profile}.
 
 <repo-context>
 {evidence}
@@ -232,6 +242,17 @@ below, classify the repository and give a sequenced remediation plan with an
 effort estimate per step. Explicitly name the single highest-risk item
 blocking a first build.
 
+Classification vocabulary (pick exactly one):
+- revive-in-place: the codebase is worth keeping; fix forward inside it.
+- dependency-surgery: the code is sound but the dependency stack needs
+  targeted replacement before anything else.
+- strangler-rewrite: replace it incrementally behind the existing system
+  while it keeps serving.
+- rebuild: the code is not worth carrying forward — build a replacement from
+  scratch and plan the data/traffic migration; the old system is a
+  requirements document, not a foundation.
+- archive: retire it; any path back costs more than it returns.
+
 Phase findings:
 <audit-findings>
 {findings}
@@ -239,7 +260,7 @@ Phase findings:
 {focus}
 JSON shape:
 {{"summary": "...",
-  "classification": "revive-in-place|dependency-surgery|strangler-rewrite|archive",
+  "classification": "revive-in-place|dependency-surgery|strangler-rewrite|rebuild|archive",
   "rationale": "...",
   "highest_risk": "the single highest-risk item blocking a first build",
   "plan": [{{"step": "...", "effort": "e.g. days/weeks", "detail": "..."}}]}}
@@ -266,6 +287,139 @@ _REQUIRED_KEYS: Mapping[str, Sequence[str]] = {
     "conventions": ("summary", "conventions"),
     "recommendation": ("summary", "classification", "highest_risk", "plan"),
 }
+
+
+#: How much of a probe command's output survives as evidence.
+_PROBE_OUTPUT_TAIL = 4_000
+
+
+@dataclass(frozen=True)
+class ProbeCommandResult:
+    """One build-probe command's real outcome."""
+
+    command: tuple
+    exit_code: int
+    output_tail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.exit_code == 0
+
+
+@dataclass
+class BuildProbe:
+    """What actually happened when the project's own commands were run.
+
+    The probe is the assessment's one opt-in departure from read-only: it
+    executes the detected profile's setup and verify commands in the
+    workspace so buildability rests on real exit codes instead of static
+    inference. Running a repository's own build is arbitrary code execution —
+    that is why it is off by default and callers are told to sandbox
+    untrusted repos.
+    """
+
+    requested: bool = False
+    commands: List[ProbeCommandResult] = field(default_factory=list)
+    skipped_reason: Optional[str] = None
+    not_run: List[tuple] = field(default_factory=list)
+
+    @property
+    def ran(self) -> bool:
+        return self.requested and self.skipped_reason is None
+
+    @property
+    def succeeded(self) -> Optional[bool]:
+        """True/False for a probe that ran; ``None`` when it did not."""
+
+        if not self.ran:
+            return None
+        return all(result.ok for result in self.commands)
+
+    def render(self) -> str:
+        """Prompt/report-ready rendering; empty when never requested."""
+
+        if not self.requested:
+            return ""
+        if self.skipped_reason is not None:
+            return f"Build probe: skipped ({self.skipped_reason})."
+        lines = [
+            "Build probe: the project's own commands were executed in the "
+            "workspace. Exit codes below are ground truth."
+        ]
+        for result in self.commands:
+            verdict = "ok" if result.ok else f"FAILED (exit {result.exit_code})"
+            lines.append(f"- `{' '.join(result.command)}` — {verdict}")
+            if result.output_tail:
+                lines.append("  output tail:")
+                lines.extend(
+                    f"    {line}" for line in result.output_tail.splitlines()
+                )
+        for command in self.not_run:
+            lines.append(
+                f"- `{' '.join(command)}` — not run (a previous command failed)"
+            )
+        return "\n".join(lines)
+
+    def to_dict(self) -> Dict:
+        return {
+            "requested": self.requested,
+            "ran": self.ran,
+            "succeeded": self.succeeded,
+            "skipped_reason": self.skipped_reason,
+            "commands": [
+                {
+                    "command": list(result.command),
+                    "exit_code": result.exit_code,
+                    "output_tail": result.output_tail,
+                }
+                for result in self.commands
+            ],
+            "not_run": [list(command) for command in self.not_run],
+        }
+
+
+def run_build_probe(
+    profile: ProjectProfile,
+    runner: Optional[CommandRunner],
+    workdir: Optional[str],
+    *,
+    timeout: float,
+) -> BuildProbe:
+    """Execute the profile's setup and verify commands for real.
+
+    Commands run in order and stop at the first failure — running the test
+    suite after a failed restore would only bury the signal. Every skip
+    (no real directory, a profile with no locally runnable commands) is
+    recorded as a reason, never silent.
+    """
+
+    probe = BuildProbe(requested=True)
+    if runner is None or workdir is None:
+        probe.skipped_reason = "no real workspace directory to run commands in"
+        return probe
+    commands = [
+        tuple(command)
+        for command in (profile.setup_command, profile.verify_command)
+        if command
+    ]
+    if not commands:
+        probe.skipped_reason = (
+            f"the {profile.kind} profile proposes no locally runnable commands"
+        )
+        return probe
+    for index, command in enumerate(commands):
+        result = runner.run(list(command), cwd=workdir, timeout=timeout)
+        probe.commands.append(
+            ProbeCommandResult(
+                command=command,
+                exit_code=result.exit_code,
+                output_tail=result.output[-_PROBE_OUTPUT_TAIL:],
+            )
+        )
+        if not result.ok:
+            probe.not_run = commands[index + 1 :]
+            break
+    return probe
 
 
 @dataclass(frozen=True)
@@ -296,6 +450,12 @@ class AssessConfig:
             them off. Off by default: it writes to the workspace.
         dormancy_days: Age gap (directory last commit vs repo head) beyond
             which the dead-code probe calls a directory dormant.
+        build_probe: Actually run the detected profile's setup and verify
+            commands so buildability rests on real exit codes. Off by
+            default — it executes the repository's own build (arbitrary
+            code) and mutates the working tree the way any build does;
+            sandbox untrusted repos.
+        build_probe_timeout: Per-command ceiling for the probe, in seconds.
     """
 
     model: Optional[str] = None
@@ -311,6 +471,8 @@ class AssessConfig:
     save_conventions: bool = True
     update_backlog: bool = False
     dormancy_days: int = 365
+    build_probe: bool = False
+    build_probe_timeout: float = 600.0
 
 
 @dataclass
@@ -442,6 +604,8 @@ class AssessmentOutcome:
     detected_components: List[Component] = field(default_factory=list)
     conventions: Optional[ConventionsProfile] = None
     backlog_stories: List[str] = field(default_factory=list)
+    build_probe: BuildProbe = field(default_factory=BuildProbe)
+    blind_spots: List[str] = field(default_factory=list)
 
     @property
     def success(self) -> bool:
@@ -615,6 +779,26 @@ class AssessmentEngine:
         self._event("start", "Assessing the repository")
         excludes = self.config.exclude_globs
         profile = detect_project(self.workspace)
+        build_probe = BuildProbe()
+        if self.config.build_probe:
+            build_probe = run_build_probe(
+                profile,
+                self.command_runner,
+                self.workdir,
+                timeout=self.config.build_probe_timeout,
+            )
+            if build_probe.skipped_reason is not None:
+                self._event(
+                    "build-probe",
+                    f"Build probe skipped: {build_probe.skipped_reason}",
+                )
+            else:
+                verdict = "green" if build_probe.succeeded else "red"
+                self._event(
+                    "build-probe",
+                    f"Build probe {verdict}: "
+                    f"{len(build_probe.commands)} command(s) executed",
+                )
         stats = inventory_stats(self.workspace, exclude_globs=excludes)
         dead_code = detect_dead_code(
             self.workspace,
@@ -651,6 +835,7 @@ class AssessmentEngine:
                 _components_block(components),
                 dead_code.render(),
                 scan.render(),
+                build_probe.render(),
             )
             if part
         )
@@ -676,6 +861,7 @@ class AssessmentEngine:
                 dead_code=dead_code,
                 dependency_scan=scan,
                 detected_components=components,
+                build_probe=build_probe,
             )
             self.tracer.end(run_span, "aborted")
             return outcome
@@ -745,6 +931,7 @@ class AssessmentEngine:
             dependency_scan=scan,
             detected_components=components,
             conventions=conventions_profile,
+            build_probe=build_probe,
         )
         if self.config.report_path is not None:
             self.workspace.write_text(self.config.report_path, outcome.report_markdown)
@@ -860,6 +1047,14 @@ class AssessmentEngine:
         summary = data.get("summary")
         return summary if isinstance(summary, str) and summary else fallback
 
+    def _blind_spot_ignores(self) -> Sequence[str]:
+        """The engine's own report directory is not an audit subject."""
+
+        path = self.config.report_path
+        if path is None or "/" not in path:
+            return ()
+        return (path.split("/", 1)[0],)
+
     def _outcome(
         self,
         profile: ProjectProfile,
@@ -873,7 +1068,9 @@ class AssessmentEngine:
         dependency_scan: Optional[DependencyScan] = None,
         detected_components: Optional[List[Component]] = None,
         conventions: Optional[ConventionsProfile] = None,
+        build_probe: Optional[BuildProbe] = None,
     ) -> AssessmentOutcome:
+        dead_code = dead_code or DeadCodeReport()
         outcome = AssessmentOutcome(
             profile=profile,
             stats=stats,
@@ -885,10 +1082,14 @@ class AssessmentEngine:
             tracer=self.tracer,
             focus=focus,
             aborted=aborted,
-            dead_code=dead_code or DeadCodeReport(),
+            dead_code=dead_code,
             dependency_scan=dependency_scan or DependencyScan(),
             detected_components=list(detected_components or []),
             conventions=conventions,
+            build_probe=build_probe or BuildProbe(),
+            blind_spots=audit_blind_spots(
+                stats, phases, dead_code, ignore=self._blind_spot_ignores()
+            ),
         )
         outcome.report_markdown = render_report(outcome)
         return outcome
@@ -923,6 +1124,8 @@ def outcome_to_dict(outcome: AssessmentOutcome) -> Dict:
         },
         "dead_code": outcome.dead_code.to_dict(),
         "dependency_scan": outcome.dependency_scan.to_dict(),
+        "build_probe": outcome.build_probe.to_dict(),
+        "blind_spots": list(outcome.blind_spots),
         "detected_components": [vars(c) for c in outcome.detected_components],
         "conventions": (
             outcome.conventions.to_dict() if outcome.conventions is not None else None
@@ -1031,6 +1234,68 @@ def outcome_to_backlog(outcome: AssessmentOutcome, backlog: Backlog) -> List[Sto
             f"{vulnerability.url} (manifest: {dep.manifest})",
         )
     return added
+
+
+#: Keys whose string values count as a citation of a repository path.
+_CITATION_KEYS = frozenset({"evidence", "path"})
+
+
+def _cited_strings(value, *, under_citation: bool = False) -> Iterator[str]:
+    """Every string cited under an ``evidence``/``path`` key, recursively.
+
+    Handles both shapes agents produce: a plain string and a list of strings.
+    """
+
+    if isinstance(value, str):
+        if under_citation:
+            yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _cited_strings(item, under_citation=key in _CITATION_KEYS)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _cited_strings(item, under_citation=under_citation)
+
+
+def _mentions(text: str, top: str) -> bool:
+    """Whether ``text`` cites a path inside the top-level entry ``top``."""
+
+    for token in re.split(r"""[\s,;'"`()\[\]<>]+""", text):
+        token = token.rstrip(".:")
+        if token == top or token.startswith(top + "/"):
+            return True
+    return False
+
+
+def audit_blind_spots(
+    stats: InventoryStats,
+    phases: Dict[str, PhaseResult],
+    dead_code: DeadCodeReport,
+    *,
+    ignore: Sequence[str] = (),
+) -> List[str]:
+    """Top-level directories no finding ever cited — exact, no model.
+
+    Agents sample files on large repositories, and a sampled audit reads as
+    a complete one unless the gaps are named. A directory the deterministic
+    inventory counted but no phase finding (nor dead-code probe) cited was
+    never actually examined; the report says so instead of implying coverage.
+
+    ``ignore`` names top-level entries that are not audit subjects at all —
+    the engine passes its own report directory, so a re-assessment does not
+    flag the previous run's report as "unexamined".
+    """
+
+    cited: List[str] = [f.path for f in dead_code.findings]
+    for result in phases.values():
+        cited.extend(_cited_strings(result.data))
+    return [
+        top
+        for top in sorted(stats.loc_by_top)
+        if top != "(root)"
+        and top not in ignore
+        and not any(_mentions(text, top) for text in cited)
+    ]
 
 
 def _render_findings_for_prompt(phases: Dict[str, PhaseResult]) -> str:
@@ -1216,9 +1481,20 @@ def render_report(outcome: AssessmentOutcome) -> str:
 
     lines += ["", "## Appendix — deterministic inventory", ""]
     lines.append(outcome.stats.render())
-    for block in (outcome.dead_code.render(), outcome.dependency_scan.render()):
+    for block in (
+        outcome.dead_code.render(),
+        outcome.dependency_scan.render(),
+        outcome.build_probe.render(),
+    ):
         if block:
             lines += ["", block]
+    if outcome.blind_spots:
+        lines += [
+            "",
+            "Audit blind spots — top-level directories no finding cited: "
+            + ", ".join(f"`{name}/`" for name in outcome.blind_spots)
+            + ". Treat them as unexamined, not as clean.",
+        ]
     lines.append("")
     if outcome.dependency_scan.queried:
         lines.append(

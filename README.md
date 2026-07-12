@@ -70,18 +70,26 @@ QA, security, docs, reliability, and deployment.
 - ✅ **Audits what it didn't build** — `--assess` turns the team loose on an
   existing repo (legacy .NET monolith included: solution-aware profiles,
   VSTest/xUnit failure parsing) and produces a phased, path-cited assessment
-  — buildability, dependency/secret/data risk, test reality, and a
-  classification with a sequenced remediation plan — without mutating the
-  repo (see [`docs/ASSESSMENT.md`](docs/ASSESSMENT.md)).
+  — buildability, dependency/secret/data risk, test reality, and a verdict
+  from a fixed vocabulary (revive-in-place, dependency-surgery,
+  strangler-rewrite, rebuild-from-scratch, archive) with a sequenced
+  remediation plan — without mutating the repo. Opt-in `--build-probe` runs
+  the project's own setup/verify commands so buildability rests on real exit
+  codes, and the report names its **audit blind spots** (top-level
+  directories no finding cited) so a sampled audit can't read as a complete
+  one (see [`docs/ASSESSMENT.md`](docs/ASSESSMENT.md)).
 - ✅ **Finds dead code deterministically** — exact probes, no model guessing:
   sources no legacy MSBuild project compiles, projects no solution includes,
   and directories dormant for a year while the repo stayed active. Vendored
   noise is excluded by default (`--exclude` to customise) and
   `--component-fanout` deep-dives each sub-project in parallel.
-- ✅ **Scans dependencies live** — exact pins parsed from `packages.config`,
-  `package.json`, `requirements.txt`, and `Cargo.toml` are checked against
-  OSV.dev in one batch call (graceful offline fallback, `--no-osv-scan` to
-  opt out), so CVE findings cite advisories, not recollections.
+- ✅ **Scans dependencies live** — exact pins parsed from the manifests
+  (`packages.config`, `package.json`, `requirements.txt`, `Cargo.toml`) and
+  the lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`, NuGet
+  `packages.lock.json`) are checked against OSV.dev in one batch call
+  (graceful offline fallback, `--no-osv-scan` to opt out), so CVE findings
+  cite advisories, not recollections — and range-specified projects still
+  get their resolved versions scanned.
 - ✅ **Learns the house style and follows it** — assessment captures a cited
   conventions profile (naming, layout, test patterns, plus `.editorconfig` /
   ReSharper `.DotSettings` / linter configs), persists it, and every later
@@ -353,6 +361,11 @@ dev-team --assess --workspace /path/to/legacy-repo \
 dev-team --assess --workspace /path/to/legacy-repo \
     --component-fanout --backlog --exclude 'Libraries/*' --exclude '*/bin/*' \
     "Full audit" "dead code, upgrade candidates, house conventions"
+
+# ground the buildability verdict in real exit codes (runs the repo's own
+# build — trusted repos or a sandbox only)
+dev-team --assess --workspace /path/to/legacy-repo --build-probe \
+    "Buildability" "can this actually restore and test today?"
 
 # deliver against a repo whose build only runs in remote CI
 dev-team "Fix the SVG endpoint" "..." --deliver --workspace /path/to/repo \

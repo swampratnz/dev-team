@@ -227,3 +227,166 @@ def test_http_fetch_posts_querybatch(monkeypatch):
     assert captured["url"].endswith("/v1/querybatch")
     assert captured["body"] == {"queries": [{"version": "1.0"}]}
     assert captured["timeout"] == 30.0
+
+
+# --- lockfile parsers -------------------------------------------------------------
+
+
+def test_parse_package_lock_v3_packages_map():
+    from dev_team.depscan import parse_package_lock
+
+    text = json.dumps(
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "my-app", "version": "1.0.0"},
+                "node_modules/left-pad": {"version": "1.3.0"},
+                "node_modules/@scope/pkg": {"version": "2.0.0"},
+                "node_modules/aliased": {"name": "real-name", "version": "3.0.0"},
+                "node_modules/linked": {"link": True},
+                "node_modules/broken": "not a dict",
+                "node_modules/unversioned": {},
+                "node_modules/": {"version": "1.0.0"},
+            },
+        }
+    )
+    deps = parse_package_lock(text, "package-lock.json")
+    assert [(d.name, d.version) for d in deps] == [
+        ("@scope/pkg", "2.0.0"),
+        ("real-name", "3.0.0"),
+        ("left-pad", "1.3.0"),
+    ]
+    assert all(d.ecosystem == "npm" for d in deps)
+
+
+def test_parse_package_lock_v1_nested_dependencies():
+    from dev_team.depscan import parse_package_lock
+
+    text = json.dumps(
+        {
+            "lockfileVersion": 1,
+            "dependencies": {
+                "a": {"version": "1.0.0", "dependencies": {"b": {"version": "2.0.0"}}},
+                "unversioned": {},
+                "broken": "not a dict",
+            },
+        }
+    )
+    deps = parse_package_lock(text, "package-lock.json")
+    assert [(d.name, d.version) for d in deps] == [("a", "1.0.0"), ("b", "2.0.0")]
+
+
+def test_parse_package_lock_rejects_junk():
+    from dev_team.depscan import parse_package_lock
+
+    assert parse_package_lock("not json", "l") == []
+    assert parse_package_lock('"a string"', "l") == []
+    assert parse_package_lock("{}", "l") == []
+
+
+def test_parse_poetry_lock():
+    from dev_team.depscan import parse_poetry_lock
+
+    text = """\
+[[package]]
+name = "requests"
+version = "2.31.0"
+
+[[package]]
+name = "versionless"
+"""
+    deps = parse_poetry_lock(text, "poetry.lock")
+    assert [(d.name, d.version, d.ecosystem) for d in deps] == [
+        ("requests", "2.31.0", "PyPI"),
+    ]
+    assert parse_poetry_lock("not = = toml", "l") == []
+    assert parse_poetry_lock('[package]\nname = "table-not-array"', "l") == []
+    assert parse_poetry_lock('package = ["not a dict"]', "l") == []
+
+
+def test_parse_cargo_lock_skips_workspace_crates():
+    from dev_team.depscan import parse_cargo_lock
+
+    text = """\
+[[package]]
+name = "my-own-crate"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.190"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "sourced-but-versionless"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"""
+    deps = parse_cargo_lock(text, "Cargo.lock")
+    assert [(d.name, d.version, d.ecosystem) for d in deps] == [
+        ("serde", "1.0.190", "crates.io"),
+    ]
+    assert parse_cargo_lock("not = = toml", "l") == []
+    assert parse_cargo_lock('name = "no packages"', "l") == []
+    assert parse_cargo_lock('package = ["not a dict"]', "l") == []
+
+
+def test_parse_packages_lock_json():
+    from dev_team.depscan import parse_packages_lock_json
+
+    text = json.dumps(
+        {
+            "version": 1,
+            "dependencies": {
+                ".NETFramework,Version=v4.7": {
+                    "Newtonsoft.Json": {"type": "Direct", "resolved": "9.0.1"},
+                    "My.Sibling": {"type": "Project"},
+                    "Unresolved": {"type": "Direct"},
+                    "BadResolved": {"type": "Direct", "resolved": 9},
+                    "broken": "not a dict",
+                },
+                "netstandard2.0": {"Newtonsoft.Json": {"type": "Direct", "resolved": "9.0.1"}},
+                "broken-framework": "not a dict",
+            },
+        }
+    )
+    deps = parse_packages_lock_json(text, "packages.lock.json")
+    # the duplicate across frameworks survives here; collect_dependencies dedupes
+    assert [(d.name, d.version, d.ecosystem) for d in deps] == [
+        ("Newtonsoft.Json", "9.0.1", "NuGet"),
+        ("Newtonsoft.Json", "9.0.1", "NuGet"),
+    ]
+    assert parse_packages_lock_json("not json", "l") == []
+    assert parse_packages_lock_json('"a string"', "l") == []
+    assert parse_packages_lock_json('{"dependencies": "not a dict"}', "l") == []
+
+
+def test_collect_dependencies_reads_lockfiles_and_dedupes():
+    ws = InMemoryWorkspace(
+        {
+            # an open range: the manifest alone yields nothing scannable
+            "package.json": json.dumps({"dependencies": {"left-pad": ">=1.0.0"}}),
+            "package-lock.json": json.dumps(
+                {"packages": {"node_modules/left-pad": {"version": "1.3.5"}}}
+            ),
+            "backend/poetry.lock": '[[package]]\nname = "requests"\nversion = "2.31.0"\n',
+            "rust/Cargo.lock": (
+                '[[package]]\nname = "serde"\nversion = "1.0.190"\nsource = "registry+x"\n'
+            ),
+            "dotnet/packages.lock.json": json.dumps(
+                {
+                    "dependencies": {
+                        "net47": {"Moq": {"type": "Direct", "resolved": "4.2.0"}},
+                        "net48": {"Moq": {"type": "Direct", "resolved": "4.2.0"}},
+                    }
+                }
+            ),
+        }
+    )
+    deps = collect_dependencies(ws)
+    assert {(d.ecosystem, d.name, d.version) for d in deps} == {
+        ("npm", "left-pad", "1.3.5"),
+        ("PyPI", "requests", "2.31.0"),
+        ("crates.io", "serde", "1.0.190"),
+        ("NuGet", "Moq", "4.2.0"),
+    }
+    assert len(deps) == 4  # cross-framework NuGet duplicate deduplicated

@@ -6,23 +6,36 @@ from __future__ import annotations
 from helpers import run
 
 from dev_team.assessment import (
+    CLASSIFICATIONS,
     AssessConfig,
     AssessmentEngine,
     AssessmentOutcome,
+    BuildProbe,
     Component,
     InventoryStats,
     PhaseResult,
+    ProbeCommandResult,
     _components_block,
     _effort_points,
+    _mentions,
+    audit_blind_spots,
     detect_components,
     inventory_stats,
     outcome_to_backlog,
     outcome_to_dict,
     render_report,
+    run_build_probe,
     scope_question,
 )
 from dev_team.budget import Budget
-from dev_team.execution import InMemoryWorkspace, LocalWorkspace
+from dev_team.deadcode import DeadCodeFinding, DeadCodeReport
+from dev_team.execution import (
+    CommandResult,
+    FakeCommandRunner,
+    InMemoryWorkspace,
+    LocalWorkspace,
+)
+from dev_team.profile import ProjectProfile
 from dev_team.interaction import Reply, ScriptedChannel
 from dev_team.persona import Roster
 from dev_team.testing import ScriptedRunner, json_response
@@ -980,3 +993,294 @@ def test_report_renders_component_entry_without_summary_or_findings():
     report = render_report(_bare_outcome(phases=phases))
     assert "### web (`web`)" in report
     assert "_Deep-dive failed" not in report
+
+
+# --- rebuild classification -------------------------------------------------------
+
+
+def test_rebuild_is_a_first_class_classification():
+    assert "rebuild" in CLASSIFICATIONS
+    responses = assess_responses(
+        **{"product manager": recommendation_dict("rebuild")}
+    )
+    engine = _engine(ScriptedRunner(by_system_prompt=responses))
+    outcome = run(engine.assess())
+    assert outcome.success is True
+    assert outcome.classification == "rebuild"
+    assert "**Classification: rebuild**" in outcome.report_markdown
+
+
+# --- build probe ------------------------------------------------------------------
+
+
+_NODE_PROFILE = ProjectProfile(
+    kind="node",
+    verify_command=("npm", "test"),
+    setup_command=("npm", "install"),
+)
+
+
+def test_run_build_probe_needs_a_real_directory():
+    probe = run_build_probe(_NODE_PROFILE, None, "/repo", timeout=60.0)
+    assert probe.requested and not probe.ran
+    assert "no real workspace directory" in probe.skipped_reason
+    probe = run_build_probe(_NODE_PROFILE, FakeCommandRunner(), None, timeout=60.0)
+    assert "no real workspace directory" in probe.skipped_reason
+    assert probe.succeeded is None
+    assert "skipped" in probe.render()
+
+
+def test_run_build_probe_skips_profiles_with_no_commands():
+    profile = ProjectProfile(
+        kind="dotnet-framework", verify_command=None, locally_runnable=False
+    )
+    probe = run_build_probe(profile, FakeCommandRunner(), "/repo", timeout=60.0)
+    assert not probe.ran
+    assert "dotnet-framework profile proposes no locally runnable" in probe.skipped_reason
+
+
+def test_run_build_probe_green_runs_setup_then_verify():
+    runner = FakeCommandRunner()
+    runner.add_rule("npm test", CommandResult(["npm", "test"], 0, "42 passing", ""))
+    probe = run_build_probe(_NODE_PROFILE, runner, "/repo", timeout=60.0)
+    assert probe.ran and probe.succeeded is True
+    assert [c.command for c in probe.commands] == [("npm", "install"), ("npm", "test")]
+    assert probe.not_run == []
+    assert runner.calls == [["npm", "install"], ["npm", "test"]]
+    rendered = probe.render()
+    assert "`npm install` — ok" in rendered
+    assert "`npm test` — ok" in rendered
+    assert "42 passing" in rendered  # output tail survives as evidence
+
+
+def test_run_build_probe_stops_at_first_failure():
+    runner = FakeCommandRunner()
+    runner.add_rule(
+        "npm install", CommandResult(["npm", "install"], 1, "", "ERESOLVE unable to resolve")
+    )
+    probe = run_build_probe(_NODE_PROFILE, runner, "/repo", timeout=60.0)
+    assert probe.ran and probe.succeeded is False
+    assert [c.command for c in probe.commands] == [("npm", "install")]
+    assert probe.not_run == [("npm", "test")]
+    assert runner.calls == [["npm", "install"]]  # verify never ran
+    rendered = probe.render()
+    assert "`npm install` — FAILED (exit 1)" in rendered
+    assert "ERESOLVE" in rendered
+    assert "`npm test` — not run (a previous command failed)" in rendered
+
+
+def test_run_build_probe_verify_only_profile_and_output_truncation():
+    profile = ProjectProfile(kind="rust", verify_command=("cargo", "test"))
+    runner = FakeCommandRunner()
+    runner.add_rule(
+        "cargo test", CommandResult(["cargo", "test"], 0, "x" * 5_000, "")
+    )
+    probe = run_build_probe(profile, runner, "/repo", timeout=60.0)
+    assert [c.command for c in probe.commands] == [("cargo", "test")]
+    assert len(probe.commands[0].output_tail) == 4_000
+
+
+def test_build_probe_render_and_dict_when_never_requested():
+    probe = BuildProbe()
+    assert probe.render() == ""
+    assert probe.ran is False and probe.succeeded is None
+    payload = probe.to_dict()
+    assert payload["requested"] is False
+    assert payload["ran"] is False
+    assert payload["succeeded"] is None
+
+
+def test_build_probe_to_dict_round_trips_commands():
+    probe = BuildProbe(
+        requested=True,
+        commands=[ProbeCommandResult(("npm", "install"), 1, "boom")],
+        not_run=[("npm", "test")],
+    )
+    payload = probe.to_dict()
+    assert payload["succeeded"] is False
+    assert payload["commands"] == [
+        {"command": ["npm", "install"], "exit_code": 1, "output_tail": "boom"}
+    ]
+    assert payload["not_run"] == [["npm", "test"]]
+
+
+def test_build_probe_command_without_output_renders_no_tail():
+    probe = BuildProbe(
+        requested=True, commands=[ProbeCommandResult(("npm", "test"), 0, "")]
+    )
+    assert "output tail" not in probe.render()
+
+
+def _node_repo(tmp_path):
+    (tmp_path / "package.json").write_text('{"name": "app", "version": "1.0.0"}')
+    (tmp_path / "index.js").write_text("module.exports = 1;\n")
+    return tmp_path
+
+
+def test_assess_build_probe_feeds_evidence_and_report(tmp_path):
+    events = []
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    command_runner = FakeCommandRunner()
+    command_runner.add_rule(
+        "npm test", CommandResult(["npm", "test"], 1, "", "Error: Cannot find module")
+    )
+    engine = AssessmentEngine(
+        runner,
+        workspace=LocalWorkspace(str(_node_repo(tmp_path))),
+        config=AssessConfig(build_probe=True),
+        budget=Budget(),
+        listener=events.append,
+        command_runner=command_runner,
+    )
+    outcome = run(engine.assess())
+    assert outcome.build_probe.ran and outcome.build_probe.succeeded is False
+    assert ["npm", "install"] in command_runner.calls
+    # real results reach the auditors as evidence...
+    buildability_call = next(
+        c for c in runner.calls if "BUILDABILITY" in c["prompt"]
+    )
+    assert "Build probe" in buildability_call["prompt"]
+    assert "Cannot find module" in buildability_call["prompt"]
+    # ...and the report appendix.
+    assert "Build probe" in outcome.report_markdown
+    assert any(e.stage == "build-probe" and "red" in e.message for e in events)
+    assert outcome_to_dict(outcome)["build_probe"]["succeeded"] is False
+
+
+def test_assess_build_probe_green_event(tmp_path):
+    events = []
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = AssessmentEngine(
+        runner,
+        workspace=LocalWorkspace(str(_node_repo(tmp_path))),
+        config=AssessConfig(build_probe=True),
+        budget=Budget(),
+        listener=events.append,
+        command_runner=FakeCommandRunner(),
+    )
+    outcome = run(engine.assess())
+    assert outcome.build_probe.succeeded is True
+    assert any(e.stage == "build-probe" and "green" in e.message for e in events)
+
+
+def test_assess_build_probe_skipped_without_real_directory():
+    events = []
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = AssessmentEngine(
+        runner,
+        workspace=_workspace(),  # in-memory: no directory to run commands in
+        config=AssessConfig(build_probe=True),
+        budget=Budget(),
+        listener=events.append,
+        command_runner=FakeCommandRunner(),
+    )
+    outcome = run(engine.assess())
+    assert not outcome.build_probe.ran
+    assert "no real workspace directory" in outcome.build_probe.skipped_reason
+    assert any(e.stage == "build-probe" and "skipped" in e.message for e in events)
+    assert "Build probe: skipped" in outcome.report_markdown
+
+
+def test_assess_default_never_runs_build_commands():
+    command_runner = FakeCommandRunner()
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(runner, command_runner=command_runner)
+    outcome = run(engine.assess())
+    assert outcome.build_probe.requested is False
+    assert command_runner.calls == []  # in-memory workspace: not even git
+    assert "Build probe" not in outcome.report_markdown
+
+
+# --- audit blind spots ------------------------------------------------------------
+
+
+def test_mentions_tokenises_citations():
+    assert _mentions("see src/Api/Program.cs", "src")
+    assert _mentions("(evidence: `web/app.js`)", "web")
+    assert _mentions("the src directory.", "src")
+    assert not _mentions("sources are unclear", "src")
+    assert not _mentions("api/src/thing", "src")
+
+
+def test_audit_blind_spots_names_uncited_directories():
+    stats = InventoryStats(loc_by_top={"src": 100, "legacy": 50, "(root)": 5})
+    phases = {
+        "inventory": PhaseResult(
+            phase="inventory",
+            role="architect",
+            data={
+                "findings": [{"claim": "x", "evidence": "src/App.cs"}],
+                "count": 3,  # non-citation leaves are ignored
+            },
+        )
+    }
+    assert audit_blind_spots(stats, phases, DeadCodeReport()) == ["legacy"]
+
+
+def test_audit_blind_spots_counts_path_keys_and_dead_code():
+    stats = InventoryStats(
+        loc_by_top={"web": 10, "Sleepy": 20, "tools": 30, "(root)": 1}
+    )
+    phases = {
+        "inventory": PhaseResult(
+            phase="inventory",
+            role="architect",
+            data={
+                "components": [{"name": "SPA", "path": "web", "purpose": "ui"}],
+                "boundary": {"evidence": ["tools/build.sh"]},  # non-str evidence: recursed
+            },
+        )
+    }
+    dead = DeadCodeReport(
+        findings=[DeadCodeFinding(probe="dormant-directories", path="Sleepy", detail="old")]
+    )
+    assert audit_blind_spots(stats, phases, dead) == []
+    assert audit_blind_spots(stats, {}, DeadCodeReport()) == ["Sleepy", "tools", "web"]
+
+
+def test_report_names_blind_spots():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    ws = InMemoryWorkspace(
+        {
+            "MyApp.sln": "Microsoft Visual Studio Solution File",
+            "src/Api/Api.csproj": "<Project><TargetFramework>net47</TargetFramework></Project>",
+            "web/package.json": "{}",
+            "uncharted/blob.py": "x = 1\n",
+        }
+    )
+    engine = _engine(runner, workspace=ws)
+    outcome = run(engine.assess())
+    assert outcome.blind_spots == ["uncharted"]
+    assert "Audit blind spots" in outcome.report_markdown
+    assert "`uncharted/`" in outcome.report_markdown
+    assert outcome_to_dict(outcome)["blind_spots"] == ["uncharted"]
+
+
+def test_report_omits_blind_spots_when_everything_was_cited():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    outcome = run(_engine(runner).assess())
+    assert outcome.blind_spots == []
+    assert "Audit blind spots" not in outcome.report_markdown
+
+
+def test_audit_blind_spots_ignores_named_entries():
+    stats = InventoryStats(loc_by_top={"audit": 5, "src": 10, "(root)": 1})
+    assert audit_blind_spots(stats, {}, DeadCodeReport(), ignore=("audit",)) == ["src"]
+
+
+def test_reassessment_does_not_flag_its_own_report_directory():
+    ws = _workspace()
+    ws.write_text("audit/assessment.md", "# a previous run's report")
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    outcome = run(_engine(runner, workspace=ws).assess())
+    assert outcome.blind_spots == []
+
+
+def test_root_level_report_path_ignores_nothing():
+    ws = _workspace()
+    ws.write_text("audit/assessment.md", "# a previous run's report")
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(runner, workspace=ws, config=AssessConfig(report_path="report.md"))
+    outcome = run(engine.assess())
+    # with the report at the root, the leftover audit/ dir is a real blind spot
+    assert outcome.blind_spots == ["audit"]

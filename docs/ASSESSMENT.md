@@ -6,7 +6,9 @@ project — and get back a **cited, phased audit report** instead of a code
 change. Assessment is **read-only by construction**: no delivery branch, no
 baseline commit, no quality gates, no `.dev_team/` bookkeeping. The auditing
 agents get read-only tools (`Read`/`Grep`/`Glob`) rooted at the workspace,
-and the only write the run makes is the report itself.
+and the only write the run makes is the report itself. (One opt-in
+exception: `--build-probe` runs the project's own build for a ground-truth
+buildability verdict — see below.)
 
 ```bash
 dev-team --assess --workspace /path/to/legacy-repo \
@@ -38,9 +40,13 @@ versions (upgrades break those).
 
 Phase 1 runs first; phases 2–4 run **in parallel**, each anchored by the
 inventory summary; phase 5 synthesises. Wren (technical writer) closes with
-an executive summary. Classifications are fixed vocabulary:
-`revive-in-place`, `dependency-surgery`, `strangler-rewrite`, or `archive` —
-anything else fails the phase rather than being reported as a verdict.
+an executive summary. Classifications are fixed vocabulary —
+`revive-in-place`, `dependency-surgery`, `strangler-rewrite`, `rebuild`
+(build a replacement from scratch; the old system is a requirements
+document, not a foundation), or `archive` — anything else fails the phase
+rather than being reported as a verdict. The prompt defines each option, so
+"upgrade in place", "incremental rewrite", and "big-bang rebuild" are all
+first-class answers the audit can give.
 
 Two deterministic anchors keep the agents honest: the repo context (file
 tree + manifest heads) and an exact inventory (LOC per top-level directory,
@@ -88,14 +94,38 @@ machinery understands them now:
 
 - **Exactly-pinned dependencies get a live OSV.dev scan; everything else
   is model knowledge** — the report footer says which mode produced the
-  claims. Range-specified dependencies (`>=`, `*`) and EOL judgments still
-  come from training data; treat those as a triage list, not a compliance
-  scan.
+  claims. Lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`,
+  NuGet `packages.lock.json`) are parsed alongside the manifests, so a
+  range-specified project still gets its *resolved* versions scanned;
+  only dependencies with no lockfile and no exact pin fall back to
+  training data. EOL judgments always do — treat those as a triage list,
+  not a compliance scan.
 - Phase evidence is as good as what the auditors read: on very large repos
-  the deterministic inventory is exact, but agents sample files. Narrow the
-  scope interactively (or via the description) for depth where it matters.
-- Buildability is assessed statically — nothing is restored, installed, or
-  compiled.
+  the deterministic inventory is exact, but agents sample files. The report
+  appendix names the **audit blind spots** — top-level directories no
+  finding cited — so a sampled audit cannot read as a complete one. Narrow
+  the scope interactively (or via the description) for depth where it
+  matters.
+- Buildability is assessed statically by default — nothing is restored,
+  installed, or compiled. Opt in to `--build-probe` to ground the verdict
+  in real exit codes (see below).
+
+## Build probe (`--build-probe`)
+
+The one opt-in departure from read-only: the detected profile's setup and
+verify commands (e.g. `npm install` + `npm test`, `dotnet restore` +
+`dotnet test`) are actually executed in the workspace, and their exit codes
+and output tails are fed to the buildability auditor as ground truth and
+recorded in the report appendix. Commands stop at the first failure —
+running the test suite after a failed restore would only bury the signal —
+and profiles with no locally runnable commands (legacy .NET Framework)
+skip with a recorded reason instead of pretending.
+
+**Safety**: this executes the repository's own build scripts — arbitrary
+code — and mutates the working tree the way any build does
+(`node_modules/`, `obj/`, lockfile refreshes). It is off by default; only
+use it on trusted repositories or run the whole assessment inside a
+sandboxed container/VM, exactly as for delivery runs.
 
 ## Deterministic analyses (v0.7)
 
@@ -107,10 +137,15 @@ involved, so their findings are exact and citable:
   directories whose last commit trails the repository head by
   `dormancy_days` (default 365). Probes skip themselves with a recorded
   reason when preconditions are missing (no git, SDK-style projects).
-- **Live dependency scan** — exact pins from `packages.config`,
-  `package.json`, `requirements.txt`, and `Cargo.toml` queried against
-  OSV.dev in one batch (`--no-osv-scan` opts out; offline degrades to a
-  labelled model-knowledge fallback).
+- **Live dependency scan** — exact pins from the manifests
+  (`packages.config`, `package.json`, `requirements.txt`, `Cargo.toml`)
+  and the lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`,
+  NuGet `packages.lock.json`) queried against OSV.dev in one batch
+  (`--no-osv-scan` opts out; offline degrades to a labelled
+  model-knowledge fallback).
+- **Audit blind spots** — the exact set of top-level directories no phase
+  finding (nor dead-code probe) cited, listed in the report appendix so
+  sampling gaps are named instead of implied clean.
 - **Component detection** — one component per directory holding a manifest;
   `--component-fanout` runs a parallel per-component deep-dive
   (`max_components` caps it).
