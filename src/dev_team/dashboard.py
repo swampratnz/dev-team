@@ -175,6 +175,32 @@ def collect_state(
     }
 
 
+#: How many timeline entries a single agent's history carries.
+_HISTORY_LIMIT = 100
+
+
+def agent_history(workspace: Workspace, role: str) -> List[Dict]:
+    """One role's event history: chronological (oldest-first), last 100 entries.
+
+    Reads the same journal as the feed but keeps only events for ``role`` and
+    only the per-event fields the timeline shows, so it is cheap and unit
+    testable without the socket. An unknown/absent ``role`` yields ``[]``.
+    """
+
+    history = [
+        {
+            "ts": event.get("ts"),
+            "run": event.get("run"),
+            "stage": event.get("stage"),
+            "message": event.get("message"),
+            "detail": event.get("detail"),
+        }
+        for event in read_events(workspace)
+        if event.get("role") == role
+    ]
+    return history[-_HISTORY_LIMIT:]
+
+
 def _make_handler(workspace: Workspace) -> type:
     """A request handler class bound to ``workspace``."""
 
@@ -199,6 +225,8 @@ def _make_handler(workspace: Workspace) -> type:
                 self._send(200, "application/json", json.dumps(collect_state(workspace)))
             elif parts.path == "/api/report":
                 self._report(parts.query)
+            elif parts.path == "/api/agent":
+                self._agent(parts.query)
             else:
                 self._send(404, "text/plain", "not found")
 
@@ -210,6 +238,19 @@ def _make_handler(workspace: Workspace) -> type:
                 self._send(404, "text/plain", "unknown report")
                 return
             self._send(200, "text/plain", workspace.read_text(requested))
+
+        def _agent(self, query: str) -> None:
+            # A lean on-click route: filter the journal to one role on demand
+            # so the 2.5s /api/state poll stays small. An unknown or absent
+            # role is not an error — the UI shows an empty timeline.
+            role = parse_qs(query).get("role", [""])[0]
+            persona = DEFAULT_CAST.get(role)
+            payload = {
+                "role": role,
+                "name": persona.name if persona else role,
+                "history": agent_history(workspace, role),
+            }
+            self._send(200, "application/json", json.dumps(payload))
 
     return Handler
 
@@ -331,8 +372,14 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
 .chip.idle    { border-style: dashed; color: var(--ink-3); }
 
 .agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
-.agent { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
-         padding: 12px 14px; box-shadow: var(--shadow); }
+.agent { position: relative; background: var(--card); border: 1px solid var(--line);
+         border-radius: 10px; padding: 12px 14px; box-shadow: var(--shadow); cursor: pointer;
+         transition: transform .15s ease, border-color .15s ease; }
+.agent:hover { transform: translateY(-2px); border-color: var(--accent); }
+.agent:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.agent .hint { position: absolute; top: 10px; right: 12px; font-size: 11px;
+               color: var(--ink-3); white-space: nowrap; }
+.agent:hover .hint, .agent:focus-visible .hint { color: var(--accent); }
 .agent .who { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .avatar { width: 34px; height: 34px; border-radius: 50%; flex: none;
           display: flex; align-items: center; justify-content: center;
@@ -475,6 +522,21 @@ details[open] summary .preview { display: none; }
 .md th, .md td { border: 1px solid var(--line); padding: 5px 10px; text-align: left; }
 .md th { background: var(--inset); color: var(--ink); }
 
+.tl-run { padding: 16px 0 4px; font-size: 11px; text-transform: uppercase;
+          letter-spacing: .06em; color: var(--ink-3); font-weight: 600; }
+.tl-run:first-child { padding-top: 0; }
+.tl-run code { font-size: 11px; text-transform: none; letter-spacing: 0; }
+.tl { position: relative; margin-left: 5px; padding: 8px 0 8px 18px;
+      border-left: 2px solid var(--line); }
+.tl::before { content: ""; position: absolute; left: -5px; top: 13px; width: 8px; height: 8px;
+              border-radius: 50%; background: var(--accent); }
+.tl.good::before { background: var(--good); }
+.tl.bad::before { background: var(--critical); }
+.tl .head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.tl .when { margin-left: auto; color: var(--ink-3); font-size: 12px; white-space: nowrap; }
+.tl .msg { margin-top: 5px; color: var(--ink); overflow-wrap: anywhere; }
+.tl .detail { margin-top: 3px; color: var(--ink-3); font-size: 12px; overflow-wrap: anywhere; }
+
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
   html { scroll-behavior: auto; }
@@ -520,6 +582,15 @@ details[open] summary .preview { display: none; }
       <button id="modal-close" aria-label="close report">&#x2715;</button>
     </div>
     <div class="modal-body md" id="modal-body"></div>
+  </div>
+</div>
+<div class="overlay" id="agent-overlay" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="agent-title">
+    <div class="modal-head">
+      <code id="agent-title"></code>
+      <button id="agent-close" aria-label="close agent history">&#x2715;</button>
+    </div>
+    <div class="modal-body" id="agent-body"></div>
   </div>
 </div>
 <script>
@@ -697,7 +768,8 @@ function agents(s) {
     const msg = last
       ? esc(last.message) + (last.detail ? ` <span class="muted">(${esc(last.detail)})</span>` : "")
       : '<span class="muted">no recorded activity</span>';
-    return `<div class="agent ${v.cls}">
+    return `<div class="agent ${v.cls}" role="button" tabindex="0" data-role="${esc(a.role)}" aria-label="${esc(who)} \\u2014 open event history" title="open ${esc(who)}'s event history">
+      <span class="hint" aria-hidden="true">history \\u203a</span>
       <div class="who">
         <span class="avatar" aria-hidden="true">${esc(who.charAt(0).toUpperCase())}</span>
         <div><div class="name">${esc(who)}</div><div class="role">${esc(a.role)}</div></div>
@@ -843,6 +915,58 @@ function openModal(path) {
 
 function closeModal() { $("overlay").hidden = true; }
 
+// ---- agent history modal ----
+// A per-entry stage class, reusing the feed's good/bad stage vocabulary.
+function stageClass(stage) {
+  const s = String(stage || "").toLowerCase();
+  if (STAGE_BAD.has(s)) return "bad";
+  if (STAGE_GOOD.has(s)) return "good";
+  return "";
+}
+
+// Render one agent's history as a vertical timeline, oldest -> newest so it
+// reads top-to-bottom as a story, grouped by run. SECURITY: every field is
+// service/agent-derived and possibly repo-influenced, so all of it goes
+// through esc() (chip() escapes its own label) before touching innerHTML.
+function renderHistory(data) {
+  const items = (data && data.history) || [];
+  if (!items.length) return '<p class="muted">No recorded activity yet.</p>';
+  const out = [];
+  let lastRun;
+  for (const e of items) {
+    if (e.run !== lastRun) {
+      lastRun = e.run;
+      out.push(`<div class="tl-run">run <code>${esc(e.run)}</code></div>`);
+    }
+    const kind = stageClass(e.stage);
+    out.push(`<div class="tl${kind ? " " + kind : ""}">
+      <div class="head">${chip(e.stage, kind === "good" ? "done" : kind === "bad" ? "blocked" : "")}<span class="when" title="${esc(absTime(e.ts))}">${esc(ago(e.ts))}</span></div>
+      <div class="msg">${esc(e.message)}</div>
+      ${e.detail ? `<div class="detail">${esc(e.detail)}</div>` : ""}
+    </div>`);
+  }
+  return out.join("");
+}
+
+function openAgent(role) {
+  $("agent-title").textContent = role;
+  $("agent-body").innerHTML = '<p class="muted">loading\\u2026</p>';
+  $("agent-overlay").hidden = false;
+  $("agent-close").focus();
+  fetch("/api/agent?role=" + encodeURIComponent(role))
+    .then(res => { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
+    .then(data => {
+      const label = (data.name && data.name !== data.role)
+        ? data.name + " (" + data.role + ")" : (data.role || role);
+      $("agent-title").textContent = label;
+      $("agent-title").title = label;
+      $("agent-body").innerHTML = renderHistory(data);
+    })
+    .catch(() => { $("agent-body").innerHTML = '<p class="muted">failed to load history</p>'; });
+}
+
+function closeAgent() { $("agent-overlay").hidden = true; }
+
 // ---- run -> feed cross-filter ----
 function toggleRun(id) {
   filters.run = filters.run === id ? "" : id;
@@ -882,9 +1006,19 @@ $("reports").addEventListener("click", e => {
   const btn = e.target.closest("[data-path]");
   if (btn) openModal(btn.dataset.path);
 });
+$("agents").addEventListener("click", e => {
+  const card = e.target.closest("[data-role]");
+  if (card) openAgent(card.dataset.role);
+});
+$("agents").addEventListener("keydown", e => {
+  const card = e.target.closest("[data-role]");
+  if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openAgent(card.dataset.role); }
+});
 $("modal-close").addEventListener("click", closeModal);
 $("overlay").addEventListener("click", e => { if (e.target === $("overlay")) closeModal(); });
-document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+$("agent-close").addEventListener("click", closeAgent);
+$("agent-overlay").addEventListener("click", e => { if (e.target === $("agent-overlay")) closeAgent(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") { closeModal(); closeAgent(); } });
 
 // ---- poll loop ----
 let fails = 0;
