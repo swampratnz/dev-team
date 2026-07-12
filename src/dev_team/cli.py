@@ -30,7 +30,12 @@ from .report import (
     result_to_dict,
 )
 from .sdk import AgentRunner, ChatBackend, ClaudeChatBackend
-from .sources import clone_or_update, parse_repo, resolve_github_token
+from .sources import (
+    clone_or_update,
+    default_env_file,
+    parse_repo,
+    resolve_github_token,
+)
 from .team import DevTeam
 
 # Any one of these satisfies the credential preflight. The Claude CLI (which
@@ -229,17 +234,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="OWNER/NAME",
         help="Clone this GitHub repository (owner/name or a git URL) and use "
         "the clone as the workspace (with --assess or --deliver). Private "
-        "repositories authenticate with a GITHUB_TOKEN/GH_TOKEN read from "
-        "--env-file (or ./.env, or the process environment). An existing "
+        "repositories authenticate with a GITHUB_TOKEN/GH_TOKEN found "
+        "automatically in ./.env, ~/.config/dev-team/dev-team.env, or "
+        "/etc/dev-team/dev-team.env (override with --env-file). An existing "
         "clone is fast-forwarded instead of re-cloned.",
     )
     parser.add_argument(
         "--env-file",
         default=None,
         metavar="FILE",
-        help="KEY=VALUE file holding GITHUB_TOKEN/GH_TOKEN for --repo "
-        "(default: ./.env when present). The token stays out of the "
-        "process environment, so commands the agents run never see it.",
+        help="KEY=VALUE file holding GITHUB_TOKEN/GH_TOKEN for --repo, "
+        "overriding the default search (./.env, "
+        "~/.config/dev-team/dev-team.env, /etc/dev-team/dev-team.env). "
+        "The token stays out of the process environment, so commands the "
+        "agents run never see it.",
     )
     parser.add_argument(
         "--verify-command",
@@ -533,21 +541,22 @@ async def _chat(
 def _materialise_repo(args, default_workspace: str) -> None:
     """Clone (or update) ``--repo`` and point ``--workspace`` at the result.
 
-    The token is resolved from ``--env-file`` (default: ``./.env`` when
-    present) or, failing that, taken *out of* the process environment — the
+    The token is resolved from ``--env-file`` or, without one, the default
+    search (``./.env``, then ``~/.config/dev-team/dev-team.env``, then
+    ``/etc/dev-team/dev-team.env``) — set up once, never passed per run.
+    Failing all of those it is taken *out of* the process environment — the
     engines' subprocesses must never inherit it. An explicit ``--workspace``
     is the clone destination; otherwise each repository gets its own
     directory under the default workspace root.
     """
 
     ref = parse_repo(args.repo)
-    env_file = args.env_file
-    if env_file is None and Path(".env").is_file():
-        env_file = ".env"
+    env_file = args.env_file if args.env_file is not None else default_env_file()
     token = resolve_github_token(env_file)
+    via = f" (env file: {env_file})" if env_file is not None else ""
     if args.workspace == default_workspace:
         args.workspace = str(Path(default_workspace) / ref.workspace_name)
-    print(f"fetching {ref.slug} into {args.workspace}", file=sys.stderr)
+    print(f"fetching {ref.slug} into {args.workspace}{via}", file=sys.stderr)
     clone_or_update(
         ref, args.workspace, runner=SubprocessCommandRunner(), token=token
     )

@@ -17,12 +17,14 @@ dev-team --assess --workspace /path/to/legacy-repo \
     --budget-usd 10 --interactive --verbose
 ```
 
-No local checkout? `--repo owner/name` clones the repository first (private
-repos authenticate with a `GITHUB_TOKEN` read from `--env-file` or `./.env`;
-the token is handed to git per-command and stripped from the process
-environment, so nothing the audit executes can read it) and uses the clone
-as the workspace. A repository already cloned by a previous run is
-fast-forwarded, not re-cloned.
+No local checkout? `--repo owner/name` clones the repository first and uses
+the clone as the workspace. Private repos authenticate with a `GITHUB_TOKEN`
+from an env file that is configured once and found automatically — `./.env`,
+then `~/.config/dev-team/dev-team.env`, then `/etc/dev-team/dev-team.env`
+(`--env-file` overrides the search). The token is handed to git per-command
+and stripped from the process environment, so nothing the audit executes can
+read it. A repository already cloned by a previous run is fast-forwarded,
+not re-cloned.
 
 The optional title/description scope the audit (they are woven into every
 phase prompt); `--report` defaults to `audit/assessment.md` inside the

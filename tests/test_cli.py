@@ -739,6 +739,7 @@ def test_main_repo_explicit_workspace_and_process_env_fallback(
     from test_assessment import assess_responses
 
     monkeypatch.chdir(tmp_path)  # no .env here
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-xdg"))
     monkeypatch.setenv("GITHUB_TOKEN", "proc-token")
     captured = {}
     monkeypatch.setattr(
@@ -775,3 +776,27 @@ def test_main_repo_invalid_ref_fails_cleanly(capsys):
     code = main(["--assess", "--repo", "%%%"], runner=ScriptedRunner([]))
     assert code == 2
     assert "unrecognised repository reference" in capsys.readouterr().err
+
+
+def test_main_repo_finds_user_level_env_file_without_flags(
+    tmp_path, monkeypatch, capsys
+):
+    from test_assessment import assess_responses
+
+    monkeypatch.chdir(tmp_path)  # no ./.env
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    config = xdg / "dev-team" / "dev-team.env"
+    config.parent.mkdir(parents=True)
+    config.write_text("GITHUB_TOKEN=configured-once\n")
+    captured = {}
+    monkeypatch.setattr(
+        "dev_team.cli.clone_or_update", _fake_clone_writing_dotnet(captured)
+    )
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(["--assess", "--repo", "acme/mono", "--json"], runner=runner)
+    assert code == 0
+    assert captured["token"] == "configured-once"
+    assert f"env file: {config}" in capsys.readouterr().err

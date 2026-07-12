@@ -8,7 +8,10 @@ Token hygiene is the whole design:
 
 - The GitHub token comes from an **env file** (``KEY=VALUE`` lines, e.g. the
   same file a systemd unit loads) or, failing that, the process environment.
-  It is read into memory and *popped* from ``os.environ`` when found there,
+  The file is found without being passed: ``--env-file`` overrides a default
+  search of ``./.env``, ``~/.config/dev-team/dev-team.env``, and
+  ``/etc/dev-team/dev-team.env`` — configure it once at setup time. Tokens
+  are read into memory and *popped* from ``os.environ`` when found there,
   so commands the engines later execute — gates, build probes, the code
   under audit — can never read it.
 - git receives the credential through per-command ``GIT_CONFIG_*``
@@ -29,13 +32,47 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, MutableMapping, Optional
+from typing import Dict, MutableMapping, Optional, Sequence
 
 from .errors import DevTeamError
 from .execution import CommandResult, CommandRunner
 
 #: Environment (file or process) keys checked for the token, in order.
 TOKEN_KEYS = ("GITHUB_TOKEN", "GH_TOKEN")
+
+#: System-wide env file, the last resort of the default search.
+SYSTEM_ENV_FILE = "/etc/dev-team/dev-team.env"
+
+
+def default_env_file(
+    candidates: Optional[Sequence[Path]] = None,
+) -> Optional[str]:
+    """The env file a run should use when ``--env-file`` was not passed.
+
+    Searched in order — project, then user, then system — so the credential
+    is configured once at setup time and every later run just finds it:
+
+    1. ``./.env`` (the working directory)
+    2. ``$XDG_CONFIG_HOME/dev-team/dev-team.env``
+       (``~/.config/dev-team/dev-team.env`` by default)
+    3. ``/etc/dev-team/dev-team.env``
+
+    Returns the first path that exists, or ``None``.
+    """
+
+    if candidates is None:
+        config_home = Path(
+            os.environ.get("XDG_CONFIG_HOME", "~/.config")
+        ).expanduser()
+        candidates = (
+            Path(".env"),
+            config_home / "dev-team" / "dev-team.env",
+            Path(SYSTEM_ENV_FILE),
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 #: Ceiling for one git command; large monoliths clone slowly, not forever.
 _GIT_TIMEOUT_SECONDS = 900.0
