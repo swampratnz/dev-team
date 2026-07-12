@@ -138,6 +138,7 @@ from .sources import (
     RepoRef,
     SourceError,
     clone_or_update,
+    default_env_file,
     load_env_file,
     parse_repo,
     resolve_github_token,
@@ -272,6 +273,7 @@ __all__ = [
     "SourceError",
     "parse_repo",
     "clone_or_update",
+    "default_env_file",
     "load_env_file",
     "resolve_github_token",
     # verification

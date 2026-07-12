@@ -189,10 +189,13 @@ runs from a web UI or chat bot instead, see
   root-owned `*.env` files (`chmod 600`), not in the unit or the repo. A
   subscription token is a credential for your whole Claude account — treat it
   like a password and regenerate it (`claude setup-token`) if exposed.
-- For `--repo`, prefer passing the GitHub token via `--env-file FILE` over
-  exporting it: dev-team reads the file itself, hands the credential to git
+- For `--repo`, keep the GitHub token in an env file rather than exporting
+  it: dev-team reads the file itself, hands the credential to git
   per-command, and never places it in the process environment — so gates,
-  build probes, and the code under audit cannot read it. Use a fine-grained
+  build probes, and the code under audit cannot read it. Configure it once;
+  every run finds it automatically (`./.env`, then
+  `~/.config/dev-team/dev-team.env`, then `/etc/dev-team/dev-team.env` —
+  the natural home on a server; `--env-file` overrides). Use a fine-grained
   PAT with read-only **Contents** permission scoped to the repositories you
   actually audit, not a classic `repo`-scope token.
 - The agents run the Claude CLI in `acceptEdits` mode by default, with tools

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+from pathlib import Path
 
 import pytest
 
@@ -273,3 +274,45 @@ def test_clone_failure_hints_when_no_credential_was_usable(tmp_path):
     )
     with pytest.raises(SourceError, match="no usable credential"):
         clone_or_update(_REF, str(tmp_path / "c"), runner=runner)
+
+
+# --- default env-file discovery -----------------------------------------------------
+
+
+def test_default_env_file_prefers_cwd_then_user_config(tmp_path, monkeypatch):
+    from dev_team.sources import default_env_file
+
+    monkeypatch.chdir(tmp_path)
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    assert default_env_file() is None  # nothing configured anywhere
+
+    user_file = xdg / "dev-team" / "dev-team.env"
+    user_file.parent.mkdir(parents=True)
+    user_file.write_text("GITHUB_TOKEN=user-level\n")
+    assert default_env_file() == str(user_file)
+
+    (tmp_path / ".env").write_text("GITHUB_TOKEN=project-level\n")
+    assert default_env_file() == str(Path(".env"))  # cwd wins over user config
+
+
+def test_default_env_file_explicit_candidates_cover_system_path(tmp_path):
+    from dev_team.sources import default_env_file
+
+    system = tmp_path / "etc" / "dev-team" / "dev-team.env"
+    system.parent.mkdir(parents=True)
+    system.write_text("GITHUB_TOKEN=system-level\n")
+    found = default_env_file(candidates=(tmp_path / "missing.env", system))
+    assert found == str(system)
+
+
+def test_default_env_file_xdg_default_is_home_config(monkeypatch, tmp_path):
+    from dev_team.sources import default_env_file
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    target = tmp_path / ".config" / "dev-team" / "dev-team.env"
+    target.parent.mkdir(parents=True)
+    target.write_text("GITHUB_TOKEN=home-config\n")
+    assert default_env_file() == str(target)

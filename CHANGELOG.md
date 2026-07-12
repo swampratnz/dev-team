@@ -13,8 +13,14 @@ sections below are reconstructed from the repository history.
   (anything else at the destination is refused, and local changes fail the
   update loudly rather than being overwritten). Valid with `--assess`,
   `--deliver`, and `--chat`.
+- **The env file is configured once and found automatically**: without
+  `--env-file`, the default search checks `./.env`, then
+  `$XDG_CONFIG_HOME/dev-team/dev-team.env`
+  (`~/.config/dev-team/dev-team.env`), then `/etc/dev-team/dev-team.env` —
+  no per-run flag needed. The fetch line on stderr names the env file a run
+  used, so credential debugging never involves guessing.
 - **PAT auth with strict token hygiene**: `GITHUB_TOKEN`/`GH_TOKEN` is read
-  from an env file (`--env-file FILE`, or `./.env` when present) or, failing
+  from an env file (see the default search above) or, failing
   that, taken *out of* the process environment. git receives the credential
   through per-command `GIT_CONFIG_*` variables (an `http.extraheader`
   basic-auth header) — never the URL — so nothing token-shaped lands in

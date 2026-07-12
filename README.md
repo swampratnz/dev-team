@@ -104,11 +104,12 @@ QA, security, docs, reliability, and deployment.
   `--remote-verify-trigger` / `--remote-verify-status`.
 - ✅ **Fetches the repo itself** — `--repo owner/name` clones (or
   fast-forwards) the target straight from GitHub and uses the clone as the
-  workspace; private repositories authenticate with a `GITHUB_TOKEN` read
-  from an env file (`--env-file`, or `./.env`). The token never touches the
-  URL, argv, `.git/config`, or the environment of any command the agents
-  run — it is handed to git per-command and stripped from the process
-  environment.
+  workspace; private repositories authenticate with a `GITHUB_TOKEN` from an
+  env file configured once and found automatically (`./.env`, then
+  `~/.config/dev-team/dev-team.env`, then `/etc/dev-team/dev-team.env`;
+  `--env-file` overrides). The token never touches the URL, argv,
+  `.git/config`, or the environment of any command the agents run — it is
+  handed to git per-command and stripped from the process environment.
 - ✅ **Ubuntu-ready** — packaged for deployment as a container or systemd unit.
 
 The capability set was chosen from a structured research pass across seven
@@ -365,11 +366,14 @@ dev-team --assess --workspace /path/to/legacy-repo \
     --report audit/assessment.md \
     "Legacy monolith" "dormant 2-3 years, frontend + backend" --budget-usd 10
 
-# no local checkout? point at GitHub and let it clone (private repos read
-# GITHUB_TOKEN from --env-file or ./.env; the token never reaches the
-# commands the agents execute)
-echo 'GITHUB_TOKEN=github_pat_...' > ~/.config/dev-team.env && chmod 600 ~/.config/dev-team.env
-dev-team --assess --repo acme/legacy-monolith --env-file ~/.config/dev-team.env \
+# no local checkout? point at GitHub and let it clone. Configure the token
+# once — it is found automatically on every later run (./.env, then
+# ~/.config/dev-team/dev-team.env, then /etc/dev-team/dev-team.env) and
+# never reaches the commands the agents execute
+mkdir -p ~/.config/dev-team
+echo 'GITHUB_TOKEN=github_pat_...' > ~/.config/dev-team/dev-team.env
+chmod 600 ~/.config/dev-team/dev-team.env
+dev-team --assess --repo acme/legacy-monolith \
     "Legacy monolith" "assess upgrade paths vs rebuild"
 
 # a deep audit of a monolith: per-component fan-out, findings into the
