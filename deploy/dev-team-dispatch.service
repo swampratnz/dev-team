@@ -30,7 +30,12 @@ User=devteam
 Group=devteam
 WorkingDirectory=/opt/dev-team
 EnvironmentFile=/etc/dev-team/dev-team.env
-ExecStart=/opt/dev-team/.venv/bin/dev-team --dispatch --host 100.116.115.8 --port 8738
+# --dashboard-workspace makes dispatched jobs visible on the standing
+# `dev-team --dashboard` process (which watches /opt/dev-team/workspace): each
+# job also journals its events there (as its own run) and mirrors its assess
+# report under audit/<job-id>/. Each job still runs in its own isolated
+# workspace under /opt/dev-team/jobs/<id>.
+ExecStart=/opt/dev-team/.venv/bin/dev-team --dispatch --host 100.116.115.8 --port 8738 --dashboard-workspace /opt/dev-team/workspace
 Restart=on-failure
 RestartSec=5
 

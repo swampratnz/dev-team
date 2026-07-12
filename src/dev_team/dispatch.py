@@ -48,7 +48,7 @@ from .assessment import AssessConfig
 from .budget import Budget
 from .config import TeamConfig
 from .engine import EngineConfig
-from .eventlog import EventLog, read_events
+from .eventlog import EventLog, compose, read_events
 from .execution import LocalWorkspace, SubprocessCommandRunner, Workspace
 from .models import FeatureRequest
 from .report import delivery_to_dict
@@ -153,12 +153,19 @@ class Dispatcher:
         clock: Callable[[], float] = time.time,
         jobs_root: str = DEFAULT_JOBS_ROOT,
         queue_cap: int = DEFAULT_QUEUE_CAP,
+        dashboard_workspace: Optional[Workspace] = None,
     ) -> None:
         self.token = token
         self._runner = runner
         self._materialise = materialise or _default_materialise
         self._clock = clock
         self._jobs_root = jobs_root
+        # Optional shared workspace the standing `--dashboard` process watches:
+        # when set, every job ALSO journals its events here (same run id, so it
+        # shows as its own run/agent-cards on the dashboard) and an assess run
+        # mirrors its report under `audit/<id>/`. The job's OWN workspace stays
+        # the source of truth and isolated — this is a read-only-visibility copy.
+        self._dashboard_workspace = dashboard_workspace
         self._queue_cap = queue_cap
         self._registry: Dict[str, JobRecord] = {}
         self._order: List[str] = []
@@ -323,7 +330,16 @@ class Dispatcher:
         dest = str(Path(self._jobs_root) / spec.id)
         workspace = self._materialise(spec, dest)
         record.workspace = workspace
+        # The job's own workspace is always journalled (drives GET /jobs/{id}
+        # progress). When a dashboard workspace is configured, fan the same
+        # events out to it too — same run id, so the standing dashboard shows
+        # this job as its own run without ever touching the isolated job dir.
         listener = EventLog(workspace, run=spec.id, clock=self._clock)
+        if self._dashboard_workspace is not None:
+            listener = compose(
+                listener,
+                EventLog(self._dashboard_workspace, run=spec.id, clock=self._clock),
+            )
         team = DevTeam(
             self._runner,
             config=TeamConfig(),
@@ -337,6 +353,7 @@ class Dispatcher:
                 budget=budget,
                 config=AssessConfig(),
             )
+            self._mirror_report(spec.id, outcome)
         else:
             outcome = await team.deliver(
                 FeatureRequest(title=spec.title, description=spec.description),
@@ -345,6 +362,21 @@ class Dispatcher:
                 config=EngineConfig(commit=True),
             )
         return outcome, outcome.cost_usd
+
+    def _mirror_report(self, job_id: str, outcome: Any) -> None:
+        """Copy an assess run's report into the dashboard workspace.
+
+        Written under a per-job `audit/<id>/` path so concurrent history never
+        collides and the dashboard's Reports panel attributes it. No-op when no
+        dashboard workspace is configured or the run produced no report.
+        """
+
+        if self._dashboard_workspace is None:
+            return
+        report = getattr(outcome, "report_markdown", None)
+        if not report:
+            return
+        self._dashboard_workspace.write_text(f"audit/{job_id}/assessment.md", report)
 
     # -- serialisation -------------------------------------------------------
 
@@ -540,6 +572,7 @@ class DispatchServer:
         clock: Callable[[], float] = time.time,
         jobs_root: str = DEFAULT_JOBS_ROOT,
         queue_cap: int = DEFAULT_QUEUE_CAP,
+        dashboard_workspace: Optional[Workspace] = None,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -548,6 +581,7 @@ class DispatchServer:
             clock=clock,
             jobs_root=jobs_root,
             queue_cap=queue_cap,
+            dashboard_workspace=dashboard_workspace,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()

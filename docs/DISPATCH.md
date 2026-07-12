@@ -40,6 +40,18 @@ overlapping runs would corrupt each other. A submit returns immediately with a
 queue `position` (0 = starts as soon as the worker is free); the pending queue
 is capped (default 16) and a submit past the cap returns `503`.
 
+## Dashboard visibility
+
+Dispatched jobs run in their own isolated workspaces (`<jobs-root>/<id>`), so
+they don't appear on a standing `dev-team --dashboard` (which watches a single
+workspace) by default. Pass `--dashboard-workspace DIR` to the dispatch service
+and every job **also** journals its events into `DIR` under the same run id —
+so it shows up as its own run/agent-cards on a dashboard pointed at `DIR` — and
+an assess run mirrors its report to `DIR/audit/<job-id>/assessment.md` for the
+Reports panel. The job's own workspace stays the source of truth; this is a
+read-only visibility copy. Point the dashboard and the dispatcher at the same
+`DIR` (e.g. `/opt/dev-team/workspace`) to watch dispatched runs live.
+
 ## API
 
 Base `http://<host>:<port>`. All bodies are JSON.

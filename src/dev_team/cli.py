@@ -202,6 +202,16 @@ def build_parser() -> argparse.ArgumentParser:
         "code — only widen this on a trusted network.",
     )
     parser.add_argument(
+        "--dashboard-workspace",
+        default=None,
+        metavar="DIR",
+        help="With --dispatch: a shared workspace that a separate "
+        "`--dashboard` process watches. Each dispatched job also journals "
+        "its events here (shown as its own run) and mirrors its assess "
+        "report under audit/<job-id>/, so dispatched runs are visible on the "
+        "dashboard. Each job still runs in its own isolated workspace.",
+    )
+    parser.add_argument(
         "--report",
         default=None,
         metavar="FILE",
@@ -388,6 +398,8 @@ def _validate_args(
         parser.error("--port: only valid with --dashboard or --dispatch")
     if args.host is not None and not (args.dashboard or args.dispatch):
         parser.error("--host: only valid with --dashboard or --dispatch")
+    if args.dashboard_workspace is not None and not args.dispatch:
+        parser.error("--dashboard-workspace: only valid with --dispatch")
     if args.report is not None and not args.assess:
         parser.error("--report: only valid with --assess")
     if args.chat:
@@ -659,6 +671,11 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
         host=args.host if args.host is not None else "127.0.0.1",
         port=args.port if args.port is not None else 8738,
         runner=runner,
+        dashboard_workspace=(
+            LocalWorkspace(args.dashboard_workspace)
+            if args.dashboard_workspace is not None
+            else None
+        ),
     )
     print(
         f"dev-team dispatch service at {server.url} (Ctrl-C to stop)",
