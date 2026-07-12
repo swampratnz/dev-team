@@ -288,6 +288,9 @@ Key modules:
   read-only web dashboard served over it (see `docs/DASHBOARD.md`).
 - `dispatch.py` — an authenticated (bearer-token), single-flight HTTP service
   to submit/poll/fetch assess & deliver jobs remotely (see `docs/DISPATCH.md`).
+- `transcripts.py` — opt-in capture of each agent call's raw
+  system-prompt/prompt/response, viewable per-agent in the dashboard
+  (off by default; see `docs/TRANSCRIPTS.md`).
 - `memory.py` / `backlog.py` — blackboard, ADRs, cross-run memory,
   checkpoints, persistent backlog.
 - `budget.py` / `trace.py` / `approval.py` / `policy.py` / `instrument.py` —

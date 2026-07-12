@@ -23,7 +23,7 @@ from .engine import EngineConfig
 from .errors import DevTeamError
 from .eventlog import EventLog, compose
 from .events import AgentEvent
-from .execution import LocalWorkspace, SubprocessCommandRunner
+from .execution import DEFAULT_EXCLUDED_DIRS, LocalWorkspace, SubprocessCommandRunner
 from .interaction import ChannelApprovalGate, ConsoleChannel
 from .models import FeatureRequest
 from .persona import Roster
@@ -41,6 +41,7 @@ from .sources import (
     resolve_github_token,
 )
 from .team import DevTeam
+from .transcripts import TranscriptRecorder
 
 # Any one of these satisfies the credential preflight. The Claude CLI (which
 # the Agent SDK spawns) resolves them itself; dev-team only checks presence so
@@ -372,6 +373,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print progress events as the team works.",
     )
+    parser.add_argument(
+        "--record-transcripts",
+        action="store_true",
+        help="Capture each agent call's raw system prompt, prompt, response "
+        "and cost under .dev_team/transcripts/ so they show in the dashboard's "
+        "agent modal (with --assess/--deliver/--dispatch). OFF by default. "
+        "Transcripts contain raw repository content (including any secrets in "
+        "the repo) and the dashboard is unauthenticated — only enable on a "
+        "trusted (tailnet) network. The dispatch service also honours the "
+        "DEV_TEAM_RECORD_TRANSCRIPTS environment variable.",
+    )
     return parser
 
 
@@ -402,6 +414,12 @@ def _validate_args(
         parser.error("--dashboard-workspace: only valid with --dispatch")
     if args.report is not None and not args.assess:
         parser.error("--report: only valid with --assess")
+    if args.record_transcripts and not (
+        args.assess or args.deliver or args.dispatch or args.chat
+    ):
+        parser.error(
+            "--record-transcripts: only valid with --assess/--deliver/--dispatch"
+        )
     if args.chat:
         if args.title is not None or args.description is not None:
             parser.error("--chat shapes the feature in conversation; omit "
@@ -509,7 +527,21 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
     )
 
 
-async def _deliver(team: DevTeam, request: FeatureRequest, args) -> int:
+def _transcript_recorder(args, run: Optional[str]) -> Optional[TranscriptRecorder]:
+    """A recorder tied to the run's event-log id, or ``None`` when disabled.
+
+    The recorder MUST share the run id used for the :class:`EventLog` so the
+    dashboard correlates a transcript with the agent's timeline.
+    """
+
+    if not args.record_transcripts or run is None:
+        return None
+    return TranscriptRecorder(LocalWorkspace(args.workspace), run=run)
+
+
+async def _deliver(
+    team: DevTeam, request: FeatureRequest, args, run: Optional[str] = None
+) -> int:
     """Run real delivery and print the result; returns the exit code."""
 
     kwargs = {}
@@ -517,6 +549,9 @@ async def _deliver(team: DevTeam, request: FeatureRequest, args) -> int:
         # Route the engine's approval points (feature commit, push/deploy/rm
         # commands) through the same conversation as plan review.
         kwargs["approval"] = ChannelApprovalGate(team.interaction)
+    recorder = _transcript_recorder(args, run)
+    if recorder is not None:
+        kwargs["transcript_recorder"] = recorder
     outcome = await team.deliver(
         request,
         workspace=LocalWorkspace(args.workspace),
@@ -531,7 +566,7 @@ async def _deliver(team: DevTeam, request: FeatureRequest, args) -> int:
     return 0 if outcome.success else 1
 
 
-async def _assess(team: DevTeam, args) -> int:
+async def _assess(team: DevTeam, args, run: Optional[str] = None) -> int:
     """Run a read-only repository assessment; returns the exit code."""
 
     focus_parts = [p for p in (args.title, args.description) if p]
@@ -552,10 +587,15 @@ async def _assess(team: DevTeam, args) -> int:
         config_kwargs["save_conventions"] = False
     if args.build_probe:
         config_kwargs["build_probe"] = True
+    kwargs = {}
+    recorder = _transcript_recorder(args, run)
+    if recorder is not None:
+        kwargs["transcript_recorder"] = recorder
     outcome = await team.assess(
         workspace=LocalWorkspace(args.workspace),
         budget=Budget(limit_usd=args.budget_usd),
         config=AssessConfig(**config_kwargs),
+        **kwargs,
     )
     if args.json:
         print(json.dumps(outcome_to_dict(outcome), indent=2))
@@ -625,11 +665,17 @@ def _materialise_repo(args, default_workspace: str) -> None:
     )
 
 
+#: The dashboard lists ``.dev_team/transcripts/`` to surface transcripts, so
+#: (unlike prompt-facing listings) it must NOT exclude ``.dev_team`` — every
+#: other heavy/vendored directory stays excluded.
+_DASHBOARD_EXCLUDED_DIRS = DEFAULT_EXCLUDED_DIRS - {".dev_team"}
+
+
 def _serve_dashboard(args) -> int:
     """Serve the workspace dashboard until interrupted; returns exit code."""
 
     server = DashboardServer(
-        LocalWorkspace(args.workspace),
+        LocalWorkspace(args.workspace, excluded_dirs=_DASHBOARD_EXCLUDED_DIRS),
         host=args.host if args.host is not None else "127.0.0.1",
         port=args.port if args.port is not None else 8737,
     )
@@ -649,6 +695,17 @@ def _serve_dashboard(args) -> int:
 
 #: Environment variable holding the dispatch service's bearer token.
 DISPATCH_TOKEN_ENV = "DEV_TEAM_DISPATCH_TOKEN"
+
+#: Environment variable that (truthily) enables transcript recording for the
+#: dispatch service — the box sets this in the unit's EnvironmentFile rather
+#: than passing --record-transcripts, keeping the shipped unit OFF by default.
+RECORD_TRANSCRIPTS_ENV = "DEV_TEAM_RECORD_TRANSCRIPTS"
+
+
+def _env_truthy(value: Optional[str]) -> bool:
+    """Whether an env var string reads as on (``1``/``true``/``yes``)."""
+
+    return (value or "").strip().lower() in ("1", "true", "yes")
 
 
 def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
@@ -675,6 +732,10 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
             LocalWorkspace(args.dashboard_workspace)
             if args.dashboard_workspace is not None
             else None
+        ),
+        record_transcripts=(
+            args.record_transcripts
+            or _env_truthy(os.environ.get(RECORD_TRANSCRIPTS_ENV))
         ),
     )
     print(
@@ -748,10 +809,15 @@ def _run(
         interaction=ConsoleChannel() if args.interactive else None,
     )
 
+    # The recorder must journal transcripts under the SAME run id as the
+    # events, so the dashboard can correlate them; that id lives on the
+    # EventLog built above (None in modes that keep no event log).
+    run_id = event_log.run if event_log is not None else None
+
     if args.chat:
         return asyncio.run(_chat(team, args, chat_backend))
     if args.assess:
-        return asyncio.run(_assess(team, args))
+        return asyncio.run(_assess(team, args, run_id))
 
     request = FeatureRequest(
         title=args.title,
@@ -759,7 +825,7 @@ def _run(
         constraints=list(args.constraints),
     )
     if args.deliver:
-        return asyncio.run(_deliver(team, request, args))
+        return asyncio.run(_deliver(team, request, args, run_id))
     return asyncio.run(_simulate(team, request, args))
 
 

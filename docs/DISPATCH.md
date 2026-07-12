@@ -126,3 +126,8 @@ never exposed to the public internet. `DEV_TEAM_DISPATCH_TOKEN` (and the
 Claude credentials) live in the unit's `EnvironmentFile`
 (`/etc/dev-team/dev-team.env`). Each job's clone lives under
 `/opt/dev-team/jobs/<id>`.
+
+To capture each agent call's raw I/O for the dashboard, set
+`DEV_TEAM_RECORD_TRANSCRIPTS=1` in that `EnvironmentFile` (or pass
+`--record-transcripts`). It is **off by default** and records sensitive raw
+repo content — see [`docs/TRANSCRIPTS.md`](TRANSCRIPTS.md).

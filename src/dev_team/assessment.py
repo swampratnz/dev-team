@@ -65,6 +65,7 @@ from .persona import Roster
 from .profile import ProjectProfile, detect_project
 from .sdk import AgentRunner
 from .trace import Tracer
+from .transcripts import TranscriptRecorder
 
 # Assessments read more of the tree than feature planning does.
 _TREE_ENTRIES = 400
@@ -668,6 +669,7 @@ class AssessmentEngine:
         interaction: Optional[InteractionChannel] = None,
         command_runner: Optional[CommandRunner] = None,
         osv_fetch: Optional[Fetch] = None,
+        transcript_recorder: Optional[TranscriptRecorder] = None,
     ) -> None:
         self.workspace: Workspace = workspace or InMemoryWorkspace()
         self.config = config or AssessConfig()
@@ -676,6 +678,7 @@ class AssessmentEngine:
         self.listener = listener
         self.roster = roster if roster is not None else Roster.default()
         self.interaction = interaction
+        self.transcript_recorder = transcript_recorder
         root = getattr(self.workspace, "root", None)
         self.workdir: Optional[str] = str(root) if root is not None else None
         # Read-only git queries (dead-code dormancy) need a real directory.
@@ -686,7 +689,11 @@ class AssessmentEngine:
 
         def make(cls):
             wrapped = InstrumentedRunner(
-                runner, cls.role, budget=self.budget, tracer=self.tracer
+                runner,
+                cls.role,
+                budget=self.budget,
+                tracer=self.tracer,
+                transcript_recorder=self.transcript_recorder,
             )
             return cls(
                 wrapped,

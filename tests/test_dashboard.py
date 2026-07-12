@@ -273,3 +273,61 @@ def test_server_agent_history_unknown_and_absent_role(server):
 def test_server_url_names_host_and_port(server):
     assert server.url.startswith("http://127.0.0.1:")
     assert server.url.endswith("/")
+
+
+# --- transcripts routes ------------------------------------------------------
+
+
+@pytest.fixture
+def transcript_server():
+    from dev_team.sdk import AgentResult
+    from dev_team.transcripts import TranscriptRecorder
+
+    ws = InMemoryWorkspace()
+    _journal(ws, AgentEvent("engineer", "implement", "building"), run="deliver-1")
+    rec = TranscriptRecorder(ws, run="deliver-1", clock=lambda: 5.0)
+    rec.record(role="engineer", system_prompt="be an engineer", prompt="build it",
+               result=AgentResult(text="<script>alert(1)</script>", cost_usd=0.2))
+    srv = DashboardServer(ws, port=0)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield srv
+    srv.shutdown()
+    thread.join(timeout=5)
+
+
+def test_transcripts_list_route(transcript_server):
+    headers, body = _get(transcript_server, "/api/transcripts?run=deliver-1&role=engineer")
+    assert headers["Content-Type"].startswith("application/json")
+    data = json.loads(body)
+    assert data["run"] == "deliver-1"
+    assert data["role"] == "engineer"
+    assert [t["seq"] for t in data["transcripts"]] == [1]
+    assert data["transcripts"][0]["cost_usd"] == 0.2
+
+
+def test_transcripts_list_empty_is_still_200(transcript_server):
+    _, body = _get(transcript_server, "/api/transcripts?run=deliver-1&role=ghost")
+    assert json.loads(body)["transcripts"] == []
+
+
+def test_transcript_detail_route(transcript_server):
+    _, body = _get(transcript_server, "/api/transcript?run=deliver-1&role=engineer&seq=1")
+    data = json.loads(body)
+    assert data["system_prompt"] == "be an engineer"
+    # raw, unescaped in the JSON payload; the client escapes it before the DOM
+    assert data["response"] == "<script>alert(1)</script>"
+
+
+def test_transcript_detail_unknown_or_guarded_is_404(transcript_server):
+    for bad in (
+        "/api/transcript?run=deliver-1&role=engineer&seq=99",   # absent seq
+        "/api/transcript?run=../etc&role=engineer&seq=1",        # traversal run
+        "/api/transcript?run=deliver-1&role=..&seq=1",           # traversal role
+        "/api/transcript?run=deliver-1&role=engineer&seq=x",     # bad seq
+        "/api/transcript",                                        # no params
+    ):
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _get(transcript_server, bad)
+        assert excinfo.value.code == 404
+        excinfo.value.close()
