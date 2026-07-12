@@ -1,0 +1,466 @@
+"""Tests for the authenticated HTTP dispatch service."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import threading
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import pytest
+
+from helpers import engine_responses
+from test_assessment import assess_responses
+
+from dev_team import __version__
+from dev_team import dispatch as dispatch_mod
+from dev_team.dispatch import (
+    Dispatcher,
+    DispatchServer,
+    JobRecord,
+    JobSpec,
+    QueueFull,
+    ValidationError,
+    _default_materialise,
+)
+from dev_team.execution import InMemoryWorkspace, LocalWorkspace
+from dev_team.testing import ScriptedRunner
+
+TOKEN = "s3cr3t-token"
+
+
+def _mem_materialise(spec, dest):
+    """A fake clone: no disk, no network — just a fresh in-memory workspace."""
+
+    return InMemoryWorkspace()
+
+
+def _assess_runner():
+    return ScriptedRunner(by_system_prompt=assess_responses())
+
+
+def _deliver_runner():
+    return ScriptedRunner(by_system_prompt=engine_responses())
+
+
+# --- build_spec validation ----------------------------------------------------
+
+
+def test_build_spec_assess_defaults_title_to_slug_and_blank_description():
+    spec = Dispatcher(token="x").build_spec({"mode": "assess", "repo": "acme/mono"})
+    assert spec.mode == "assess"
+    assert spec.title == "acme/mono"
+    assert spec.description == ""
+    assert spec.budget_usd is None
+
+
+def test_build_spec_assess_keeps_supplied_title_and_description():
+    spec = Dispatcher(token="x").build_spec(
+        {"mode": "assess", "repo": "acme/mono", "title": "Audit", "description": "dig"}
+    )
+    assert spec.title == "Audit"
+    assert spec.description == "dig"
+
+
+def test_build_spec_assess_non_string_description_becomes_blank():
+    spec = Dispatcher(token="x").build_spec(
+        {"mode": "assess", "repo": "acme/mono", "description": 123}
+    )
+    assert spec.description == ""
+
+
+def test_build_spec_deliver_requires_title_and_description():
+    disp = Dispatcher(token="x")
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "T", "description": "D"}
+    )
+    assert spec.mode == "deliver"
+    with pytest.raises(ValidationError):
+        disp.build_spec({"mode": "deliver", "repo": "acme/mono", "description": "D"})
+    with pytest.raises(ValidationError):
+        disp.build_spec({"mode": "deliver", "repo": "acme/mono", "title": "T"})
+
+
+def test_build_spec_rejects_bad_mode_and_repo():
+    disp = Dispatcher(token="x")
+    with pytest.raises(ValidationError):
+        disp.build_spec({"mode": "nope", "repo": "acme/mono"})
+    with pytest.raises(ValidationError):
+        disp.build_spec({"repo": "acme/mono"})  # missing mode
+    with pytest.raises(ValidationError):
+        disp.build_spec({"mode": "assess"})  # missing repo (not a string)
+    with pytest.raises(ValidationError):
+        disp.build_spec({"mode": "assess", "repo": "   "})  # empty repo
+    with pytest.raises(ValidationError):
+        disp.build_spec({"mode": "assess", "repo": "%%%"})  # unparseable
+
+
+def test_build_spec_validates_budget():
+    disp = Dispatcher(token="x")
+    assert disp.build_spec({"mode": "assess", "repo": "a/b", "budget_usd": 5}).budget_usd == 5
+    assert disp.build_spec(
+        {"mode": "assess", "repo": "a/b", "budget_usd": None}
+    ).budget_usd is None
+    for bad in (True, "5", 0, -1):
+        with pytest.raises(ValidationError):
+            disp.build_spec({"mode": "assess", "repo": "a/b", "budget_usd": bad})
+
+
+# --- submit / registry --------------------------------------------------------
+
+
+def test_submit_assigns_positions_and_recent_is_newest_first():
+    disp = Dispatcher(token="x")  # worker never started, so jobs stay queued
+    id1, pos1 = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+    id2, pos2 = disp.submit(disp.build_spec({"mode": "deliver", "repo": "a/two",
+                                             "title": "T", "description": "D"}))
+    assert (pos1, pos2) == (0, 1)
+    assert [r.spec.id for r in disp.recent()] == [id2, id1]
+    assert disp.get(id1).state == "queued"
+    assert disp.get("unknown") is None
+
+
+def test_submit_raises_queue_full_at_cap():
+    disp = Dispatcher(token="x", queue_cap=2)
+    disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+    disp.submit(disp.build_spec({"mode": "assess", "repo": "a/two"}))
+    with pytest.raises(QueueFull):
+        disp.submit(disp.build_spec({"mode": "assess", "repo": "a/three"}))
+
+
+def test_wait_on_unknown_job_returns_false():
+    assert Dispatcher(token="x").wait("nope", timeout=0.1) is False
+
+
+def test_start_is_idempotent_and_stop_without_start_is_safe():
+    disp = Dispatcher(token="x")
+    disp.stop()  # never started — the thread-None branch
+    disp.start()
+    disp.start()  # second call is a no-op
+    disp.stop()
+
+
+# --- run_job / worker (offline, injected fakes) -------------------------------
+
+
+def test_run_job_assess_path():
+    disp = Dispatcher(token="x", runner=_assess_runner(), materialise=_mem_materialise)
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec.id = "assess-x"
+    outcome, cost = asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert outcome.success is True
+    assert outcome.classification == "dependency-surgery"
+    assert cost == 0.0
+
+
+def test_run_job_deliver_path():
+    disp = Dispatcher(token="x", runner=_deliver_runner(), materialise=_mem_materialise)
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d"}
+    )
+    spec.id = "deliver-x"
+    outcome, cost = asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert outcome.success is True
+
+
+def test_worker_runs_a_successful_job():
+    disp = Dispatcher(token="x", runner=_assess_runner(), materialise=_mem_materialise)
+    disp.start()
+    try:
+        job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "acme/mono"}))
+        assert disp.wait(job_id, 5) is True
+        record = disp.get(job_id)
+        assert record.state == "succeeded"
+        assert record.started is not None and record.ended is not None
+        assert record.cost_usd == 0.0
+    finally:
+        disp.stop()
+
+
+def test_worker_marks_a_failing_job_failed():
+    def boom(spec, dest):
+        raise RuntimeError("clone exploded")
+
+    disp = Dispatcher(token="x", materialise=boom)
+    disp.start()
+    try:
+        job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "acme/mono"}))
+        assert disp.wait(job_id, 5) is True
+        record = disp.get(job_id)
+        assert record.state == "failed"
+        assert "clone exploded" in record.error
+        assert record.cost_usd == 0.0
+    finally:
+        disp.stop()
+
+
+def test_worker_is_single_flight_and_ordered():
+    order = []
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        order.append(spec.id)
+        if len(order) == 1:
+            first_in.set()
+            release.wait(5)  # hold job 1 so job 2 must wait its turn
+        return InMemoryWorkspace()
+
+    disp = Dispatcher(token="x", runner=_assess_runner(), materialise=materialise)
+    disp.start()
+    try:
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        id2, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/two"}))
+        assert first_in.wait(5)
+        # job 1 is running (mid-materialise); job 2 has not started yet
+        assert disp.get(id1).state == "running"
+        assert disp.get(id2).state == "queued"
+        release.set()
+        assert disp.wait(id1, 5) and disp.wait(id2, 5)
+        assert order == [id1, id2]
+        assert disp.get(id2).state == "succeeded"
+    finally:
+        release.set()
+        disp.stop()
+
+
+def test_default_materialise_clones_and_returns_local_workspace(tmp_path, monkeypatch):
+    calls = {}
+
+    def fake_clone(ref, dest, *, runner, token=None, timeout=None):
+        calls.update(slug=ref.slug, dest=dest, token=token)
+        Path(dest).mkdir(parents=True, exist_ok=True)
+        return dest
+
+    monkeypatch.setattr(dispatch_mod, "clone_or_update", fake_clone)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    spec = JobSpec(mode="assess", repo="acme/mono", title="t", description="",
+                   budget_usd=None, id="assess-1")
+    ws = _default_materialise(spec, str(tmp_path / "clone"))
+    assert calls["slug"] == "acme/mono"
+    assert isinstance(ws, LocalWorkspace)
+
+
+# --- the HTTP server ----------------------------------------------------------
+
+
+@contextlib.contextmanager
+def running(**kwargs):
+    server = DispatchServer(TOKEN, port=0, **kwargs)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def _call(server, path, *, method="GET", token=TOKEN, body=None):
+    url = server.url.rstrip("/") + path
+    headers = {}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if body is not None:
+        data = body if isinstance(body, (bytes, bytearray)) else json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return res.status, json.loads(res.read().decode())
+    except urllib.error.HTTPError as exc:
+        payload = json.loads(exc.read().decode())
+        exc.close()  # HTTPError carries the response socket
+        return exc.code, payload
+
+
+def test_health_needs_no_auth_and_reports_version():
+    with running(materialise=_mem_materialise) as server:
+        status, payload = _call(server, "/health", token=None)
+    assert status == 200
+    assert payload == {
+        "status": "ok",
+        "service": "dev-team-dispatch",
+        "version": __version__,
+    }
+
+
+def test_url_names_host_and_port():
+    with running(materialise=_mem_materialise) as server:
+        assert server.url.startswith("http://127.0.0.1:")
+        assert server.url.endswith("/")
+
+
+def test_unauthorized_without_and_with_wrong_token():
+    with running(materialise=_mem_materialise) as server:
+        assert _call(server, "/jobs", token=None) == (401, {"error": "unauthorized"})
+        assert _call(server, "/jobs", token="wrong") == (401, {"error": "unauthorized"})
+        status, payload = _call(
+            server, "/jobs", method="POST", token=None,
+            body={"mode": "assess", "repo": "a/b"},
+        )
+        assert (status, payload) == (401, {"error": "unauthorized"})
+
+
+def test_submit_assess_flows_to_a_result():
+    with running(runner=_assess_runner(), materialise=_mem_materialise) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST", body={"mode": "assess", "repo": "acme/mono"}
+        )
+        assert status == 202
+        assert payload["state"] == "queued"
+        assert payload["position"] == 0
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+
+        status, job = _call(server, f"/jobs/{job_id}")
+        assert status == 200
+        assert job["state"] == "succeeded"
+        assert job["mode"] == "assess"
+        assert job["progress"], "a finished assess should have journalled progress"
+        assert set(job["progress"][0]) == {"role", "stage", "message", "ts"}
+
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["kind"] == "assess"
+        assert result["success"] is True
+        assert result["classification"] == "dependency-surgery"
+        assert "report_markdown" in result
+
+
+def test_submit_deliver_flows_to_a_result():
+    with running(runner=_deliver_runner(), materialise=_mem_materialise) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d"},
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["kind"] == "deliver"
+        assert result["success"] is True
+
+
+def test_submit_validation_errors_are_400():
+    with running(materialise=_mem_materialise) as server:
+        bad_bodies = [
+            {"mode": "nope", "repo": "a/b"},
+            {"mode": "assess", "repo": ""},
+            {"mode": "assess", "repo": "a/b", "budget_usd": -1},
+            {"mode": "deliver", "repo": "a/b", "description": "d"},  # no title
+        ]
+        for body in bad_bodies:
+            status, payload = _call(server, "/jobs", method="POST", body=body)
+            assert status == 400
+            assert "error" in payload
+        # malformed JSON and a non-object body
+        assert _call(server, "/jobs", method="POST", body=b"{not json")[0] == 400
+        assert _call(server, "/jobs", method="POST", body=b"123")[0] == 400
+        # an empty body (no Content-Length) -> treated as {} -> missing mode
+        assert _call(server, "/jobs", method="POST", body=None)[0] == 400
+
+
+def test_queue_full_returns_503():
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    with running(runner=_assess_runner(), materialise=materialise, queue_cap=1) as server:
+        # job 1 is picked up and blocks in materialise (running, not queued)
+        _call(server, "/jobs", method="POST", body={"mode": "assess", "repo": "a/one"})
+        assert first_in.wait(5)
+        # job 2 fills the single queue slot
+        assert _call(server, "/jobs", method="POST",
+                     body={"mode": "assess", "repo": "a/two"})[0] == 202
+        # job 3 overflows -> 503
+        assert _call(server, "/jobs", method="POST",
+                     body={"mode": "assess", "repo": "a/three"}) == (
+            503, {"error": "queue full"})
+        release.set()
+
+
+def test_list_jobs_is_newest_first():
+    with running(runner=_assess_runner(), materialise=_mem_materialise) as server:
+        _, one = _call(server, "/jobs", method="POST", body={"mode": "assess", "repo": "a/one"})
+        server.dispatcher.wait(one["id"], 5)
+        _, two = _call(server, "/jobs", method="POST", body={"mode": "assess", "repo": "a/two"})
+        server.dispatcher.wait(two["id"], 5)
+        status, payload = _call(server, "/jobs")
+        assert status == 200
+        ids = [j["id"] for j in payload["jobs"]]
+        assert ids == [two["id"], one["id"]]
+        assert set(payload["jobs"][0]) == {"id", "mode", "repo", "state", "started", "ended"}
+
+
+def test_status_and_result_across_queued_running_and_404():
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    with running(runner=_assess_runner(), materialise=materialise) as server:
+        _, one = _call(server, "/jobs", method="POST", body={"mode": "assess", "repo": "a/one"})
+        assert first_in.wait(5)
+        _, two = _call(server, "/jobs", method="POST", body={"mode": "assess", "repo": "a/two"})
+
+        _, running_job = _call(server, f"/jobs/{one['id']}")
+        assert running_job["state"] == "running"
+        assert running_job["progress"] == []  # workspace not assigned yet
+
+        _, queued_job = _call(server, f"/jobs/{two['id']}")
+        assert queued_job["state"] == "queued"
+        assert queued_job["started"] is None
+
+        assert _call(server, f"/jobs/{one['id']}/result") == (
+            409, {"error": "not finished", "state": "running"})
+        assert _call(server, f"/jobs/{two['id']}/result") == (
+            409, {"error": "not finished", "state": "queued"})
+
+        assert _call(server, "/jobs/ghost") == (404, {"error": "unknown job"})
+        assert _call(server, "/jobs/ghost/result") == (404, {"error": "unknown job"})
+        release.set()
+        server.dispatcher.wait(one["id"], 5)
+        server.dispatcher.wait(two["id"], 5)
+
+
+def test_failed_job_status_and_result():
+    def boom(spec, dest):
+        raise RuntimeError("materialise failed")
+
+    with running(materialise=boom) as server:
+        _, payload = _call(server, "/jobs", method="POST",
+                           body={"mode": "assess", "repo": "a/b"})
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        _, job = _call(server, f"/jobs/{job_id}")
+        assert job["state"] == "failed"
+        assert "materialise failed" in job["error"]
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result == {
+            "kind": "assess",
+            "success": False,
+            "error": job["error"],
+            "cost_usd": 0,
+        }
+
+
+def test_unknown_routes_are_404():
+    with running(materialise=_mem_materialise) as server:
+        assert _call(server, "/nope")[0] == 404
+        assert _call(server, "/jobs/abc/extra")[0] == 404  # 2 segments after jobs, not result
+        assert _call(server, "/nope", method="POST", body={})[0] == 404

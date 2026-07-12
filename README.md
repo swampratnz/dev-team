@@ -286,6 +286,8 @@ Key modules:
   workspace, PAT-authenticated from an env file with strict token hygiene.
 - `eventlog.py` / `dashboard.py` — the per-workspace event journal and the
   read-only web dashboard served over it (see `docs/DASHBOARD.md`).
+- `dispatch.py` — an authenticated (bearer-token), single-flight HTTP service
+  to submit/poll/fetch assess & deliver jobs remotely (see `docs/DISPATCH.md`).
 - `memory.py` / `backlog.py` — blackboard, ADRs, cross-run memory,
   checkpoints, persistent backlog.
 - `budget.py` / `trace.py` / `approval.py` / `policy.py` / `instrument.py` —

@@ -1,0 +1,50 @@
+# Singleton, long-lived unit for the dev-team HTTP dispatch service.
+#
+#   sudo cp deploy/dev-team-dispatch.service /etc/systemd/system/
+#   sudo systemctl enable --now dev-team-dispatch.service
+#
+# Reads /etc/dev-team/dev-team.env, which must define:
+#   - DEV_TEAM_DISPATCH_TOKEN  the bearer token callers present as
+#                              `Authorization: Bearer <token>` (a credential —
+#                              keep it out of version control; rotate by
+#                              editing the env file and restarting the unit)
+#   - credentials: CLAUDE_CODE_OAUTH_TOKEN (Claude subscription, from
+#                  `claude setup-token`) or ANTHROPIC_API_KEY (Claude API);
+#                  submitted jobs run real agents.
+#   - optionally GITHUB_TOKEN/GH_TOKEN for cloning private repos.
+#
+# The service binds the tailnet IP ONLY (100.116.115.8 below) so it is never
+# reachable from the public internet — it authenticates every route except
+# /health, but it also holds Claude credentials and executes agent code, so
+# keep both the sandbox hardening and the tailnet-only bind. Jobs run one at a
+# time (single-flight): the box has one shared Claude subscription.
+[Unit]
+Description=dev-team HTTP dispatch service (authenticated remote job runner)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Requires=tailscaled.service
+
+[Service]
+Type=simple
+User=devteam
+Group=devteam
+WorkingDirectory=/opt/dev-team
+EnvironmentFile=/etc/dev-team/dev-team.env
+ExecStart=/opt/dev-team/.venv/bin/dev-team --dispatch --host 100.116.115.8 --port 8738
+Restart=on-failure
+RestartSec=5
+
+# Hardening (mirrors deploy/dev-team@.service).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/dev-team
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

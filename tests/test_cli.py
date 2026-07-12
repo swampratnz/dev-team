@@ -215,6 +215,7 @@ def _no_credentials(monkeypatch, tmp_path):
     for name in CREDENTIAL_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.claude/.credentials.json
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows spells HOME this way
 
 
 @pytest.mark.parametrize(
@@ -867,6 +868,85 @@ def test_main_dashboard_flag_validation():
         ["--dashboard", "--chat"],
         ["T", "D", "--port", "9000"],
         ["T", "D", "--host", "0.0.0.0"],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main(argv, runner=ScriptedRunner([]))
+        assert excinfo.value.code == 2
+
+
+# --- dispatch service -------------------------------------------------------------
+
+
+class _FakeDispatchServer:
+    instances = []
+
+    def __init__(self, token, *, host, port, runner=None):
+        self.token, self.host, self.port, self.runner = token, host, port, runner
+        self.interrupted = False
+        self.shut_down = False
+        _FakeDispatchServer.instances.append(self)
+
+    @property
+    def url(self):
+        return f"http://{self.host}:{self.port}/"
+
+    def serve_forever(self):
+        if self.interrupted:
+            raise KeyboardInterrupt
+
+    def shutdown(self):
+        self.shut_down = True
+
+
+def test_main_dispatch_serves_with_env_token(monkeypatch, capsys):
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    code = main(
+        ["--dispatch", "--host", "100.64.0.1", "--port", "8738"],
+        runner=ScriptedRunner([]),
+    )
+    assert code == 0
+    (server,) = _FakeDispatchServer.instances
+    assert (server.host, server.port) == ("100.64.0.1", 8738)
+    assert server.token == "tok"
+    assert server.runner is not None  # the injected runner is threaded through
+    assert server.shut_down is True
+    assert "dispatch service at" in capsys.readouterr().err
+
+
+def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+
+    original_init = _FakeDispatchServer.__init__
+
+    def interrupting_init(self, token, *, host, port, runner=None):
+        original_init(self, token, host=host, port=port, runner=runner)
+        self.interrupted = True
+
+    monkeypatch.setattr(_FakeDispatchServer, "__init__", interrupting_init)
+    code = main(["--dispatch"], runner=ScriptedRunner([]))
+    assert code == 0  # KeyboardInterrupt is a clean stop
+    (server,) = _FakeDispatchServer.instances
+    assert (server.host, server.port) == ("127.0.0.1", 8738)
+    assert server.shut_down is True
+
+
+def test_main_dispatch_requires_token(monkeypatch, capsys):
+    monkeypatch.delenv("DEV_TEAM_DISPATCH_TOKEN", raising=False)
+    code = main(["--dispatch"], runner=ScriptedRunner([]))
+    assert code == 2
+    assert "DEV_TEAM_DISPATCH_TOKEN" in capsys.readouterr().err
+
+
+def test_main_dispatch_flag_validation():
+    for argv in (
+        ["--dispatch", "--assess"],
+        ["--dispatch", "--deliver", "T", "D"],
+        ["--dispatch", "--chat"],
+        ["--dispatch", "--dashboard"],
     ):
         with pytest.raises(SystemExit) as excinfo:
             main(argv, runner=ScriptedRunner([]))
