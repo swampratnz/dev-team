@@ -23,8 +23,9 @@ from .base import BaseAgent
 _SYSTEM = """\
 You are a senior software engineer. You implement one task at a time, writing
 clean, well-structured code with automated tests for the acceptance criteria.
-You read existing code before modifying it. When given review feedback you
-address every blocking comment.
+You read existing code before modifying it, and you match the existing
+codebase's conventions — naming, layout, test style — rather than imposing
+your own. When given review feedback you address every blocking comment.
 Always respond with a single JSON object and nothing else."""
 
 # The tool loop that makes the engineer a real agent rather than a text
@@ -62,6 +63,14 @@ def _listing_section(listing: Optional[Sequence[str]]) -> str:
     return f"Files currently in the workspace:\n{files}"
 
 
+def _conventions_section(conventions: Optional[str]) -> str:
+    """Render the house-conventions block, when a profile exists."""
+
+    if not conventions:
+        return ""
+    return f"\n{conventions}\n"
+
+
 def _task_section(task: Task, design: Design) -> str:
     criteria = "\n".join(
         f"- {c}" for c in task.acceptance_criteria
@@ -92,6 +101,7 @@ class EngineerAgent(BaseAgent):
         feedback: Optional[Review] = None,
         *,
         workspace_listing: Optional[Sequence[str]] = None,
+        conventions: Optional[str] = None,
         model: Optional[str] = None,
     ) -> Implementation:
         """Implement ``task`` by describing every file change as JSON."""
@@ -102,7 +112,7 @@ Implement the following task.
 {_task_section(task, design)}
 
 {_listing_section(workspace_listing)}
-
+{_conventions_section(conventions)}
 {_feedback_section(feedback)}
 
 Include automated tests for the acceptance criteria among the files you write.
@@ -126,6 +136,7 @@ Respond with JSON of the form:
         feedback: Optional[Review] = None,
         *,
         cwd: str,
+        conventions: Optional[str] = None,
         model: Optional[str] = None,
         tools: Optional[Sequence[str]] = None,
     ) -> Implementation:
@@ -145,7 +156,7 @@ write a test that reproduces the problem FIRST, watch it fail, then implement
 until it passes.
 
 {_task_section(task, design)}
-
+{_conventions_section(conventions)}
 {_feedback_section(feedback)}
 
 When the work is complete, respond with JSON of the form (no file contents —

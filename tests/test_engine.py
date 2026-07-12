@@ -25,11 +25,11 @@ from dev_team.execution import (
 )
 from dev_team.git import GitRepo
 from dev_team.memory import CheckpointStore
-from dev_team.models import Design, FeatureRequest, TaskStatus
+from dev_team.models import Design, FeatureRequest, Implementation, TaskStatus
 from dev_team.sdk import AgentResult
 from dev_team.testing import ScriptedRunner, json_response
 from dev_team.trace import Tracer
-from dev_team.verification import DoDReport, GateResult
+from dev_team.verification import DoDReport, GateResult, RemoteCIGate
 
 
 class _Clock:
@@ -1752,3 +1752,118 @@ def test_backlog_reuses_epic_and_stories_across_runs():
     assert len(backlog.epics) == 1  # rerun reused the epic
     assert len(backlog.stories) == 1  # and the story
     assert backlog.stories[0].status is ItemStatus.DONE
+
+
+def test_config_rejects_bad_remote_verify_settings():
+    with pytest.raises(ValueError):
+        EngineConfig(remote_verify_status=["ci"], remote_verify_max_polls=0)
+    with pytest.raises(ValueError):
+        EngineConfig(remote_verify_status=["ci"], remote_verify_interval_seconds=-1)
+    with pytest.raises(ValueError):
+        EngineConfig(remote_verify_trigger=["ci", "run"])
+
+
+def test_remote_verify_config_builds_remote_gate():
+    engine = DeliveryEngine(
+        ScriptedRunner([]),
+        workspace=InMemoryWorkspace(),
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(
+            remote_verify_status=("ci", "status"),
+            remote_verify_trigger=("ci", "run"),
+            remote_verify_max_polls=2,
+            remote_verify_interval_seconds=0.0,
+        ),
+    )
+    assert engine._local_verification is False
+    (gate,) = engine.definition_of_done.gates
+    assert isinstance(gate, RemoteCIGate)
+    assert list(gate.status_command) == ["ci", "status"]
+    assert list(gate.trigger_command) == ["ci", "run"]
+    assert gate.max_polls == 2
+
+
+def test_explicit_verify_command_beats_remote_verify():
+    engine = DeliveryEngine(
+        ScriptedRunner([]),
+        workspace=InMemoryWorkspace(),
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(
+            verify_command=("pytest", "-q"), remote_verify_status=("ci", "status")
+        ),
+    )
+    assert engine._local_verification is True
+    (gate,) = engine.definition_of_done.gates
+    assert gate.name == "tests"
+
+
+def test_gates_degrade_when_project_not_locally_runnable():
+    events = []
+    legacy = (
+        '<Project ToolsVersion="12.0">'
+        "<TargetFrameworkVersion>v4.5.2</TargetFrameworkVersion></Project>"
+    )
+    engine = DeliveryEngine(
+        ScriptedRunner([]),
+        workspace=InMemoryWorkspace(
+            {"App.sln": "x", "App/App.csproj": legacy, "App/packages.config": "<p/>"}
+        ),
+        command_runner=FakeCommandRunner(),
+        listener=events.append,
+    )
+    engine._resolve_gates()
+    assert engine._local_verification is False
+    (gate,) = engine.definition_of_done.gates
+    assert gate.name == "verification-unavailable"
+    report = engine.definition_of_done.evaluate(engine._gate_context())
+    assert report.passed is True
+    assert "evidence-based review" in report.results[0].detail
+    assert any("no local verify command" in e.message for e in events)
+    assert engine.blackboard.get("project_profile") == "dotnet-framework"
+
+
+def test_vacuous_check_skipped_without_local_verification():
+    engine = DeliveryEngine(
+        ScriptedRunner([]),
+        workspace=InMemoryWorkspace({"x.py": "x = 1"}),
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(remote_verify_status=("ci", "status")),
+    )
+    impl = Implementation(task_id="T1", summary="s", files=[])
+    assert run(engine._tests_are_vacuous(impl, engine.workspace, engine.git, None, None)) is False
+
+
+def test_delivery_injects_stored_conventions_into_prompts():
+    from dev_team.conventions import ConventionsProfile, ConventionsStore
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    ws = InMemoryWorkspace()
+    ConventionsStore(ws).save(
+        ConventionsProfile(
+            summary="PascalCase members; MSTest tests.",
+            conventions=[{"aspect": "naming", "convention": "PascalCase everywhere"}],
+        )
+    )
+    engine = _engine(runner, workspace=ws)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert engine._conventions is not None
+
+    def _prompts_for(role_fragment):
+        return [
+            c["prompt"]
+            for c in runner.calls
+            if role_fragment in (c.get("system_prompt") or "")
+        ]
+
+    assert any("House conventions" in p for p in _prompts_for("software engineer"))
+    assert any("House conventions" in p for p in _prompts_for("code reviewer"))
+
+
+def test_delivery_without_conventions_leaves_prompts_clean():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert engine._conventions is None
+    assert not any("House conventions" in c["prompt"] for c in runner.calls)

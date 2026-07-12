@@ -9,8 +9,9 @@ summarisation) so it costs nothing and can be tested exactly.
 
 from __future__ import annotations
 
+import fnmatch
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 from .execution import Workspace
 
@@ -30,6 +31,12 @@ _MANIFESTS = (
 
 MAX_TREE_ENTRIES = 150
 MANIFEST_HEAD_CHARS = 1_500
+
+
+def path_excluded(path: str, exclude_globs: Sequence[str]) -> bool:
+    """Whether ``path`` matches any exclude glob (fnmatch semantics)."""
+
+    return any(fnmatch.fnmatch(path, pattern) for pattern in exclude_globs)
 
 
 @dataclass
@@ -70,10 +77,20 @@ def build_repo_context(
     *,
     max_tree_entries: int = MAX_TREE_ENTRIES,
     manifest_head_chars: int = MANIFEST_HEAD_CHARS,
+    exclude_globs: Sequence[str] = (),
 ) -> RepoContext:
-    """Inspect ``workspace`` and return its :class:`RepoContext`."""
+    """Inspect ``workspace`` and return its :class:`RepoContext`.
 
-    files = [f for f in workspace.list_files() if not f.startswith(".dev_team/")]
+    ``exclude_globs`` drops noise (vendored packages, build output) from the
+    tree before the entry cap applies, so a monolith's signal is not spent on
+    its ``packages/`` directory.
+    """
+
+    files = [
+        f
+        for f in workspace.list_files()
+        if not f.startswith(".dev_team/") and not path_excluded(f, exclude_globs)
+    ]
     heads: Dict[str, str] = {}
     for name in _MANIFESTS:
         if name in files:

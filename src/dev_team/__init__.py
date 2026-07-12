@@ -25,14 +25,31 @@ from .approval import (
     PolicyApprovalGate,
 )
 from .assessment import (
+    DEFAULT_EXCLUDE_GLOBS,
     AssessConfig,
     AssessmentEngine,
     AssessmentOutcome,
+    Component,
     InventoryStats,
     PhaseResult,
+    detect_components,
     inventory_stats,
+    outcome_to_backlog,
     outcome_to_dict,
     render_report,
+)
+from .conventions import (
+    ConventionsProfile,
+    ConventionsStore,
+    detect_convention_sources,
+)
+from .deadcode import DeadCodeFinding, DeadCodeReport, detect_dead_code
+from .depscan import (
+    Dependency,
+    DependencyScan,
+    Vulnerability,
+    collect_dependencies,
+    scan_dependencies,
 )
 from .backlog import Backlog, BacklogStore, Epic, Iteration, ItemStatus, Story
 from .budget import Budget, BudgetExceededError, UsageMeter, UsageRecord
@@ -124,10 +141,11 @@ from .verification import (
     GateContext,
     GateResult,
     PredicateGate,
+    RemoteCIGate,
 )
 from .workflow import DevelopmentWorkflow
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "__version__",
@@ -146,7 +164,23 @@ __all__ = [
     "InventoryStats",
     "inventory_stats",
     "outcome_to_dict",
+    "outcome_to_backlog",
     "render_report",
+    "Component",
+    "detect_components",
+    "DEFAULT_EXCLUDE_GLOBS",
+    # dead code, dependency scanning, conventions
+    "DeadCodeFinding",
+    "DeadCodeReport",
+    "detect_dead_code",
+    "Dependency",
+    "DependencyScan",
+    "Vulnerability",
+    "collect_dependencies",
+    "scan_dependencies",
+    "ConventionsProfile",
+    "ConventionsStore",
+    "detect_convention_sources",
     # sdk boundary
     "AgentEvent",
     "AgentResult",
@@ -224,6 +258,7 @@ __all__ = [
     "CommandGate",
     "CoverageGate",
     "PredicateGate",
+    "RemoteCIGate",
     "DefinitionOfDone",
     "DoDReport",
     # scheduling & planning

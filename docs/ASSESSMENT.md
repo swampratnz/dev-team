@@ -86,15 +86,44 @@ machinery understands them now:
 
 ## Honest limitations
 
-- **CVE/EOL findings come from model knowledge, not a live scan** — the
-  report says so in its footer. For a repo dormant since ~2023 this is
-  usually sufficient to name the big ones; treat it as a triage list, not a
-  compliance scan.
+- **Exactly-pinned dependencies get a live OSV.dev scan; everything else
+  is model knowledge** — the report footer says which mode produced the
+  claims. Range-specified dependencies (`>=`, `*`) and EOL judgments still
+  come from training data; treat those as a triage list, not a compliance
+  scan.
 - Phase evidence is as good as what the auditors read: on very large repos
   the deterministic inventory is exact, but agents sample files. Narrow the
   scope interactively (or via the description) for depth where it matters.
 - Buildability is assessed statically — nothing is restored, installed, or
   compiled.
+
+## Deterministic analyses (v0.7)
+
+Alongside the agent phases, four deterministic analyses run with no model
+involved, so their findings are exact and citable:
+
+- **Dead-code probes** — `.cs` files no legacy MSBuild project references in
+  its `<Compile>` items; `.csproj` files no `.sln` includes; top-level
+  directories whose last commit trails the repository head by
+  `dormancy_days` (default 365). Probes skip themselves with a recorded
+  reason when preconditions are missing (no git, SDK-style projects).
+- **Live dependency scan** — exact pins from `packages.config`,
+  `package.json`, `requirements.txt`, and `Cargo.toml` queried against
+  OSV.dev in one batch (`--no-osv-scan` opts out; offline degrades to a
+  labelled model-knowledge fallback).
+- **Component detection** — one component per directory holding a manifest;
+  `--component-fanout` runs a parallel per-component deep-dive
+  (`max_components` caps it).
+- **Convention sources** — `.editorconfig`, ReSharper `.DotSettings`,
+  rulesets and linter configs feed the conventions side-phase, whose cited
+  profile persists to `.dev_team/conventions.json` for delivery runs
+  (`--no-conventions` opts out).
+
+Excludes (`--exclude`, default: vendored/build-output globs) apply to the
+tree, statistics, and component detection. `--backlog` converts the audit's
+findings into estimated stories in `.dev_team/backlog.json`, deduplicated by
+title, under an "Assessment remediation" epic — the input queue for later
+`--deliver` runs.
 
 ## Library use
 

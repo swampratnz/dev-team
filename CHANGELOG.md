@@ -5,6 +5,65 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+## [0.7.0] — Legacy-repo analysis: dead code, live CVEs, conventions, remote CI
+
+### Assessment
+- **Deterministic dead-code probes** feed the audit with exact, citable
+  findings (no model guessing): `.cs` files no legacy MSBuild project
+  compiles (`<Compile Include>` diff vs disk), `.csproj` files no `.sln`
+  references, and top-level directories dormant for `dormancy_days`
+  (default 365) while the repo stayed active (git-based; skipped cleanly
+  outside git). Findings land in the evidence block, the report appendix,
+  and `--json` (`dead_code`).
+- **Live dependency vulnerability scanning via OSV.dev**: exact pins parsed
+  deterministically from `packages.config` (NuGet), `package.json`,
+  `requirements.txt`, and `Cargo.toml` are checked against the OSV batch
+  API in one call — every ecosystem, one endpoint. Offline or failed
+  queries degrade to a labelled model-knowledge fallback; `--no-osv-scan`
+  opts out. The report footer now says which mode produced the CVE claims.
+- **House-conventions capture**: a parallel side-phase profiles the
+  repository's own style — naming, layout, test patterns, error handling —
+  with citations, merges in machine-readable configs (`.editorconfig`,
+  ReSharper `.DotSettings`, linter configs, rulesets), and persists to
+  `.dev_team/conventions.json` (`--no-conventions` opts out). Advisory:
+  its failure degrades the report, never the audit verdict.
+- **Assessment → backlog bridge** (`--backlog` / `update_backlog`):
+  remediation-plan steps, must-fix build blockers and dependencies,
+  hardcoded secrets, dead-code hits, and live vulnerability records become
+  estimated stories under one "Assessment remediation" epic in the
+  persistent backlog, deduplicated by title so re-audits refresh instead
+  of flood. This is the loop from "audited" to "remediated": delivery
+  runs can now work the audit off story by story.
+- **Exclude globs and component fan-out for monoliths**: vendored noise
+  (`packages/`, `node_modules/`, `bin/`, `obj/`, binaries) is excluded
+  from the tree, stats, and component detection by default (`--exclude`
+  replaces the defaults; `--max-tree-entries` raises the cap), and
+  `--component-fanout` gives each detected sub-project (per-directory
+  manifests, `.csproj` included) its own parallel deep-dive section in
+  the report, capped by `max_components`.
+
+### Delivery
+- **Legacy .NET Framework detection**: `packages.config` anywhere, or
+  old-style project XML (`ToolsVersion`/`TargetFrameworkVersion`),
+  resolves to a `dotnet-framework` profile that is *not locally runnable*
+  — `dotnet test` never was going to work — instead of a profile that
+  fails every task.
+- **Graceful verification degrade**: on a stack with no runnable local
+  verify command, gates degrade to an explicit `verification-unavailable`
+  marker: review, security, and static findings become the quality bar,
+  the fail-to-pass check is disabled as meaningless, and the events say
+  exactly what happened and how to do better.
+- **Remote CI verification gate** (`--remote-verify-status` /
+  `--remote-verify-trigger`): delegate the Definition of Done to the CI
+  system that *can* build the repo — trigger a run, poll a status command
+  until it exits zero. Any CI with a CLI plugs in; polling cadence is
+  configurable (`remote_verify_max_polls`, `remote_verify_interval_seconds`).
+- **Conventions-aware engineer and reviewer**: a stored conventions
+  profile is injected into implementation prompts ("match the house
+  style") and review prompts (deviations are findings), so work on a
+  legacy repo lands in the repo's own idiom instead of a modernisation
+  patchwork.
+
 ### Assessment & .NET
 - **A third engine audits existing repositories** (`--assess` /
   `DevTeam.assess`): read-only by construction (no branch, no gates, no

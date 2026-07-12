@@ -73,6 +73,27 @@ QA, security, docs, reliability, and deployment.
   — buildability, dependency/secret/data risk, test reality, and a
   classification with a sequenced remediation plan — without mutating the
   repo (see [`docs/ASSESSMENT.md`](docs/ASSESSMENT.md)).
+- ✅ **Finds dead code deterministically** — exact probes, no model guessing:
+  sources no legacy MSBuild project compiles, projects no solution includes,
+  and directories dormant for a year while the repo stayed active. Vendored
+  noise is excluded by default (`--exclude` to customise) and
+  `--component-fanout` deep-dives each sub-project in parallel.
+- ✅ **Scans dependencies live** — exact pins parsed from `packages.config`,
+  `package.json`, `requirements.txt`, and `Cargo.toml` are checked against
+  OSV.dev in one batch call (graceful offline fallback, `--no-osv-scan` to
+  opt out), so CVE findings cite advisories, not recollections.
+- ✅ **Learns the house style and follows it** — assessment captures a cited
+  conventions profile (naming, layout, test patterns, plus `.editorconfig` /
+  ReSharper `.DotSettings` / linter configs), persists it, and every later
+  delivery injects it into the engineer's and reviewer's prompts.
+- ✅ **Closes the audit → fix loop** — `--backlog` converts findings
+  (remediation steps, build blockers, must-fix dependencies, secrets, dead
+  code, live CVEs) into estimated stories in the persistent backlog for
+  delivery runs to work off.
+- ✅ **Verifies through your CI when it must** — stacks that cannot build
+  locally (legacy .NET Framework) degrade to evidence-based review instead
+  of failing every task, or gate on your real pipeline via
+  `--remote-verify-trigger` / `--remote-verify-status`.
 - ✅ **Ubuntu-ready** — packaged for deployment as a container or systemd unit.
 
 The capability set was chosen from a structured research pass across seven
@@ -316,6 +337,17 @@ Audit an existing repository (read-only; writes only the report):
 dev-team --assess --workspace /path/to/legacy-repo \
     --report audit/assessment.md \
     "Legacy monolith" "dormant 2-3 years, frontend + backend" --budget-usd 10
+
+# a deep audit of a monolith: per-component fan-out, findings into the
+# backlog for later delivery runs, extra excludes for vendored noise
+dev-team --assess --workspace /path/to/legacy-repo \
+    --component-fanout --backlog --exclude 'Libraries/*' --exclude '*/bin/*' \
+    "Full audit" "dead code, upgrade candidates, house conventions"
+
+# deliver against a repo whose build only runs in remote CI
+dev-team "Fix the SVG endpoint" "..." --deliver --workspace /path/to/repo \
+    --remote-verify-trigger "az pipelines run --name Build" \
+    --remote-verify-status "az pipelines runs show --id 123 --query succeeded"
 ```
 
 Exit codes: `0` success, `1` completed with failed tasks, `2` invalid input

@@ -105,6 +105,7 @@ class ReviewerAgent(BaseAgent):
         file_contents: Optional[Mapping[str, str]] = None,
         diff: Optional[str] = None,
         static_findings: Optional[str] = None,
+        conventions: Optional[str] = None,
         workspace_root: Optional[str] = None,
     ) -> Review:
         """Review ``implementation`` against ``task``.
@@ -115,6 +116,8 @@ class ReviewerAgent(BaseAgent):
         matters when a modified file is large. ``static_findings`` is linter/
         type-checker output — the reviewer triages it rather than re-deriving
         it, and spends its own judgment on what tools cannot see.
+        ``conventions`` is the stored house-conventions profile; deviations
+        from it are review findings like any other.
         ``workspace_root`` is where the read-only evidence tools operate.
         """
 
@@ -126,6 +129,13 @@ class ReviewerAgent(BaseAgent):
             "\nStatic analysis output (triage: escalate what matters, ignore noise):\n"
             f"<static-analysis>\n{static_findings[:4000]}\n</static-analysis>\n"
             if static_findings
+            else ""
+        )
+        house_style = (
+            f"\n{conventions}\n"
+            "Flag deviations from these conventions (severity: minor unless "
+            "they damage consistency badly).\n"
+            if conventions
             else ""
         )
         prompt = f"""\
@@ -140,7 +150,7 @@ Engineer notes: {implementation.notes or "(none)"}
 
 Changed files (with content):
 {files}
-{render_diff(diff)}{analysis}
+{render_diff(diff)}{analysis}{house_style}
 Respond with JSON of the form:
 {{
   "approved": true,
