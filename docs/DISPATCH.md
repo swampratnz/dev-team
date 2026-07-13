@@ -48,9 +48,15 @@ workspace) by default. Pass `--dashboard-workspace DIR` to the dispatch service
 and every job **also** journals its events into `DIR` under the same run id —
 so it shows up as its own run/agent-cards on a dashboard pointed at `DIR` — and
 an assess run mirrors its report to `DIR/audit/<job-id>/assessment.md` for the
-Reports panel. The job's own workspace stays the source of truth; this is a
-read-only visibility copy. Point the dashboard and the dispatcher at the same
-`DIR` (e.g. `/opt/dev-team/workspace`) to watch dispatched runs live.
+Reports panel **and its structured result to
+`DIR/audit/<job-id>/assessment.json`** (the exact `outcome_to_dict` shape).
+That JSON is the disk-keyed record `POST /jobs/{id}/backlog` reads later —
+the in-memory job registry is lost on a service restart, but the persisted
+assessments are not. The job's own workspace stays the source of truth; this
+is a read-only visibility copy (the shared backlog in `DIR` is the one
+deliberate exception — see `backlog` below). Point the dashboard and the
+dispatcher at the same `DIR` (e.g. `/opt/dev-team/workspace`) to watch
+dispatched runs live.
 
 ## API
 
@@ -68,18 +74,25 @@ Body:
 
 ```json
 {"mode":"assess|deliver","repo":"owner/name or url",
- "title":"...","description":"...","budget_usd":10}
+ "title":"...","description":"...","budget_usd":10,"backlog":false}
 ```
 
 - `mode` must be `assess` or `deliver`.
 - `repo` is a GitHub `owner/name` slug or any git URL (must parse).
 - `budget_usd` is `null` or a positive number.
+- `backlog` (optional, default `false`, must be a boolean): with `true` an
+  assess job also converts its findings into stories — in the job's own
+  `.dev_team/backlog.json` and, when a `--dashboard-workspace` is configured,
+  merged into that workspace's shared backlog (deduplicated by title).
+  Ignored for `deliver`. Leaving it `false` costs nothing later: backlog
+  generation can always be run after the fact via `POST /jobs/{id}/backlog`.
 - `deliver` requires a non-empty `title` and `description`.
 - `assess` defaults `title` to the repo slug and `description` to `""`.
 
 → `202 {"id":"assess-…","state":"queued","position":0}`. Errors:
-`400 {"error":…}` (bad mode/repo/budget, missing title or description for
-deliver, malformed JSON), `401`, `503 {"error":"queue full"}`.
+`400 {"error":…}` (bad mode/repo/budget, non-boolean backlog, missing title
+or description for deliver, malformed JSON), `401`,
+`503 {"error":"queue full"}`.
 
 ### `GET /jobs` (auth) — list
 
@@ -114,6 +127,33 @@ id → `404 {"error":"unknown job"}`.
 - unknown id → `404`.
 
 State machine: `queued → running → succeeded | failed`.
+
+### `POST /jobs/{id}/backlog` (auth, no body) — generate the backlog later
+
+Turns a finished assess job's persisted findings into backlog stories — a
+pure disk transform: **no agents, no LLM calls, $0**, answered synchronously
+(no queue slot). It reads `audit/{id}/assessment.json` from the dashboard
+workspace and merges the stories into that workspace's
+`.dev_team/backlog.json`, deduplicated by title, so repeat calls are
+idempotent (`stories_added` drops to `0`).
+
+```json
+{"job_id":"assess-…","stories_added":7,"stories_total":7}
+```
+
+Errors:
+
+- `404 {"error":"no assessment for that job"}` — no
+  `audit/{id}/assessment.json` in the dashboard workspace. Note the
+  retroactivity caveat: jobs assessed **before** this feature existed never
+  persisted one, so they 404 — re-assess to get the file.
+- `409 {"error":"backlog generation needs a dashboard workspace"}` — the
+  service was started without `--dashboard-workspace`.
+- `401` — as everywhere.
+
+Because it reads only the persisted JSON (never the in-memory registry),
+this endpoint keeps working for jobs that ran **before a service restart** —
+assess once, generate the backlog any time.
 
 ## Deployment
 

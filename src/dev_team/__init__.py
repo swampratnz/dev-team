@@ -25,6 +25,7 @@ from .approval import (
     PolicyApprovalGate,
 )
 from .assessment import (
+    ASSESSMENT_JSON_PATH,
     DEFAULT_EXCLUDE_GLOBS,
     AssessConfig,
     AssessmentEngine,
@@ -36,6 +37,7 @@ from .assessment import (
     ProbeCommandResult,
     audit_blind_spots,
     detect_components,
+    dict_to_backlog,
     inventory_stats,
     outcome_to_backlog,
     outcome_to_dict,
@@ -181,6 +183,8 @@ __all__ = [
     "inventory_stats",
     "outcome_to_dict",
     "outcome_to_backlog",
+    "dict_to_backlog",
+    "ASSESSMENT_JSON_PATH",
     "render_report",
     "Component",
     "detect_components",

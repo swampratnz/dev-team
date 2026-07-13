@@ -110,6 +110,20 @@ def test_build_spec_validates_budget():
             disp.build_spec({"mode": "assess", "repo": "a/b", "budget_usd": bad})
 
 
+def test_build_spec_backlog_defaults_false_and_must_be_bool():
+    disp = Dispatcher(token="x")
+    assert disp.build_spec({"mode": "assess", "repo": "a/b"}).backlog is False
+    assert disp.build_spec(
+        {"mode": "assess", "repo": "a/b", "backlog": True}
+    ).backlog is True
+    assert disp.build_spec(
+        {"mode": "assess", "repo": "a/b", "backlog": False}
+    ).backlog is False
+    for bad in (1, 0, "true", None, [], {}):
+        with pytest.raises(ValidationError):
+            disp.build_spec({"mode": "assess", "repo": "a/b", "backlog": bad})
+
+
 # --- submit / registry --------------------------------------------------------
 
 
@@ -304,6 +318,124 @@ def test_mirror_report_skips_an_outcome_with_no_report():
 
     disp._mirror_report("job-x", _NoReport())
     assert not any(p.startswith("audit/") for p in dash.list_files())
+
+
+def test_run_job_mirrors_assessment_json_into_the_dashboard_workspace():
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_assess_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec.id = "assess-json"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    # The structured result lands beside the markdown report — this file is
+    # what POST /jobs/{id}/backlog reads later, even after a restart.
+    data = json.loads(dash.read_text("audit/assess-json/assessment.json"))
+    assert data["classification"] == "dependency-surgery"
+    assert data["phases"]["recommendation"]["ok"] is True
+
+
+def test_run_job_assess_with_backlog_updates_job_and_dashboard_backlogs():
+    from dev_team.backlog import BacklogStore
+
+    dash = InMemoryWorkspace()
+    job_ws = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_assess_runner(),
+        materialise=lambda spec, dest: job_ws,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono", "backlog": True})
+    spec.id = "assess-bl"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    # update_backlog=True wrote the job workspace's own backlog ...
+    job_backlog = BacklogStore(job_ws).load()
+    assert job_backlog.stories
+    # ... and the same stories were merged into the dashboard workspace so
+    # its backlog panel shows them immediately.
+    dash_backlog = BacklogStore(dash).load()
+    assert {s.title for s in dash_backlog.stories} == {
+        s.title for s in job_backlog.stories
+    }
+
+
+def test_run_job_assess_with_backlog_but_no_dashboard_workspace():
+    from dev_team.backlog import BacklogStore
+
+    job_ws = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=lambda spec, dest: job_ws
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono", "backlog": True})
+    spec.id = "assess-bl-solo"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert BacklogStore(job_ws).load().stories  # merge skipped, job backlog kept
+
+
+def _assessment_payload():
+    """A minimal outcome_to_dict-shaped payload with one plan step."""
+
+    return {
+        "classification": "dependency-surgery",
+        "phases": {
+            "recommendation": {
+                "role": "product-manager",
+                "ok": True,
+                "error": None,
+                "data": {
+                    "plan": [
+                        {"step": "Pin build chain", "effort": "2 days", "detail": "CI"}
+                    ]
+                },
+            }
+        },
+        "dead_code": {"findings": []},
+        "dependency_scan": {"vulnerabilities": []},
+    }
+
+
+def test_make_backlog_survives_a_restart_by_reading_disk():
+    from dev_team.backlog import BacklogStore
+
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-old/assessment.json", json.dumps(_assessment_payload())
+    )
+    # A FRESH dispatcher: empty in-memory registry, as after a service
+    # restart — the endpoint must work from the persisted JSON alone.
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.make_backlog("assess-old")
+    assert (status, payload) == (
+        200,
+        {"job_id": "assess-old", "stories_added": 1, "stories_total": 1},
+    )
+    stored = BacklogStore(dash).load()
+    assert [s.title for s in stored.stories] == ["Pin build chain"]
+    # a second call dedupes by title instead of flooding
+    status, payload = disp.make_backlog("assess-old")
+    assert (status, payload) == (
+        200,
+        {"job_id": "assess-old", "stories_added": 0, "stories_total": 1},
+    )
+
+
+def test_make_backlog_missing_assessment_is_404():
+    disp = Dispatcher(token="x", dashboard_workspace=InMemoryWorkspace())
+    assert disp.make_backlog("ghost") == (
+        404,
+        {"error": "no assessment for that job"},
+    )
+
+
+def test_make_backlog_without_dashboard_workspace_is_409():
+    assert Dispatcher(token="x").make_backlog("any") == (
+        409,
+        {"error": "backlog generation needs a dashboard workspace"},
+    )
 
 
 def test_worker_is_single_flight_and_ordered():
@@ -568,8 +700,73 @@ def test_failed_job_status_and_result():
         }
 
 
+def test_post_jobs_with_backlog_true_flows_to_stories():
+    dash = InMemoryWorkspace()
+    with running(
+        runner=_assess_runner(), materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "assess", "repo": "acme/mono", "backlog": True},
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        # the run itself merged the stories into the dashboard workspace
+        assert dash.exists(".dev_team/backlog.json")
+        stories = json.loads(dash.read_text(".dev_team/backlog.json"))["stories"]
+        assert stories
+        # calling the later endpoint again is idempotent (dedup by title)
+        status, result = _call(server, f"/jobs/{job_id}/backlog", method="POST")
+        assert status == 200
+        assert result == {
+            "job_id": job_id,
+            "stories_added": 0,
+            "stories_total": len(stories),
+        }
+        # a non-bool backlog flag is rejected up front
+        assert _call(
+            server, "/jobs", method="POST",
+            body={"mode": "assess", "repo": "acme/mono", "backlog": "yes"},
+        )[0] == 400
+
+
+def test_post_jobs_id_backlog_generates_after_the_fact():
+    dash = InMemoryWorkspace()
+    with running(
+        runner=_assess_runner(), materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        _, payload = _call(
+            server, "/jobs", method="POST", body={"mode": "assess", "repo": "acme/mono"}
+        )
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        assert not dash.exists(".dev_team/backlog.json")  # nothing yet
+        status, result = _call(server, f"/jobs/{job_id}/backlog", method="POST")
+        assert status == 200
+        assert set(result) == {"job_id", "stories_added", "stories_total"}
+        assert result["job_id"] == job_id
+        assert result["stories_added"] > 0
+        assert result["stories_total"] == result["stories_added"]
+        assert dash.exists(".dev_team/backlog.json")
+
+
+def test_post_jobs_id_backlog_auth_and_error_contract():
+    dash = InMemoryWorkspace()
+    with running(materialise=_mem_materialise, dashboard_workspace=dash) as server:
+        assert _call(server, "/jobs/x/backlog", method="POST", token=None) == (
+            401, {"error": "unauthorized"})
+        assert _call(server, "/jobs/x/backlog", method="POST") == (
+            404, {"error": "no assessment for that job"})
+    with running(materialise=_mem_materialise) as server:  # no dashboard workspace
+        assert _call(server, "/jobs/x/backlog", method="POST") == (
+            409, {"error": "backlog generation needs a dashboard workspace"})
+
+
 def test_unknown_routes_are_404():
     with running(materialise=_mem_materialise) as server:
         assert _call(server, "/nope")[0] == 404
         assert _call(server, "/jobs/abc/extra")[0] == 404  # 2 segments after jobs, not result
         assert _call(server, "/nope", method="POST", body={})[0] == 404
+        # 2 segments after jobs but not "backlog" -> still 404
+        assert _call(server, "/jobs/abc/extra", method="POST", body={})[0] == 404

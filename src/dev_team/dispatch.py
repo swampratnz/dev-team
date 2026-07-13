@@ -44,7 +44,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from .assessment import AssessConfig
+from .assessment import AssessConfig, dict_to_backlog, outcome_to_dict
+from .backlog import BacklogStore
 from .budget import Budget
 from .config import TeamConfig
 from .engine import EngineConfig
@@ -104,6 +105,7 @@ class JobSpec:
     title: str
     description: str
     budget_usd: Optional[float]
+    backlog: bool = False
     id: str = ""
 
 
@@ -168,8 +170,11 @@ class Dispatcher:
         # Optional shared workspace the standing `--dashboard` process watches:
         # when set, every job ALSO journals its events here (same run id, so it
         # shows as its own run/agent-cards on the dashboard) and an assess run
-        # mirrors its report under `audit/<id>/`. The job's OWN workspace stays
-        # the source of truth and isolated — this is a read-only-visibility copy.
+        # mirrors its report AND structured result under `audit/<id>/` — the
+        # JSON is what POST /jobs/{id}/backlog reads later. The job's OWN
+        # workspace stays the source of truth and isolated; the backlog merge
+        # is the one deliberate exception (the dashboard workspace owns the
+        # cross-job backlog).
         self._dashboard_workspace = dashboard_workspace
         self._queue_cap = queue_cap
         self._registry: Dict[str, JobRecord] = {}
@@ -235,6 +240,9 @@ class Dispatcher:
                 raise ValidationError("budget_usd must be a number or null")
             if budget <= 0:
                 raise ValidationError("budget_usd must be greater than 0")
+        backlog = body.get("backlog", False)
+        if not isinstance(backlog, bool):
+            raise ValidationError("backlog must be true or false")
         title = body.get("title")
         description = body.get("description")
         if mode == "deliver":
@@ -253,6 +261,7 @@ class Dispatcher:
             title=title,
             description=description,
             budget_usd=budget,
+            backlog=backlog,
         )
 
     def submit(self, spec: JobSpec) -> Tuple[str, int]:
@@ -363,10 +372,21 @@ class Dispatcher:
             outcome = await team.assess(
                 workspace=workspace,
                 budget=budget,
-                config=AssessConfig(),
+                config=AssessConfig(update_backlog=spec.backlog),
                 **kwargs,
             )
             self._mirror_report(spec.id, outcome)
+            self._mirror_assessment_json(spec.id, outcome)
+            if spec.backlog and self._dashboard_workspace is not None:
+                # Merge, don't copy: the dashboard workspace accumulates
+                # stories across many jobs, and copying the job's own
+                # .dev_team/backlog.json over it would clobber that history.
+                # Running the same dict transform against the dashboard's
+                # backlog reuses the dedup-by-title logic — exactly what
+                # POST /jobs/{id}/backlog does later — so the panel shows
+                # the stories immediately and a re-assess refreshes instead
+                # of flooding.
+                self._merge_backlog(outcome_to_dict(outcome))
         else:
             outcome = await team.deliver(
                 FeatureRequest(title=spec.title, description=spec.description),
@@ -391,6 +411,61 @@ class Dispatcher:
         if not report:
             return
         self._dashboard_workspace.write_text(f"audit/{job_id}/assessment.md", report)
+
+    def _mirror_assessment_json(self, job_id: str, outcome: Any) -> None:
+        """Persist the structured assess result into the dashboard workspace.
+
+        ``audit/<id>/assessment.json`` (the exact ``outcome_to_dict`` shape)
+        is the disk-keyed record :meth:`make_backlog` reads later. The
+        in-memory registry is lost on restart, so the later-backlog path must
+        never depend on it — this file is what makes ``POST
+        /jobs/{id}/backlog`` restart-safe. No-op when no dashboard workspace
+        is configured (mirrors :meth:`_mirror_report`).
+        """
+
+        if self._dashboard_workspace is None:
+            return
+        self._dashboard_workspace.write_text(
+            f"audit/{job_id}/assessment.json",
+            json.dumps(outcome_to_dict(outcome), indent=2),
+        )
+
+    def _merge_backlog(self, data: Dict[str, Any]) -> Tuple[int, int]:
+        """Merge a serialised assessment into the dashboard-workspace backlog.
+
+        Returns ``(stories_added, stories_total)``. Callers guarantee a
+        dashboard workspace is configured.
+        """
+
+        store = BacklogStore(self._dashboard_workspace)
+        backlog = store.load()
+        added = dict_to_backlog(data, backlog)
+        store.save(backlog)
+        return len(added), len(backlog.stories)
+
+    def make_backlog(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """Generate backlog stories from a finished assess job — later, free.
+
+        The ``POST /jobs/{id}/backlog`` core: reads
+        ``audit/<job_id>/assessment.json`` from the dashboard workspace (disk,
+        never the in-memory registry, so it survives a service restart) and
+        merges its findings into the workspace's ``.dev_team/backlog.json``.
+        A pure transform — no agents, no LLM calls, $0. Returns
+        ``(status_code, payload)`` exactly as the HTTP layer sends it.
+        """
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "backlog generation needs a dashboard workspace"}
+        path = f"audit/{job_id}/assessment.json"
+        if not self._dashboard_workspace.exists(path):
+            return 404, {"error": "no assessment for that job"}
+        data = json.loads(self._dashboard_workspace.read_text(path))
+        added, total = self._merge_backlog(data)
+        return 200, {
+            "job_id": job_id,
+            "stories_added": added,
+            "stories_total": total,
+        }
 
     # -- serialisation -------------------------------------------------------
 
@@ -523,6 +598,13 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             if path == "/jobs":
                 self._create()
+                return
+            parts = path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "backlog":
+                # Synchronous on purpose: a pure disk transform (no agents,
+                # no queue slot needed) that answers in one round-trip.
+                status, payload = dispatcher.make_backlog(parts[1])
+                self._json(status, payload)
                 return
             self._json(404, {"error": "not found"})
 
