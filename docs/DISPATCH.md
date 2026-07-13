@@ -126,7 +126,7 @@ are excluded by default; `?archived=1` includes them:
 
 ```json
 {"id":"…","mode":"assess","repo":"…",
- "state":"queued|running|succeeded|failed",
+ "state":"queued|running|succeeded|failed|cancelled",
  "started":num|null,"ended":num|null,"cost_usd":num|null,"error":str|null,
  "progress":[{"role":"…","stage":"…","message":"…","ts":num}]}
 ```
@@ -146,10 +146,13 @@ id → `404 {"error":"unknown job"}`.
   `"verdict":"confirmed|refuted|needs-context","rationale":str,`
   `"citations":[{"path":str,"note":str}],"cost_usd":num}`.
 - **failed**: `{"kind":<mode>,"success":false,"error":str,"cost_usd":0}`.
+- **cancelled**: `{"kind":<mode>,"success":false,"error":"cancelled","cost_usd":0}`.
 - still **queued/running**: `409 {"error":"not finished","state":<state>}`.
 - unknown id → `404`.
 
-State machine: `queued → running → succeeded | failed`.
+State machine: `queued → running → succeeded | failed`, plus `queued →
+cancelled` (see *Cancel* below) — `cancelled` is reachable only from
+`queued`, never from `running`.
 
 ### `POST /jobs/{id}/backlog` (auth, no body) — generate the backlog later
 
@@ -177,6 +180,51 @@ Errors:
 Because it reads only the persisted JSON (never the in-memory registry),
 this endpoint keeps working for jobs that ran **before a service restart** —
 assess once, generate the backlog any time.
+
+## Cancel
+
+The box has exactly one worker, so a mis-submitted or no-longer-wanted job
+sitting in `queued` has no way out except waiting for it to run anyway or
+restarting the whole service (which drops the entire in-memory queue,
+including every other legitimately queued job). Cancel is the missing rung
+on the job lifecycle: a one-way `queued → cancelled` transition, mirroring
+the archive/unarchive precedent's shape (in-memory mutation guarded by the
+existing lock, not a new store).
+
+### `POST /jobs/{id}/cancel` (auth, no body)
+
+→ `200 {"id":"assess-…","state":"cancelled"}`. Errors:
+
+- `404 {"error":"unknown job"}` — no such job id.
+- `409 {"error":"job is not queued","state":<state>}` — the job is
+  `running` (an in-flight clone/agent session is out of scope for this
+  lighter-weight lifecycle op, same boundary `archive_job` draws) or
+  already terminal (`succeeded`/`failed`/`cancelled`). **Not idempotent**:
+  cancelling an already-cancelled job is a `409`, matching every other
+  one-way state-machine transition in this file — only archive/unarchive
+  is idempotent, because it flips a boolean flag rather than progressing a
+  state machine.
+- `401` — as everywhere.
+
+A cancelled job never reaches `run_job`: no clone, no workspace, no disk
+I/O, no agent/LLM call, $0 cost. `GET /jobs/{id}/result` on a cancelled job
+returns `200 {"kind":<mode>,"success":false,"error":"cancelled","cost_usd":0}`
+rather than the `409 not finished` a genuinely pending job gets. Cancelling
+also frees the queue-cap slot the job was holding (`GET /jobs` and the
+`POST /jobs` cap only count jobs still `state: "queued"`).
+
+`GET /jobs` lists a cancelled job like any other — it is not auto-archived,
+so the record of *why* the queue was shorter stays visible. However, a
+cancelled job is cancelled before `run_job` (and therefore the meta.json
+mirror) ever runs, so `POST /jobs/{id}/archive` on a cancelled job still
+`404`s with `{"error":"no assessment for that job"}` — the same pre-existing
+limitation `archive_job` already has for every `deliver` job today, not
+something cancel changes.
+
+**Concurrency**: `cancel_job` shares the same lock as the worker's
+`queued → running` transition, so the two are mutually exclusive —
+whichever call wins a race decides the outcome deterministically. A job can
+never end up both running and marked cancelled.
 
 ## Archive / unarchive
 
