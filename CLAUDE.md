@@ -51,3 +51,83 @@ Stop and raise it rather than proceed if any of these are true: the work would p
 ## Definition of done
 
 Data classification and tier stated. No secrets in code, config, logs, or context. Least privilege applied. Dependencies verified. Security-sensitive code reviewed. Prompt-injection and untrusted-output handling in place for any AI feature. Agents registered with an approved auth pattern and allowlisted tool servers. Tests passed and evidenced. Release Checklist complete. A named owner recorded.
+
+## Multi-loop pipeline
+
+This repo is developed by a supervised multi-session pipeline — see
+`docs/PIPELINE.md`. If you are running as one of those loops, obey the
+ownership rules:
+
+- **Only the build loop** writes code or opens PRs. PR-review comments only;
+  research & adversarial touch issues only. One exception: the **autofix
+  loop** (`pipeline-pr-autofix.yml`) may push fixes to an existing
+  build-worker PR branch when its CI fails — bounded to 2 attempts; same-repo
+  bot PRs with a `Closes #` body only (unrelated bot PRs like Dependabot
+  bumps and PRs already labelled `needs-human` are skipped); and only from CI
+  `run_attempt` ≥ 2 (the ci-retry loop below gets one free machine rerun
+  first, so agents never chase one-off flakes), then it escalates
+  `needs-human`. Before assuming a code defect it checks for a flaky,
+  unrelated test (re-run in isolation with `--no-cov` — a partial run can
+  never satisfy the global coverage gate — and if it passes there, CI is
+  re-triggered with an empty commit instead of pushing a bogus "fix"). It
+  never opens or merges PRs. Do not misflag its pushes as an ownership
+  violation.
+- The **conflict-resolver loop** (`pipeline-pr-conflict.yml`) may push a
+  `main`-merge to an existing PR branch when that PR is CONFLICTING. It is
+  two-hop: a `discover` job (on every push to `main`, on PR
+  opened/ready-for-review — a PR can be *born* conflicted — and on an hourly
+  backstop sweep) finds conflicting same-repo PRs and self-dispatches the
+  `resolve` job via `workflow_dispatch`, because claude-code-action won't run
+  under a `push` event. The dispatch payload carries PR **numbers only**;
+  resolve re-derives the branch from the API and re-verifies the full
+  eligibility contract before checkout: same-repo (never a fork), not
+  `needs-human`/`no-auto-resolve`, still CONFLICTING, and **either** a bot PR
+  with `Closes #` **or** a maintainer PR whose author is in the
+  `MAINTAINER_LOGINS` allowlist. One attempt per conflict: a failed
+  resolution escalates `needs-human`, and the eligibility filter skips
+  `needs-human` PRs so it never thrashes. Same push guardrails as autofix
+  (read-only `gh`, exact `git push origin HEAD`). It never opens or merges
+  PRs. Do not misflag its merge commits as an ownership violation either.
+- The **revise loop** (`pipeline-pr-revise.yml`) may push review-response
+  commits to an existing build-worker PR branch when the PR-review worker's
+  verdict is "Changes requested" — the green-CI case autofix (CI-failure
+  keyed) never touches. Two-hop like the conflict resolver: the review
+  workflow's post step self-dispatches it via `workflow_dispatch` (a
+  GITHUB_TOKEN-posted comment can never trigger a workflow), the payload
+  carries the PR number only, and eligibility plus the still-pending verdict
+  are re-verified from the API before checkout. Bounded to 2 attempts per PR
+  via marker comments, then it escalates `needs-human`; a "Needs a human
+  decision" verdict labels `needs-human` directly from the review workflow.
+  It never opens or merges PRs. Do not misflag its pushes as an ownership
+  violation either.
+- The **build-retry loop** (`pipeline-build-retry.yml`) auto-re-runs a build
+  worker run that failed to produce a PR, via `gh run rerun`, bounded by
+  `run_attempt` (≤3 total attempts). The build worker escalates `needs-human`
+  only on its final attempt, so transient/infra failures recover unattended
+  and a human is pinged only for persistent ones — don't re-add manual
+  re-trigger steps for build failures.
+- The **ci-retry loop** (`ci-retry.yml`) gives a failed CI run one blind
+  machine rerun (`gh run rerun --failed`, `run_attempt` < 2) before any agent
+  engages. It holds `actions: write` only, touches no code, and hands off to
+  autofix from attempt 2.
+- The build worker runs the **full CI gate** (`ruff check .` and `pytest`
+  with the 100% branch-coverage gate, on the same setup-python + editable
+  install ci.yml uses) BEFORE opening a PR, so "green locally" matches CI.
+  Keep it that way when editing either the pipeline workflows or `ci.yml` —
+  they must run the same checks. Never weaken the coverage gate to make a
+  build pass.
+- **No loop merges PRs — a human merges.** This is the pipeline restatement
+  of section 5 above (no single actor develops, tests, and deploys without
+  approval and oversight). It is enforced structurally, not just by prompt:
+  the workers' `--allowedTools` grant no blanket `git:*`/`gh:*`/`python:*`
+  and no form of `gh pr merge` or `gh api`; branch protection on `main` is
+  the enforceable backstop and a required repo setting.
+- WIP caps: ≤3 open `status:draft`. Builds run **per-issue** (each issue its
+  own `concurrency` group, so distinct issues run in parallel and none evicts
+  another — a single shared group would silently *cancel* queued builds, and
+  cancellations aren't retried). Every run draws on the shared Max pool
+  (also serving the sibling community-agent pipeline and the Dave Discord
+  bot), so don't release large bursts of approvals at once.
+- Coordinate only through issue labels; when blocked or ambiguous, add
+  `needs-human` and stop rather than guess.
+- Everything traces to an issue number.
