@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from dev_team.backlog import Backlog, BacklogStore, ItemStatus
+from dev_team.backlog import Backlog, BacklogStore, ItemStatus, validate_dependencies
+from dev_team.errors import DependencyCycleError
 from dev_team.execution import InMemoryWorkspace
 
 
@@ -94,6 +95,98 @@ def test_story_provenance_fields_roundtrip():
     assert restored.stories[0].finding_id == "risk.secrets[0]"
     assert restored.stories[1].source_job is None
     assert restored.stories[1].finding_id is None
+
+
+def test_declined_status_roundtrips():
+    bl = Backlog()
+    bl.add_story("Won't do")
+    bl.stories[0].status = ItemStatus.DECLINED
+    data = bl.to_dict()
+    assert data["stories"][0]["status"] == "declined"
+    restored = Backlog.from_dict(data)
+    assert restored.stories[0].status is ItemStatus.DECLINED
+    # a declined story is neither ready nor counted as velocity
+    assert restored.ready_stories() == []
+    assert restored.velocity() == 0
+
+
+def test_depends_on_and_updated_at_roundtrip_only_when_set():
+    bl = Backlog()
+    first = bl.add_story("First")
+    second = bl.add_story("Second")
+    second.depends_on = [first.id]
+    second.updated_at = 1234.5
+    plain, tracked = bl.to_dict()["stories"]
+    # unset board fields are omitted — the pre-board on-disk shape is kept
+    assert "depends_on" not in plain
+    assert "updated_at" not in plain
+    assert tracked["depends_on"] == [first.id]
+    assert tracked["updated_at"] == 1234.5
+    restored = Backlog.from_dict(bl.to_dict())
+    assert restored.stories[0].depends_on == []
+    assert restored.stories[0].updated_at is None
+    assert restored.stories[1].depends_on == [first.id]
+    assert restored.stories[1].updated_at == 1234.5
+
+
+def test_story_ids_are_not_reused_after_a_delete():
+    # Count-based minting would hand "S2" back after this delete, silently
+    # re-attaching S2's dependency edges/provenance to an unrelated newcomer.
+    bl = _backlog()  # S1..S3
+    bl.stories = [s for s in bl.stories if s.id != "S2"]
+    assert bl.add_story("Replacement").id == "S4"  # one past the max, not len+1
+    bl.stories = [s for s in bl.stories if s.id != "S1"]
+    assert bl.add_story("Another").id == "S5"
+
+
+def test_epic_ids_are_not_reused_after_a_delete():
+    bl = Backlog()
+    bl.add_epic("One")
+    bl.add_epic("Two")
+    bl.add_epic("Three")
+    bl.epics = [e for e in bl.epics if e.id != "E2"]
+    assert bl.add_epic("Four").id == "E4"
+
+
+def test_id_minting_ignores_non_numeric_suffixes():
+    # Hand-edited files can hold odd ids; minting skips them rather than dies.
+    bl = Backlog.from_dict(
+        {
+            "epics": [],
+            "stories": [
+                {"id": "S2x", "title": "odd"},
+                {"id": "X9", "title": "other prefix"},
+                {"id": "S7", "title": "numeric"},
+            ],
+        }
+    )
+    assert bl.add_story("fresh").id == "S8"
+
+
+def test_validate_dependencies_accepts_a_clean_graph():
+    bl = _backlog()
+    bl.stories[1].depends_on = ["S1"]
+    bl.stories[2].depends_on = ["S1", "S2"]
+    validate_dependencies(bl)  # no exception
+
+
+def test_validate_dependencies_rejects_unknown_and_self_edges():
+    bl = _backlog()
+    bl.stories[0].depends_on = ["S99"]
+    with pytest.raises(ValueError, match="unknown story 'S99'"):
+        validate_dependencies(bl)
+    bl.stories[0].depends_on = ["S1"]
+    with pytest.raises(ValueError, match="depends on itself"):
+        validate_dependencies(bl)
+
+
+def test_validate_dependencies_rejects_a_cycle():
+    bl = _backlog()
+    bl.stories[0].depends_on = ["S2"]
+    bl.stories[1].depends_on = ["S1"]
+    with pytest.raises(DependencyCycleError) as excinfo:
+        validate_dependencies(bl)
+    assert excinfo.value.task_ids == ["S1", "S2"]  # S3 is not implicated
 
 
 def test_backlog_json_written_before_provenance_still_loads():

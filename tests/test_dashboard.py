@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import threading
 import urllib.error
@@ -582,3 +583,198 @@ def test_open_server_login_lifecycle_is_harmless(server):
     assert "Max-Age=0" in headers["Set-Cookie"]
     status, _, _ = _request(server, "POST", "/nope")
     assert status == 404
+
+
+# --- the board write proxy (/api/backlog/* → the dispatch service) ------------
+
+DISPATCH_URL = "http://dispatch.test:8738"
+DISPATCH_TOKEN = "sekrit-dispatch-token"
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+
+@pytest.fixture
+def proxy_server():
+    ws = InMemoryWorkspace()
+    srv = DashboardServer(
+        ws, port=0, token=TOKEN,
+        dispatch_url=DISPATCH_URL, dispatch_token=DISPATCH_TOKEN,
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield srv
+    srv.shutdown()
+    thread.join(timeout=5)
+
+
+class _FakeDispatchResponse:
+    """The slice of urlopen's response the proxy uses (a context manager)."""
+
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _capture_urlopen(monkeypatch, *, status=200, body=b'{"ok": true}', error=None):
+    """Swap urlopen for a fake that records the outbound Request."""
+
+    seen = []
+
+    def fake_urlopen(request, timeout=None):
+        seen.append(request)
+        if error is not None:
+            raise error
+        return _FakeDispatchResponse(status, body)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return seen
+
+
+def test_proxy_forwards_post_with_the_dispatch_bearer(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch, status=201, body=b'{"id": "S9", "title": "Runbook"}'
+    )
+    payload = json.dumps({"title": "Runbook"})
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/backlog/story",
+        headers={**AUTH, "Content-Type": "application/json"}, body=payload,
+    )
+    # the dispatch answer (status + body) is relayed verbatim
+    assert status == 201
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"id": "S9", "title": "Runbook"}
+    # the outbound request: right URL, method, auth, content type, and body
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/backlog/story"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.get_header("Content-type") == "application/json"
+    assert request.data == payload.encode()
+
+
+def test_proxy_forwards_patch_and_delete_methods(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch, body=b'{"id": "S1"}')
+    status, _, _ = _request(
+        proxy_server, "PATCH", "/api/backlog/story/S1",
+        headers=AUTH, body=json.dumps({"estimate": 2}),
+    )
+    assert status == 200
+    status, _, _ = _request(proxy_server, "DELETE", "/api/backlog/story/S1",
+                            headers=AUTH)
+    assert status == 200
+    patch, delete = seen
+    assert patch.get_method() == "PATCH"
+    assert patch.full_url == f"{DISPATCH_URL}/backlog/story/S1"
+    assert json.loads(patch.data) == {"estimate": 2}
+    assert delete.get_method() == "DELETE"
+    assert delete.data is None  # no body → none forwarded
+    assert delete.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+
+
+def test_proxy_relays_a_dispatch_rejection(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/backlog/story/S1/deps", 400, "Bad Request", None,
+        io.BytesIO(b'{"error": "story S1 depends on itself"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/backlog/story/S1/deps",
+        headers=AUTH, body=json.dumps({"depends_on": ["S1"]}),
+    )
+    assert status == 400
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "story S1 depends on itself"}
+
+
+def test_proxy_unreachable_dispatch_is_502(proxy_server, monkeypatch):
+    _capture_urlopen(monkeypatch, error=urllib.error.URLError("refused"))
+    status, _, body = _request(
+        proxy_server, "POST", "/api/backlog/story", headers=AUTH, body="{}"
+    )
+    assert status == 502
+    assert json.loads(body) == {"error": "dispatch service unreachable"}
+    assert "refused" not in body  # no internals leak
+
+
+def test_proxy_tolerates_a_malformed_content_length(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    status, _, _ = _request(
+        proxy_server, "POST", "/api/backlog/story/S1/decline",
+        headers={**AUTH, "Content-Length": "xyz"},
+    )
+    assert status == 200
+    (request,) = seen
+    assert request.data is None  # unreadable length → treated as no body
+
+
+def test_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    for method in ("POST", "PATCH", "DELETE"):
+        status, headers, body = _request(
+            proxy_server, method, "/api/backlog/story/S1"
+        )
+        assert status == 401
+        assert headers["Content-Type"].startswith("application/json")
+        assert json.loads(body) == {"error": "unauthorized"}
+    # a PATCH/DELETE outside /api/ gets the login page, like GET/POST do
+    status, headers, _ = _request(proxy_server, "PATCH", "/nope")
+    assert status == 401
+    assert headers["Content-Type"].startswith("text/html")
+    assert seen == []  # nothing was ever forwarded
+
+
+def test_proxy_scope_is_strictly_api_backlog(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    # authorised writes anywhere else are 404 — the proxy is not a general
+    # passthrough to the dispatch service
+    for method, path in (
+        ("POST", "/api/state"),
+        ("POST", "/jobs"),
+        ("PATCH", "/api/report"),
+        ("DELETE", "/api/transcripts"),
+        ("POST", "/api/backlogs/story"),  # prefix must match exactly
+    ):
+        status, _, _ = _request(proxy_server, method, path, headers=AUTH)
+        assert status == 404
+    assert seen == []
+
+
+def test_proxy_unconfigured_board_editing_is_501(token_server, monkeypatch):
+    # token_server has no dispatch_url/dispatch_token wired
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "POST", "/api/backlog/story", headers=AUTH, body="{}"
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "board editing not configured"}
+    assert seen == []
+
+
+def test_proxy_url_without_token_stays_read_only(monkeypatch):
+    # A dispatch URL alone (e.g. localhost dev with no DEV_TEAM_DISPATCH_TOKEN)
+    # must not forward unauthenticated writes: still 501.
+    seen = _capture_urlopen(monkeypatch)
+    srv = DashboardServer(
+        InMemoryWorkspace(), port=0, token=TOKEN, dispatch_url=DISPATCH_URL
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, body = _request(
+            srv, "DELETE", "/api/backlog/story/S1", headers=AUTH
+        )
+        assert status == 501
+        assert json.loads(body) == {"error": "board editing not configured"}
+        assert seen == []
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)

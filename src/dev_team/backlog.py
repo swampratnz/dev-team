@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
+from .errors import DependencyCycleError
 from .execution import Workspace
 
 
@@ -22,6 +23,7 @@ class ItemStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     DONE = "done"
     BLOCKED = "blocked"
+    DECLINED = "declined"
 
 
 @dataclass
@@ -44,6 +46,11 @@ class Story:
     traced back to — and independently re-verified against — the claim it
     came from. Deterministic findings (dead code, dependency scan) and
     hand-written stories leave both ``None``.
+
+    ``depends_on`` holds the ids of stories that must land before this one
+    (validated by :func:`validate_dependencies`); ``updated_at`` is the epoch
+    timestamp of the last mutation through the dispatch backlog API. Both
+    serialise only when set, so older backlog files keep their shape.
     """
 
     id: str
@@ -54,6 +61,8 @@ class Story:
     epic_id: Optional[str] = None
     source_job: Optional[str] = None
     finding_id: Optional[str] = None
+    depends_on: List[str] = field(default_factory=list)
+    updated_at: Optional[float] = None
 
 
 @dataclass
@@ -81,7 +90,11 @@ class Backlog:
     def add_epic(self, title: str, description: str = "") -> Epic:
         """Create and append an epic with an auto-assigned id."""
 
-        epic = Epic(id=f"E{len(self.epics) + 1}", title=title, description=description)
+        epic = Epic(
+            id=_mint_id("E", (e.id for e in self.epics)),
+            title=title,
+            description=description,
+        )
         self.epics.append(epic)
         return epic
 
@@ -100,7 +113,7 @@ class Backlog:
         if estimate < 1:
             raise ValueError("estimate must be at least 1")
         story = Story(
-            id=f"S{len(self.stories) + 1}",
+            id=_mint_id("S", (s.id for s in self.stories)),
             title=title,
             description=description,
             estimate=estimate,
@@ -156,6 +169,70 @@ class Backlog:
         return cls(epics=epics, stories=stories)
 
 
+def _mint_id(prefix: str, existing: Iterable[str]) -> str:
+    """A fresh ``<prefix><n>`` id one past the highest numeric suffix in use.
+
+    Scanning for the maximum (rather than counting items) means an id is
+    never reused after a delete: remove ``S2`` from ``S1..S3`` and the next
+    story is ``S4``, so dependency edges and finding provenance can never
+    silently re-attach to an unrelated newcomer. Ids with a non-numeric
+    suffix (hand-edited files) are ignored rather than fatal.
+    """
+
+    highest = 0
+    for item_id in existing:
+        suffix = item_id[len(prefix):]
+        if item_id.startswith(prefix) and suffix.isdigit():
+            highest = max(highest, int(suffix))
+    return f"{prefix}{highest + 1}"
+
+
+def validate_dependencies(backlog: Backlog) -> None:
+    """Validate every story's ``depends_on`` edges, eagerly and structurally.
+
+    Mirrors the plan linter's discipline (unknown/self edges are defects,
+    never silently dropped) and :func:`~dev_team.ordering.topological_order`'s
+    cycle detection, but over :class:`Story` objects — the plan pipeline's
+    ``Task``/``lint_plan`` machinery (acceptance criteria, plan-size caps)
+    does not apply to a standing backlog.
+
+    Raises:
+        ValueError: an edge names an unknown story id, or a story depends
+            on itself.
+        DependencyCycleError: the dependency graph contains a cycle.
+    """
+
+    ids = {story.id for story in backlog.stories}
+    for story in backlog.stories:
+        for dep in story.depends_on:
+            if dep == story.id:
+                raise ValueError(f"story {story.id} depends on itself")
+            if dep not in ids:
+                raise ValueError(
+                    f"story {story.id} depends on unknown story {dep!r}"
+                )
+    # Kahn's algorithm: peel stories whose dependencies are all resolved;
+    # anything left over is (part of) a cycle.
+    indegree = {story.id: len(story.depends_on) for story in backlog.stories}
+    dependents: Dict[str, List[str]] = {story.id: [] for story in backlog.stories}
+    for story in backlog.stories:
+        for dep in story.depends_on:
+            dependents[dep].append(story.id)
+    ready = [story_id for story_id, count in indegree.items() if count == 0]
+    resolved = 0
+    while ready:
+        current = ready.pop()
+        resolved += 1
+        for dependent in dependents[current]:
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                ready.append(dependent)
+    if resolved != len(indegree):
+        raise DependencyCycleError(
+            sorted(story_id for story_id, count in indegree.items() if count > 0)
+        )
+
+
 def _story_to_dict(story: Story) -> Dict[str, Any]:
     data = asdict(story)
     data["status"] = story.status.value
@@ -164,6 +241,12 @@ def _story_to_dict(story: Story) -> Dict[str, Any]:
     for key in ("source_job", "finding_id"):
         if data[key] is None:
             del data[key]
+    # Same rule for the board fields: an empty dependency list and an unset
+    # update stamp are omitted, keeping the pre-board on-disk shape.
+    if not data["depends_on"]:
+        del data["depends_on"]
+    if data["updated_at"] is None:
+        del data["updated_at"]
     return data
 
 

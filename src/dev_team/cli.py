@@ -62,6 +62,10 @@ CREDENTIAL_ENV_VARS = (
     "CLAUDE_CODE_USE_VERTEX",  # Google Vertex AI
 )
 
+#: Where the dashboard's board-write proxy sends /api/backlog/* edits when
+#: --dispatch-url is not given: the dispatch service's default local bind.
+DEFAULT_DISPATCH_URL = "http://127.0.0.1:8738"
+
 _MISSING_CREDENTIALS = """\
 no Claude credentials found. The agents run via the Claude Code CLI, which
 needs one of:
@@ -221,6 +225,16 @@ def build_parser() -> argparse.ArgumentParser:
         "its events here (shown as its own run) and mirrors its assess "
         "report under audit/<job-id>/, so dispatched runs are visible on the "
         "dashboard. Each job still runs in its own isolated workspace.",
+    )
+    parser.add_argument(
+        "--dispatch-url",
+        default=None,
+        metavar="URL",
+        help="With --dashboard: base URL of the dispatch service the board's "
+        f"write actions (/api/backlog/*) are proxied to (default "
+        f"{DEFAULT_DISPATCH_URL}). The proxy authenticates with the "
+        "DEV_TEAM_DISPATCH_TOKEN environment variable; without that token "
+        "the board stays read-only (writes answer 501).",
     )
     parser.add_argument(
         "--report",
@@ -473,6 +487,8 @@ def _validate_args(
         parser.error("--host: only valid with --dashboard or --dispatch")
     if args.dashboard_workspace is not None and not args.dispatch:
         parser.error("--dashboard-workspace: only valid with --dispatch")
+    if args.dispatch_url is not None and not args.dashboard:
+        parser.error("--dispatch-url: only valid with --dashboard")
     if args.report is not None and not args.assess:
         parser.error("--report: only valid with --assess")
     if args.record_transcripts and not (
@@ -763,11 +779,21 @@ def _serve_dashboard(args) -> int:
             f"transcripts). Set ${DASHBOARD_TOKEN_ENV} to require a token.",
             file=sys.stderr,
         )
+    # The board's write path: /api/backlog/* edits are proxied to the
+    # dispatch service, authenticated with ITS bearer token. An unset/empty
+    # dispatch token (localhost dev without a dispatch service) leaves the
+    # board read-only — the proxy answers 501 rather than forwarding
+    # unauthenticated. The token value itself is never printed.
+    dispatch_token = os.environ.get(DISPATCH_TOKEN_ENV, "")
     server = DashboardServer(
         LocalWorkspace(args.workspace, excluded_dirs=_DASHBOARD_EXCLUDED_DIRS),
         host=host,
         port=args.port if args.port is not None else 8737,
         token=token or None,
+        dispatch_url=(
+            args.dispatch_url if args.dispatch_url is not None else DEFAULT_DISPATCH_URL
+        ),
+        dispatch_token=dispatch_token or None,
     )
     print(
         f"dev-team dashboard for {args.workspace} at {server.url} "
