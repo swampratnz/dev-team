@@ -312,6 +312,127 @@ def test_memory_state_filters_non_dict_decisions():
     assert memory["retrospectives"] == []
 
 
+# --- archived jobs: excluded from activity/reports/backlog by default --------
+
+
+def _archived_workspace():
+    ws = InMemoryWorkspace()
+    _journal(ws, AgentEvent("engineer", "implement", "hidden"), run="assess-a")
+    _journal(ws, AgentEvent("qa", "test", "visible"), run="assess-b")
+    ws.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"repo": "a/b", "mode": "assess", "id": "assess-a",
+                    "archived": True, "archived_at": 1.0}),
+    )
+    ws.write_text(
+        "audit/assess-b/meta.json",
+        json.dumps({"repo": "a/b", "mode": "assess", "id": "assess-b"}),
+    )
+    ws.write_text("audit/assess-a/assessment.md", "# hidden report")
+    ws.write_text("audit/assess-b/assessment.md", "# visible report")
+    store = BacklogStore(ws)
+    backlog = store.load()
+    epic = backlog.add_epic("Remediation")
+    hidden = backlog.add_story("From archived job", "", epic_id=epic.id)
+    hidden.source_job = "assess-a"
+    visible = backlog.add_story("From live job", "", epic_id=epic.id)
+    visible.source_job = "assess-b"
+    backlog.add_story("No source job")
+    store.save(backlog)
+    return ws
+
+
+def test_collect_state_excludes_archived_job_by_default():
+    ws = _archived_workspace()
+    state = collect_state(ws)
+    assert state["archived_jobs"] == ["assess-a"]
+    assert state["include_archived"] is False
+    assert [r["run"] for r in state["activity"]] == ["assess-b"]
+    assert [r["id"] for r in state["runs"]] == ["assess-b"]
+    assert state["reports"] == ["audit/assess-b/assessment.md"]
+    (epic_state,) = state["backlog"]["epics"]
+    assert [s["title"] for s in epic_state["stories"]] == ["From live job"]
+    assert [s["title"] for s in state["backlog"]["orphan_stories"]] == ["No source job"]
+
+
+def test_collect_state_include_archived_reveals_everything():
+    ws = _archived_workspace()
+    state = collect_state(ws, include_archived=True)
+    assert state["include_archived"] is True
+    assert {r["run"] for r in state["activity"]} == {"assess-a", "assess-b"}
+    assert {r["id"] for r in state["runs"]} == {"assess-a", "assess-b"}
+    assert set(state["reports"]) == {
+        "audit/assess-a/assessment.md", "audit/assess-b/assessment.md",
+    }
+    (epic_state,) = state["backlog"]["epics"]
+    assert {s["title"] for s in epic_state["stories"]} == {
+        "From archived job", "From live job",
+    }
+    # archived_jobs always lists every archived id, regardless of the view
+    assert state["archived_jobs"] == ["assess-a"]
+
+
+def test_collect_state_archive_round_trip_reappears_unmodified():
+    # Mirrors the dispatch service's own archive_job/unarchive_job mutation
+    # (flip the meta.json marker in place) rather than two static fixtures,
+    # to prove the SAME on-disk transition round-trips through the state
+    # the dashboard's three surfaces (activity, reports, backlog) render.
+    ws = InMemoryWorkspace()
+    _journal(ws, AgentEvent("engineer", "implement", "hello"), run="assess-r")
+    ws.write_text("audit/assess-r/assessment.md", "# report")
+    store = BacklogStore(ws)
+    backlog = store.load()
+    epic = backlog.add_epic("Remediation")
+    story = backlog.add_story("From assess-r", "", epic_id=epic.id)
+    story.source_job = "assess-r"
+    store.save(backlog)
+    live_meta = json.dumps({"repo": "a/b", "mode": "assess", "id": "assess-r"})
+    archived_meta = json.dumps({
+        "repo": "a/b", "mode": "assess", "id": "assess-r",
+        "archived": True, "archived_at": 5.0,
+    })
+    ws.write_text("audit/assess-r/meta.json", live_meta)
+
+    state = collect_state(ws)
+    assert state["archived_jobs"] == []
+    assert [r["run"] for r in state["activity"]] == ["assess-r"]
+
+    ws.write_text("audit/assess-r/meta.json", archived_meta)
+    state = collect_state(ws)
+    assert state["archived_jobs"] == ["assess-r"]
+    assert state["activity"] == []
+    assert state["reports"] == []
+    assert state["backlog"]["epics"][0]["stories"] == []
+
+    ws.write_text("audit/assess-r/meta.json", live_meta)
+    state = collect_state(ws)
+    assert state["archived_jobs"] == []
+    assert [r["run"] for r in state["activity"]] == ["assess-r"]
+    assert state["reports"] == ["audit/assess-r/assessment.md"]
+    assert [s["title"] for s in state["backlog"]["epics"][0]["stories"]] == [
+        "From assess-r"
+    ]
+
+
+def test_archived_job_ids_tolerates_corrupt_and_non_matching_meta():
+    from dev_team.dashboard import _archived_job_ids
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/corrupt/meta.json", "{not json")
+    ws.write_text("audit/wrong-name/assessment.json", "{}")  # not meta.json
+    ws.write_text("audit/not-archived/meta.json", json.dumps({"archived": False}))
+    ws.write_text("audit/archived/meta.json", json.dumps({"archived": True}))
+    assert _archived_job_ids(ws) == frozenset({"archived"})
+
+
+def test_report_job_id_extracts_the_owning_job_or_none():
+    from dev_team.dashboard import _report_job_id
+
+    assert _report_job_id("audit/assess-x/report.md") == "assess-x"
+    assert _report_job_id("audit/assessment.md") is None
+    assert _report_job_id("sub/audit/deep.md") is None
+
+
 # --- agent history -----------------------------------------------------------------
 
 
@@ -910,3 +1031,91 @@ def test_proxy_url_without_token_stays_read_only(monkeypatch):
     finally:
         srv.shutdown()
         thread.join(timeout=5)
+
+
+# --- the job lifecycle proxy (/api/jobs/{id}/archive|unarchive → dispatch) ----
+
+
+def test_jobs_proxy_forwards_archive_and_unarchive(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch, status=200, body=b'{"id": "assess-a", "archived": true}'
+    )
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/archive", headers=AUTH
+    )
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"id": "assess-a", "archived": True}
+    status, _, _ = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/unarchive", headers=AUTH
+    )
+    assert status == 200
+    archive_req, unarchive_req = seen
+    assert archive_req.full_url == f"{DISPATCH_URL}/jobs/assess-a/archive"
+    assert archive_req.get_method() == "POST"
+    assert archive_req.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert unarchive_req.full_url == f"{DISPATCH_URL}/jobs/assess-a/unarchive"
+
+
+def test_jobs_proxy_relays_a_dispatch_rejection(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/jobs/assess-a/archive", 409, "Conflict", None,
+        io.BytesIO(b'{"error": "job is running"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/archive", headers=AUTH
+    )
+    assert status == 409
+    assert json.loads(body) == {"error": "job is running"}
+
+
+def test_jobs_proxy_rejects_actions_outside_archive_unarchive(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    # neither an unknown action nor a bare/deeper path is forwarded — the
+    # proxy is scoped to exactly /api/jobs/{id}/archive|unarchive, never a
+    # general passthrough to the dispatch job surface (which would let a
+    # browser submit jobs with the dispatch token)
+    for path in (
+        "/api/jobs/assess-a/submit",
+        "/api/jobs/assess-a",
+        "/api/jobs/assess-a/archive/extra",
+    ):
+        status, _, body = _request(proxy_server, "POST", path, headers=AUTH)
+        assert status == 404
+        assert json.loads(body) == {"error": "not found"}
+    assert seen == []
+
+
+def test_jobs_proxy_unconfigured_is_501(token_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "POST", "/api/jobs/assess-a/archive", headers=AUTH
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "job actions not configured"}
+    assert seen == []
+
+
+def test_jobs_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/archive"
+    )
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+# --- /api/state?archived=1 ----------------------------------------------------
+
+
+def test_state_route_archived_query_param(server):
+    status, _, body = _request(server, "GET", "/api/state")
+    assert status == 200
+    assert json.loads(body)["include_archived"] is False
+    status, _, body = _request(server, "GET", "/api/state?archived=1")
+    assert status == 200
+    assert json.loads(body)["include_archived"] is True

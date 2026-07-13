@@ -28,6 +28,10 @@ workspace on every request.
 | **House conventions** — the captured style summary | `.dev_team/conventions.json` |
 | **Reports** — every `audit/*.md`, viewable in place | the workspace tree |
 
+Runs, Reports, and the Kanban board all exclude **archived** jobs by
+default (see *Archived jobs* below) — a "show archived" toggle above the
+Runs panel reveals them.
+
 Stat tiles across the top summarise runs recorded, open/done/blocked/declined
 stories, and time since the last activity.
 
@@ -57,6 +61,27 @@ dispatch service's error messages — is repo-derived or round-trips through
 the server, so the page escapes all of it before it reaches the DOM
 (`esc()` / `textContent`, never raw `innerHTML`). Without a dispatch token
 the controls answer `501` and the board is effectively read-only.
+
+### Archived jobs
+
+Test/demo runs and superseded re-assessments accumulate with no lifecycle,
+and a stale or fabricated verification pollutes the dispatch service's
+`GET /calibration` rollup. **Archive** (see [`docs/DISPATCH.md`](DISPATCH.md))
+hides a job's activity, report, and backlog stories without deleting
+anything — the data stays on disk and is fully restorable with
+**unarchive**.
+
+- A "show archived" checkbox above the **Runs** panel toggles
+  `GET /api/state?archived=1`, which reveals archived runs, reports, and
+  backlog stories (each marked with a dashed "archived" chip) alongside the
+  live ones.
+- Each **run row** and **report row** carries an archive/unarchive button.
+  Clicking it POSTs `/api/jobs/{id}/archive` or `/api/jobs/{id}/unarchive`
+  through the dashboard — the same narrow-proxy pattern the board write path
+  uses (below): the dispatch bearer token stays server-side, and the proxy
+  forwards **only** those two actions, never a general `/jobs` passthrough.
+  Archiving a job that is still `queued`/`running` is rejected (`409`) by
+  the dispatch service itself.
 
 ### Story detail (click a backlog story)
 
@@ -137,6 +162,13 @@ narrow proxy to the **dispatch service**, which owns every backlog write:
 browser ──(dashboard token)──▶ dashboard /api/backlog/* ──(dispatch token)──▶ dispatch /backlog/*
 ```
 
+Archive/unarchive (above) is a second, equally narrow proxy of the same
+shape:
+
+```
+browser ──(dashboard token)──▶ dashboard /api/jobs/{id}/archive|unarchive ──(dispatch token)──▶ dispatch /jobs/{id}/archive|unarchive
+```
+
 - **The proxy** (`--dashboard` with `--dispatch-url`, default
   `http://127.0.0.1:8738`): authorised `POST`/`PATCH`/`DELETE` requests
   under `/api/backlog/` are forwarded — same method, same JSON body — to
@@ -149,6 +181,11 @@ browser ──(dashboard token)──▶ dashboard /api/backlog/* ──(dispatc
   to the browser. With `DEV_TEAM_DISPATCH_TOKEN` unset the board is
   read-only and writes answer `501 {"error": "board editing not
   configured"}`.
+- The same `--dispatch-url`/`DEV_TEAM_DISPATCH_TOKEN` configuration also
+  gates the archive/unarchive proxy: `/api/jobs/{id}/archive` and
+  `/api/jobs/{id}/unarchive` are the **only** two actions forwarded (never a
+  general `/api/jobs/*` passthrough), and without a token they answer
+  `501 {"error": "job actions not configured"}`.
 - **Auth is layered**: the browser authenticates to the dashboard
   (dashboard token / cookie, checked first); the dashboard process — not
   the browser — holds the dispatch bearer token. Both comparisons are
@@ -183,10 +220,15 @@ API: every board control calls the proxied `/api/backlog/*` routes.
 Everything the page shows is plain JSON, usable by your own tooling (add
 the bearer header when a token is set):
 
-- `GET /api/state` — the full dashboard state document.
+- `GET /api/state` — the full dashboard state document. `?archived=1`
+  includes archived jobs' activity, reports, and backlog stories (`state`
+  always carries `archived_jobs` — every archived id — and
+  `include_archived`, reflecting which view this response is).
 - `GET /api/report?path=audit/assessment.md` — a report's markdown (only
   paths the workspace actually lists are served).
 - `POST /login` (form field `token`) / `POST /logout` — the browser cookie
   session lifecycle described above.
 - `POST|PATCH|DELETE /api/backlog/...` — the board write proxy described
   above (requires dashboard auth; `501` until a dispatch token is wired).
+- `POST /api/jobs/{id}/archive` / `POST /api/jobs/{id}/unarchive` — the
+  archive/unarchive proxy described above (same auth and `501` gating).

@@ -42,7 +42,7 @@ from urllib.parse import parse_qs, urlsplit
 from .backlog import BacklogStore
 from .conventions import ConventionsStore
 from .eventlog import read_events
-from .execution import Workspace
+from .execution import Workspace, WorkspaceError
 from .memory import ProjectMemory
 from .persona import DEFAULT_CAST
 from .transcripts import list_transcripts, read_transcript
@@ -98,11 +98,21 @@ def _run_summaries(events: List[Dict]) -> List[Dict]:
     return list(reversed(ordered))[:_RUN_LIMIT]
 
 
-def _backlog_state(workspace: Workspace) -> Dict:
+def _backlog_state(workspace: Workspace, *, hide: frozenset = frozenset()) -> Dict:
+    """The Kanban board's data, with any archived-job stories filtered out.
+
+    ``hide`` is a set of archived job ids; a story whose ``source_job`` is
+    in it is left off the board entirely (present=True still reflects the
+    workspace's real backlog, not the filtered view). Passing an empty set
+    (the default) keeps every story, exactly the pre-archive behaviour.
+    """
+
     backlog = BacklogStore(workspace).load()
     counts = {"todo": 0, "in_progress": 0, "done": 0, "blocked": 0, "declined": 0}
     by_epic: Dict[Optional[str], List[Dict]] = {}
     for story in backlog.stories:
+        if story.source_job and story.source_job in hide:
+            continue
         status = story.status.value
         counts[status] = counts.get(status, 0) + 1
         by_epic.setdefault(story.epic_id, []).append(
@@ -177,12 +187,69 @@ def _report_paths(workspace: Workspace) -> List[str]:
     )
 
 
-def collect_state(
-    workspace: Workspace, *, clock: Callable[[], float] = time.time
-) -> Dict:
-    """Everything the dashboard shows, freshly read from the workspace."""
+def _report_job_id(path: str) -> Optional[str]:
+    """The job id a report path is filed under, if any (else ``None``).
 
+    Mirrors how the dispatch service mirrors reports: ``audit/<id>/...``.
+    A report with no ``audit/<something>/`` segment (e.g. a bare
+    ``audit/assessment.md`` from a direct, non-dispatch assess run) has no
+    owning job, so archiving never hides it.
+    """
+
+    parts = path.split("/")
+    for i, part in enumerate(parts[:-1]):
+        if part == "audit" and i + 1 < len(parts) - 1:
+            return parts[i + 1]
+    return None
+
+
+def _archived_job_ids(workspace: Workspace) -> frozenset:
+    """Job ids whose mirrored ``audit/<id>/meta.json`` is marked archived.
+
+    Read straight from the shared workspace: the dispatch service mirrors
+    ``meta.json`` into the very same tree the dashboard watches, so no
+    dispatch call is needed here. A missing or corrupt ``meta.json`` is
+    simply not archived — never a 500 for the whole state payload.
+    """
+
+    ids = set()
+    for path in workspace.list_files():
+        parts = path.split("/")
+        if len(parts) != 3 or parts[0] != "audit" or parts[2] != "meta.json":
+            continue
+        try:
+            meta = json.loads(workspace.read_text(path))
+        except (OSError, ValueError, WorkspaceError):
+            continue
+        if meta.get("archived"):
+            ids.add(parts[1])
+    return frozenset(ids)
+
+
+def collect_state(
+    workspace: Workspace,
+    *,
+    clock: Callable[[], float] = time.time,
+    include_archived: bool = False,
+) -> Dict:
+    """Everything the dashboard shows, freshly read from the workspace.
+
+    Jobs marked archived (via the dispatch service's archive/unarchive
+    lifecycle) are excluded from the activity feed, the Reports panel, and
+    backlog stories carrying their ``source_job`` — by default.
+    ``include_archived=True`` (``GET /api/state?archived=1``) reveals them
+    again; ``archived_jobs`` always lists every archived id so the UI can
+    render a toggle regardless of which view is showing.
+    """
+
+    archived = _archived_job_ids(workspace)
+    hide = frozenset() if include_archived else archived
     events = read_events(workspace)
+    if hide:
+        events = [e for e in events if str(e.get("run", "")) not in hide]
+    reports = _report_paths(workspace)
+    if hide:
+        reports = [p for p in reports if _report_job_id(p) not in hide]
     root = getattr(workspace, "root", None)
     return {
         "generated_at": clock(),
@@ -190,10 +257,12 @@ def collect_state(
         "agents": _agent_cards(events),
         "activity": list(reversed(events[-_FEED_LIMIT:])),
         "runs": _run_summaries(events),
-        "backlog": _backlog_state(workspace),
+        "backlog": _backlog_state(workspace, hide=hide),
         "memory": _memory_state(workspace),
         "conventions": _conventions_state(workspace),
-        "reports": _report_paths(workspace),
+        "reports": reports,
+        "archived_jobs": sorted(archived),
+        "include_archived": include_archived,
     }
 
 
@@ -235,6 +304,17 @@ _MAX_LOGIN_BODY = 4096
 #: dashboard session drive the whole dispatch surface (submit jobs, run
 #: agents) with it. Board edits only.
 _BACKLOG_PROXY_PREFIX = "/api/backlog/"
+
+#: The path prefix whose writes are proxied to the dispatch service's job
+#: lifecycle actions. Just as narrow as the backlog proxy above, and for the
+#: same reason: scoped to exactly ``/api/jobs/{id}/archive`` and
+#: ``/api/jobs/{id}/unarchive`` (see :data:`_JOBS_PROXY_ACTIONS`), never a
+#: blanket passthrough to the dispatch job surface (which would let a
+#: browser submit jobs with the dispatch token).
+_JOBS_PROXY_PREFIX = "/api/jobs/"
+
+#: The only two actions the jobs proxy will forward.
+_JOBS_PROXY_ACTIONS = frozenset({"archive", "unarchive"})
 
 #: How long a proxied board write may take end to end. The dispatch cores are
 #: pure disk transforms, so anything slower means the service is wedged.
@@ -292,9 +372,11 @@ def _make_handler(
 
     With BOTH ``dispatch_url`` and ``dispatch_token`` set, authorised writes
     under ``/api/backlog/`` are forwarded to the dispatch service's
-    ``/backlog`` mutation API (the board's write path); with either unset the
-    board is read-only and those writes answer ``501``. The dispatch token is
-    only ever sent to ``dispatch_url`` — never logged or reflected.
+    ``/backlog`` mutation API (the board's write path), and
+    ``/api/jobs/{id}/archive`` or ``/api/jobs/{id}/unarchive`` are forwarded
+    to the matching ``/jobs/{id}/...`` lifecycle route; with either unset
+    both stay unavailable and those writes answer ``501``. The dispatch
+    token is only ever sent to ``dispatch_url`` — never logged or reflected.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -390,6 +472,8 @@ def _make_handler(
                 self._reject(path)
             elif path.startswith(_BACKLOG_PROXY_PREFIX):
                 self._proxy_backlog("POST", path)
+            elif path.startswith(_JOBS_PROXY_PREFIX):
+                self._proxy_jobs(path)
             else:
                 self._send(404, "text/plain", "not found")
 
@@ -419,6 +503,41 @@ def _make_handler(
         # is reachable through the dashboard, and the dispatch token is
         # never logged, echoed, or handed to the client.
 
+        def _proxy(self, method: str, url_suffix: str, body: Optional[bytes]) -> None:
+            """Forward one authorised, in-scope write to the dispatch service.
+
+            Shared by :meth:`_proxy_backlog` and :meth:`_proxy_jobs`: build
+            the request with the dispatch bearer token (never the browser's
+            credentials), relay a success or a dispatch rejection
+            (400/401/404/409) verbatim, and fail securely (502, no
+            internals) when the service is unreachable.
+            """
+
+            request = urllib.request.Request(
+                f"{dispatch_url.rstrip('/')}{url_suffix}",
+                data=body,
+                method=method,
+                headers={
+                    "Authorization": f"Bearer {dispatch_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=_PROXY_TIMEOUT) as res:
+                    self._send(
+                        res.status, "application/json", res.read().decode("utf-8")
+                    )
+            except urllib.error.HTTPError as exc:
+                payload = exc.read().decode("utf-8")
+                exc.close()
+                self._send(exc.code, "application/json", payload)
+            except urllib.error.URLError:
+                self._send(
+                    502,
+                    "application/json",
+                    json.dumps({"error": "dispatch service unreachable"}),
+                )
+
         def _proxy_backlog(self, method: str, path: str) -> None:
             if not (dispatch_url and dispatch_token):
                 self._send(
@@ -433,34 +552,27 @@ def _make_handler(
                 length = 0
             body = self.rfile.read(length) if length > 0 else None
             rest = path[len(_BACKLOG_PROXY_PREFIX):]
-            request = urllib.request.Request(
-                f"{dispatch_url.rstrip('/')}/backlog/{rest}",
-                data=body,
-                method=method,
-                headers={
-                    "Authorization": f"Bearer {dispatch_token}",
-                    "Content-Type": "application/json",
-                },
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=_PROXY_TIMEOUT) as res:
-                    self._send(
-                        res.status, "application/json", res.read().decode("utf-8")
-                    )
-            except urllib.error.HTTPError as exc:
-                # Dispatch rejections (400/401/404/409) are real answers —
-                # relay status and JSON body verbatim.
-                payload = exc.read().decode("utf-8")
-                exc.close()
-                self._send(exc.code, "application/json", payload)
-            except urllib.error.URLError:
-                # Fail securely: no stack traces, no target details beyond
-                # "the write path is down".
+            self._proxy(method, f"/backlog/{rest}", body)
+
+        # -- job lifecycle actions: a second, equally narrow proxy ----------
+        # archive/unarchive are POST-only and take no body; scope is exactly
+        # /api/jobs/{id}/archive|unarchive, never a general /jobs passthrough
+        # (see _JOBS_PROXY_PREFIX).
+
+        def _proxy_jobs(self, path: str) -> None:
+            if not (dispatch_url and dispatch_token):
                 self._send(
-                    502,
+                    501,
                     "application/json",
-                    json.dumps({"error": "dispatch service unreachable"}),
+                    json.dumps({"error": "job actions not configured"}),
                 )
+                return
+            rest = path[len(_JOBS_PROXY_PREFIX):]
+            parts = rest.split("/")
+            if len(parts) != 2 or parts[1] not in _JOBS_PROXY_ACTIONS:
+                self._send(404, "application/json", json.dumps({"error": "not found"}))
+                return
+            self._proxy("POST", f"/jobs/{rest}", b"")
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             parts = urlsplit(self.path)
@@ -469,7 +581,19 @@ def _make_handler(
             elif parts.path == "/":
                 self._send(200, "text/html", DASHBOARD_HTML)
             elif parts.path == "/api/state":
-                self._send(200, "application/json", json.dumps(collect_state(workspace)))
+                # ?archived=1 reveals archived jobs' activity/reports/backlog
+                # stories too; any other value (or its absence) keeps them
+                # hidden, mirroring the dispatch service's GET /jobs?archived=1.
+                include_archived = (
+                    parse_qs(parts.query).get("archived", ["0"])[0] == "1"
+                )
+                self._send(
+                    200,
+                    "application/json",
+                    json.dumps(
+                        collect_state(workspace, include_archived=include_archived)
+                    ),
+                )
             elif parts.path == "/api/report":
                 self._report(parts.query)
             elif parts.path == "/api/agent":
@@ -810,6 +934,16 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
 .board-err, .err { color: var(--critical); font-size: 12px; margin: 6px 0;
                    overflow-wrap: anywhere; }
 .chip.declined { border-style: dashed; color: var(--ink-3); text-decoration: line-through; }
+.chip.archived { border-style: dashed; color: var(--ink-3); }
+.section-head { display: flex; align-items: center; justify-content: space-between;
+                gap: 10px; margin: 24px 0 10px; flex-wrap: wrap; }
+.section-head h2 { margin: 0; }
+.archtoggle { display: flex; align-items: center; gap: 5px; font-size: 12px;
+              color: var(--ink-3); cursor: pointer; }
+.archbtn { background: none; border: 1px solid var(--line); border-radius: 6px;
+           color: var(--ink-2); font-size: 11px; padding: 2px 8px; cursor: pointer;
+           margin-left: 6px; }
+.archbtn:hover { color: var(--ink); border-color: var(--ink-3); }
 .story-form input, .story-form textarea {
   width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--inset); color: var(--ink); font: inherit; font-size: 13px;
@@ -851,11 +985,13 @@ details[open] summary .preview { display: none; }
 .list li:first-child { border-top: 0; }
 
 .report { display: block; width: 100%; text-align: left; background: none; border: none;
-          border-top: 1px solid var(--line-soft); border-radius: 4px; padding: 7px 4px;
+          border-radius: 4px; padding: 7px 4px;
           cursor: pointer; color: var(--accent); overflow-wrap: anywhere;
           font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; }
-.report:first-child { border-top: 0; }
 .report:hover { background: var(--accent-soft); }
+.report-row { display: flex; align-items: center; gap: 4px; border-top: 1px solid var(--line-soft); }
+.report-row:first-child { border-top: 0; }
+.report-row .report { flex: 1; }
 
 .overlay { position: fixed; inset: 0; z-index: 40; background: rgba(11, 11, 11, .45);
            display: flex; align-items: center; justify-content: center; padding: 24px; }
@@ -950,7 +1086,10 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
       </div>
       <ul class="feed" id="feed"><li class="muted">no events yet</li></ul>
     </div>
-    <h2>Runs</h2>
+    <div class="section-head">
+      <h2>Runs</h2>
+      <label class="archtoggle"><input type="checkbox" id="show-archived" aria-label="show archived jobs"> show archived</label>
+    </div>
     <div class="runs" id="runs"><div class="panel muted">no runs recorded</div></div>
   </div>
   <div>
@@ -1224,11 +1363,20 @@ function runChip(stage) {
   return chip("\\u25B6 running", "active");
 }
 
+// One archive/unarchive button, forwarded through the dashboard's own
+// /api/jobs/{id}/... proxy (the dispatch bearer token stays server-side).
+function archiveButton(id, archived) {
+  const action = archived ? "unarchive" : "archive";
+  return `<button class="archbtn" data-archjob="${esc(id)}" data-arch-action="${action}" title="${action} this job">${action}</button>`;
+}
+
 function runsPanel(s) {
   if (!s.runs.length) { put($("runs"), '<div class="panel muted">no runs recorded</div>'); return; }
+  const archivedSet = new Set(s.archived_jobs || []);
   put($("runs"), s.runs.map(r => {
     const cost = parseCost(r.last_message);
     const dur = (r.started != null && r.ended != null) ? fmtDur(r.ended - r.started) : "";
+    const isArchived = archivedSet.has(r.id);
     const meta = [
       dur && `<span title="started ${esc(absTime(r.started))}">${esc(dur)}</span>`,
       `<span>${esc(r.events)} event${r.events === 1 ? "" : "s"}</span>`,
@@ -1236,8 +1384,8 @@ function runsPanel(s) {
       `<span title="${esc(absTime(r.ended))}">${esc(ago(r.ended))}</span>`,
     ].filter(Boolean).join("");
     return `<div class="run${filters.run === r.id ? " selected" : ""}" data-run="${esc(r.id)}" role="button" tabindex="0" title="filter the activity feed to ${esc(r.id)}">
-      <div class="top"><code>${esc(r.id)}</code>${runChip(r.last_stage)}</div>
-      <div class="meta">${meta}</div>
+      <div class="top"><code>${esc(r.id)}</code>${runChip(r.last_stage)}${isArchived ? chip("archived", "archived") : ""}</div>
+      <div class="meta">${meta}${archiveButton(r.id, isArchived)}</div>
       ${r.last_message ? `<div class="msg" title="${esc(r.last_message)}">${esc(r.last_message)}</div>` : ""}
     </div>`;
   }).join(""));
@@ -1360,10 +1508,27 @@ function memory(s) {
     });
 }
 
+// The job id a report path is filed under (audit/<id>/...), if any — mirrors
+// the server's _report_job_id so archived reports get the same badge/button.
+function reportJobId(path) {
+  const parts = path.split("/");
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (parts[i] === "audit" && i + 1 < parts.length - 1) return parts[i + 1];
+  }
+  return null;
+}
+
 function reports(s) {
   if (!s.reports.length) { put($("reports"), '<span class="muted">no assessment reports</span>'); return; }
-  put($("reports"), s.reports.map(p =>
-    `<button class="report" data-path="${esc(p)}" title="open ${esc(p)}">${esc(p)}</button>`).join(""));
+  const archivedSet = new Set(s.archived_jobs || []);
+  put($("reports"), s.reports.map(p => {
+    const jobId = reportJobId(p);
+    const isArchived = jobId && archivedSet.has(jobId);
+    return `<div class="report-row">
+      <button class="report" data-path="${esc(p)}" title="open ${esc(p)}">${esc(p)}${isArchived ? " " + chip("archived", "archived") : ""}</button>
+      ${jobId ? archiveButton(jobId, isArchived) : ""}
+    </div>`;
+  }).join(""));
 }
 
 // ---- report modal ----
@@ -1707,14 +1872,30 @@ function toggleRun(id) {
   if (filters.run) $("activity-title").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+// ---- job archive / unarchive (forwarded via /api/jobs/{id}/... proxy) ----
+async function archiveJob(id, action) {
+  try {
+    const res = await fetch("/api/jobs/" + encodeURIComponent(id) + "/" + action, { method: "POST" });
+    if (!res.ok) throw new Error(String(res.status));
+    await refresh();
+  } catch (err) { showBoardError(action + " failed: " + err.message); }
+}
+
 // ---- wiring ----
 $("runs").addEventListener("click", e => {
+  const arch = e.target.closest("[data-archjob]");
+  if (arch) { archiveJob(arch.dataset.archjob, arch.dataset.archAction); return; }
   const card = e.target.closest("[data-run]");
   if (card) toggleRun(card.dataset.run);
 });
 $("runs").addEventListener("keydown", e => {
+  if (e.target.closest("[data-archjob]")) return; // a real <button>: handles its own Enter/Space
   const card = e.target.closest("[data-run]");
   if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleRun(card.dataset.run); }
+});
+$("show-archived").addEventListener("change", e => {
+  showArchived = e.target.checked;
+  refresh();
 });
 $("f-agent").addEventListener("change", e => {
   filters.agent = e.target.value;
@@ -1734,6 +1915,8 @@ $("f-clear").addEventListener("click", () => {
   syncClear();
 });
 $("reports").addEventListener("click", e => {
+  const arch = e.target.closest("[data-archjob]");
+  if (arch) { archiveJob(arch.dataset.archjob, arch.dataset.archAction); return; }
   const btn = e.target.closest("[data-path]");
   if (btn) openModal(btn.dataset.path);
 });
@@ -1811,9 +1994,11 @@ function beat(ok) {
   }
 }
 
+let showArchived = false;
+
 async function refresh() {
   try {
-    const res = await fetch("/api/state");
+    const res = await fetch("/api/state" + (showArchived ? "?archived=1" : ""));
     if (!res.ok) throw new Error(String(res.status));
     const s = await res.json();
     state = s;

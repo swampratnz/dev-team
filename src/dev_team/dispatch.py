@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .assessment import (
     AssessConfig,
@@ -236,6 +236,15 @@ class Dispatcher:
         # (make_backlog + the /backlog mutation API) all read-modify-write
         # the same file, and unserialised writers lose each other's updates.
         self._backlog_lock = threading.Lock()
+        # Serialises every load→mutate→save of a job's audit/<id>/meta.json
+        # archived marker. The worker thread writes meta.json exactly once,
+        # via _mirror_meta, while the job's registry state is still
+        # "running" (before _execute flips it to a terminal state) — and
+        # archive_job refuses a "running"/"queued" job below, so the worker
+        # and this lock's critical section never race each other. What this
+        # lock actually guards is concurrent archive/unarchive HTTP calls
+        # against the same job racing each other's read-modify-write.
+        self._meta_lock = threading.Lock()
         self._queue: "queue.Queue[Any]" = queue.Queue()
         self._seq = 0
         self._thread: Optional[threading.Thread] = None
@@ -421,12 +430,20 @@ class Dispatcher:
         with self._lock:
             return self._registry.get(job_id)
 
-    def recent(self) -> List[JobRecord]:
-        """The newest-first records, capped at :data:`_LIST_LIMIT`."""
+    def recent(self, *, include_archived: bool = False) -> List[JobRecord]:
+        """The newest-first records, capped at :data:`_LIST_LIMIT`.
+
+        Archived jobs (per their mirrored ``meta.json``) are excluded by
+        default; ``include_archived=True`` (``GET /jobs?archived=1``) reveals
+        them too.
+        """
 
         with self._lock:
             ordered = [self._registry[j] for j in self._order]
-        return list(reversed(ordered))[:_LIST_LIMIT]
+        records = list(reversed(ordered))
+        if not include_archived:
+            records = [r for r in records if not self._is_archived(r.spec.id)]
+        return records[:_LIST_LIMIT]
 
     def wait(self, job_id: str, timeout: float = 5.0) -> bool:
         """Block until ``job_id`` reaches a terminal state (test aid)."""
@@ -645,6 +662,82 @@ class Dispatcher:
             path, existing + json.dumps(entry) + "\n"
         )
 
+    # -- archive / unarchive (job lifecycle) ----------------------------------
+
+    def _meta_path(self, job_id: str) -> str:
+        return f"audit/{job_id}/meta.json"
+
+    def _read_meta(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Parsed ``meta.json`` for ``job_id``, or ``None`` if unavailable.
+
+        Fails closed exactly like :meth:`_exists`: a traversal-shaped id, a
+        job whose assessment was never mirrored, and a corrupt file are all
+        indistinguishable from "no such job" to the caller — never a 500.
+        """
+
+        if self._dashboard_workspace is None:
+            return None
+        path = self._meta_path(job_id)
+        if not self._exists(path):
+            return None
+        try:
+            return json.loads(self._dashboard_workspace.read_text(path))
+        except (OSError, ValueError, WorkspaceError):
+            return None
+
+    def _is_archived(self, job_id: str) -> bool:
+        """Whether ``job_id``'s mirrored ``meta.json`` is marked archived."""
+
+        meta = self._read_meta(job_id)
+        return bool(meta and meta.get("archived", False))
+
+    def _job_running(self, job_id: str) -> bool:
+        """Whether ``job_id`` is ``queued`` or ``running`` in the registry."""
+
+        with self._lock:
+            record = self._registry.get(job_id)
+            return record is not None and record.state not in _TERMINAL
+
+    def _set_archived(self, job_id: str, archived: bool) -> Tuple[int, Dict[str, Any]]:
+        """Shared core for archive/unarchive: flip the ``archived`` marker.
+
+        Requires a persisted ``meta.json`` (the same precondition every
+        other disk-keyed route enforces) — missing or corrupt is a 404, not
+        a 500. Archiving (never unarchiving) a job still ``queued`` or
+        ``running`` is refused with 409: its files are still being written
+        by the single-flight worker. Unarchiving a job that is not archived
+        is idempotent (200), matching every other idempotent mutation here.
+        """
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "archive needs a dashboard workspace"}
+        if archived and self._job_running(job_id):
+            return 409, {"error": "job is running"}
+        with self._meta_lock:
+            meta = self._read_meta(job_id)
+            if meta is None:
+                return 404, {"error": "no assessment for that job"}
+            if archived:
+                meta["archived"] = True
+                meta["archived_at"] = self._clock()
+            else:
+                meta.pop("archived", None)
+                meta.pop("archived_at", None)
+            self._dashboard_workspace.write_text(
+                self._meta_path(job_id), json.dumps(meta)
+            )
+        return 200, {"id": job_id, "archived": archived}
+
+    def archive_job(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /jobs/{id}/archive`` core."""
+
+        return self._set_archived(job_id, True)
+
+    def unarchive_job(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /jobs/{id}/unarchive`` core."""
+
+        return self._set_archived(job_id, False)
+
     def list_job_findings(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
         """The ``GET /jobs/{id}/findings`` core: the re-checkable claims.
 
@@ -698,9 +791,11 @@ class Dispatcher:
         Walks every ``audit/*/verifications.jsonl`` in the dashboard
         workspace, tolerantly parsing each line (a corrupt line is skipped,
         same as :meth:`verifications`), and rolls the union up with
-        :func:`calibration_summary`. ``jobs_counted`` is the number of files
-        that contributed at least one parseable line — a pure, $0, disk-only
-        aggregate, like :meth:`make_backlog`.
+        :func:`calibration_summary`. A job whose ``meta.json`` is marked
+        archived is skipped entirely — its verdicts must not skew the
+        rollup — and reappears once unarchived. ``jobs_counted`` is the
+        number of files that contributed at least one parseable line — a
+        pure, $0, disk-only aggregate, like :meth:`make_backlog`.
         """
 
         if self._dashboard_workspace is None:
@@ -711,6 +806,9 @@ class Dispatcher:
             if not path.startswith("audit/") or not path.endswith(
                 "/verifications.jsonl"
             ):
+                continue
+            parts = path.split("/")
+            if len(parts) == 3 and self._is_archived(parts[1]):
                 continue
             contributed = False
             for line in self._dashboard_workspace.read_text(path).splitlines():
@@ -1083,7 +1181,8 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             )
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
-            path = urlsplit(self.path).path
+            split = urlsplit(self.path)
+            path = split.path
             if path == "/health":
                 from . import __version__
 
@@ -1100,9 +1199,21 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 self._json(401, {"error": "unauthorized"})
                 return
             if path == "/jobs":
+                # ?archived=1 reveals archived jobs too; any other value (or
+                # its absence) keeps the default exclusion.
+                include_archived = (
+                    parse_qs(split.query).get("archived", ["0"])[0] == "1"
+                )
                 self._json(
                     200,
-                    {"jobs": [dispatcher.summary(r) for r in dispatcher.recent()]},
+                    {
+                        "jobs": [
+                            dispatcher.summary(r)
+                            for r in dispatcher.recent(
+                                include_archived=include_archived
+                            )
+                        ]
+                    },
                 )
                 return
             if path == "/backlog":
@@ -1144,6 +1255,18 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 # Synchronous on purpose: a pure disk transform (no agents,
                 # no queue slot needed) that answers in one round-trip.
                 status, payload = dispatcher.make_backlog(parts[1])
+                self._json(status, payload)
+                return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] in (
+                "archive",
+                "unarchive",
+            ):
+                # Same shape as .../backlog above: a pure disk transform,
+                # synchronous, no queue slot.
+                if parts[2] == "archive":
+                    status, payload = dispatcher.archive_job(parts[1])
+                else:
+                    status, payload = dispatcher.unarchive_job(parts[1])
                 self._json(status, payload)
                 return
             if parts[0] == "backlog":

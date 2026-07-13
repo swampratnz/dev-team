@@ -114,7 +114,8 @@ malformed JSON), `401`, `404` / `409` (verify — see below),
 
 ### `GET /jobs` (auth) — list
 
-Newest-first, capped at 25:
+Newest-first, capped at 25. Archived jobs (see *Archive / unarchive* below)
+are excluded by default; `?archived=1` includes them:
 
 ```json
 {"jobs":[{"id":"…","mode":"assess","repo":"…","state":"…",
@@ -176,6 +177,53 @@ Errors:
 Because it reads only the persisted JSON (never the in-memory registry),
 this endpoint keeps working for jobs that ran **before a service restart** —
 assess once, generate the backlog any time.
+
+## Archive / unarchive
+
+Test/demo runs and superseded re-assessments accumulate with no lifecycle —
+worse, a stale or fabricated verification pollutes the `GET /calibration`
+rollup. Archiving hides a job (and its stories/verdicts) from every listing
+without deleting anything: the data stays on disk and is fully restorable.
+**This is metadata-only** — permanent deletion (`DELETE /jobs/{id}`, backlog
+epic/story removal, transcript surgery) is explicitly out of scope; the
+pre-existing manual `rm -r` path is unchanged for that.
+
+### `POST /jobs/{id}/archive` (auth, no body)
+
+Sets `archived: true` (+ `archived_at`) on `audit/{id}/meta.json` — the same
+mirror `verify`/`make_backlog` already read, so no new store is introduced.
+
+→ `200 {"id":"assess-…","archived":true}`. Errors:
+
+- `404 {"error":"no assessment for that job"}` — no persisted `meta.json`
+  (predates the feature, was never mirrored, or the id is malformed/
+  traversal-shaped — a job id is never used to build a path outside its own
+  `audit/{id}/` directory).
+- `409 {"error":"job is running"}` — the job is `queued` or `running` in the
+  in-memory registry; its files are still being written by the single-flight
+  worker. Unarchiving has no such restriction.
+- `409 {"error":"archive needs a dashboard workspace"}` — no
+  `--dashboard-workspace` configured.
+- `401` — as everywhere.
+
+### `POST /jobs/{id}/unarchive` (auth, no body)
+
+Clears the marker. **Idempotent**: unarchiving a job that is not archived is
+still `200 {"id":"…","archived":false}`, not an error. Same 404/409-workspace
+errors as archive (never the running-job 409).
+
+### Effect elsewhere
+
+- `GET /jobs` and `GET /calibration` exclude an archived job (see above).
+- The dashboard's activity feed, Reports panel, and Kanban board (stories
+  carrying that job's `source_job`) exclude it too, with a "show archived"
+  toggle to reveal it again — see [`docs/DASHBOARD.md`](DASHBOARD.md).
+- Concurrency: archiving is guarded by the same rule that already protects
+  `meta.json` — the single-flight worker writes it exactly once, while the
+  job is still `queued`/`running`, and archiving a `queued`/`running` job is
+  refused above, so the worker and an archive/unarchive call never race.
+  What remains is concurrent archive/unarchive calls against the same job,
+  which the dispatcher serialises with a dedicated lock.
 
 ## Finding re-verification (mode `verify` + two read routes)
 
@@ -251,7 +299,10 @@ A pure, $0, disk-only aggregate over **every** persisted verification, not
 just one job's: walks `audit/*/verifications.jsonl` in the dashboard
 workspace, groups entries by the phase prefix of their `finding_id`
 (`"risk.secrets[0]"` → `risk`), and counts `confirmed`/`refuted`/
-`needs_context` per phase and overall.
+`needs_context` per phase and overall. A job marked archived (see
+*Archive / unarchive* above) is skipped entirely, so a stale or fabricated
+verification stops skewing the rollup the moment its job is archived, and
+resumes contributing the moment it is unarchived.
 
 ```json
 {"phases":{"risk":{"confirmed":6,"refuted":1,"needs_context":1,
