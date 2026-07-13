@@ -198,9 +198,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="ADDR",
         help="Bind address for --dashboard or --dispatch (default 127.0.0.1). "
-        "The dashboard has no authentication and can read any file the "
-        "workspace holds; the dispatch service authenticates but runs agent "
-        "code — only widen this on a trusted network.",
+        "The dashboard can read any file the workspace holds — set "
+        "DEV_TEAM_DASHBOARD_TOKEN when widening the bind (unauthenticated "
+        "non-local binds get a stderr warning); the dispatch service "
+        "authenticates but runs agent code — only widen this on a trusted "
+        "network.",
     )
     parser.add_argument(
         "--dashboard-workspace",
@@ -671,13 +673,37 @@ def _materialise_repo(args, default_workspace: str) -> None:
 _DASHBOARD_EXCLUDED_DIRS = DEFAULT_EXCLUDED_DIRS - {".dev_team"}
 
 
-def _serve_dashboard(args) -> int:
-    """Serve the workspace dashboard until interrupted; returns exit code."""
+#: Environment variable holding the dashboard's (opt-in) access token.
+#: When set, every dashboard route requires it — as a bearer header or via
+#: the browser login form (see ``dashboard.py``). Rotate by changing the
+#: value and restarting. Empty/unset keeps the dashboard open (localhost
+#: dev); this is a stopgap until an IdP (Auth0) integration lands.
+DASHBOARD_TOKEN_ENV = "DEV_TEAM_DASHBOARD_TOKEN"
 
+
+def _serve_dashboard(args) -> int:
+    """Serve the workspace dashboard until interrupted; returns exit code.
+
+    Unlike --dispatch, a missing token is not an error (localhost dev must
+    keep working), but binding beyond loopback without one earns a stderr
+    warning: the workspace — including any recorded transcripts — would be
+    readable by anyone who can reach the port.
+    """
+
+    token = os.environ.get(DASHBOARD_TOKEN_ENV, "")
+    host = args.host if args.host is not None else "127.0.0.1"
+    if not token and host not in ("127.0.0.1", "localhost"):
+        print(
+            f"WARNING: the dashboard on {host} is UNAUTHENTICATED - anyone "
+            "who can reach it can read the whole workspace (events, reports, "
+            f"transcripts). Set ${DASHBOARD_TOKEN_ENV} to require a token.",
+            file=sys.stderr,
+        )
     server = DashboardServer(
         LocalWorkspace(args.workspace, excluded_dirs=_DASHBOARD_EXCLUDED_DIRS),
-        host=args.host if args.host is not None else "127.0.0.1",
+        host=host,
         port=args.port if args.port is not None else 8737,
+        token=token or None,
     )
     print(
         f"dev-team dashboard for {args.workspace} at {server.url} "

@@ -11,14 +11,28 @@ read-only over the workspace, bound to localhost by default. It reads shared
 state from disk on every request, so it runs happily as a separate process
 next to (or without) an active delivery — start it once and leave it open.
 It serves live state, not secrets — but anything in the workspace is
-readable through it, so keep the bind address local unless the host is
-trusted.
+readable through it (transcripts carry raw assessed-repo content), so keep
+the bind address local unless the host is trusted.
+
+**Auth (stopgap).** Passing ``token=`` to :class:`DashboardServer` puts every
+route behind that token: ``Authorization: Bearer <token>`` for API callers,
+or a ``devteam_dash`` session cookie that a browser obtains by submitting
+the token to ``POST /login`` (and drops via ``POST /logout``). Comparisons
+are constant-time (:func:`hmac.compare_digest`), the token is never logged,
+reflected in a response, or accepted from a URL, and the cookie is
+``HttpOnly; SameSite=Strict``. The cookie value is the token itself —
+rotation is "change the env var and restart". This is a deliberate stopgap
+until an IdP (Auth0) lands; the seam a real integration replaces is
+``Handler._authorised`` plus the /login//logout flow. With no token the
+dashboard is exactly as open as before (localhost dev).
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import time
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlsplit
@@ -202,8 +216,32 @@ def agent_history(workspace: Workspace, role: str) -> List[Dict]:
     return history[-_HISTORY_LIMIT:]
 
 
-def _make_handler(workspace: Workspace) -> type:
-    """A request handler class bound to ``workspace``."""
+#: The session cookie a browser holds after ``POST /login``.
+_COOKIE_NAME = "devteam_dash"
+
+#: Upper bound on a ``/login`` form body; anything larger is rejected unread.
+_MAX_LOGIN_BODY = 4096
+
+
+def _tokens_match(provided: str, expected: str) -> bool:
+    """Constant-time equality over the full values (as UTF-8 bytes).
+
+    Bytes rather than str because :func:`hmac.compare_digest` refuses
+    non-ASCII text, and ``provided`` is attacker-controlled — a stray byte
+    must read as "no match", never become an exception.
+    """
+
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _make_handler(workspace: Workspace, token: Optional[str] = None) -> type:
+    """A request handler class bound to ``workspace``.
+
+    With ``token`` set, every route requires it — as a bearer header or as
+    the session cookie minted by ``POST /login``. ``None`` keeps every route
+    open (the pre-auth localhost-dev behaviour). ``_authorised`` is the seam
+    a later Auth0/IdP integration replaces.
+    """
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:  # noqa: A002
@@ -218,9 +256,94 @@ def _make_handler(workspace: Workspace) -> type:
             self.end_headers()
             self.wfile.write(payload)
 
+        # -- auth (stopgap; see the module docstring) -----------------------
+
+        def _authorised(self) -> bool:
+            """Whether this request may proceed: bearer header or cookie.
+
+            Mirrors the dispatch service's discipline: constant-time
+            comparison over the full value, and the token is never logged,
+            echoed into a response, or read from a URL.
+            """
+
+            if token is None:
+                return True
+            if _tokens_match(self.headers.get("Authorization", ""), f"Bearer {token}"):
+                return True
+            morsel = SimpleCookie(self.headers.get("Cookie", "")).get(_COOKIE_NAME)
+            return morsel is not None and _tokens_match(morsel.value, token)
+
+        def _reject(self, path: str) -> None:
+            """401 an unauthenticated request: JSON for the API, the login
+            page for anything a browser would render. Same body either way
+            the credentials are wrong — no detail leaks."""
+
+            if path.startswith("/api/"):
+                self._send(401, "application/json", json.dumps({"error": "unauthorized"}))
+            else:
+                self._send(401, "text/html", LOGIN_HTML)
+
+        def _redirect(self, cookie: Optional[str]) -> None:
+            """303 back to ``/``, optionally (re)setting the session cookie."""
+
+            self.send_response(303)
+            self.send_header("Location", "/")
+            if cookie is not None:
+                self.send_header("Set-Cookie", cookie)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _login(self) -> None:
+            """Exchange a form-posted token for the session cookie.
+
+            The body read is Content-Length-bounded (an oversized or absent
+            body is rejected unread) and the submitted value is compared in
+            constant time. Every failure yields the same 401 form with the
+            same generic note.
+            """
+
+            if token is None:
+                self._redirect(None)  # nothing to log in to; the page is open
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if not 0 < length <= _MAX_LOGIN_BODY:
+                self._send(401, "text/html", LOGIN_FAILED_HTML)
+                return
+            body = self.rfile.read(length).decode("utf-8", "replace")
+            submitted = parse_qs(body).get("token", [""])[0]
+            if not _tokens_match(submitted, token):
+                self._send(401, "text/html", LOGIN_FAILED_HTML)
+                return
+            self._redirect(
+                f"{_COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path=/"
+            )
+
+        def _logout(self) -> None:
+            """Drop the session cookie; ``/`` then shows the login form."""
+
+            self._redirect(
+                f"{_COOKIE_NAME}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/"
+            )
+
+        def do_POST(self) -> None:  # noqa: N802 (http.server API)
+            path = urlsplit(self.path).path
+            if path == "/login":
+                self._login()
+            elif path == "/logout":
+                self._logout()
+            elif not self._authorised():
+                self._reject(path)
+            else:
+                self._send(404, "text/plain", "not found")
+
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             parts = urlsplit(self.path)
-            if parts.path == "/":
+            if not self._authorised():
+                self._reject(parts.path)
+            elif parts.path == "/":
                 self._send(200, "text/html", DASHBOARD_HTML)
             elif parts.path == "/api/state":
                 self._send(200, "application/json", json.dumps(collect_state(workspace)))
@@ -260,10 +383,11 @@ def _make_handler(workspace: Workspace) -> type:
         # -- transcripts: a SENSITIVE surface -------------------------------
         # These two routes serve the raw system-prompt/prompt/response of each
         # agent call, which can include repository content (and any secrets in
-        # it). Access is tailnet-only for now (no dashboard auth yet); an auth
-        # layer is meant to wrap exactly these routes later. The read helpers
-        # sanitise every query param and gate on workspace membership (the
-        # traversal guard), mirroring /api/report.
+        # it). Run with a token whenever transcripts are enabled or the bind
+        # is non-local: _authorised gates these routes like everything else
+        # (an IdP replaces that seam later). The read helpers sanitise every
+        # query param and gate on workspace membership (the traversal guard),
+        # mirroring /api/report.
 
         def _transcripts(self, query: str) -> None:
             # A list is never an error: an empty list means "none recorded /
@@ -293,13 +417,25 @@ def _make_handler(workspace: Workspace) -> type:
 
 
 class DashboardServer:
-    """The dashboard HTTP server; read-only over one workspace."""
+    """The dashboard HTTP server; read-only over one workspace.
+
+    ``token`` (optional) puts every route behind bearer/cookie auth — see
+    the module docstring. Pick a URL/cookie-safe token (e.g. from
+    ``secrets.token_urlsafe``): the cookie value is the token verbatim.
+    """
 
     def __init__(
-        self, workspace: Workspace, *, host: str = "127.0.0.1", port: int = 8737
+        self,
+        workspace: Workspace,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 8737,
+        token: Optional[str] = None,
     ) -> None:
         self.workspace = workspace
-        self.httpd = ThreadingHTTPServer((host, port), _make_handler(workspace))
+        self.httpd = ThreadingHTTPServer(
+            (host, port), _make_handler(workspace, token)
+        )
 
     @property
     def url(self) -> str:
@@ -1189,3 +1325,69 @@ setInterval(refresh, 2500);
 </body>
 </html>
 """
+
+# --------------------------------------------------------------------------
+# The login page: what an unauthenticated browser gets instead of the
+# dashboard. Self-contained like the main page (inline CSS, no external
+# assets, light/dark via the same palette), one password field POSTed
+# form-encoded to /login. Built with .replace() on a __NOTE__ marker
+# (not .format(): the CSS braces would need escaping). The failure note is
+# deliberately generic — nothing about the expected token leaks.
+# --------------------------------------------------------------------------
+
+_LOGIN_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dev-team login</title>
+<style>
+:root {
+  --bg: #f6f6f4; --card: #ffffff; --line: #e5e4e0;
+  --ink: #0b0b0b; --ink-2: #52514e; --accent: #2a78d6; --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141413; --card: #212120; --line: #383835;
+    --ink: #ffffff; --ink-2: #c3c2b7; --accent: #3987e5;
+  }
+}
+* { box-sizing: border-box; margin: 0; }
+body { background: var(--bg); color: var(--ink);
+       font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+       min-height: 100vh; display: flex; align-items: center;
+       justify-content: center; padding: 24px; }
+form { background: var(--card); border: 1px solid var(--line);
+       border-radius: 12px; padding: 28px; width: min(360px, 100%); }
+h1 { font-size: 18px; letter-spacing: -.01em; margin-bottom: 4px; }
+h1 small { color: var(--ink-2); font-weight: 500; font-size: 13px; margin-left: 6px; }
+p { color: var(--ink-2); font-size: 13px; margin-bottom: 14px; }
+.err { color: var(--critical); font-weight: 600; }
+input { width: 100%; padding: 8px 10px; border: 1px solid var(--line);
+        border-radius: 8px; background: var(--bg); color: var(--ink);
+        font: inherit; margin-bottom: 12px; }
+button { width: 100%; padding: 8px 10px; border: 0; border-radius: 8px;
+         background: var(--accent); color: #fff; font: inherit;
+         font-weight: 600; cursor: pointer; }
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>dev-team<small>dashboard</small></h1>
+  <p>This dashboard requires an access token.</p>
+  __NOTE__
+  <input type="password" name="token" placeholder="access token"
+         autofocus autocomplete="current-password" aria-label="access token">
+  <button type="submit">Sign in</button>
+</form>
+</body>
+</html>
+"""
+
+#: The page an unauthenticated browser gets (401 body).
+LOGIN_HTML = _LOGIN_TEMPLATE.replace("__NOTE__", "")
+
+#: The same page after a failed ``POST /login`` — generic note, no detail.
+LOGIN_FAILED_HTML = _LOGIN_TEMPLATE.replace(
+    "__NOTE__", '<p class="err" role="alert">Invalid token.</p>'
+)

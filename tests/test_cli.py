@@ -809,8 +809,9 @@ def test_main_repo_finds_user_level_env_file_without_flags(
 class _FakeDashboardServer:
     instances = []
 
-    def __init__(self, workspace, *, host, port):
+    def __init__(self, workspace, *, host, port, token=None):
         self.workspace, self.host, self.port = workspace, host, port
+        self.token = token
         self.interrupted = False
         self.shut_down = False
         _FakeDashboardServer.instances.append(self)
@@ -830,6 +831,7 @@ class _FakeDashboardServer:
 def test_main_dashboard_serves_workspace(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
     _FakeDashboardServer.instances.clear()
+    monkeypatch.delenv("DEV_TEAM_DASHBOARD_TOKEN", raising=False)
     code = main(
         ["--dashboard", "--workspace", str(tmp_path), "--port", "9000",
          "--host", "0.0.0.0"],
@@ -849,8 +851,8 @@ def test_main_dashboard_defaults_and_ctrl_c(tmp_path, monkeypatch):
 
     original_init = _FakeDashboardServer.__init__
 
-    def interrupting_init(self, workspace, *, host, port):
-        original_init(self, workspace, host=host, port=port)
+    def interrupting_init(self, workspace, *, host, port, token=None):
+        original_init(self, workspace, host=host, port=port, token=token)
         self.interrupted = True
 
     monkeypatch.setattr(_FakeDashboardServer, "__init__", interrupting_init)
@@ -859,6 +861,57 @@ def test_main_dashboard_defaults_and_ctrl_c(tmp_path, monkeypatch):
     (server,) = _FakeDashboardServer.instances
     assert (server.host, server.port) == ("127.0.0.1", 8737)
     assert server.shut_down is True
+
+
+def test_main_dashboard_token_env_is_wired(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DASHBOARD_TOKEN", "dash-tok")
+    code = main(
+        ["--dashboard", "--workspace", str(tmp_path), "--host", "100.64.0.1"],
+        runner=None,
+    )
+    assert code == 0
+    (server,) = _FakeDashboardServer.instances
+    assert server.token == "dash-tok"
+    err = capsys.readouterr().err
+    assert "UNAUTHENTICATED" not in err  # a token silences the non-local nudge
+    assert "dash-tok" not in err  # the token itself is never printed
+
+
+def test_main_dashboard_warns_on_nonlocal_bind_without_token(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    monkeypatch.delenv("DEV_TEAM_DASHBOARD_TOKEN", raising=False)
+    code = main(
+        ["--dashboard", "--workspace", str(tmp_path), "--host", "0.0.0.0"],
+        runner=None,
+    )
+    assert code == 0  # a nudge, not a hard failure (back-compat)
+    (server,) = _FakeDashboardServer.instances
+    assert server.token is None
+    err = capsys.readouterr().err
+    assert "UNAUTHENTICATED" in err
+    assert "DEV_TEAM_DASHBOARD_TOKEN" in err
+
+
+def test_main_dashboard_local_bind_without_token_is_quiet(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    monkeypatch.delenv("DEV_TEAM_DASHBOARD_TOKEN", raising=False)
+    for host_args in ([], ["--host", "127.0.0.1"], ["--host", "localhost"]):
+        _FakeDashboardServer.instances.clear()
+        code = main(
+            ["--dashboard", "--workspace", str(tmp_path), *host_args],
+            runner=None,
+        )
+        assert code == 0
+        (server,) = _FakeDashboardServer.instances
+        assert server.token is None
+        assert "UNAUTHENTICATED" not in capsys.readouterr().err
 
 
 def test_main_dashboard_flag_validation():

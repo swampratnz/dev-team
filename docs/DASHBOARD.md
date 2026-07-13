@@ -44,15 +44,49 @@ line is skipped, never fatal. Library users can journal too — pass an
 ## Serving beyond localhost
 
 `--port` picks the port (default 8737); `--host 0.0.0.0` binds wider. The
-dashboard is **read-only but unauthenticated** — it exposes the event
-journal, backlog, memory, and any markdown report in the workspace to
-whoever can reach it. Keep the default localhost bind unless the network is
-trusted, or put it behind a reverse proxy that adds auth.
+dashboard is read-only but exposes the event journal, backlog, memory, any
+markdown report — and, when recording is enabled, the raw
+[agent transcripts](TRANSCRIPTS.md) — to whoever can reach it. **Set a
+token whenever the bind is non-local or transcripts are enabled.** Binding
+beyond loopback without one prints a stderr warning (it does not refuse, so
+existing localhost-adjacent setups keep working).
+
+## Authentication (opt-in token)
+
+Set `DEV_TEAM_DASHBOARD_TOKEN` before starting the dashboard and **every
+route requires it**:
+
+```bash
+DEV_TEAM_DASHBOARD_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
+  dev-team --dashboard --workspace /path/to/repo --host 100.x.y.z
+```
+
+- **Browsers** get a login page on any unauthenticated page request; a
+  correct token sets a `devteam_dash` session cookie
+  (`HttpOnly; SameSite=Strict; Path=/`) and redirects to the dashboard.
+  `POST /logout` clears it.
+- **API callers** send `Authorization: Bearer <token>`; unauthenticated
+  `/api/*` requests get `401 {"error": "unauthorized"}`.
+- Comparison is constant-time (`hmac.compare_digest`), the token is never
+  logged or reflected in a response, and it never appears in a URL. Pick a
+  URL/cookie-safe value (e.g. `secrets.token_urlsafe`) — the cookie value is
+  the token verbatim.
+- **Rotation:** change the env var and restart; existing cookies stop
+  working immediately.
+- Empty/unset keeps the dashboard **open**, exactly as before — for
+  localhost development only.
+
+This is a stopgap until an IdP (Auth0) integration lands; the seam it
+replaces is `Handler._authorised` (plus the `/login` flow) in
+`dashboard.py`.
 
 ## API
 
-Everything the page shows is plain JSON, usable by your own tooling:
+Everything the page shows is plain JSON, usable by your own tooling (add
+the bearer header when a token is set):
 
 - `GET /api/state` — the full dashboard state document.
 - `GET /api/report?path=audit/assessment.md` — a report's markdown (only
   paths the workspace actually lists are served).
+- `POST /login` (form field `token`) / `POST /logout` — the browser cookie
+  session lifecycle described above.

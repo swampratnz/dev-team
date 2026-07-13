@@ -7,11 +7,13 @@ surface per-agent in the dashboard's agent modal.
 
 > **Security — read this first.** A transcript contains the raw content of the
 > assessed/delivered repository (including any secrets committed to that repo)
-> and the model's verbatim reply. The dashboard is **unauthenticated and
-> tailnet-only today** (an Auth0 layer is planned; the transcript routes are
-> written as a clearly-delimited sensitive surface so auth can wrap them
-> cleanly). **Only enable recording on a trusted network**, and treat the
-> `.dev_team/transcripts/` directory as sensitive.
+> and the model's verbatim reply. **Whenever recording is enabled — or the
+> dashboard binds beyond localhost — set `DEV_TEAM_DASHBOARD_TOKEN`** so every
+> dashboard route (the transcript routes included) requires the token via
+> bearer header or the browser login cookie (see
+> [DASHBOARD.md](DASHBOARD.md#authentication-opt-in-token)). This token is a
+> stopgap until an Auth0/IdP layer lands. Keep the bind on a trusted network
+> regardless, and treat the `.dev_team/transcripts/` directory as sensitive.
 
 ## What it captures
 
