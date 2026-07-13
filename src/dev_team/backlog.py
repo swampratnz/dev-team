@@ -35,7 +35,16 @@ class Epic:
 
 @dataclass
 class Story:
-    """A single user story with an effort estimate in points."""
+    """A single user story with an effort estimate in points.
+
+    ``source_job`` and ``finding_id`` are optional provenance: stories bred
+    from an assessment's LLM findings carry the dispatch job that produced
+    the assessment and the finding's positional id (the exact id
+    :func:`~dev_team.assessment.list_findings` assigns), so a story can be
+    traced back to — and independently re-verified against — the claim it
+    came from. Deterministic findings (dead code, dependency scan) and
+    hand-written stories leave both ``None``.
+    """
 
     id: str
     title: str
@@ -43,6 +52,8 @@ class Story:
     estimate: int = 1
     status: ItemStatus = ItemStatus.TODO
     epic_id: Optional[str] = None
+    source_job: Optional[str] = None
+    finding_id: Optional[str] = None
 
 
 @dataclass
@@ -80,6 +91,9 @@ class Backlog:
         description: str = "",
         estimate: int = 1,
         epic_id: Optional[str] = None,
+        *,
+        source_job: Optional[str] = None,
+        finding_id: Optional[str] = None,
     ) -> Story:
         """Create and append a story with an auto-assigned id."""
 
@@ -91,6 +105,8 @@ class Backlog:
             description=description,
             estimate=estimate,
             epic_id=epic_id,
+            source_job=source_job,
+            finding_id=finding_id,
         )
         self.stories.append(story)
         return story
@@ -143,12 +159,18 @@ class Backlog:
 def _story_to_dict(story: Story) -> Dict[str, Any]:
     data = asdict(story)
     data["status"] = story.status.value
+    # The provenance fields are serialised only when set, so backlogs written
+    # before (or without) finding provenance keep their exact on-disk shape.
+    for key in ("source_job", "finding_id"):
+        if data[key] is None:
+            del data[key]
     return data
 
 
 def _story_from_dict(data: Dict[str, Any]) -> Story:
     payload = dict(data)
     payload["status"] = ItemStatus(payload.get("status", "todo"))
+    # Absent provenance keys (older backlog.json files) default to None.
     return Story(**payload)
 
 

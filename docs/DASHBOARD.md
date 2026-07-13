@@ -23,13 +23,33 @@ workspace on every request.
 | **The team** — one card per agent: persona, current stage, last message, how long ago | `.dev_team/events.jsonl` (journaled by every run) |
 | **Activity** — the newest events across all agents and engines | same journal |
 | **Runs** — recent runs with their last message and event counts | same journal |
-| **Backlog** — epics with story-point progress bars, story status chips (todo / ▶ in progress / ✓ done / ✕ blocked) | `.dev_team/backlog.json` |
+| **Backlog** — one epic **per assessed repository** ("Remediation — \<repo\>") with story-point progress bars and story status chips (todo / ▶ in progress / ✓ done / ✕ blocked); clickable stories (see below) | `.dev_team/backlog.json` |
 | **Memory** — run count, recent retrospectives, ADR titles | `.dev_team/memory.json` |
 | **House conventions** — the captured style summary | `.dev_team/conventions.json` |
 | **Reports** — every `audit/*.md`, viewable in place | the workspace tree |
 
 Stat tiles across the top summarise runs recorded, open/done/blocked
 stories, and time since the last activity.
+
+### Story detail (click a backlog story)
+
+Every backlog story is clickable (mouse or Enter/Space). The modal shows
+the story's full description, estimate, status, the epic it belongs to,
+and — when the story was generated from an assessment finding — where it
+came from:
+
+- A story bred from an **LLM finding** carries its source job and finding
+  id (`recommendation.plan[0]`, `risk.secrets[1]`, …) and shows a copyable
+  **`dev_team_verify <source_job> <finding_id>`** one-liner: it re-checks
+  that single claim with a fresh, skeptical agent against a clean clone,
+  fully independent of the auditor that wrote it.
+- A **deterministic** story (dependency scan, dead-code probe) is exact
+  program output, not a model claim — the modal says so and suggests
+  re-running the assessment to refresh it.
+
+Story titles and descriptions are repository-derived content; like reports
+and transcripts, the modal renders them escape-first, so markup or scripts
+inside a finding display as inert text.
 
 ## The event journal
 

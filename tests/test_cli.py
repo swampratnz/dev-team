@@ -755,6 +755,25 @@ def test_main_make_backlog_json_output_and_dedupe(tmp_path, capsys):
     }
 
 
+def test_main_make_backlog_uses_job_meta_for_per_repo_epic(tmp_path, capsys):
+    """With meta.json beside the assessment, stories get repo epic + provenance."""
+
+    ws = _persisted_assessment(tmp_path)
+    (ws / ".dev_team" / "meta.json").write_text(
+        json.dumps({"repo": "acme/rota", "mode": "assess", "id": "assess-7"})
+    )
+    assert main(["--make-backlog", str(ws), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "stories_added": 1,
+        "stories_total": 1,
+    }
+    stored = json.loads((ws / ".dev_team" / "backlog.json").read_text())
+    assert stored["epics"][0]["title"] == "Remediation — acme/rota"
+    (story,) = stored["stories"]
+    assert story["source_job"] == "assess-7"
+    assert story["finding_id"] == "recommendation.plan[0]"
+
+
 def test_main_make_backlog_missing_assessment_exits_2(tmp_path, capsys):
     code = main(["--make-backlog", str(tmp_path / "empty")])
     captured = capsys.readouterr()

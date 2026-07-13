@@ -931,6 +931,90 @@ def test_dict_to_backlog_from_a_json_round_trip():
     assert dict_to_backlog(payload, backlog) == []
 
 
+def test_dict_to_backlog_per_repo_epics_and_scoped_dedup():
+    """With a repo, each repository gets its own epic and its own dedup scope."""
+
+    from dev_team.backlog import Backlog
+
+    data = json.loads(json.dumps(outcome_to_dict(_findings_outcome())))
+    backlog = Backlog()
+    first = dict_to_backlog(data, backlog, repo="acme/one", source_job="assess-1")
+    assert [s.title for s in first] == _FINDINGS_TITLES
+    assert backlog.epics[0].title == "Remediation — acme/one"
+    assert backlog.epics[0].description == (
+        "From assessment of acme/one (classification: dependency-surgery)"
+    )
+    # A DIFFERENT repo gets its own epic: identical finding titles under
+    # another repo's epic are new stories, never suppressed.
+    second = dict_to_backlog(data, backlog, repo="acme/two", source_job="assess-2")
+    assert [s.title for s in second] == _FINDINGS_TITLES
+    assert [e.title for e in backlog.epics] == [
+        "Remediation — acme/one", "Remediation — acme/two",
+    ]
+    assert all(s.epic_id == backlog.epics[1].id for s in second)
+    # Re-assessing the SAME repo refreshes its epic: dedup within, no flood.
+    assert dict_to_backlog(data, backlog, repo="acme/one", source_job="assess-3") == []
+    assert len(backlog.epics) == 2
+    assert len(backlog.stories) == 2 * len(_FINDINGS_TITLES)
+    # A findings-free assessment of a repo still names its classification.
+    bare = Backlog()
+    assert dict_to_backlog(
+        outcome_to_dict(_bare_outcome()), bare, repo="acme/empty"
+    ) == []
+    assert bare.epics[0].description == (
+        "From assessment of acme/empty (classification: unclassified)"
+    )
+
+
+def test_dict_to_backlog_threads_finding_provenance():
+    """LLM-finding stories carry list_findings' exact ids; deterministic don't."""
+
+    from dev_team.assessment import list_findings
+    from dev_team.backlog import Backlog
+
+    data = outcome_to_dict(_findings_outcome())
+    stories = dict_to_backlog(data, Backlog(), repo="acme/one", source_job="assess-1")
+    by_title = {s.title: s for s in stories}
+    assert by_title["Pin build chain"].finding_id == "recommendation.plan[0]"
+    assert (
+        by_title["Fix build blocker: needs Windows"].finding_id
+        == "buildability.blockers[0]"
+    )
+    assert (
+        by_title["Upgrade or replace dependency Moq"].finding_id
+        == "risk.dependencies[0]"
+    )
+    assert (
+        by_title["Remove hardcoded secret: license committed"].finding_id
+        == "risk.secrets[0]"
+    )
+    # Every threaded id resolves against the finding enumerator — the two
+    # schemes cannot drift, so `--verify` / dev_team_verify can re-check it.
+    known = {f["id"] for f in list_findings(data)}
+    assert {s.finding_id for s in stories if s.finding_id is not None} <= known
+    assert all(s.source_job == "assess-1" for s in stories)
+    # Deterministic findings are exact program output, not model claims.
+    for title in (
+        "Remove dead code (orphaned-projects: 1 path(s))",
+        "Remove dead code (unreferenced-sources: 25 path(s))",
+        "Patch Moq 4.2.1409.1722: GHSA-1",
+    ):
+        assert by_title[title].finding_id is None
+
+
+def test_outcome_to_backlog_keeps_the_single_epic_without_repo_context():
+    """The wrapper stays back-compatible: no repo, no source job."""
+
+    from dev_team.backlog import Backlog
+
+    backlog = Backlog()
+    stories = outcome_to_backlog(_findings_outcome(), backlog)
+    assert backlog.epics[0].title == "Assessment remediation"
+    assert all(s.source_job is None for s in stories)
+    # finding ids are intrinsic to the finding, so they thread regardless
+    assert {s.finding_id for s in stories} > {None}
+
+
 # --- persisted structured result ---------------------------------------------------
 
 

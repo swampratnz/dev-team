@@ -801,9 +801,17 @@ def _make_backlog(args) -> int:
             "run --assess there first"
         )
     data = json.loads(workspace.read_text(ASSESSMENT_JSON_PATH))
+    # When job metadata sits beside the assessment (a dispatch-produced
+    # workspace), the stories get a per-repository epic and finding
+    # provenance; without it the historical single-epic behaviour holds.
+    repo = source_job = None
+    if workspace.exists(".dev_team/meta.json"):
+        meta = json.loads(workspace.read_text(".dev_team/meta.json"))
+        repo = meta.get("repo")
+        source_job = meta.get("id")
     store = BacklogStore(workspace)
     backlog = store.load()
-    added = dict_to_backlog(data, backlog)
+    added = dict_to_backlog(data, backlog, repo=repo, source_job=source_job)
     store.save(backlog)
     if args.json:
         print(

@@ -104,6 +104,74 @@ def test_collect_state_backlog_epics_points_and_orphans():
     assert [s["title"] for s in state["orphan_stories"]] == ["Loose story"]
 
 
+def test_collect_state_backlog_carries_story_detail_and_provenance():
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    backlog = store.load()
+    epic = backlog.add_epic(
+        "Remediation — acme/rota", "From assessment of acme/rota"
+    )
+    backlog.add_story(
+        "Remove hardcoded secret: connection string",
+        "Evidence: Web.config line 12",
+        estimate=1,
+        epic_id=epic.id,
+        source_job="assess-1",
+        finding_id="risk.secrets[0]",
+    )
+    backlog.add_story("Patch Moq 4.2: GHSA-1", "https://osv.dev/GHSA-1", epic_id=epic.id)
+    store.save(backlog)
+
+    state = collect_state(ws)["backlog"]
+    (epic_state,) = state["epics"]
+    # the epic's description reaches the page (the repo/classification line)
+    assert epic_state["description"] == "From assessment of acme/rota"
+    llm, deterministic = epic_state["stories"]
+    # the story modal needs the full description plus the re-verify hook ids
+    assert llm["description"] == "Evidence: Web.config line 12"
+    assert llm["source_job"] == "assess-1"
+    assert llm["finding_id"] == "risk.secrets[0]"
+    # deterministic stories surface None so the page shows the muted note
+    assert deterministic["source_job"] is None
+    assert deterministic["finding_id"] is None
+
+
+def test_dashboard_page_story_modal_desk_check():
+    """Static desk-check of the story-modal JS (CI has no browser).
+
+    Stories are repo-derived (assessment findings quote repository content),
+    so the load-bearing properties are pinned against the page source: rows
+    are keyboard-operable buttons, every story field flows through esc()
+    before innerHTML (a <script> in a description must render inert), the
+    dev_team_verify one-liner appears only when BOTH provenance ids exist,
+    and deterministic stories get the muted non-verifiable note.
+    """
+
+    # clickable, keyboard-operable story rows opening the modal
+    assert 'role="button" tabindex="0" data-story="${esc(st.id)}"' in DASHBOARD_HTML
+    assert "openStory(row.dataset.story)" in DASHBOARD_HTML
+    assert 'e.key === "Enter" || e.key === " "' in DASHBOARD_HTML
+    # escape-first rendering of the untrusted fields shown in the modal
+    assert "${st.description ? esc(st.description)" in DASHBOARD_HTML
+    assert "${esc(st.epic)}" in DASHBOARD_HTML
+    assert "${esc(st.source_job)}" in DASHBOARD_HTML
+    # the title bypasses innerHTML entirely (textContent never parses HTML)
+    assert '$("story-title").textContent = st.id' in DASHBOARD_HTML
+    # the re-verify hook requires BOTH ids and is escaped end to end
+    assert "if (st.finding_id && st.source_job)" in DASHBOARD_HTML
+    assert '"dev_team_verify " + st.source_job + " " + st.finding_id' in DASHBOARD_HTML
+    assert "<code>${esc(cmd)}</code>" in DASHBOARD_HTML
+    assert 'data-copy="${esc(cmd)}"' in DASHBOARD_HTML
+    # deterministic stories: the muted, non-verifiable note
+    assert "Deterministic finding (dependency/dead-code scan)" in DASHBOARD_HTML
+    assert "not agent-verifiable" in DASHBOARD_HTML
+    # modal chrome reuses the shared overlay machinery (close / Esc / outside)
+    assert 'id="story-overlay"' in DASHBOARD_HTML
+    assert 'id="story-close"' in DASHBOARD_HTML
+    assert "closeStory(); }" in DASHBOARD_HTML
+    assert "<title>dev-team dashboard</title>" in DASHBOARD_HTML
+
+
 def test_collect_state_empty_workspace_is_all_absent():
     state = collect_state(InMemoryWorkspace())
     assert state["backlog"]["present"] is False

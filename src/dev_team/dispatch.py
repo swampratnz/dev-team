@@ -489,8 +489,11 @@ class Dispatcher:
                 # backlog reuses the dedup-by-title logic — exactly what
                 # POST /jobs/{id}/backlog does later — so the panel shows
                 # the stories immediately and a re-assess refreshes instead
-                # of flooding.
-                self._merge_backlog(outcome_to_dict(outcome))
+                # of flooding. repo/source_job give the stories a
+                # per-repository epic and finding provenance.
+                self._merge_backlog(
+                    outcome_to_dict(outcome), repo=spec.repo, source_job=spec.id
+                )
         else:
             outcome = await team.deliver(
                 FeatureRequest(title=spec.title, description=spec.description),
@@ -650,16 +653,24 @@ class Dispatcher:
                     entries.append(json.loads(line))
         return 200, {"job_id": job_id, "verifications": entries}
 
-    def _merge_backlog(self, data: Dict[str, Any]) -> Tuple[int, int]:
+    def _merge_backlog(
+        self,
+        data: Dict[str, Any],
+        *,
+        repo: Optional[str] = None,
+        source_job: Optional[str] = None,
+    ) -> Tuple[int, int]:
         """Merge a serialised assessment into the dashboard-workspace backlog.
 
-        Returns ``(stories_added, stories_total)``. Callers guarantee a
-        dashboard workspace is configured.
+        ``repo``/``source_job`` flow into :func:`dict_to_backlog`: with a
+        repo the stories land under that repository's own epic and carry
+        finding provenance. Returns ``(stories_added, stories_total)``.
+        Callers guarantee a dashboard workspace is configured.
         """
 
         store = BacklogStore(self._dashboard_workspace)
         backlog = store.load()
-        added = dict_to_backlog(data, backlog)
+        added = dict_to_backlog(data, backlog, repo=repo, source_job=source_job)
         store.save(backlog)
         return len(added), len(backlog.stories)
 
@@ -680,7 +691,15 @@ class Dispatcher:
         if not self._dashboard_workspace.exists(path):
             return 404, {"error": "no assessment for that job"}
         data = json.loads(self._dashboard_workspace.read_text(path))
-        added, total = self._merge_backlog(data)
+        # meta.json (mirrored beside every assessment since verify landed)
+        # names the audited repo — that keys the per-repository epic. Older
+        # mirrors without it fall back to the single shared epic.
+        repo = None
+        meta_path = f"audit/{job_id}/meta.json"
+        if self._dashboard_workspace.exists(meta_path):
+            meta = json.loads(self._dashboard_workspace.read_text(meta_path))
+            repo = meta.get("repo")
+        added, total = self._merge_backlog(data, repo=repo, source_job=job_id)
         return 200, {
             "job_id": job_id,
             "stories_added": added,
