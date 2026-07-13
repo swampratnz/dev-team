@@ -262,6 +262,26 @@ def test_dashboard_page_story_modal_desk_check():
     assert "<title>dev-team dashboard</title>" in DASHBOARD_HTML
 
 
+def test_dashboard_html_calibration_panel_escapes_and_handles_empty():
+    """Static desk-check of the calibration panel JS (CI has no browser).
+
+    Pins: the panel is wired into the memory column next to House
+    conventions, every phase name and count flows through ``esc()`` before
+    ``innerHTML`` (a ``<script>``-named phase must render inert), an
+    ``overall`` row is always appended, and a zero-total rollup renders the
+    muted empty state rather than an empty table.
+    """
+
+    assert 'details("calibration", "Verdict calibration"' in DASHBOARD_HTML
+    assert "if (!cal.overall.total) return" in DASHBOARD_HTML
+    assert "no verifications recorded yet" in DASHBOARD_HTML
+    # every phase/overall row field passes through esc()
+    assert "<td>${esc(phase)}</td>" in DASHBOARD_HTML
+    assert "<td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td><td>${esc(b.needs_context)}</td>" in DASHBOARD_HTML
+    assert "<td>${esc(b.total)}</td><td>${esc(rate)}</td>" in DASHBOARD_HTML
+    assert 'calibrationRow("overall", cal.overall)' in DASHBOARD_HTML
+
+
 def test_collect_state_empty_workspace_is_all_absent():
     state = collect_state(InMemoryWorkspace())
     assert state["backlog"]["present"] is False
@@ -433,6 +453,157 @@ def test_report_job_id_extracts_the_owning_job_or_none():
     assert _report_job_id("sub/audit/deep.md") is None
 
 
+# --- calibration ---------------------------------------------------------------------
+
+
+def test_calibration_state_empty_workspace():
+    from dev_team.dashboard import _calibration_state
+
+    assert _calibration_state(InMemoryWorkspace()) == {
+        "phases": {},
+        "overall": {
+            "confirmed": 0, "refuted": 0, "needs_context": 0,
+            "total": 0, "confirm_rate": None,
+        },
+        "jobs_counted": 0,
+    }
+
+
+def _verification_line(finding_id, verdict):
+    return json.dumps({"finding_id": finding_id, "verdict": verdict})
+
+
+def test_calibration_state_excludes_archived_job_by_default():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"id": "assess-a", "archived": True}),
+    )
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        _verification_line("risk.secrets[0]", "confirmed") + "\n",
+    )
+    ws.write_text(
+        "audit/assess-b/verifications.jsonl",
+        _verification_line("risk.secrets[1]", "refuted") + "\n",
+    )
+
+    state = _calibration_state(ws)
+    assert state["jobs_counted"] == 1
+    assert state["phases"] == {
+        "risk": {
+            "confirmed": 0, "refuted": 1, "needs_context": 0,
+            "total": 1, "confirm_rate": 0.0,
+        }
+    }
+    assert state["overall"]["total"] == 1
+
+
+def test_calibration_state_include_archived_reveals_everything():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"id": "assess-a", "archived": True}),
+    )
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        _verification_line("risk.secrets[0]", "confirmed") + "\n",
+    )
+    ws.write_text(
+        "audit/assess-b/verifications.jsonl",
+        _verification_line("risk.secrets[1]", "refuted") + "\n",
+    )
+
+    state = _calibration_state(ws, include_archived=True)
+    assert state["jobs_counted"] == 2
+    assert state["phases"]["risk"] == {
+        "confirmed": 1, "refuted": 1, "needs_context": 0,
+        "total": 2, "confirm_rate": 0.5,
+    }
+    assert state["overall"]["total"] == 2
+
+
+def test_calibration_state_tolerates_corrupt_line_and_counts_the_rest():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        "{not json\n" + _verification_line("qa.tests[0]", "confirmed") + "\n",
+    )
+    state = _calibration_state(ws)
+    assert state["jobs_counted"] == 1
+    assert state["overall"] == {
+        "confirmed": 1, "refuted": 0, "needs_context": 0,
+        "total": 1, "confirm_rate": 1.0,
+    }
+
+
+def test_calibration_state_skips_blank_lines_and_uncontributing_files():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        "\n   \n" + _verification_line("qa.tests[0]", "confirmed") + "\n",
+    )
+    ws.write_text("audit/assess-b/verifications.jsonl", "{not json\n\n")
+
+    state = _calibration_state(ws)
+    assert state["jobs_counted"] == 1
+    assert state["overall"]["total"] == 1
+
+
+def test_calibration_state_excludes_out_of_contract_entries():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        "\n".join(
+            [
+                _verification_line("qa.tests[0]", "maybe"),  # bad verdict
+                _verification_line(None, "confirmed"),  # non-string finding_id
+                _verification_line("qa.tests[1]", "confirmed"),
+            ]
+        )
+        + "\n",
+    )
+    state = _calibration_state(ws)
+    assert state["overall"] == {
+        "confirmed": 1, "refuted": 0, "needs_context": 0,
+        "total": 1, "confirm_rate": 1.0,
+    }
+
+
+def test_collect_state_calibration_key_matches_calibration_state():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"id": "assess-a", "archived": True}),
+    )
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        _verification_line("risk.secrets[0]", "confirmed") + "\n",
+    )
+    ws.write_text(
+        "audit/assess-b/verifications.jsonl",
+        _verification_line("risk.secrets[1]", "refuted") + "\n",
+    )
+
+    for include_archived in (False, True):
+        state = collect_state(ws, include_archived=include_archived)
+        assert state["calibration"] == _calibration_state(
+            ws, include_archived=include_archived
+        )
+
+
 # --- agent history -----------------------------------------------------------------
 
 
@@ -519,6 +690,7 @@ def test_server_serves_the_page_and_state(server):
     assert headers["Content-Type"].startswith("application/json")
     state = json.loads(body)
     assert state["activity"][0]["message"] == "building"
+    assert set(state["calibration"]) == {"phases", "overall", "jobs_counted"}
 
 
 def test_server_serves_known_reports_only(server):

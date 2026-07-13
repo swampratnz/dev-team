@@ -26,6 +26,7 @@ workspace on every request.
 | **Backlog** — an interactive **Kanban board** per epic (one epic **per assessed repository**, "Remediation — \<repo\>"): four columns (To do / In progress / Blocked / Done) with per-column counts, a muted Declined row, story-point progress bars, dependency indicators, and clickable cards (see below) | `.dev_team/backlog.json` (writes via the dispatch proxy) |
 | **Memory** — run count, recent retrospectives, ADR titles | `.dev_team/memory.json` |
 | **House conventions** — the captured style summary | `.dev_team/conventions.json` |
+| **Verdict calibration** — per-phase and overall confirmed/refuted/needs-context counts and confirm rate | `audit/<id>/verifications.jsonl` (same aggregate as `GET /calibration`) |
 | **Reports** — every `audit/*.md`, viewable in place | the workspace tree |
 
 Runs, Reports, and the Kanban board all exclude **archived** jobs by
@@ -102,6 +103,19 @@ came from:
 Story titles and descriptions are repository-derived content; like reports
 and transcripts, the modal renders them escape-first, so markup or scripts
 inside a finding display as inert text.
+
+### Calibration
+
+The **Verdict calibration** panel (next to House conventions) shows the same
+rollup the dispatch service's `GET /calibration` computes (see
+[`docs/DISPATCH.md`](DISPATCH.md)) — a table of per-phase
+confirmed/refuted/needs-context counts and confirm rate, plus an overall
+row — computed in-process from `audit/<id>/verifications.jsonl` on the
+shared workspace tree rather than proxied to a running dispatch service, so
+it works even when the dashboard is running standalone. It respects the
+same archived-job exclusion and "show archived" toggle as the rest of the
+page, and renders a muted empty state until the first verification is
+recorded.
 
 ## The event journal
 

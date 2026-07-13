@@ -86,6 +86,14 @@ sections below are reconstructed from the repository history.
   `.dev_team/events.jsonl` — bounded, corruption-tolerant — which is what
   the dashboard reads. Library users get the same via `EventLog` composed
   into the engine `listener`.
+- **Verdict calibration panel** (`docs/DASHBOARD.md`): the dashboard now
+  renders the same per-phase/overall confirmed/refuted/needs-context rollup
+  `GET /calibration` computes, next to House conventions — computed
+  in-process from `audit/<id>/verifications.jsonl` on the shared workspace
+  tree rather than proxied to the dispatch service, so it works standalone.
+  Respects the same `include_archived` exclusion as the rest of the page;
+  a zero-verification workspace renders a muted empty state, not an empty
+  table.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /
