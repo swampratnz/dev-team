@@ -906,6 +906,9 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
 <div class="tiles" id="tiles"></div>
 <h2>The team</h2>
 <div class="agents" id="agents"></div>
+<h2>Backlog</h2>
+<div class="board-err" id="board-error" role="alert" hidden></div>
+<div class="panel" id="backlog"><span class="muted">no backlog yet</span></div>
 <div class="cols">
   <div>
     <h2 id="activity-title">Activity</h2>
@@ -921,9 +924,6 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
     <div class="runs" id="runs"><div class="panel muted">no runs recorded</div></div>
   </div>
   <div>
-    <h2>Backlog</h2>
-    <div class="board-err" id="board-error" role="alert" hidden></div>
-    <div class="panel" id="backlog"><span class="muted">no backlog yet</span></div>
     <h2>Memory &amp; conventions</h2>
     <div class="panel" id="memory"><span class="muted">no cross-run memory yet</span></div>
     <h2>Reports</h2>
