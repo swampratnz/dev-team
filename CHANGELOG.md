@@ -159,6 +159,15 @@ sections below are reconstructed from the repository history.
   dead-code probe) cited — a sampled audit can no longer read as a
   complete one. Evidence citations count whether agents return a string
   or a list of paths.
+- **Broken citation detection**: the report appendix and `--json`
+  (`broken_citations`) deterministically flag findings that cite a bare
+  file path (`Web.config`, `src/Api/Program.cs:42`) not present in the
+  repository — the opposite failure mode from blind spots, and the $0
+  automatic counterpart to the `--verify` re-check's "a citation that
+  doesn't exist is itself a result." No agent call, no filesystem read of
+  the cited path — pure set-membership against the already-enumerated file
+  list. Prose and multi-part citations are deliberately left unflagged to
+  keep the heuristic false-positive-free.
 
 ## [0.7.0] — Legacy-repo analysis: dead code, live CVEs, conventions, remote CI
 

@@ -33,7 +33,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Mapping, Optional, Sequence
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
 
 from .agents import (
     ArchitectAgent,
@@ -630,6 +630,7 @@ class AssessmentOutcome:
     backlog_stories: List[str] = field(default_factory=list)
     build_probe: BuildProbe = field(default_factory=BuildProbe)
     blind_spots: List[str] = field(default_factory=list)
+    broken_citations: Dict[str, List[str]] = field(default_factory=dict)
 
     @property
     def success(self) -> bool:
@@ -1131,6 +1132,7 @@ class AssessmentEngine:
             blind_spots=audit_blind_spots(
                 stats, phases, dead_code, ignore=self._blind_spot_ignores()
             ),
+            broken_citations=broken_citations(phases, self.workspace.list_files()),
         )
         outcome.report_markdown = render_report(outcome)
         return outcome
@@ -1167,6 +1169,7 @@ def outcome_to_dict(outcome: AssessmentOutcome) -> Dict:
         "dependency_scan": outcome.dependency_scan.to_dict(),
         "build_probe": outcome.build_probe.to_dict(),
         "blind_spots": list(outcome.blind_spots),
+        "broken_citations": dict(outcome.broken_citations),
         "detected_components": [vars(c) for c in outcome.detected_components],
         "conventions": (
             outcome.conventions.to_dict() if outcome.conventions is not None else None
@@ -1714,6 +1717,56 @@ def audit_blind_spots(
     ]
 
 
+#: Chars a bare relative path may contain — no whitespace, commas, or quoting.
+_BARE_PATH_CHARS_RE = re.compile(r"^[\w.\-/]+$")
+
+
+def _looks_like_bare_path(s: str) -> bool:
+    """True only for strings that read as an unambiguous bare relative path.
+
+    Deliberately conservative: prose evidence ("looked at the auth module"),
+    multi-part citations ("Web.config, see connection string"), and URLs are
+    left alone rather than risk becoming false positives in a false-positive
+    detector. Only citations this confident are ever flagged.
+    """
+
+    if not s or "://" in s or not _BARE_PATH_CHARS_RE.match(s):
+        return False
+    return "." in s or "/" in s
+
+
+def _strip_locator(s: str) -> str:
+    """Strip a trailing ``:123`` / ``#L123`` line-anchor before the existence check."""
+
+    return re.sub(r"(:\d+|#L\d+)$", "", s)
+
+
+def broken_citations(
+    phases: Dict[str, PhaseResult], files: Iterable[str]
+) -> Dict[str, List[str]]:
+    """Per-phase citations that look like a bare path but don't exist.
+
+    Mirrors :func:`audit_blind_spots`' shape and honesty: a citation this
+    precise that still doesn't resolve is strong evidence the claim itself
+    is unreliable, not just imprecisely cited.
+    """
+
+    known = set(files)
+    out: Dict[str, List[str]] = {}
+    for name, result in phases.items():
+        broken = sorted(
+            {
+                s
+                for s in _cited_strings(result.data)
+                if _looks_like_bare_path(_strip_locator(s))
+                and _strip_locator(s) not in known
+            }
+        )
+        if broken:
+            out[name] = broken
+    return out
+
+
 def _render_findings_for_prompt(phases: Dict[str, PhaseResult]) -> str:
     """Compact JSON-ish rendering of completed phases for downstream prompts."""
 
@@ -1917,6 +1970,17 @@ def render_report(outcome: AssessmentOutcome) -> str:
             "Audit blind spots — top-level directories no finding cited: "
             + ", ".join(f"`{name}/`" for name in outcome.blind_spots)
             + ". Treat them as unexamined, not as clean.",
+        ]
+    if outcome.broken_citations:
+        parts = "; ".join(
+            f"{phase}: " + ", ".join(f"`{c}`" for c in citations)
+            for phase, citations in outcome.broken_citations.items()
+        )
+        lines += [
+            "",
+            "Citations that don't resolve to a real file — "
+            + parts
+            + ". Treat the underlying claim as unconfirmed, not just imprecisely cited.",
         ]
     lines.append("")
     if outcome.dependency_scan.queried:
