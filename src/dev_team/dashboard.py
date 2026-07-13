@@ -39,6 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlsplit
 
+from .assessment import calibration_summary
 from .backlog import BacklogStore
 from .conventions import ConventionsStore
 from .eventlog import read_events
@@ -226,6 +227,42 @@ def _archived_job_ids(workspace: Workspace) -> frozenset:
     return frozenset(ids)
 
 
+def _calibration_state(workspace: Workspace, *, include_archived: bool = False) -> Dict:
+    """The dashboard's own copy of ``Dispatcher.calibration()``'s rollup.
+
+    Walks ``audit/<id>/verifications.jsonl`` straight off the shared
+    workspace tree — the same pattern :func:`_archived_job_ids` already
+    uses — rather than proxying to a possibly-absent dispatch service. Each
+    line is parsed the same corrupt-line-tolerant way ``_archived_job_ids``
+    tolerates a corrupt ``meta.json``: a bad line is skipped, never fatal.
+    A job in :func:`_archived_job_ids` is excluded unless
+    ``include_archived`` is set, mirroring the flag :func:`collect_state`
+    threads through every other panel.
+    """
+
+    archived = frozenset() if include_archived else _archived_job_ids(workspace)
+    entries: List[Dict] = []
+    jobs_counted = 0
+    for path in workspace.list_files():
+        if not path.startswith("audit/") or not path.endswith("/verifications.jsonl"):
+            continue
+        parts = path.split("/")
+        if len(parts) == 3 and parts[1] in archived:
+            continue
+        contributed = False
+        for line in workspace.read_text(path).splitlines():
+            if not line.strip():
+                continue
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                continue
+            contributed = True
+        if contributed:
+            jobs_counted += 1
+    return {**calibration_summary(entries), "jobs_counted": jobs_counted}
+
+
 def collect_state(
     workspace: Workspace,
     *,
@@ -260,6 +297,7 @@ def collect_state(
         "backlog": _backlog_state(workspace, hide=hide),
         "memory": _memory_state(workspace),
         "conventions": _conventions_state(workspace),
+        "calibration": _calibration_state(workspace, include_archived=include_archived),
         "reports": reports,
         "archived_jobs": sorted(archived),
         "include_archived": include_archived,
@@ -983,6 +1021,10 @@ details[open] summary .preview { display: none; }
 .list li { padding: 5px 0; border-top: 1px solid var(--line-soft); font-size: 13px;
            color: var(--ink-2); }
 .list li:first-child { border-top: 0; }
+.cal-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+.cal-table th, .cal-table td { text-align: left; padding: 4px 6px; border-top: 1px solid var(--line-soft); }
+.cal-table th { color: var(--ink-3); font-weight: 600; }
+.cal-table .cal-overall { font-weight: 600; }
 
 .report { display: block; width: 100%; text-align: left; background: none; border: none;
           border-radius: 4px; padding: 7px 4px;
@@ -1480,6 +1522,24 @@ function details(key, title, body, open) {
   return `<details data-key="${key}"${open ? " open" : ""}><summary>${title}</summary>${body}</details>`;
 }
 
+// One calibration table row: phase (or "overall") plus its verdict counts.
+// SECURITY: phase names come from persisted finding_ids (model-authored,
+// untrusted) — esc() before innerHTML, same as every other panel.
+function calibrationRow(phase, b) {
+  const rate = b.confirm_rate === null ? "\\u2014" : `${Math.round(b.confirm_rate * 100)}%`;
+  return `<tr${phase === "overall" ? ' class="cal-overall"' : ""}><td>${esc(phase)}</td>`
+    + `<td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td><td>${esc(b.needs_context)}</td>`
+    + `<td>${esc(b.total)}</td><td>${esc(rate)}</td></tr>`;
+}
+
+function calibrationPanel(cal) {
+  if (!cal.overall.total) return '<span class="muted">no verifications recorded yet</span>';
+  const rows = Object.keys(cal.phases).sort().map(p => calibrationRow(p, cal.phases[p])).join("")
+    + calibrationRow("overall", cal.overall);
+  return `<table class="cal-table"><thead><tr><th>phase</th><th>confirmed</th><th>refuted</th>`
+    + `<th>needs context</th><th>total</th><th>confirm rate</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
 function memory(s) {
   const el = $("memory");
   const parts = [];
@@ -1498,6 +1558,9 @@ function memory(s) {
     parts.push(details("conventions",
       `House conventions<span class="preview">${esc(s.conventions.summary)}</span>`,
       `<div class="det-body">${esc(s.conventions.summary)}</div>`, false));
+  }
+  if (s.calibration) {
+    parts.push(details("calibration", "Verdict calibration", calibrationPanel(s.calibration), false));
   }
   const html = parts.join("") || '<span class="muted">no cross-run memory yet</span>';
   const open = {};
