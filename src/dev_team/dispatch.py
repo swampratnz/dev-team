@@ -513,8 +513,16 @@ class Dispatcher:
         ``{"kind":"verify","success":false,…}``).
         """
 
+        # verify_finding drives the agent DIRECTLY, not through DevTeam, so it
+        # needs a concrete runner. In production self._runner is None (the real
+        # SDK runner is created lazily inside DevTeam); resolve it the same way
+        # the assess/deliver branch does — DevTeam(runner).runner returns the
+        # injected runner in tests and a real ClaudeAgentRunner otherwise. Done
+        # unconditionally (no `or`) so there is no in-dispatch branch to leave
+        # uncovered; the None->real fallback lives in DevTeam, already tested.
+        runner = DevTeam(self._runner, config=TeamConfig()).runner
         result = await verify_finding(
-            self._runner,
+            runner,
             workspace,
             spec.finding,
             budget=Budget(limit_usd=spec.budget_usd),
