@@ -1758,7 +1758,8 @@ def broken_citations(
             {
                 s
                 for s in _cited_strings(result.data)
-                if _looks_like_bare_path(s) and _strip_locator(s) not in known
+                if _looks_like_bare_path(_strip_locator(s))
+                and _strip_locator(s) not in known
             }
         )
         if broken:

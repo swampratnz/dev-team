@@ -1662,6 +1662,33 @@ def test_broken_citations_is_case_sensitive():
     assert broken_citations(phases, ["src/real.py"]) == {"risk": ["SRC/real.py"]}
 
 
+def test_broken_citations_flags_a_fabricated_path_with_a_line_locator():
+    phases = {
+        "risk": PhaseResult(
+            phase="risk",
+            role="security engineer",
+            data={"secrets": [{"claim": "x", "evidence": "Web.config:10"}]},
+        )
+    }
+    assert broken_citations(phases, ["src/real.py"]) == {"risk": ["Web.config:10"]}
+
+
+def test_broken_citations_no_false_positive_for_a_real_path_with_a_line_locator():
+    phases = {
+        "risk": PhaseResult(
+            phase="risk",
+            role="security engineer",
+            data={
+                "secrets": [
+                    {"claim": "x", "evidence": "src/Api/Program.cs:42"},
+                    {"claim": "y", "evidence": "app.py#L10"},
+                ]
+            },
+        )
+    }
+    assert broken_citations(phases, ["src/Api/Program.cs", "app.py"]) == {}
+
+
 def test_broken_citations_never_reads_the_filesystem_for_a_traversal_citation():
     class NoReadWorkspace(InMemoryWorkspace):
         def read_text(self, path):
