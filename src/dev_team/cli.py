@@ -17,7 +17,9 @@ from .assessment import (
     ASSESSMENT_JSON_PATH,
     AssessConfig,
     dict_to_backlog,
+    find_finding,
     outcome_to_dict,
+    verify_finding,
 )
 from .backlog import BacklogStore
 from .budget import Budget
@@ -39,7 +41,7 @@ from .report import (
     render_summary,
     result_to_dict,
 )
-from .sdk import AgentRunner, ChatBackend, ClaudeChatBackend
+from .sdk import AgentRunner, ChatBackend, ClaudeAgentRunner, ClaudeChatBackend
 from .sources import (
     clone_or_update,
     default_env_file,
@@ -275,6 +277,26 @@ def build_parser() -> argparse.ArgumentParser:
         "later. Standalone: not combined with other modes.",
     )
     parser.add_argument(
+        "--verify",
+        default=None,
+        metavar="DIR",
+        help="Re-check ONE finding of the assessment persisted in DIR "
+        "(.dev_team/assessment.json, written by every --assess run) against "
+        "the code: a fresh skeptical agent with read-only tools reads the "
+        "cited files, hunts for contradicting evidence, and answers "
+        "confirmed/refuted/needs-context with citations. Requires --finding "
+        "and Claude credentials (an agent runs). Standalone: not combined "
+        "with other modes.",
+    )
+    parser.add_argument(
+        "--finding",
+        default=None,
+        metavar="ID",
+        help="Which finding --verify re-checks: a finding id from the "
+        "persisted assessment (e.g. 'risk.secrets[0]') or a case-insensitive "
+        "substring of its claim text (first match wins).",
+    )
+    parser.add_argument(
         "--no-conventions",
         action="store_true",
         help="Do not persist the captured house-conventions profile "
@@ -432,6 +454,19 @@ def _validate_args(
             "--make-backlog is a standalone offline transform; it cannot be "
             "combined with --assess/--deliver/--chat/--dashboard/--dispatch"
         )
+    if args.verify is not None and (
+        args.assess or args.deliver or args.chat or args.dashboard
+        or args.dispatch or args.make_backlog is not None
+    ):
+        parser.error(
+            "--verify re-checks one persisted finding; it cannot be combined "
+            "with --assess/--deliver/--chat/--dashboard/--dispatch/"
+            "--make-backlog"
+        )
+    if args.verify is not None and args.finding is None:
+        parser.error("--verify requires --finding (a finding id or claim substring)")
+    if args.finding is not None and args.verify is None:
+        parser.error("--finding: only valid with --verify")
     if args.port is not None and not (args.dashboard or args.dispatch):
         parser.error("--port: only valid with --dashboard or --dispatch")
     if args.host is not None and not (args.dashboard or args.dispatch):
@@ -454,7 +489,7 @@ def _validate_args(
             parser.error("--json: not available with --chat (stdout is the conversation)")
     elif not (
         args.assess or args.dashboard or args.dispatch
-        or args.make_backlog is not None
+        or args.make_backlog is not None or args.verify is not None
     ):
         if args.title is None or args.description is None:
             parser.error("title and description are required (or use --chat)")
@@ -507,7 +542,9 @@ def _reject_deliver_only_flags(
         ("--remote-verify-status", args.remote_verify_status is not None),
         ("--remote-verify-trigger", args.remote_verify_trigger is not None),
     ]
-    if not args.assess:
+    if not (args.assess or args.verify is not None):
+        # An assessment and a finding re-verification both run metered agents
+        # against a real workspace, so a cost ceiling is legitimate for them.
         checks += [("--budget-usd", args.budget_usd is not None)]
     if not (args.assess or args.dashboard):
         checks += [
@@ -786,6 +823,53 @@ def _make_backlog(args) -> int:
     return 0
 
 
+async def _verify_one(args, runner: AgentRunner) -> int:
+    """Re-check one persisted assessment finding; returns the exit code.
+
+    Reads ``<DIR>/.dev_team/assessment.json`` (the ``--assess`` output),
+    resolves ``--finding`` by id or claim substring, and has a FRESH
+    skeptical agent — read-only tools, rooted at the assessed clone — try to
+    refute the claim. Unlike ``--make-backlog`` this RUNS AN AGENT, so it
+    sits behind the credential preflight and accepts ``--budget-usd``.
+
+    Exit code ``0``: a verdict was produced (``refuted`` is a *successful*
+    verification); ``1``: the verifier itself failed (budget, unusable
+    response); ``2`` (raised): no persisted assessment or no matching
+    finding.
+    """
+
+    workspace = LocalWorkspace(args.verify)
+    if not workspace.exists(ASSESSMENT_JSON_PATH):
+        raise DevTeamError(
+            f"no assessment.json in {args.verify}/.dev_team — "
+            "run --assess there first"
+        )
+    data = json.loads(workspace.read_text(ASSESSMENT_JSON_PATH))
+    finding = find_finding(data, args.finding)
+    if finding is None:
+        raise DevTeamError(
+            f"no finding matches {args.finding!r}; pass an id like "
+            "'risk.secrets[0]' or a substring of the claim text"
+        )
+    result = await verify_finding(
+        runner, workspace, finding, budget=Budget(limit_usd=args.budget_usd)
+    )
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0 if result["success"] else 1
+    if not result["success"]:
+        print(f"verification failed: {result['error']}")
+        return 1
+    print(f"{finding['id']} — {result['verdict']}")
+    print(f"claim: {finding['claim']}")
+    if result["rationale"]:
+        print(f"rationale: {result['rationale']}")
+    for citation in result["citations"]:
+        print(f"  - {citation['path']}: {citation['note']}")
+    print(f"cost: ${result['cost_usd']:.4f}")
+    return 0
+
+
 #: Environment variable holding the dispatch service's bearer token.
 DISPATCH_TOKEN_ENV = "DEV_TEAM_DISPATCH_TOKEN"
 
@@ -871,6 +955,13 @@ def _run(
         # This process runs real agents for submitted jobs, so credentials are
         # required (checked above unless a runner was injected).
         return _serve_dispatch(args, runner)
+
+    if args.verify is not None:
+        # Re-verification runs a real agent (hence the credential preflight
+        # above), but needs no DevTeam — one fresh skeptical verifier.
+        return asyncio.run(
+            _verify_one(args, runner or ClaudeAgentRunner(default_model=args.model))
+        )
 
     if args.repo is not None:
         _materialise_repo(args, parser.get_default("workspace"))

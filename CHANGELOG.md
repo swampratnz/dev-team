@@ -5,6 +5,30 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Finding re-verification
+- **A fresh skeptical agent can re-check any ONE persisted assessment
+  finding** against the code (`docs/ASSESSMENT.md`): `list_findings`
+  enumerates the LLM phases' claims from `.dev_team/assessment.json` with
+  positional ids (`risk.secrets[0]`; component deep-dives nest), and
+  `verify_finding` runs a security-engineer-disciplined verifier — never
+  the claim's author — with read-only tools (`Read`/`Grep`/`Glob`) and
+  refute-first instructions, returning exactly
+  `confirmed|refuted|needs-context` plus rationale and citations. The
+  claim under review is treated as untrusted (delimited) content;
+  out-of-contract verdicts degrade to `needs-context`. Deterministic
+  `dead_code`/`dependency_scan` outputs are excluded — they are program
+  results, not model claims.
+- **CLI**: `dev-team --verify DIR --finding <id-or-claim-substring>`
+  (`--json`, `--budget-usd`). Runs an agent, so it sits behind the
+  credential preflight — unlike `--make-backlog`.
+- **Dispatch** (`docs/DISPATCH.md`): a `verify` job mode (validated
+  synchronously against disk at submit time) plus
+  `GET /jobs/{id}/findings` and `GET /jobs/{id}/verifications`. Assess
+  runs now mirror `audit/<id>/meta.json` (repo identity) beside the
+  assessment JSON, and verify verdicts append to
+  `audit/<source>/verifications.jsonl` — all disk-keyed, so the whole
+  flow survives a service restart.
+
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the
   workspace** (`docs/DASHBOARD.md`): one card per agent with its current

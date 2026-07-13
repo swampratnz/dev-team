@@ -204,6 +204,68 @@ transform — `--make-backlog` exits with "no assessment.json … run --assess
 there first"; re-assess once to create the file. Opting out
 (`persist_result=False`) likewise forfeits the later, free path.
 
+## Re-verifying a finding (`--verify`)
+
+An audit's claims are model output — useful, cited, and still fallible. The
+re-verification path lets you take any ONE persisted finding and have a
+**fresh skeptical agent** re-check it against the code:
+
+```bash
+dev-team --assess --workspace /path/to/repo            # once, persisted
+dev-team --verify /path/to/repo --finding risk.secrets[0]
+dev-team --verify /path/to/repo --finding "connection string" --json
+```
+
+The verification model, deliberately adversarial:
+
+- **A fresh agent, never the author.** The re-check always runs under the
+  security engineer's evidence discipline ("if you cannot point at the code,
+  it is at most informational"), regardless of which role made the claim —
+  the original phase agent never gets to grade its own work.
+- **Refute-first.** The prompt instructs the verifier to read the cited
+  files and actively grep for *contradicting* evidence before accepting the
+  claim. A citation that doesn't exist is itself a result.
+- **Read-only, least privilege.** The verifier gets exactly
+  `Read`/`Grep`/`Glob` rooted at the workspace — it can inspect, never
+  mutate or execute.
+- **Untrusted input handling.** The claim under review is model-authored
+  text; it is passed inside a delimited block, and the agent's standing
+  instructions forbid following instructions found inside delimited
+  content.
+- **Closed verdict set.** The answer is exactly `confirmed`, `refuted`, or
+  `needs-context`, plus a rationale and `citations` (files the verifier
+  actually read). An out-of-contract verdict is downgraded to
+  `needs-context`, never promoted to a confirmation.
+
+**Finding ids** are positional paths into the persisted assessment:
+`inventory.findings[0]`, `buildability.blockers[2]`, `risk.secrets[0]`,
+`coverage.tests[1]`, `conventions.conventions[0]`,
+`recommendation.plan[3]`, and — for component deep-dives, which nest —
+`components.components[0].findings[1]`. `--finding` also accepts a
+case-insensitive substring of the claim text (first match wins). Each
+enumerated finding carries a short content hash of its claim so callers can
+detect a claim drifting between enumeration and verification.
+
+**Scope: LLM phases only.** Only the model-authored claim lists are
+re-verifiable. The deterministic outputs (`dead_code`, `dependency_scan`)
+are exact program results, not claims — re-checking them with a model would
+add noise, not confidence.
+
+Unlike `--make-backlog`, `--verify` **runs an agent**, so it needs Claude
+credentials and accepts `--budget-usd`. It is standalone (not combined with
+other modes) and requires `--finding`. Exit codes: `0` a verdict was
+produced (`refuted` is a *successful* verification), `1` the verifier
+itself failed (budget, unusable response), `2` no persisted assessment or
+no matching finding.
+
+The dispatch service exposes the same model remotely as a `verify` job mode
+plus `GET /jobs/{id}/findings` and `GET /jobs/{id}/verifications`; there the
+repository identity for the re-clone comes from `audit/<job-id>/meta.json`,
+written beside every mirrored assessment (see
+[`docs/DISPATCH.md`](DISPATCH.md)). In code:
+`list_findings(data)` / `find_finding(data, id_or_substring)` /
+`await verify_finding(runner, workspace, finding, budget=…)`.
+
 ## Library use
 
 ```python

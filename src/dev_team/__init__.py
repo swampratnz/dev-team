@@ -27,6 +27,7 @@ from .approval import (
 from .assessment import (
     ASSESSMENT_JSON_PATH,
     DEFAULT_EXCLUDE_GLOBS,
+    VERIFY_VERDICTS,
     AssessConfig,
     AssessmentEngine,
     AssessmentOutcome,
@@ -38,11 +39,14 @@ from .assessment import (
     audit_blind_spots,
     detect_components,
     dict_to_backlog,
+    find_finding,
     inventory_stats,
+    list_findings,
     outcome_to_backlog,
     outcome_to_dict,
     render_report,
     run_build_probe,
+    verify_finding,
 )
 from .conventions import (
     ConventionsProfile,
@@ -185,6 +189,10 @@ __all__ = [
     "outcome_to_backlog",
     "dict_to_backlog",
     "ASSESSMENT_JSON_PATH",
+    "list_findings",
+    "find_finding",
+    "verify_finding",
+    "VERIFY_VERDICTS",
     "render_report",
     "Component",
     "detect_components",

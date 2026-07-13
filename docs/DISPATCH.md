@@ -1,9 +1,10 @@
 # The dispatch service (`--dispatch`)
 
 An authenticated HTTP API that lets an external caller drive the team
-remotely: **submit** an assess or deliver job against a repository, **poll**
-its status, and **fetch** the result. It wraps the same code paths as
-`dev-team --assess` / `--deliver` — clone the repo, build a `DevTeam`, run it.
+remotely: **submit** an assess, deliver, or verify job against a repository,
+**poll** its status, and **fetch** the result. It wraps the same code paths
+as `dev-team --assess` / `--deliver` / `--verify` — clone the repo, build a
+`DevTeam` (or, for verify, one fresh skeptical agent), run it.
 
 ```bash
 DEV_TEAM_DISPATCH_TOKEN=$(openssl rand -hex 32) \
@@ -48,11 +49,16 @@ workspace) by default. Pass `--dashboard-workspace DIR` to the dispatch service
 and every job **also** journals its events into `DIR` under the same run id —
 so it shows up as its own run/agent-cards on a dashboard pointed at `DIR` — and
 an assess run mirrors its report to `DIR/audit/<job-id>/assessment.md` for the
-Reports panel **and its structured result to
-`DIR/audit/<job-id>/assessment.json`** (the exact `outcome_to_dict` shape).
-That JSON is the disk-keyed record `POST /jobs/{id}/backlog` reads later —
-the in-memory job registry is lost on a service restart, but the persisted
-assessments are not. The job's own workspace stays the source of truth; this
+Reports panel, **its structured result to
+`DIR/audit/<job-id>/assessment.json`** (the exact `outcome_to_dict` shape),
+and **its repo identity to `DIR/audit/<job-id>/meta.json`**
+(`{"repo","mode","id"}`). That JSON is the disk-keyed record
+`POST /jobs/{id}/backlog`, `GET /jobs/{id}/findings`, and the `verify` mode
+read later — the in-memory job registry is lost on a service restart, but
+the persisted assessments are not (`meta.json` is how a verify job knows
+which repository to re-clone after a restart). Verify verdicts append to
+`DIR/audit/<source-job-id>/verifications.jsonl`, which is what
+`GET /jobs/{id}/verifications` reads. The job's own workspace stays the source of truth; this
 is a read-only visibility copy (the shared backlog in `DIR` is the one
 deliberate exception — see `backlog` below). Point the dashboard and the
 dispatcher at the same `DIR` (e.g. `/opt/dev-team/workspace`) to watch
@@ -70,15 +76,23 @@ Base `http://<host>:<port>`. All bodies are JSON.
 
 ### `POST /jobs` (auth) — submit
 
-Body:
+Body (assess/deliver):
 
 ```json
 {"mode":"assess|deliver","repo":"owner/name or url",
  "title":"...","description":"...","budget_usd":10,"backlog":false}
 ```
 
-- `mode` must be `assess` or `deliver`.
-- `repo` is a GitHub `owner/name` slug or any git URL (must parse).
+Body (verify — see *Finding re-verification* below):
+
+```json
+{"mode":"verify","source_job":"assess-…","finding_id":"risk.secrets[0]",
+ "budget_usd":2}
+```
+
+- `mode` must be `assess`, `deliver`, or `verify`.
+- `repo` is a GitHub `owner/name` slug or any git URL (must parse). Not
+  sent for `verify` — the repo comes from the source job's `meta.json`.
 - `budget_usd` is `null` or a positive number.
 - `backlog` (optional, default `false`, must be a boolean): with `true` an
   assess job also converts its findings into stories — in the job's own
@@ -88,10 +102,14 @@ Body:
   generation can always be run after the fact via `POST /jobs/{id}/backlog`.
 - `deliver` requires a non-empty `title` and `description`.
 - `assess` defaults `title` to the repo slug and `description` to `""`.
+- `verify` requires a non-empty `source_job` and `finding_id`; it is
+  **validated synchronously against disk** at submit time (missing
+  assessment/finding → immediate `404`, no queue slot wasted).
 
 → `202 {"id":"assess-…","state":"queued","position":0}`. Errors:
 `400 {"error":…}` (bad mode/repo/budget, non-boolean backlog, missing title
-or description for deliver, malformed JSON), `401`,
+or description for deliver, missing source_job/finding_id for verify,
+malformed JSON), `401`, `404` / `409` (verify — see below),
 `503 {"error":"queue full"}`.
 
 ### `GET /jobs` (auth) — list
@@ -122,6 +140,10 @@ id → `404 {"error":"unknown job"}`.
   `"executive_summary":str,"report_path":str|null,"report_markdown":str,`
   `"cost_usd":num}`
 - **succeeded**, deliver: `{"kind":"deliver", …delivery fields…}`.
+- **succeeded**, verify:
+  `{"kind":"verify","source_job":str,"finding_id":str,`
+  `"verdict":"confirmed|refuted|needs-context","rationale":str,`
+  `"citations":[{"path":str,"note":str}],"cost_usd":num}`.
 - **failed**: `{"kind":<mode>,"success":false,"error":str,"cost_usd":0}`.
 - still **queued/running**: `409 {"error":"not finished","state":<state>}`.
 - unknown id → `404`.
@@ -154,6 +176,74 @@ Errors:
 Because it reads only the persisted JSON (never the in-memory registry),
 this endpoint keeps working for jobs that ran **before a service restart** —
 assess once, generate the backlog any time.
+
+## Finding re-verification (mode `verify` + two read routes)
+
+An assess job's claims are model output. The `verify` mode has a **fresh
+skeptical agent** re-check ONE persisted finding against a fresh clone of
+the source job's repository: read-only tools, refute-first instructions, a
+closed `confirmed|refuted|needs-context` verdict set with citations. The
+full verification model (fresh agent ≠ original author, LLM-phases-only
+scope, untrusted-claim handling) is documented in
+[`docs/ASSESSMENT.md`](ASSESSMENT.md).
+
+Everything is **disk-keyed** off the dashboard workspace — never the
+in-memory registry — so it all survives a service restart:
+`audit/<id>/assessment.json` (the findings), `audit/<id>/meta.json` (which
+repo to re-clone), `audit/<id>/verifications.jsonl` (the verdict history).
+All three routes therefore answer
+`409 {"error":"… needs a dashboard workspace"}` when the service was
+started without `--dashboard-workspace`, and jobs assessed **before this
+feature existed** lack `meta.json` and answer
+`404 {"error":"no assessment for that job"}` on submit — re-assess once to
+record it.
+
+### `GET /jobs/{id}/findings` (auth) — enumerate re-checkable claims
+
+```json
+{"job_id":"assess-…","findings":[
+  {"id":"risk.secrets[0]","phase":"risk","role":"security-engineer",
+   "claim":"connection string committed","evidence":"Web.config",
+   "hash":"1f0c94ab23de"}]}
+```
+
+Positional ids (`phase.list[i]`; component deep-dives nest as
+`components.components[i].findings[j]`); only phases that completed are
+enumerated, and the deterministic `dead_code`/`dependency_scan` outputs are
+excluded (exact program results, not model claims). `hash` is a short
+content hash of the claim so a caller can spot drift between enumeration
+and verification. `404 {"error":"no assessment for that job"}` when
+`audit/{id}/assessment.json` is absent.
+
+### `POST /jobs` with `{"mode":"verify",…}` — submit a re-check
+
+`{"mode":"verify","source_job":<assess job id>,"finding_id":<finding id or
+case-insensitive claim substring>,"budget_usd":number|null}` →
+`202 {"id":"verify-…","state":"queued","position":n}`. The finding is
+resolved synchronously at submit time and the job re-clones the repo named
+by the source job's `meta.json`. Errors: `400` (missing/blank
+`source_job`/`finding_id`), `404 {"error":"no assessment for that job"}`,
+`404 {"error":"finding not found"}`,
+`409 {"error":"verify needs a dashboard workspace"}`.
+
+The job then flows through the normal machinery: single-flight queue,
+`GET /jobs/{id}` status, and `GET /jobs/{id}/result` (shapes above — a
+verifier that itself fails is a failed job:
+`{"kind":"verify","success":false,…}`; a `refuted` verdict is a
+*successful* verification).
+
+### `GET /jobs/{source-id}/verifications` (auth) — verdict history
+
+```json
+{"job_id":"assess-…","verifications":[
+  {"finding_id":"risk.secrets[0]","verdict":"confirmed","rationale":"…",
+   "citations":[{"path":"Web.config","note":"…"}],"cost_usd":0.04,
+   "ts":1789345678.0}]}
+```
+
+Chronological (append order under the single-flight worker); empty list for
+an assessed job never verified; `404 {"error":"no assessment for that
+job"}` for an unknown id.
 
 ## Deployment
 
