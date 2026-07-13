@@ -61,6 +61,14 @@ sections below are reconstructed from the repository history.
   assessment JSON, and verify verdicts append to
   `audit/<source>/verifications.jsonl` — all disk-keyed, so the whole
   flow survives a service restart.
+- **Verdict calibration** (`docs/DISPATCH.md`): `GET /calibration`, a pure,
+  $0, disk-only aggregate rolling up every persisted
+  `audit/*/verifications.jsonl` across jobs into per-phase and overall
+  `confirmed`/`refuted`/`needs_context` counts with a `confirm_rate` —
+  the cross-job rollup `docs/VISION.md` names as the verdict-calibration
+  gap left after per-job re-verification (PR #25) shipped. No agent calls;
+  an out-of-contract verdict or non-string `finding_id` is dropped, not
+  trusted, same as the write-time fail-secure posture.
 
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the

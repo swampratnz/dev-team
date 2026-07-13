@@ -47,6 +47,7 @@ from urllib.parse import urlsplit
 
 from .assessment import (
     AssessConfig,
+    calibration_summary,
     dict_to_backlog,
     find_finding,
     list_findings,
@@ -691,6 +692,39 @@ class Dispatcher:
                     continue
         return 200, {"job_id": job_id, "verifications": entries}
 
+    def calibration(self) -> Tuple[int, Dict[str, Any]]:
+        """The ``GET /calibration`` core: verdict calibration, across every job.
+
+        Walks every ``audit/*/verifications.jsonl`` in the dashboard
+        workspace, tolerantly parsing each line (a corrupt line is skipped,
+        same as :meth:`verifications`), and rolls the union up with
+        :func:`calibration_summary`. ``jobs_counted`` is the number of files
+        that contributed at least one parseable line — a pure, $0, disk-only
+        aggregate, like :meth:`make_backlog`.
+        """
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "calibration needs a dashboard workspace"}
+        entries: List[Dict[str, Any]] = []
+        jobs_counted = 0
+        for path in self._dashboard_workspace.list_files():
+            if not path.startswith("audit/") or not path.endswith(
+                "/verifications.jsonl"
+            ):
+                continue
+            contributed = False
+            for line in self._dashboard_workspace.read_text(path).splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except ValueError:
+                    continue
+                contributed = True
+            if contributed:
+                jobs_counted += 1
+        return 200, {**calibration_summary(entries), "jobs_counted": jobs_counted}
+
     def _merge_backlog(
         self,
         data: Dict[str, Any],
@@ -1073,6 +1107,10 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             if path == "/backlog":
                 status, payload = dispatcher.board()
+                self._json(status, payload)
+                return
+            if path == "/calibration":
+                status, payload = dispatcher.calibration()
                 self._json(status, payload)
                 return
             parts = path.strip("/").split("/")

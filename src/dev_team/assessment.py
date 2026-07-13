@@ -1484,6 +1484,66 @@ def find_finding(data: Dict, finding_id: str) -> Optional[Dict]:
 #: The only verdicts a re-verification may return.
 VERIFY_VERDICTS = ("confirmed", "refuted", "needs-context")
 
+
+def phase_from_finding_id(finding_id: str) -> str:
+    """The phase prefix of a finding id (``"risk.secrets[0]"`` -> ``"risk"``).
+
+    Finding ids are ``phase.list[i]`` (or, for component deep-dives,
+    ``components.components[i].findings[j]``) — the phase is always the text
+    before the first ``.``. A malformed id with no ``.`` (should never happen
+    for an id :func:`list_findings` minted, but this reads persisted
+    verification entries, which are untrusted) returns itself unchanged
+    rather than raising.
+    """
+
+    phase, sep, _rest = finding_id.partition(".")
+    return phase if sep else finding_id
+
+
+def calibration_summary(entries: List[Dict]) -> Dict:
+    """Roll up persisted verification entries into a per-phase calibration.
+
+    Groups by :func:`phase_from_finding_id` and counts
+    ``confirmed``/``refuted``/``needs_context`` per phase (using the closed
+    :data:`VERIFY_VERDICTS` set) plus an ``overall`` rollup, each with a
+    ``confirm_rate`` of ``confirmed / total`` (``None`` when ``total`` is 0).
+
+    An entry with a non-string/missing ``finding_id``, a verdict outside
+    ``VERIFY_VERDICTS``, or that is not itself a dict, is dropped rather than
+    trusted — the same fail-secure posture :func:`verify_finding` applies at
+    write time, re-applied here at read time: an out-of-contract verdict must
+    never inflate a count.
+    """
+
+    def _bucket() -> Dict[str, int]:
+        return {"confirmed": 0, "refuted": 0, "needs_context": 0, "total": 0}
+
+    phases: Dict[str, Dict[str, int]] = {}
+    overall = _bucket()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        finding_id = entry.get("finding_id")
+        verdict = entry.get("verdict")
+        if not isinstance(finding_id, str) or verdict not in VERIFY_VERDICTS:
+            continue
+        key = verdict.replace("-", "_")
+        bucket = phases.setdefault(phase_from_finding_id(finding_id), _bucket())
+        bucket[key] += 1
+        bucket["total"] += 1
+        overall[key] += 1
+        overall["total"] += 1
+    result_phases = {}
+    for name, bucket in phases.items():
+        bucket["confirm_rate"] = (
+            bucket["confirmed"] / bucket["total"] if bucket["total"] else None
+        )
+        result_phases[name] = bucket
+    overall["confirm_rate"] = (
+        overall["confirmed"] / overall["total"] if overall["total"] else None
+    )
+    return {"phases": result_phases, "overall": overall}
+
 VERIFY_PROMPT = """\
 Independent re-verification of ONE finding from an earlier repository audit.
 You did not write this finding; a different agent did, and it may be wrong.
