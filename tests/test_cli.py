@@ -793,6 +793,176 @@ def test_main_assess_persists_result_then_make_backlog_generates(tmp_path, capsy
     assert payload["stories_total"] == payload["stories_added"]
 
 
+# --- --verify / --finding -----------------------------------------------------------
+
+
+def _verify_runner(payload=None):
+    from dev_team.testing import json_response
+
+    payload = payload or {
+        "verdict": "confirmed",
+        "rationale": "read the file",
+        "citations": [{"path": "global.json", "note": "pin present"}],
+    }
+    return ScriptedRunner(
+        by_system_prompt={"application security engineer": json_response(payload)}
+    )
+
+
+def test_main_verify_text_output(tmp_path, capsys):
+    ws = _persisted_assessment(tmp_path)
+    code = main(
+        ["--verify", str(ws), "--finding", "recommendation.plan[0]"],
+        runner=_verify_runner(),
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "recommendation.plan[0] — confirmed" in out
+    assert "claim: Pin build chain" in out
+    assert "rationale: read the file" in out
+    assert "  - global.json: pin present" in out
+    assert "cost: $0.0000" in out
+
+
+def test_main_verify_json_output_and_claim_substring(tmp_path, capsys):
+    ws = _persisted_assessment(tmp_path)
+    code = main(
+        ["--verify", str(ws), "--finding", "pin BUILD", "--json"],
+        runner=_verify_runner(),
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["success"] is True
+    assert payload["verdict"] == "confirmed"
+    assert payload["finding_id"] == "recommendation.plan[0]"
+    assert payload["citations"] == [{"path": "global.json", "note": "pin present"}]
+
+
+def test_main_verify_refuted_without_rationale_or_citations(tmp_path, capsys):
+    ws = _persisted_assessment(tmp_path)
+    code = main(
+        ["--verify", str(ws), "--finding", "Pin build chain"],
+        runner=_verify_runner({"verdict": "refuted", "rationale": "", "citations": []}),
+    )
+    out = capsys.readouterr().out
+    assert code == 0  # "refuted" is a successful verification
+    assert "recommendation.plan[0] — refuted" in out
+    assert "rationale:" not in out
+
+
+def test_main_verify_accepts_budget_and_runs_read_only(tmp_path):
+    ws = _persisted_assessment(tmp_path)
+    runner = _verify_runner()
+    code = main(
+        ["--verify", str(ws), "--finding", "pin build", "--budget-usd", "5"],
+        runner=runner,
+    )
+    assert code == 0
+    (call,) = runner.calls
+    assert tuple(call["allowed_tools"]) == ("Read", "Grep", "Glob")
+    assert call["cwd"] == str(ws.resolve())  # rooted at the assessed clone
+
+
+def test_main_verify_agent_failure_exits_1(tmp_path, capsys):
+    ws = _persisted_assessment(tmp_path)
+    runner = ScriptedRunner(
+        by_system_prompt={"application security engineer": "not json"}
+    )
+    code = main(["--verify", str(ws), "--finding", "pin build"], runner=runner)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "verification failed:" in out
+    # and the --json flavour keeps the exit code
+    code = main(
+        ["--verify", str(ws), "--finding", "pin build", "--json"],
+        runner=ScriptedRunner(
+            by_system_prompt={"application security engineer": "not json"}
+        ),
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["success"] is False
+
+
+def test_main_verify_missing_assessment_exits_2(tmp_path, capsys):
+    code = main(
+        ["--verify", str(tmp_path / "empty"), "--finding", "x"],
+        runner=ScriptedRunner([]),
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "no assessment.json" in captured.err
+    assert "--assess" in captured.err
+    assert captured.out == ""
+
+
+def test_main_verify_unmatched_finding_exits_2(tmp_path, capsys):
+    ws = _persisted_assessment(tmp_path)
+    code = main(
+        ["--verify", str(ws), "--finding", "no such claim"],
+        runner=ScriptedRunner([]),
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "no finding matches" in captured.err
+    assert "risk.secrets[0]" in captured.err  # the error teaches the id shape
+
+
+def test_main_verify_flag_validation():
+    for argv in (
+        ["--verify", ".", "--finding", "x", "--assess"],
+        ["--verify", ".", "--finding", "x", "--deliver"],
+        ["--verify", ".", "--finding", "x", "--chat"],
+        ["--verify", ".", "--finding", "x", "--dashboard"],
+        ["--verify", ".", "--finding", "x", "--dispatch"],
+        ["--verify", ".", "--finding", "x", "--make-backlog", "."],
+        ["--verify", "."],                       # --finding is required
+        ["T", "D", "--finding", "x"],            # --finding needs --verify
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main(argv, runner=ScriptedRunner([]))
+        assert excinfo.value.code == 2
+
+
+def test_main_verify_requires_credentials(monkeypatch, tmp_path, capsys):
+    # Unlike --make-backlog, --verify RUNS AN AGENT → the preflight applies.
+    _no_credentials(monkeypatch, tmp_path)
+    ws = _persisted_assessment(tmp_path)
+    code = main(["--verify", str(ws), "--finding", "pin build"])  # no runner
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "claude setup-token" in captured.err
+
+
+def test_main_verify_builds_real_runner_when_none_injected(
+    monkeypatch, tmp_path, capsys
+):
+    from dev_team.sdk import ClaudeAgentRunner
+
+    ws = _persisted_assessment(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    seen = {}
+
+    async def fake_verify(runner, workspace, finding, *, budget=None, **kwargs):
+        seen["runner"] = runner
+        return {
+            "success": True,
+            "verdict": "needs-context",
+            "rationale": "",
+            "citations": [],
+            "finding_id": finding["id"],
+            "source_job": None,
+            "cost_usd": 0.0,
+        }
+
+    monkeypatch.setattr("dev_team.cli.verify_finding", fake_verify)
+    code = main(["--verify", str(ws), "--finding", "pin build", "--model", "opus"])
+    assert code == 0
+    assert isinstance(seen["runner"], ClaudeAgentRunner)
+    assert seen["runner"].default_model == "opus"
+    assert "needs-context" in capsys.readouterr().out
+
+
 # --- --repo / --env-file ----------------------------------------------------------
 
 

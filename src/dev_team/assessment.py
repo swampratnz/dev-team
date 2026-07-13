@@ -25,6 +25,7 @@ side effects on the working tree — which is why it is off by default.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -1201,6 +1202,20 @@ def outcome_to_backlog(outcome: AssessmentOutcome, backlog: Backlog) -> List[Sto
     return dict_to_backlog(outcome_to_dict(outcome), backlog)
 
 
+def _phase_payload(phases: Mapping, name: str) -> Dict:
+    """The named phase's payload, or ``{}`` when it is absent or failed.
+
+    The ``ok`` guard matters: a failed phase's ``data`` may hold unvalidated
+    content, and neither the backlog bridge nor the finding enumerator may
+    treat it as trustworthy findings.
+    """
+
+    entry = phases.get(name) or {}
+    if not entry.get("ok"):
+        return {}
+    return entry.get("data") or {}
+
+
 def dict_to_backlog(data: Dict, backlog: Backlog) -> List[Story]:
     """Convert a serialised assessment (:func:`outcome_to_dict`) into stories.
 
@@ -1234,16 +1249,7 @@ def dict_to_backlog(data: Dict, backlog: Backlog) -> List[Story]:
         )
 
     phases = data.get("phases") or {}
-
-    def phase_data(name: str) -> Dict:
-        """The phase's payload, or ``{}`` when it is absent or failed."""
-
-        entry = phases.get(name) or {}
-        if not entry.get("ok"):
-            return {}
-        return entry.get("data") or {}
-
-    for step in phase_data("recommendation").get("plan", []):
+    for step in _phase_payload(phases, "recommendation").get("plan", []):
         if not isinstance(step, dict):
             continue
         name = str(step.get("step", "")).strip()
@@ -1253,7 +1259,7 @@ def dict_to_backlog(data: Dict, backlog: Backlog) -> List[Story]:
                 str(step.get("detail", "")),
                 _effort_points(str(step.get("effort", ""))),
             )
-    for blocker in phase_data("buildability").get("blockers", []):
+    for blocker in _phase_payload(phases, "buildability").get("blockers", []):
         if not isinstance(blocker, dict):
             continue
         if blocker.get("category") != "must-fix-to-build":
@@ -1265,7 +1271,7 @@ def dict_to_backlog(data: Dict, backlog: Backlog) -> List[Story]:
                 f"Evidence: {blocker.get('evidence', '')}",
                 3,
             )
-    risk = phase_data("risk")
+    risk = _phase_payload(phases, "risk")
     for dep in risk.get("dependencies", []):
         if isinstance(dep, dict) and dep.get("action") == "must-fix":
             add(
@@ -1296,6 +1302,228 @@ def dict_to_backlog(data: Dict, backlog: Backlog) -> List[Story]:
             f"{vulnerability.get('url')} (manifest: {dep.get('manifest')})",
         )
     return added
+
+
+# ---------------------------------------------------------------------------
+# Finding re-verification: enumerate persisted claims, re-check one of them.
+# ---------------------------------------------------------------------------
+
+#: The LLM-authored claim lists per phase, in a stable order — the enumerable
+#: surface of a persisted assessment. Findings get positional ids like
+#: ``risk.secrets[0]``. The deterministic ``dead_code`` and
+#: ``dependency_scan`` results are exact program output, not model claims,
+#: so they are deliberately not re-verifiable.
+_FINDING_LISTS: Mapping[str, Sequence[str]] = {
+    "inventory": ("findings",),
+    "buildability": ("blockers",),
+    "risk": ("dependencies", "secrets", "data_layer", "external_services"),
+    "coverage": ("tests", "documentation"),
+    "conventions": ("conventions",),
+    "recommendation": ("plan",),
+}
+
+#: Fields tried, in order, for a finding's claim text (phases name it
+#: differently: findings carry ``claim``, plan steps ``step``, dependencies
+#: and external services ``name``, conventions ``convention``).
+_CLAIM_FIELDS = ("claim", "step", "name", "convention")
+
+
+def _claim_hash(claim: str) -> str:
+    """A short, stable content hash so callers can spot a drifted claim."""
+
+    return hashlib.sha256(claim.encode("utf-8")).hexdigest()[:12]
+
+
+def _as_finding(phase: str, role: str, finding_id: str, item: Dict) -> Optional[Dict]:
+    """One enumerable finding, or ``None`` when the item has no claim text."""
+
+    claim = ""
+    for name in _CLAIM_FIELDS:
+        value = item.get(name)
+        if isinstance(value, str) and value.strip():
+            claim = value.strip()
+            break
+    if not claim:
+        return None
+    evidence = item.get("evidence")
+    return {
+        "id": finding_id,
+        "phase": phase,
+        "role": role,
+        "claim": claim,
+        "evidence": evidence if isinstance(evidence, str) else "",
+        "hash": _claim_hash(claim),
+    }
+
+
+def list_findings(data: Dict) -> List[Dict]:
+    """Enumerate the re-verifiable LLM claims in a serialised assessment.
+
+    ``data`` is the exact :func:`outcome_to_dict` shape persisted at
+    :data:`ASSESSMENT_JSON_PATH`. Only phases that completed (``ok``) are
+    enumerated — a failed phase's data is unvalidated (same guard as
+    :func:`dict_to_backlog`). Each finding carries a positional id
+    (``"risk.secrets[0]"``), the auditing role, the claim text, its cited
+    evidence, and a short content hash of the claim.
+    """
+
+    phases = data.get("phases") or {}
+    findings: List[Dict] = []
+    for phase, list_keys in _FINDING_LISTS.items():
+        payload = _phase_payload(phases, phase)
+        role = str((phases.get(phase) or {}).get("role", ""))
+        for key in list_keys:
+            for index, item in enumerate(_items(payload, key)):
+                finding = _as_finding(phase, role, f"{phase}.{key}[{index}]", item)
+                if finding is not None:
+                    findings.append(finding)
+    # Component deep-dives nest their findings one level deeper.
+    payload = _phase_payload(phases, "components")
+    role = str((phases.get("components") or {}).get("role", ""))
+    for c_index, component in enumerate(_items(payload, "components")):
+        for f_index, item in enumerate(_items(component, "findings")):
+            finding = _as_finding(
+                "components",
+                role,
+                f"components.components[{c_index}].findings[{f_index}]",
+                item,
+            )
+            if finding is not None:
+                findings.append(finding)
+    return findings
+
+
+def find_finding(data: Dict, finding_id: str) -> Optional[Dict]:
+    """Resolve one finding by exact id, else case-insensitive claim substring.
+
+    Exact ids win outright; a non-id string falls back to the first finding
+    (in :func:`list_findings` order) whose claim contains it, so a human can
+    say ``"connection string"`` instead of ``"risk.secrets[0]"``. ``None``
+    when nothing matches (or the query is blank).
+    """
+
+    findings = list_findings(data)
+    for finding in findings:
+        if finding["id"] == finding_id:
+            return finding
+    needle = finding_id.strip().lower()
+    if not needle:
+        return None
+    for finding in findings:
+        if needle in finding["claim"].lower():
+            return finding
+    return None
+
+
+#: The only verdicts a re-verification may return.
+VERIFY_VERDICTS = ("confirmed", "refuted", "needs-context")
+
+VERIFY_PROMPT = """\
+Independent re-verification of ONE finding from an earlier repository audit.
+You did not write this finding; a different agent did, and it may be wrong.
+The repository is freshly cloned at your working directory.
+
+The finding under review (from the audit's {phase} phase):
+<finding-claim>
+{claim}
+</finding-claim>
+Evidence cited by the original auditor: {evidence}
+
+Work adversarially — actively try to REFUTE the claim before accepting it:
+- Read the cited file(s) yourself. If a citation does not exist, that alone
+  is significant.
+- Grep for evidence that contradicts the claim, not only evidence that
+  supports it.
+- "confirmed" only when code you actually read supports the claim;
+  "refuted" when the code contradicts it or the cited evidence is absent;
+  "needs-context" when the repository alone cannot settle it (say what
+  would settle it).
+
+Respond with a single JSON object exactly of this shape and nothing else:
+{{"verdict": "confirmed|refuted|needs-context",
+  "rationale": "what you read and why it settles (or fails to settle) it",
+  "citations": [{{"path": "file you actually read", "note": "what it shows"}}]}}
+"""
+
+
+async def verify_finding(
+    runner: AgentRunner,
+    workspace: Workspace,
+    finding: Dict,
+    *,
+    budget: Optional[Budget] = None,
+    tracer: Optional[Tracer] = None,
+    source_job: Optional[str] = None,
+) -> Dict:
+    """Re-check ONE persisted finding against a (re-)cloned repository.
+
+    A FRESH skeptical agent — the security engineer's evidence discipline,
+    never the agent that authored the claim — gets only the read-only tools
+    (Read/Grep/Glob) rooted at ``workspace`` and is told to try to refute
+    the claim. The claim text itself is model-authored and therefore
+    untrusted: it is delimited in the prompt, and the agent's standing
+    instructions forbid following instructions inside delimited blocks.
+
+    Agent failure is returned, not raised, so a caller can turn it into a
+    failed job without unwinding:
+
+    - success: ``{"success": True, "verdict", "rationale", "citations",
+      "finding_id", "source_job", "cost_usd"}`` — ``verdict`` is guaranteed
+      to be one of :data:`VERIFY_VERDICTS` (an out-of-contract verdict is
+      downgraded to ``needs-context``, never promoted to a confirmation).
+    - failure: ``{"success": False, "error", "finding_id", "source_job",
+      "cost_usd"}``.
+    """
+
+    budget = budget or Budget()
+    agent = SecurityEngineerAgent(
+        InstrumentedRunner(runner, "verifier", budget=budget, tracer=tracer)
+    )
+    root = getattr(workspace, "root", None)
+    prompt = VERIFY_PROMPT.format(
+        phase=finding.get("phase", "unknown"),
+        claim=finding.get("claim", ""),
+        evidence=finding.get("evidence") or "(none cited)",
+    )
+    base = {"finding_id": finding.get("id"), "source_job": source_job}
+    try:
+        data = await agent.ask_json(
+            prompt,
+            allowed_tools=READ_ONLY_TOOLS,
+            cwd=str(root) if root is not None else None,
+        )
+    except BudgetExceededError:
+        return {
+            **base,
+            "success": False,
+            "error": "budget exhausted",
+            "cost_usd": budget.spent,
+        }
+    except AgentResponseError as exc:
+        return {**base, "success": False, "error": str(exc), "cost_usd": budget.spent}
+    verdict = data.get("verdict")
+    rationale = str(data.get("rationale", ""))
+    if verdict not in VERIFY_VERDICTS:
+        # Fail securely: an out-of-contract verdict must never read as a
+        # confirmation (or a refutation) downstream.
+        rationale = (
+            f"verifier returned unrecognised verdict {verdict!r}; "
+            f"treated as needs-context. {rationale}"
+        ).strip()
+        verdict = "needs-context"
+    citations = [
+        {"path": str(item.get("path", "")), "note": str(item.get("note", ""))}
+        for item in data.get("citations", [])
+        if isinstance(item, dict)
+    ]
+    return {
+        **base,
+        "success": True,
+        "verdict": verdict,
+        "rationale": rationale,
+        "citations": citations,
+        "cost_usd": budget.spent,
+    }
 
 
 #: Keys whose string values count as a citation of a repository path.

@@ -23,6 +23,7 @@ from dev_team.dispatch import (
     JobRecord,
     JobSpec,
     QueueFull,
+    SubmitRejected,
     ValidationError,
     _default_materialise,
 )
@@ -770,3 +771,294 @@ def test_unknown_routes_are_404():
         assert _call(server, "/nope", method="POST", body={})[0] == 404
         # 2 segments after jobs but not "backlog" -> still 404
         assert _call(server, "/jobs/abc/extra", method="POST", body={})[0] == 404
+
+
+# --- finding re-verification (mode "verify" + the read routes) ------------------
+
+
+def _seeded_dash(source="assess-old", *, meta=True):
+    """A dashboard workspace as a finished assess job leaves it (post-restart).
+
+    Only disk state — assessment.json + meta.json under audit/<source>/ —
+    exactly what a FRESH dispatcher must be able to verify from.
+    """
+
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        f"audit/{source}/assessment.json", json.dumps(_assessment_payload())
+    )
+    if meta:
+        dash.write_text(
+            f"audit/{source}/meta.json",
+            json.dumps({"repo": "acme/mono", "mode": "assess", "id": source}),
+        )
+    return dash
+
+
+def _verifier_runner(payload=None):
+    from dev_team.testing import json_response
+
+    payload = payload or {
+        "verdict": "confirmed",
+        "rationale": "checked the build files",
+        "citations": [{"path": "global.json", "note": "pin exists"}],
+    }
+    return ScriptedRunner(
+        by_system_prompt={"application security engineer": json_response(payload)}
+    )
+
+
+def test_build_spec_verify_requires_source_job_and_finding_id():
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    for body in (
+        {"mode": "verify"},
+        {"mode": "verify", "source_job": "   "},
+        {"mode": "verify", "source_job": 7, "finding_id": "x"},
+        {"mode": "verify", "source_job": "assess-old"},
+        {"mode": "verify", "source_job": "assess-old", "finding_id": ""},
+        {"mode": "verify", "source_job": "assess-old", "finding_id": 3},
+    ):
+        with pytest.raises(ValidationError):
+            disp.build_spec(body)
+
+
+def test_build_spec_verify_without_dashboard_workspace_is_409():
+    with pytest.raises(SubmitRejected) as excinfo:
+        Dispatcher(token="x").build_spec(
+            {"mode": "verify", "source_job": "a", "finding_id": "b"}
+        )
+    assert excinfo.value.status == 409
+    assert "dashboard workspace" in str(excinfo.value)
+
+
+def test_build_spec_verify_missing_assessment_meta_or_traversal_is_404():
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash(meta=False))
+    for source in ("assess-old", "ghost", "../escape"):
+        with pytest.raises(SubmitRejected) as excinfo:
+            disp.build_spec(
+                {"mode": "verify", "source_job": source, "finding_id": "x"}
+            )
+        assert excinfo.value.status == 404
+        assert str(excinfo.value) == "no assessment for that job"
+
+
+def test_build_spec_verify_unresolvable_finding_is_404():
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    with pytest.raises(SubmitRejected) as excinfo:
+        disp.build_spec(
+            {"mode": "verify", "source_job": "assess-old",
+             "finding_id": "no such claim anywhere"}
+        )
+    assert excinfo.value.status == 404
+    assert str(excinfo.value) == "finding not found"
+
+
+def test_build_spec_verify_resolves_repo_and_finding_from_disk():
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    # by claim substring (case-insensitive) — and by exact id below
+    spec = disp.build_spec(
+        {"mode": "verify", "source_job": " assess-old ",
+         "finding_id": "pin BUILD", "budget_usd": 5}
+    )
+    assert spec.mode == "verify"
+    assert spec.repo == "acme/mono"          # from audit/<source>/meta.json
+    assert spec.source_job == "assess-old"
+    assert spec.finding_id == "recommendation.plan[0]"
+    assert spec.finding["claim"] == "Pin build chain"
+    assert spec.budget_usd == 5
+    assert spec.title == "verify recommendation.plan[0]"
+    exact = disp.build_spec(
+        {"mode": "verify", "source_job": "assess-old",
+         "finding_id": "recommendation.plan[0]"}
+    )
+    assert exact.finding_id == "recommendation.plan[0]"
+    assert exact.budget_usd is None
+
+
+def test_run_job_assess_mirrors_meta_json():
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_assess_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec.id = "assess-meta"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    meta = json.loads(dash.read_text("audit/assess-meta/meta.json"))
+    assert meta == {"repo": "acme/mono", "mode": "assess", "id": "assess-meta"}
+
+
+def test_mirror_meta_and_verification_are_noops_without_dashboard():
+    disp = Dispatcher(token="x")
+    spec = JobSpec(mode="assess", repo="a/b", title="t", description="",
+                   budget_usd=None, id="x")
+    disp._mirror_meta(spec)                                  # touches nothing
+    disp._mirror_verification("x", {"verdict": "confirmed"})  # ditto
+
+
+def test_mirror_verification_appends_and_reader_is_chronological():
+    dash = _seeded_dash()
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    disp._mirror_verification("assess-old", {"finding_id": "a", "verdict": "confirmed"})
+    disp._mirror_verification("assess-old", {"finding_id": "b", "verdict": "refuted"})
+    status, payload = disp.verifications("assess-old")
+    assert status == 200
+    assert [e["finding_id"] for e in payload["verifications"]] == ["a", "b"]
+
+
+def test_verifications_reader_tolerates_blank_lines():
+    dash = _seeded_dash()
+    dash.write_text(
+        "audit/assess-old/verifications.jsonl", '{"finding_id": "a"}\n\n'
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.verifications("assess-old")
+    assert status == 200
+    assert payload["verifications"] == [{"finding_id": "a"}]
+
+
+def test_findings_and_verifications_are_disk_keyed_with_error_contract():
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    status, payload = disp.list_job_findings("assess-old")
+    assert status == 200
+    assert payload["job_id"] == "assess-old"
+    ids = [f["id"] for f in payload["findings"]]
+    assert "recommendation.plan[0]" in ids
+    assert set(payload["findings"][0]) == {
+        "id", "phase", "role", "claim", "evidence", "hash",
+    }
+    # unknown job / traversal-shaped ids fail closed as 404
+    for job_id in ("ghost", "../escape"):
+        assert disp.list_job_findings(job_id) == (
+            404, {"error": "no assessment for that job"})
+        assert disp.verifications(job_id) == (
+            404, {"error": "no assessment for that job"})
+    # no dashboard workspace at all -> 409, like make_backlog
+    bare = Dispatcher(token="x")
+    assert bare.list_job_findings("any") == (
+        409, {"error": "findings need a dashboard workspace"})
+    assert bare.verifications("any") == (
+        409, {"error": "verifications need a dashboard workspace"})
+
+
+def test_verify_job_end_to_end_on_a_fresh_dispatcher():
+    """Simulated restart: only disk state, then submit → run → result."""
+
+    dash = _seeded_dash()
+    cloned = []
+
+    def materialise(spec, dest):
+        cloned.append(spec.repo)
+        return InMemoryWorkspace()
+
+    verifier = _verifier_runner()
+    with running(
+        runner=verifier, materialise=materialise, dashboard_workspace=dash
+    ) as server:
+        # findings are enumerable before any verify runs
+        status, payload = _call(server, "/jobs/assess-old/findings")
+        assert status == 200
+        assert any(
+            f["id"] == "recommendation.plan[0]" for f in payload["findings"]
+        )
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]", "budget_usd": 5},
+        )
+        assert status == 202
+        assert payload["state"] == "queued"
+        job_id = payload["id"]
+        assert job_id.startswith("verify-")
+        assert server.dispatcher.wait(job_id, 5)
+        assert cloned == ["acme/mono"]  # re-cloned the SOURCE job's repo
+
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result == {
+            "kind": "verify",
+            "source_job": "assess-old",
+            "finding_id": "recommendation.plan[0]",
+            "verdict": "confirmed",
+            "rationale": "checked the build files",
+            "citations": [{"path": "global.json", "note": "pin exists"}],
+            "cost_usd": 0.0,
+        }
+        # the verifier agent got read-only tools only
+        (call,) = verifier.calls
+        assert tuple(call["allowed_tools"]) == ("Read", "Grep", "Glob")
+
+        status, verifs = _call(server, "/jobs/assess-old/verifications")
+        assert status == 200
+        assert verifs["job_id"] == "assess-old"
+        (entry,) = verifs["verifications"]
+        assert entry["finding_id"] == "recommendation.plan[0]"
+        assert entry["verdict"] == "confirmed"
+        assert entry["citations"] == [{"path": "global.json", "note": "pin exists"}]
+        assert entry["cost_usd"] == 0.0
+        assert "ts" in entry
+
+
+def test_verify_job_agent_failure_becomes_a_failed_job():
+    dash = _seeded_dash()
+    verifier = ScriptedRunner(
+        by_system_prompt={"application security engineer": "garbage, not json"}
+    )
+    with running(
+        runner=verifier, materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        _, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "Pin build chain"},
+        )
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["kind"] == "verify"
+        assert result["success"] is False
+        assert "unusable response" in result["error"]
+        assert result["cost_usd"] == 0
+        # a failed re-check never writes a verdict into the history
+        _, verifs = _call(server, "/jobs/assess-old/verifications")
+        assert verifs["verifications"] == []
+
+
+def test_submit_verify_http_error_contract():
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=_seeded_dash()
+    ) as server:
+        assert _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old"},
+        )[0] == 400
+        assert _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "ghost", "finding_id": "x"},
+        ) == (404, {"error": "no assessment for that job"})
+        assert _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "never matches anything"},
+        ) == (404, {"error": "finding not found"})
+    with running(materialise=_mem_materialise) as server:  # no dashboard ws
+        assert _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "a", "finding_id": "b"},
+        ) == (409, {"error": "verify needs a dashboard workspace"})
+
+
+def test_findings_and_verifications_routes_require_auth():
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=_seeded_dash()
+    ) as server:
+        assert _call(server, "/jobs/assess-old/findings", token=None) == (
+            401, {"error": "unauthorized"})
+        assert _call(server, "/jobs/assess-old/verifications", token=None) == (
+            401, {"error": "unauthorized"})
+        # authorised: an assessed job with no verifications yet answers empty
+        assert _call(server, "/jobs/assess-old/verifications") == (
+            200, {"job_id": "assess-old", "verifications": []})

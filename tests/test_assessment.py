@@ -1392,3 +1392,312 @@ def test_root_level_report_path_ignores_nothing():
     outcome = run(engine.assess())
     # with the report at the root, the leftover audit/ dir is a real blind spot
     assert outcome.blind_spots == ["audit"]
+
+
+# --- finding enumeration + re-verification ------------------------------------
+
+
+def _verifiable_assessment():
+    """A serialised assessment rich in enumerable claims (and junk to skip)."""
+
+    return {
+        "phases": {
+            "inventory": {
+                "role": "architect", "ok": True, "error": None,
+                "data": {"findings": [
+                    {"claim": "CI config is dead", "evidence": ".teamcity/settings.kts"},
+                    {"note": "no claim text"},   # skipped: no claim field
+                    "junk",                      # skipped: not a dict
+                ]},
+            },
+            "buildability": {
+                "role": "devops", "ok": False, "error": "budget exhausted",
+                "data": {"blockers": [
+                    {"claim": "never enumerated", "category": "must-fix-to-build"}
+                ]},
+            },
+            "risk": {
+                "role": "security-engineer", "ok": True, "error": None,
+                "data": {
+                    "dependencies": [
+                        {"name": "Moq", "version": "4.2", "action": "must-fix",
+                         "evidence": "packages.config"}
+                    ],
+                    "secrets": [
+                        {"claim": "connection string committed",
+                         "evidence": "Web.config"}
+                    ],
+                    "data_layer": [],
+                    "external_services": [
+                        {"name": "payments API v1", "risk": "retired",
+                         "evidence": ["Pay.cs"]}  # non-string evidence -> ""
+                    ],
+                },
+            },
+            "coverage": {
+                "role": "qa", "ok": True, "error": None,
+                "data": {
+                    "tests": [{"claim": "MSTest suite stale", "evidence": "tests/"}],
+                    "documentation": [
+                        {"claim": "README wrong", "evidence": "README.md"}
+                    ],
+                },
+            },
+            "conventions": {
+                "role": "architect", "ok": True, "error": None,
+                "data": {"conventions": [
+                    {"aspect": "naming", "convention": "PascalCase everywhere",
+                     "evidence": "Program.cs"}
+                ]},
+            },
+            "recommendation": {
+                "role": "product-manager", "ok": True, "error": None,
+                "data": {"plan": [
+                    {"step": "Pin build chain", "effort": "2 days", "detail": "CI"}
+                ]},
+            },
+            "components": {
+                "role": "architect", "ok": True, "error": None,
+                "data": {"components": [
+                    {"name": "Api", "path": "src/Api", "findings": [
+                        {"claim": "God object in Pay.cs", "evidence": "src/Api/Pay.cs"}
+                    ]},
+                    # a nested item with no claim text is skipped, not surfaced
+                    {"name": "web", "path": "web", "findings": [{"claim": "  "}]},
+                ]},
+            },
+        },
+        # deterministic outputs: never enumerated as re-verifiable claims
+        "dead_code": {"findings": [{"probe": "x", "path": "Dead.cs"}]},
+        "dependency_scan": {"vulnerabilities": [{"id": "GHSA-1"}]},
+    }
+
+
+def test_list_findings_enumerates_llm_phases_with_positional_ids():
+    from dev_team.assessment import list_findings
+
+    findings = list_findings(_verifiable_assessment())
+    by_id = {f["id"]: f for f in findings}
+    assert set(by_id) == {
+        "inventory.findings[0]",
+        "risk.dependencies[0]",
+        "risk.secrets[0]",
+        "risk.external_services[0]",
+        "coverage.tests[0]",
+        "coverage.documentation[0]",
+        "conventions.conventions[0]",
+        "recommendation.plan[0]",
+        "components.components[0].findings[0]",
+    }
+    # claim text comes from the phase's own field: claim/step/name/convention
+    assert by_id["risk.dependencies[0]"]["claim"] == "Moq"
+    assert by_id["recommendation.plan[0]"]["claim"] == "Pin build chain"
+    assert by_id["conventions.conventions[0]"]["claim"] == "PascalCase everywhere"
+    assert by_id["risk.secrets[0]"]["claim"] == "connection string committed"
+    # role + evidence travel with the finding; non-string evidence degrades
+    assert by_id["risk.secrets[0]"]["role"] == "security-engineer"
+    assert by_id["risk.secrets[0]"]["evidence"] == "Web.config"
+    assert by_id["risk.external_services[0]"]["evidence"] == ""
+    # the components nesting is flattened with its own id shape
+    assert by_id["components.components[0].findings[0]"]["phase"] == "components"
+    assert by_id["components.components[0].findings[0]"]["role"] == "architect"
+
+
+def test_list_findings_skips_failed_phases_and_deterministic_outputs():
+    from dev_team.assessment import list_findings
+
+    findings = list_findings(_verifiable_assessment())
+    claims = [f["claim"] for f in findings]
+    assert "never enumerated" not in claims          # buildability ok:false
+    assert all("dead_code" not in f["id"] for f in findings)
+    assert all("dependency_scan" not in f["id"] for f in findings)
+    assert list_findings({}) == []                   # no phases at all
+
+
+def test_list_findings_hash_is_short_and_stable():
+    import hashlib
+
+    from dev_team.assessment import list_findings
+
+    first = list_findings(_verifiable_assessment())
+    second = list_findings(_verifiable_assessment())
+    by_id = {f["id"]: f for f in first}
+    plan = by_id["recommendation.plan[0]"]
+    expected = hashlib.sha256("Pin build chain".encode("utf-8")).hexdigest()[:12]
+    assert plan["hash"] == expected
+    assert len(plan["hash"]) == 12
+    assert [f["hash"] for f in first] == [f["hash"] for f in second]
+
+
+def test_list_findings_from_a_real_assessment_run():
+    from dev_team.assessment import list_findings
+
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    outcome = run(_engine(runner).assess())
+    payload = json.loads(json.dumps(outcome_to_dict(outcome)))  # disk round-trip
+    by_id = {f["id"]: f for f in list_findings(payload)}
+    assert by_id["inventory.findings[0]"]["claim"] == "CI config is dead"
+    assert by_id["risk.secrets[0]"]["claim"] == "connection string committed"
+    assert "buildability.blockers[0]" in by_id
+
+
+def test_find_finding_by_exact_id_then_claim_substring():
+    from dev_team.assessment import find_finding
+
+    data = _verifiable_assessment()
+    assert find_finding(data, "risk.secrets[0]")["claim"] == (
+        "connection string committed"
+    )
+    # case-insensitive substring of the claim text
+    assert find_finding(data, "CONNECTION string")["id"] == "risk.secrets[0]"
+    # first match (enumeration order) wins for an ambiguous substring
+    assert find_finding(data, "c")["id"] == "inventory.findings[0]"
+    assert find_finding(data, "no such finding anywhere") is None
+    assert find_finding(data, "   ") is None
+    assert find_finding({}, "anything") is None
+
+
+def _security_verdict(payload):
+    from dev_team.testing import json_response as _json_response
+
+    return ScriptedRunner(
+        by_system_prompt={"application security engineer": _json_response(payload)}
+    )
+
+
+def _finding_fixture(**overrides):
+    finding = {
+        "id": "risk.secrets[0]",
+        "phase": "risk",
+        "role": "security-engineer",
+        "claim": "connection string committed",
+        "evidence": "Web.config",
+        "hash": "abc123abc123",
+    }
+    finding.update(overrides)
+    return finding
+
+
+def test_verify_finding_confirmed_happy_path():
+    from dev_team.assessment import verify_finding
+
+    runner = _security_verdict(
+        {
+            "verdict": "confirmed",
+            "rationale": "read Web.config; the credential is on line 12",
+            "citations": [
+                {"path": "Web.config", "note": "line 12"},
+                "junk",          # non-dict citation dropped
+                {"path": 3},     # coerced, note defaults
+            ],
+        }
+    )
+    result = run(
+        verify_finding(
+            runner, InMemoryWorkspace(), _finding_fixture(), source_job="assess-1"
+        )
+    )
+    assert result["success"] is True
+    assert result["verdict"] == "confirmed"
+    assert result["rationale"].startswith("read Web.config")
+    assert result["citations"] == [
+        {"path": "Web.config", "note": "line 12"},
+        {"path": "3", "note": ""},
+    ]
+    assert result["finding_id"] == "risk.secrets[0]"
+    assert result["source_job"] == "assess-1"
+    assert result["cost_usd"] == 0.0
+    (call,) = runner.calls
+    # a fresh SKEPTICAL agent: security-engineer discipline, read-only tools
+    assert "application security engineer" in call["system_prompt"]
+    assert tuple(call["allowed_tools"]) == ("Read", "Grep", "Glob")
+    assert call["cwd"] is None  # in-memory workspace has no real root
+    assert "connection string committed" in call["prompt"]
+    assert "Web.config" in call["prompt"]
+    assert "REFUTE" in call["prompt"]
+    assert "<finding-claim>" in call["prompt"]  # untrusted claim is delimited
+
+
+def test_verify_finding_refuted_and_cwd_from_local_workspace(tmp_path):
+    from dev_team.assessment import verify_finding
+
+    runner = _security_verdict(
+        {"verdict": "refuted", "rationale": "no such file", "citations": []}
+    )
+    workspace = LocalWorkspace(str(tmp_path))
+    finding = _finding_fixture(evidence="")  # no citation from the auditor
+    result = run(verify_finding(runner, workspace, finding))
+    assert result["success"] is True
+    assert result["verdict"] == "refuted"
+    assert result["source_job"] is None
+    (call,) = runner.calls
+    assert call["cwd"] == str(workspace.root)
+    assert "(none cited)" in call["prompt"]
+
+
+def test_verify_finding_invalid_verdict_degrades_to_needs_context():
+    from dev_team.assessment import verify_finding
+
+    runner = _security_verdict(
+        {"verdict": "definitely!", "rationale": "trust me", "citations": []}
+    )
+    result = run(verify_finding(runner, InMemoryWorkspace(), _finding_fixture()))
+    assert result["success"] is True
+    assert result["verdict"] == "needs-context"  # never promoted to a verdict
+    assert "unrecognised verdict 'definitely!'" in result["rationale"]
+    assert "trust me" in result["rationale"]
+
+
+def test_verify_finding_missing_verdict_key_degrades_to_needs_context():
+    from dev_team.assessment import verify_finding
+
+    runner = _security_verdict({"rationale": "", "citations": []})
+    result = run(verify_finding(runner, InMemoryWorkspace(), _finding_fixture()))
+    assert result["verdict"] == "needs-context"
+    assert "unrecognised verdict None" in result["rationale"]
+
+
+def test_verify_finding_budget_exhaustion_is_a_structured_failure():
+    from dev_team.assessment import verify_finding
+
+    runner = _security_verdict({"verdict": "confirmed"})
+    result = run(
+        verify_finding(
+            runner,
+            InMemoryWorkspace(),
+            _finding_fixture(),
+            budget=Budget(limit_usd=0.0),
+            source_job="assess-9",
+        )
+    )
+    assert result["success"] is False
+    assert result["error"] == "budget exhausted"
+    assert result["cost_usd"] == 0.0
+    assert result["finding_id"] == "risk.secrets[0]"
+    assert result["source_job"] == "assess-9"
+
+
+def test_verify_finding_unusable_response_is_a_structured_failure():
+    from dev_team.assessment import verify_finding
+
+    runner = ScriptedRunner(
+        by_system_prompt={"application security engineer": "not json at all"}
+    )
+    result = run(verify_finding(runner, InMemoryWorkspace(), _finding_fixture()))
+    assert result["success"] is False
+    assert "unusable response" in result["error"]
+    assert result["cost_usd"] == 0.0
+
+
+def test_verify_finding_records_a_trace_span():
+    from dev_team.assessment import verify_finding
+    from dev_team.trace import Tracer
+
+    tracer = Tracer(clock=lambda: 1.0)
+    runner = _security_verdict({"verdict": "confirmed", "rationale": "ok"})
+    run(
+        verify_finding(
+            runner, InMemoryWorkspace(), _finding_fixture(), tracer=tracer
+        )
+    )
+    assert [s.name for s in tracer.by_kind("agent")] == ["verifier"]

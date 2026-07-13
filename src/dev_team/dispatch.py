@@ -2,8 +2,9 @@
 
 ``dev-team --dispatch`` exposes a small, bearer-authenticated HTTP API so an
 external tailnet caller (a bot) can drive the team remotely: SUBMIT a job
-(``assess`` or ``deliver`` against a repository), poll its STATUS, and fetch
-the RESULT. It wraps exactly the same code paths the CLI's ``--assess`` /
+(``assess`` or ``deliver`` against a repository, or ``verify`` to have a
+fresh skeptical agent re-check one persisted assessment finding), poll its
+STATUS, and fetch the RESULT. It wraps exactly the same code paths the CLI's ``--assess`` /
 ``--deliver`` modes use — clone the repo, build a :class:`DevTeam`, and run
 :meth:`DevTeam.assess` / :meth:`DevTeam.deliver`.
 
@@ -44,13 +45,26 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from .assessment import AssessConfig, dict_to_backlog, outcome_to_dict
+from .assessment import (
+    AssessConfig,
+    dict_to_backlog,
+    find_finding,
+    list_findings,
+    outcome_to_dict,
+    verify_finding,
+)
 from .backlog import BacklogStore
 from .budget import Budget
 from .config import TeamConfig
 from .engine import EngineConfig
+from .errors import DevTeamError
 from .eventlog import EventLog, compose, read_events
-from .execution import LocalWorkspace, SubprocessCommandRunner, Workspace
+from .execution import (
+    LocalWorkspace,
+    SubprocessCommandRunner,
+    Workspace,
+    WorkspaceError,
+)
 from .models import FeatureRequest
 from .report import delivery_to_dict
 from .sdk import AgentRunner
@@ -78,8 +92,9 @@ DEFAULT_QUEUE_CAP = 16
 _LIST_LIMIT = 25
 _PROGRESS_LIMIT = 12
 
-#: The two run modes the service accepts.
-_MODES = ("assess", "deliver")
+#: The run modes the service accepts. ``verify`` re-checks one finding from
+#: a previously mirrored assessment against a fresh clone of its repository.
+_MODES = ("assess", "deliver", "verify")
 
 #: Terminal job states.
 _TERMINAL = frozenset({"succeeded", "failed"})
@@ -96,6 +111,20 @@ class QueueFull(Exception):
     """The pending queue is at capacity — surfaced as ``503``."""
 
 
+class SubmitRejected(Exception):
+    """A verify SUBMIT that fails against persisted state, with its status.
+
+    Distinct from :class:`ValidationError` (always 400): a verify request can
+    be well-formed yet name an assessment that was never mirrored (404), a
+    finding that resolves to nothing (404), or a service with no dashboard
+    workspace to read from (409).
+    """
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 @dataclass
 class JobSpec:
     """A validated request to run one job (id assigned at submit time)."""
@@ -107,6 +136,12 @@ class JobSpec:
     budget_usd: Optional[float]
     backlog: bool = False
     id: str = ""
+    # verify only: the source assess job, the resolved finding id, and the
+    # RESOLVED finding itself (resolved synchronously at submit time so the
+    # job cannot start and then discover the finding never existed).
+    source_job: Optional[str] = None
+    finding_id: Optional[str] = None
+    finding: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -226,7 +261,15 @@ class Dispatcher:
 
         mode = body.get("mode")
         if mode not in _MODES:
-            raise ValidationError("mode must be 'assess' or 'deliver'")
+            raise ValidationError("mode must be 'assess', 'deliver' or 'verify'")
+        budget = body.get("budget_usd")
+        if budget is not None:
+            if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+                raise ValidationError("budget_usd must be a number or null")
+            if budget <= 0:
+                raise ValidationError("budget_usd must be greater than 0")
+        if mode == "verify":
+            return self._verify_spec(body, budget)
         repo = body.get("repo")
         if not isinstance(repo, str) or not repo.strip():
             raise ValidationError("repo is required")
@@ -234,12 +277,6 @@ class Dispatcher:
             ref = parse_repo(repo)
         except (SourceError, ValueError) as exc:
             raise ValidationError(f"invalid repo: {exc}")
-        budget = body.get("budget_usd")
-        if budget is not None:
-            if isinstance(budget, bool) or not isinstance(budget, (int, float)):
-                raise ValidationError("budget_usd must be a number or null")
-            if budget <= 0:
-                raise ValidationError("budget_usd must be greater than 0")
         backlog = body.get("backlog", False)
         if not isinstance(backlog, bool):
             raise ValidationError("backlog must be true or false")
@@ -262,6 +299,69 @@ class Dispatcher:
             description=description,
             budget_usd=budget,
             backlog=backlog,
+        )
+
+    def _exists(self, path: str) -> bool:
+        """Whether ``path`` exists in the dashboard workspace, failing closed.
+
+        A path the workspace refuses to resolve (traversal, absolutes — job
+        ids come off the URL/body) simply does not exist; the caller answers
+        404 instead of leaking a stack trace.
+        """
+
+        try:
+            return self._dashboard_workspace.exists(path)
+        except WorkspaceError:
+            return False
+
+    def _verify_spec(self, body: Dict[str, Any], budget: Optional[float]) -> JobSpec:
+        """Validate a verify SUBMIT against the persisted assessment on disk.
+
+        Synchronous on purpose: the caller learns at submit time that the
+        source assessment or the finding does not exist, instead of queueing
+        a job doomed to fail. Disk-keyed (never the in-memory registry), so
+        it works for source jobs that ran before a service restart. The
+        repository to re-clone comes from ``audit/<source>/meta.json``, the
+        finding from ``audit/<source>/assessment.json``.
+
+        Raises:
+            ValidationError: missing/blank ``source_job``/``finding_id``
+                (→ 400).
+            SubmitRejected: no dashboard workspace to read from (409); the
+                source assessment/meta was never mirrored, or the finding
+                resolves to nothing (404).
+        """
+
+        source_job = body.get("source_job")
+        if not isinstance(source_job, str) or not source_job.strip():
+            raise ValidationError("verify requires a source_job")
+        finding_id = body.get("finding_id")
+        if not isinstance(finding_id, str) or not finding_id.strip():
+            raise ValidationError("verify requires a finding_id")
+        source_job = source_job.strip()
+        if self._dashboard_workspace is None:
+            raise SubmitRejected(409, "verify needs a dashboard workspace")
+        assessment_path = f"audit/{source_job}/assessment.json"
+        meta_path = f"audit/{source_job}/meta.json"
+        if not self._exists(assessment_path) or not self._exists(meta_path):
+            # meta.json is written beside every mirrored assessment since
+            # verify landed; a job missing either file predates the feature
+            # (re-assess to record it) or never assessed at all.
+            raise SubmitRejected(404, "no assessment for that job")
+        data = json.loads(self._dashboard_workspace.read_text(assessment_path))
+        finding = find_finding(data, finding_id.strip())
+        if finding is None:
+            raise SubmitRejected(404, "finding not found")
+        meta = json.loads(self._dashboard_workspace.read_text(meta_path))
+        return JobSpec(
+            mode="verify",
+            repo=str(meta.get("repo", "")),
+            title=f"verify {finding['id']}",
+            description="",
+            budget_usd=budget,
+            source_job=source_job,
+            finding_id=finding["id"],
+            finding=finding,
         )
 
     def submit(self, spec: JobSpec) -> Tuple[str, int]:
@@ -344,6 +444,9 @@ class Dispatcher:
         dest = str(Path(self._jobs_root) / spec.id)
         workspace = self._materialise(spec, dest)
         record.workspace = workspace
+        if spec.mode == "verify":
+            # No DevTeam: one fresh skeptical agent re-checks one claim.
+            return await self._run_verify(spec, workspace)
         # The job's own workspace is always journalled (drives GET /jobs/{id}
         # progress). When a dashboard workspace is configured, fan the same
         # events out to it too — same run id, so the standing dashboard shows
@@ -377,6 +480,7 @@ class Dispatcher:
             )
             self._mirror_report(spec.id, outcome)
             self._mirror_assessment_json(spec.id, outcome)
+            self._mirror_meta(spec)
             if spec.backlog and self._dashboard_workspace is not None:
                 # Merge, don't copy: the dashboard workspace accumulates
                 # stories across many jobs, and copying the job's own
@@ -396,6 +500,40 @@ class Dispatcher:
                 **kwargs,
             )
         return outcome, outcome.cost_usd
+
+    async def _run_verify(self, spec: JobSpec, workspace: Workspace) -> Tuple[Any, float]:
+        """Re-check the resolved finding against the fresh clone of its repo.
+
+        A FRESH skeptical agent (see :func:`~dev_team.assessment.verify_finding`)
+        with read-only tools; the verdict is appended to the SOURCE job's
+        ``verifications.jsonl`` in the dashboard workspace, so
+        ``GET /jobs/{source}/verifications`` survives a restart exactly like
+        the mirrored assessment JSON. An agent failure is raised so the
+        worker records a failed job (and ``result()`` answers
+        ``{"kind":"verify","success":false,…}``).
+        """
+
+        result = await verify_finding(
+            self._runner,
+            workspace,
+            spec.finding,
+            budget=Budget(limit_usd=spec.budget_usd),
+            source_job=spec.source_job,
+        )
+        if not result["success"]:
+            raise DevTeamError(str(result["error"]))
+        self._mirror_verification(
+            spec.source_job,
+            {
+                "finding_id": result["finding_id"],
+                "verdict": result["verdict"],
+                "rationale": result["rationale"],
+                "citations": result["citations"],
+                "cost_usd": result["cost_usd"],
+                "ts": self._clock(),
+            },
+        )
+        return result, float(result["cost_usd"])
 
     def _mirror_report(self, job_id: str, outcome: Any) -> None:
         """Copy an assess run's report into the dashboard workspace.
@@ -429,6 +567,80 @@ class Dispatcher:
             f"audit/{job_id}/assessment.json",
             json.dumps(outcome_to_dict(outcome), indent=2),
         )
+
+    def _mirror_meta(self, spec: JobSpec) -> None:
+        """Persist the job's repo identity beside its mirrored assessment.
+
+        ``audit/<id>/meta.json`` is what a later ``verify`` submit reads to
+        know WHICH repository to re-clone. The in-memory registry also knows
+        the repo but is lost on restart, so verify must key off disk — same
+        rule as :meth:`make_backlog`. No-op without a dashboard workspace
+        (mirrors :meth:`_mirror_assessment_json`).
+        """
+
+        if self._dashboard_workspace is None:
+            return
+        self._dashboard_workspace.write_text(
+            f"audit/{spec.id}/meta.json",
+            json.dumps({"repo": spec.repo, "mode": spec.mode, "id": spec.id}),
+        )
+
+    def _mirror_verification(self, source_job: str, entry: Dict[str, Any]) -> None:
+        """Append one verification verdict to the source job's history.
+
+        Read-modify-write because :class:`~dev_team.execution.Workspace` has
+        no append primitive; the single-flight worker guarantees no
+        concurrent writers. Guarded for a missing dashboard workspace even
+        though a verify job cannot be submitted without one — fail safe.
+        """
+
+        if self._dashboard_workspace is None:
+            return
+        path = f"audit/{source_job}/verifications.jsonl"
+        existing = (
+            self._dashboard_workspace.read_text(path)
+            if self._dashboard_workspace.exists(path)
+            else ""
+        )
+        self._dashboard_workspace.write_text(
+            path, existing + json.dumps(entry) + "\n"
+        )
+
+    def list_job_findings(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The ``GET /jobs/{id}/findings`` core: the re-checkable claims.
+
+        Reads ``audit/<job_id>/assessment.json`` from the dashboard
+        workspace — disk, never the in-memory registry, so it keeps working
+        for jobs that ran before a service restart. Returns
+        ``(status_code, payload)`` exactly as the HTTP layer sends it.
+        """
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "findings need a dashboard workspace"}
+        path = f"audit/{job_id}/assessment.json"
+        if not self._exists(path):
+            return 404, {"error": "no assessment for that job"}
+        data = json.loads(self._dashboard_workspace.read_text(path))
+        return 200, {"job_id": job_id, "findings": list_findings(data)}
+
+    def verifications(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The ``GET /jobs/{id}/verifications`` core: verdicts, chronological.
+
+        Disk-keyed like :meth:`list_job_findings`; the jsonl is append-order,
+        which IS chronological under the single-flight worker.
+        """
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "verifications need a dashboard workspace"}
+        if not self._exists(f"audit/{job_id}/assessment.json"):
+            return 404, {"error": "no assessment for that job"}
+        path = f"audit/{job_id}/verifications.jsonl"
+        entries: List[Dict[str, Any]] = []
+        if self._exists(path):
+            for line in self._dashboard_workspace.read_text(path).splitlines():
+                if line.strip():
+                    entries.append(json.loads(line))
+        return 200, {"job_id": job_id, "verifications": entries}
 
     def _merge_backlog(self, data: Dict[str, Any]) -> Tuple[int, int]:
         """Merge a serialised assessment into the dashboard-workspace backlog.
@@ -523,6 +735,16 @@ class Dispatcher:
                 "cost_usd": 0,
             }
         outcome = record.outcome
+        if record.spec.mode == "verify":
+            return 200, {
+                "kind": "verify",
+                "source_job": record.spec.source_job,
+                "finding_id": outcome["finding_id"],
+                "verdict": outcome["verdict"],
+                "rationale": outcome["rationale"],
+                "citations": outcome["citations"],
+                "cost_usd": outcome["cost_usd"],
+            }
         if record.spec.mode == "assess":
             return 200, {
                 "kind": "assess",
@@ -589,6 +811,15 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "result":
                 self._result(parts[1])
                 return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "findings":
+                # Disk-keyed (no registry lookup): works after a restart.
+                status, payload = dispatcher.list_job_findings(parts[1])
+                self._json(status, payload)
+                return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "verifications":
+                status, payload = dispatcher.verifications(parts[1])
+                self._json(status, payload)
+                return
             self._json(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802 (http.server API)
@@ -623,6 +854,9 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 spec = dispatcher.build_spec(body)
             except ValidationError as exc:
                 self._json(400, {"error": str(exc)})
+                return
+            except SubmitRejected as exc:
+                self._json(exc.status, {"error": str(exc)})
                 return
             try:
                 job_id, position = dispatcher.submit(spec)
