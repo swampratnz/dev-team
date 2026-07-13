@@ -1,0 +1,307 @@
+name: Pipeline PR autofix
+
+# Event-driven CURE loop: when CI fails on a build-worker PR, invoke Claude to
+# fix the branch and push, so a red PR gets repaired without a human doing it by
+# hand. Prevention is the primary lever (pipeline-build.yml runs the full CI
+# gate — ruff + the 100% branch-coverage pytest — BEFORE opening a PR); this is
+# the safety net for the residue: genuine flakes and re-breaks when main
+# advances under an open PR.
+#
+# Guardrails (this spends the shared Max pool and pushes code, so they matter):
+#   * Same-repo PRs only. workflow_run carries secrets even for fork PRs, so
+#     running a fix on fork-controlled code would be an injection vector — the
+#     `if` below hard-requires head_repository == this repo.
+#   * Bot-authored BUILD-WORKER PRs only, identified by their `Closes #<n>`
+#     body — the build worker's contract, the same signal the conflict
+#     resolver's discover filter keys on. Human PRs and unrelated same-repo
+#     bot PRs (e.g. a Dependabot bump) are left alone.
+#   * PRs already labelled `needs-human` are SKIPPED — that label is the stop
+#     (same policy as the conflict resolver), so a cap-escalated PR never gets
+#     further agent runs or duplicate escalation comments.
+#   * Hard cap of 2 attempts per PR, counted via marker comments. After that it
+#     STOPS and escalates `needs-human` — without this it could fix→fail→fix in
+#     a loop that drains the weekly token pool.
+#   * It CANNOT push .github/workflows/* (the App token lacks the `workflows`
+#     scope), so the prompt tells it to escalate those rather than thrash.
+#   * Never merges — a human merges.
+
+on:
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+
+concurrency:
+  group: pipeline-autofix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write # claude-code-action mints its GitHub App token via OIDC
+
+jobs:
+  autofix:
+    # Only react to a FAILED CI run triggered by a same-repo pull request —
+    # and only from the run's SECOND attempt onward: ci-retry.yml gives every
+    # failed CI run one free machine rerun first (transient registry/runner
+    # failures — the ETIMEDOUT class — recover there for zero agent cost), so
+    # spending a fix agent on attempt 1 would mostly chase flakes.
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.run_attempt >= 2
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      # NB: GH_TOKEN is deliberately NOT job-level. It is set per-step on the
+      # deterministic gh steps only, so the claude-code-action "Fix" step
+      # (whose agent runs pytest/pip/cat and reads untrusted CI logs) never
+      # inherits a GITHUB_TOKEN it could exfiltrate. The agent gets its own
+      # gh/git auth from the action's App token. (This mirrors the product's
+      # own subprocess secret-hygiene rule: GITHUB_TOKEN/ANTHROPIC_* never
+      # reach the environment of executed commands.)
+      # Only ATTEMPT_MARKER comments count toward the 2-try cap. The terminal
+      # escalation comment uses a DIFFERENT marker so it can't inflate the count
+      # (a re-run of the same failed CI must not read one real attempt as two).
+      ATTEMPT_MARKER: '<!-- pipeline-autofix-attempt -->'
+      ESCALATE_MARKER: '<!-- pipeline-autofix-escalation -->'
+    steps:
+      - name: Inert notice (token not set)
+        if: env.HAS_TOKEN != 'true'
+        run: echo "CLAUDE_CODE_OAUTH_TOKEN not set — PR autofix worker is inert."
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: env.HAS_TOKEN == 'true'
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+          # Do NOT leave the job's GITHUB_TOKEN in .git/config: the fix agent
+          # reads untrusted CI logs / PR content and can `cat .git/config`,
+          # then exfiltrate it. The agent pushes with the action's own App
+          # token, and the deterministic steps use `gh` (GH_TOKEN env), so no
+          # persisted git credential is needed anywhere.
+          persist-credentials: false
+
+      - name: Resolve PR + eligibility
+        id: pr
+        if: env.HAS_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh pr list --head "$HEAD_BRANCH" --state open --json number,author,isCrossRepository,labels,body --limit 1)"
+          number="$(jq -r '.[0].number // empty' <<<"$pr_json")"
+          if [ -z "$number" ]; then
+            echo "No open PR for branch $HEAD_BRANCH — nothing to autofix."
+            exit 0
+          fi
+          is_bot="$(jq -r '.[0].author.is_bot // false' <<<"$pr_json")"
+          xrepo="$(jq -r '.[0].isCrossRepository // false' <<<"$pr_json")"
+          # Build-worker PRs only (`Closes #<n>` body) and not already escalated
+          # (`needs-human` is the stop label) — see the header guardrails.
+          is_build="$(jq -r '(.[0].body // "") | test("[Cc]loses #[0-9]+")' <<<"$pr_json")"
+          escalated="$(jq -r '[.[0].labels[]?.name] | index("needs-human") != null' <<<"$pr_json")"
+          if [ "$is_bot" != "true" ] || [ "$xrepo" = "true" ] || [ "$is_build" != "true" ] || [ "$escalated" = "true" ]; then
+            echo "PR #$number is not an eligible (same-repo, bot-authored, build-worker, not needs-human) PR — skipping."
+            exit 0
+          fi
+          # Prior autofix attempts = number of ATTEMPT_MARKER comments (only).
+          attempts="$(gh pr view "$number" --json comments --jq "[.comments[] | select(.body | contains(\"$ATTEMPT_MARKER\"))] | length")"
+          {
+            echo "number=$number"
+            echo "attempts=$attempts"
+            echo "eligible=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Escalate if attempt cap reached
+        if: env.HAS_TOKEN == 'true' && steps.pr.outputs.eligible == 'true' && fromJSON(steps.pr.outputs.attempts) >= 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          n="${{ steps.pr.outputs.number }}"
+          gh pr edit "$n" --add-label needs-human || true
+          gh pr comment "$n" --body "${ESCALATE_MARKER}
+          🤖 Autofix has already tried twice and CI is still red. Stopping to avoid a fix-fail loop; labelled \`needs-human\` for a maintainer. Latest failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${RUN_ID}"
+
+      - name: Mark attempt + record current HEAD
+        id: mark
+        if: env.HAS_TOKEN == 'true' && steps.pr.outputs.eligible == 'true' && fromJSON(steps.pr.outputs.attempts) < 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          n="${{ steps.pr.outputs.number }}"
+          attempt=$(( ${{ steps.pr.outputs.attempts }} + 1 ))
+          gh pr comment "$n" --body "${ATTEMPT_MARKER}
+          🤖 Autofix attempt ${attempt}/2: CI failed, attempting a fix on this branch."
+          {
+            echo "head_before=$(git rev-parse HEAD)"
+            echo "attempt=$attempt"
+          } >> "$GITHUB_OUTPUT"
+
+      # Match CI's toolchain (ci.yml) and install dependencies deterministically
+      # before the fix agent runs, so its `pytest`/`ruff` see a working
+      # environment (same fix as pipeline-build.yml — an uninstalled package
+      # fails every test on imports). The environment persists into the fix
+      # step. 3.11 = the requires-python floor, so oldest-version drift is
+      # caught here, not only in CI's matrix.
+      - name: Set up Python
+        if: env.HAS_TOKEN == 'true' && steps.mark.outcome == 'success'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (deterministic — do not leave to the agent)
+        if: env.HAS_TOKEN == 'true' && steps.mark.outcome == 'success'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Fix the failing checks
+        id: fix
+        if: env.HAS_TOKEN == 'true' && steps.mark.outcome == 'success'
+        continue-on-error: true # the verify step below is the source of truth
+        uses: anthropics/claude-code-action@e90deca47693f9457b72f2b53c17d7c445a87342 # v1.0.171
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # This workflow fires on workflow_run of a CI run whose actor is the
+          # claude[bot] App (it pushed the PR branch), and claude-code-action
+          # refuses non-human actors by default ("Workflow initiated by
+          # non-human actor: claude (type: Bot)") — the exact failure mode that
+          # kept this loop inert on bot PRs in the sibling pipeline. Same
+          # allow-list setting pipeline-pr-review.yml already uses for the same
+          # reason; the eligibility step above still hard-requires a same-repo
+          # bot PR.
+          allowed_bots: '*'
+          prompt: |
+            CI failed on pull request #${{ steps.pr.outputs.number }} for
+            dev-team (swampratnz/dev-team). The PR's branch is already checked
+            out here, with dependencies installed (`pip install -e ".[test]"`).
+
+            1. Find what failed: `gh run view ${{ env.RUN_ID }} --log-failed` and
+               `gh pr checks ${{ steps.pr.outputs.number }}`.
+            2. Before assuming a code defect, check for the MECHANICAL cause
+               that dominates this queue — it is self-fixable and must NOT be
+               escalated to a human:
+               A FLAKY, UNRELATED TEST. If a test fails but the PR's own diff
+               (`gh pr diff ${{ steps.pr.outputs.number }}`) does NOT touch
+               that test or the code it exercises, re-run just that test file
+               in isolation with coverage disabled
+               (`pytest --no-cov tests/<file>.py`, or the full suite twice —
+               `--no-cov` matters: a partial run can never satisfy the global
+               100% coverage gate, so a bare single-file `pytest` "fails" even
+               when every test passes). If it PASSES in isolation / on re-run,
+               it is a pre-existing flake, not your bug: do NOT try to "fix"
+               unrelated code. Instead re-trigger CI by pushing an EMPTY
+               commit —
+               `git commit --allow-empty -m "ci: re-run (flaky <test> passed in
+               isolation, unrelated to this PR)"` then `git push origin HEAD` —
+               so the branch gets a fresh CI run. (The durable fix for the
+               flaky test itself is tracked separately; your job is only to
+               stop it blocking THIS PR.)
+            3. Otherwise read CLAUDE.md (the BPG Engineering Standards — the
+               security posture you must not regress) and fix the actual cause
+               on this branch. Note the most common genuine failure here is the
+               100% BRANCH-coverage gate: pyproject.toml enforces
+               `--cov-fail-under=100` with `--cov-branch`, so the fix for a
+               coverage failure is a real test exercising the missed branch —
+               never a `pragma: no cover` on logic, and never weakening the
+               gate. Run the full gate and make EVERY check green:
+               ruff check . && pytest
+               (Re-run `pip install -e ".[test]"` first if pyproject.toml
+               changed.)
+            4. Stage and commit your fix, then push it to THIS branch with
+               EXACTLY this command (nothing else — no other push form is
+               permitted): `git push origin HEAD`. NEVER force-push and NEVER
+               push any other ref or branch. Do NOT open a new PR and do NOT
+               merge. If the fix needs a change under `.github/workflows/` (you
+               cannot push those — the token lacks the `workflows` scope) or the
+               failure is not something you can safely fix, then STOP without
+               committing/pushing, but FIRST write one line to your final message
+               naming the exact blocker (which check, which file, why) — the
+               escalation step surfaces that summary to the maintainer, so a
+               silent stop wastes their time re-deriving it from logs.
+
+            EXECUTION MODEL — READ THIS FIRST: this is a SINGLE, non-interactive
+            batch run. There is NO wakeup, NO resume, and NO background
+            continuation — when your turn ends, this job ends. Run every command
+            (the gate, tests, git) synchronously to completion in THIS turn and
+            act on its result; NEVER end your turn to "wait" for a test/command
+            to finish or in the expectation of being resumed later. Either push
+            your fix with `git push origin HEAD` in THIS turn, or (if it isn't
+            safely fixable here) stop deliberately so the no-new-commit
+            escalation hands it to a human. Running out of turns mid-fix is a
+            failure, not a pause.
+          # Tool surface is least-privilege — defence in depth, NOT a hard
+          # guarantee (the agent also has Edit/Write plus pytest/pip, i.e. code
+          # execution, so it could rewrite .git/HEAD on disk; see the main-push
+          # note below):
+          #   * `gh` is READ-only (diagnose the failure) — no merge/close/create.
+          #   * `git fetch` is pinned to `Bash(git fetch origin:*)` so the agent
+          #     can only fetch from origin, not an arbitrary remote/URL.
+          #   * `git` excludes `reset`/`remote`/blanket push. The only push tool
+          #     is `Bash(git push origin HEAD)` with NO `:*` wildcard, i.e. an
+          #     EXACT match: the agent may run only that literal command. A
+          #     wildcard form (`git push origin HEAD:*`) would also permit
+          #     `git push origin HEAD:main` (refspec src:dst) and
+          #     `git push origin HEAD --force`. Combined with the checkout
+          #     pinning the local branch name, this keeps the *tool surface* on
+          #     the current branch — but note code execution (above) means it is
+          #     not a hard stop. The push runs via the action's App token because
+          #     a GITHUB_TOKEN push wouldn't re-trigger CI. Labelling/commenting/
+          #     escalation are done by the deterministic shell steps, not here.
+          #   * No blanket `python:*` (an arbitrary-code-execution primitive);
+          #     the gate needs only `ruff check`, `pytest`, and `pip install`.
+          #   * The ENFORCEABLE guarantee that this loop cannot push to `main` is
+          #     branch protection on `main` (blocking direct/force pushes) — a
+          #     required repo setting (see docs/PIPELINE.md), not something this
+          #     file enforces. The allowlist above raises the bar; it does not
+          #     replace branch protection.
+          claude_args: |
+            --max-turns 200
+            --model sonnet
+            --allowedTools "Edit,Write,Read,MultiEdit,Grep,Glob,LS,TodoWrite,Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git restore:*),Bash(git fetch origin:*),Bash(git rev-parse:*),Bash(git push origin HEAD),Bash(gh run view:*),Bash(gh pr checks:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(ruff check:*),Bash(pytest:*),Bash(pip install:*),Bash(mkdir:*),Bash(mv:*),Bash(cp:*),Bash(cat:*),Bash(ls:*)"
+
+      - name: Verify a fix was pushed (else escalate loudly)
+        if: always() && env.HAS_TOKEN == 'true' && steps.mark.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          n="${{ steps.pr.outputs.number }}"
+          # Read the branch's current remote tip via the API (gh/GH_TOKEN) rather
+          # than `git fetch` — with persist-credentials:false there is no git
+          # credential in .git/config for a fetch, and this avoids reintroducing
+          # one. head_before was captured from the local checkout (git rev-parse
+          # HEAD needs no credential).
+          after="$(gh pr view "$n" --json headRefOid --jq '.headRefOid')"
+          if [ "$after" != "${{ steps.mark.outputs.head_before }}" ]; then
+            echo "Autofix pushed a change; CI will re-run on the new commit."
+            exit 0
+          fi
+          echo "::error::Autofix produced no new commit on ${HEAD_BRANCH}."
+          gh pr edit "$n" --add-label needs-human || true
+          # Surface the agent's own final summary (best-effort) so a maintainer
+          # sees the blocker instead of re-deriving it from run logs. A silent
+          # stop leaves none, which is itself the tell (usually a gate it
+          # couldn't make green — with the 100% coverage gate, usually coverage).
+          summary=""
+          exec_file="${{ steps.fix.outputs.execution_file }}"
+          if [ -n "${exec_file}" ] && [ -f "${exec_file}" ]; then
+            summary="$(jq -r '[.. | objects | select(.type? == "result") | .result?] | map(select(. != null)) | last // empty' "${exec_file}" 2>/dev/null | head -c 1500 || true)"
+          fi
+          {
+            printf '%s\n🤖 Autofix attempt %s pushed no fix — the cause needs a workflow-file change I can'\''t push, or it was not safely fixable. Labelled `needs-human`.\n' "${ESCALATE_MARKER}" "${{ steps.mark.outputs.attempt }}"
+            if [ -n "${summary}" ]; then
+              printf '\n<details><summary>Autofix agent'\''s final summary (what it says blocked it)</summary>\n\n%s\n\n</details>\n' "${summary}"
+            else
+              printf '\n_No agent summary was captured — it stopped without explaining, which usually means a CI gate it could not make green. Check the run log: %s/%s/actions/runs/%s_\n' "${{ github.server_url }}" "${{ github.repository }}" "${RUN_ID}"
+            fi
+          } | gh pr comment "$n" --body-file -
+          exit 1
