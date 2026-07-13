@@ -1281,6 +1281,79 @@ def test_jobs_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
     assert seen == []
 
 
+# --- the job purge proxy (/api/jobs/{id}/purge → dispatch) -------------------
+
+
+def test_jobs_proxy_forwards_purge(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch,
+        status=200,
+        body=b'{"id": "assess-a", "purged": true, '
+        b'"removed": {"workspace": true, "audit": true, "backlog_stories": 0}}',
+    )
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/purge", headers=AUTH
+    )
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body)["purged"] is True
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/jobs/assess-a/purge"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+
+
+def test_jobs_proxy_relays_a_purge_rejection(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/jobs/assess-a/purge", 409, "Conflict", None,
+        io.BytesIO(b'{"error": "job is not archived"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/purge", headers=AUTH
+    )
+    assert status == 409
+    assert json.loads(body) == {"error": "job is not archived"}
+
+
+def test_jobs_proxy_purge_unconfigured_is_501(token_server, monkeypatch):
+    # SECURITY: matches archive's own unconfigured 501 (no dispatch_url /
+    # dispatch_token wired) — never silently forwards without one.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "POST", "/api/jobs/assess-a/purge", headers=AUTH
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "job actions not configured"}
+    assert seen == []
+
+
+def test_jobs_proxy_purge_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    # SECURITY: matches archive's own auth-first behaviour — an
+    # unauthenticated dashboard call never reaches the dispatch service.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/purge"
+    )
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+def test_dashboard_html_purge_button_and_confirm_flow():
+    # The "delete permanently" action only renders for an already-archived
+    # job (purgeButton returns "" otherwise), forwards through the same
+    # /api/jobs/{id}/... proxy as archive/unarchive, and is armed by a
+    # two-step confirm identical to the story-delete confirm.
+    assert "if (!archived) return" in DASHBOARD_HTML
+    assert 'data-purgejob="${esc(id)}"' in DASHBOARD_HTML
+    assert '"/api/jobs/" + encodeURIComponent(id) + "/purge"' in DASHBOARD_HTML
+    assert '"confirm delete permanently?"' in DASHBOARD_HTML
+    assert 'e.target.closest("[data-purgejob]")' in DASHBOARD_HTML
+
+
 # --- /api/state?archived=1 ----------------------------------------------------
 
 

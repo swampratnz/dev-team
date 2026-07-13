@@ -80,9 +80,25 @@ anything — the data stays on disk and is fully restorable with
   Clicking it POSTs `/api/jobs/{id}/archive` or `/api/jobs/{id}/unarchive`
   through the dashboard — the same narrow-proxy pattern the board write path
   uses (below): the dispatch bearer token stays server-side, and the proxy
-  forwards **only** those two actions, never a general `/jobs` passthrough.
+  forwards **only** those actions, never a general `/jobs` passthrough.
   Archiving a job that is still `queued`/`running` is rejected (`409`) by
   the dispatch service itself.
+
+### Purge (permanent deletion)
+
+Archiving hides; it never reclaims disk (see
+[`docs/DISPATCH.md`](DISPATCH.md) for the full model). Each **run row**
+that is already archived also carries a **"delete permanently"** button,
+behind the same two-step confirm the backlog's story-delete button uses
+(first click arms it, second click purges). Clicking it POSTs
+`/api/jobs/{id}/purge` through the same narrow jobs proxy described above.
+
+The button only renders for a job the dashboard already knows is archived —
+that is a UX nicety, not the security boundary: the dispatch service's own
+`purge_job` re-enforces the archive-first gate server-side (`409` on a
+non-archived job) regardless of what the browser sends. Purge is **not
+idempotent** — a second call on an already-purged job answers `404`, the
+job having left every listing for good.
 
 ### Story detail (click a backlog story)
 
@@ -176,11 +192,11 @@ narrow proxy to the **dispatch service**, which owns every backlog write:
 browser ──(dashboard token)──▶ dashboard /api/backlog/* ──(dispatch token)──▶ dispatch /backlog/*
 ```
 
-Archive/unarchive (above) is a second, equally narrow proxy of the same
-shape:
+Archive/unarchive/purge (above) is a second, equally narrow proxy of the
+same shape:
 
 ```
-browser ──(dashboard token)──▶ dashboard /api/jobs/{id}/archive|unarchive ──(dispatch token)──▶ dispatch /jobs/{id}/archive|unarchive
+browser ──(dashboard token)──▶ dashboard /api/jobs/{id}/archive|unarchive|purge ──(dispatch token)──▶ dispatch /jobs/{id}/archive|unarchive|purge
 ```
 
 - **The proxy** (`--dashboard` with `--dispatch-url`, default
@@ -196,10 +212,11 @@ browser ──(dashboard token)──▶ dashboard /api/jobs/{id}/archive|unarch
   read-only and writes answer `501 {"error": "board editing not
   configured"}`.
 - The same `--dispatch-url`/`DEV_TEAM_DISPATCH_TOKEN` configuration also
-  gates the archive/unarchive proxy: `/api/jobs/{id}/archive` and
-  `/api/jobs/{id}/unarchive` are the **only** two actions forwarded (never a
-  general `/api/jobs/*` passthrough), and without a token they answer
-  `501 {"error": "job actions not configured"}`.
+  gates the archive/unarchive/purge proxy: `/api/jobs/{id}/archive`,
+  `/api/jobs/{id}/unarchive`, and `/api/jobs/{id}/purge` are the **only**
+  actions forwarded (never a general `/api/jobs/*` passthrough), and
+  without a token they answer `501 {"error": "job actions not
+  configured"}`.
 - **Auth is layered**: the browser authenticates to the dashboard
   (dashboard token / cookie, checked first); the dashboard process — not
   the browser — holds the dispatch bearer token. Both comparisons are
@@ -244,5 +261,6 @@ the bearer header when a token is set):
   session lifecycle described above.
 - `POST|PATCH|DELETE /api/backlog/...` — the board write proxy described
   above (requires dashboard auth; `501` until a dispatch token is wired).
-- `POST /api/jobs/{id}/archive` / `POST /api/jobs/{id}/unarchive` — the
-  archive/unarchive proxy described above (same auth and `501` gating).
+- `POST /api/jobs/{id}/archive` / `POST /api/jobs/{id}/unarchive` /
+  `POST /api/jobs/{id}/purge` — the archive/unarchive/purge proxy described
+  above (same auth and `501` gating).
