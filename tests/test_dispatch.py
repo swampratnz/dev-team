@@ -608,6 +608,160 @@ def test_calibration_only_counts_files_that_contributed_a_parseable_line():
     assert payload["overall"]["total"] == 1
 
 
+# --- archive / unarchive (job lifecycle) --------------------------------------
+
+
+def test_archive_without_dashboard_workspace_is_409():
+    disp = Dispatcher(token="x")
+    assert disp.archive_job("any") == (
+        409, {"error": "archive needs a dashboard workspace"})
+    assert disp.unarchive_job("any") == (
+        409, {"error": "archive needs a dashboard workspace"})
+
+
+def test_archive_missing_meta_is_404():
+    disp = Dispatcher(token="x", dashboard_workspace=InMemoryWorkspace())
+    assert disp.archive_job("ghost") == (
+        404, {"error": "no assessment for that job"})
+    assert disp.unarchive_job("ghost") == (
+        404, {"error": "no assessment for that job"})
+
+
+def test_archive_corrupt_meta_is_404():
+    dash = InMemoryWorkspace()
+    dash.write_text("audit/assess-bad/meta.json", "{not json")
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.archive_job("assess-bad") == (
+        404, {"error": "no assessment for that job"})
+
+
+def test_archive_traversal_job_id_is_404():
+    # A traversal-shaped id fails closed through _exists -> 404, exactly like
+    # make_backlog / list_job_findings, never a 500.
+    disp = Dispatcher(token="x", dashboard_workspace=InMemoryWorkspace())
+    assert disp.archive_job("../../etc/passwd") == (
+        404, {"error": "no assessment for that job"})
+    assert disp.unarchive_job("../../etc/passwd") == (
+        404, {"error": "no assessment for that job"})
+
+
+def test_archive_and_unarchive_round_trip_the_meta_marker():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-a"}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash, clock=lambda: 42.0)
+
+    status, payload = disp.archive_job("assess-a")
+    assert (status, payload) == (200, {"id": "assess-a", "archived": True})
+    meta = json.loads(dash.read_text("audit/assess-a/meta.json"))
+    assert meta["archived"] is True
+    assert meta["archived_at"] == 42.0
+    assert meta["repo"] == "acme/mono"  # existing fields survive the mutation
+
+    status, payload = disp.unarchive_job("assess-a")
+    assert (status, payload) == (200, {"id": "assess-a", "archived": False})
+    meta = json.loads(dash.read_text("audit/assess-a/meta.json"))
+    assert "archived" not in meta
+    assert "archived_at" not in meta
+
+
+def test_unarchive_a_non_archived_job_is_idempotent():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-b/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-b"}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.unarchive_job("assess-b") == (
+        200, {"id": "assess-b", "archived": False})
+
+
+def test_archive_refuses_queued_and_running_jobs():
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise,
+        dashboard_workspace=InMemoryWorkspace(),
+    )
+    disp.start()
+    try:
+        running_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+        queued_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/two"}))
+        assert disp.archive_job(running_id) == (409, {"error": "job is running"})
+        assert disp.archive_job(queued_id) == (409, {"error": "job is running"})
+    finally:
+        release.set()
+        disp.wait(running_id, 5)
+        disp.wait(queued_id, 5)
+        disp.stop()
+
+
+def test_recent_excludes_archived_jobs_by_default():
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    disp.start()
+    try:
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        disp.wait(id1, 5)
+        id2, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/two"}))
+        disp.wait(id2, 5)
+        disp.archive_job(id1)
+        assert [r.spec.id for r in disp.recent()] == [id2]
+        assert {r.spec.id for r in disp.recent(include_archived=True)} == {id1, id2}
+        disp.unarchive_job(id1)
+        assert {r.spec.id for r in disp.recent()} == {id1, id2}
+    finally:
+        disp.stop()
+
+
+def test_calibration_excludes_archived_job_and_reappears_after_unarchive():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-a"}),
+    )
+    dash.write_text(
+        "audit/assess-a/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[0]", "verdict": "confirmed"}) + "\n",
+    )
+    dash.write_text(
+        "audit/assess-b/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[1]", "verdict": "refuted"}) + "\n",
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload["jobs_counted"] == 2
+    assert payload["overall"]["total"] == 2
+
+    disp.archive_job("assess-a")
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload["jobs_counted"] == 1
+    assert payload["overall"]["total"] == 1
+    assert payload["overall"]["refuted"] == 1  # only assess-b's verdict survives
+
+    disp.unarchive_job("assess-a")
+    status, payload = disp.calibration()
+    assert payload["jobs_counted"] == 2
+    assert payload["overall"]["total"] == 2
+
+
 def test_calibration_http_route_end_to_end():
     dash = InMemoryWorkspace()
     dash.write_text(
@@ -621,6 +775,90 @@ def test_calibration_http_route_end_to_end():
         assert status == 200
         assert set(payload) == {"phases", "overall", "jobs_counted"}
         assert payload["jobs_counted"] == 1
+
+
+def test_archive_and_unarchive_http_routes_round_trip():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-http/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-http"}),
+    )
+    with running(materialise=_mem_materialise, dashboard_workspace=dash) as server:
+        assert _call(server, "/jobs/assess-http/archive", method="POST") == (
+            200, {"id": "assess-http", "archived": True})
+        meta = json.loads(dash.read_text("audit/assess-http/meta.json"))
+        assert meta["archived"] is True
+        assert _call(server, "/jobs/assess-http/unarchive", method="POST") == (
+            200, {"id": "assess-http", "archived": False})
+        meta = json.loads(dash.read_text("audit/assess-http/meta.json"))
+        assert "archived" not in meta
+
+
+def test_archive_and_unarchive_http_routes_require_auth():
+    # SECURITY: unauthenticated archive/unarchive answers 401, matching
+    # every other dispatch route.
+    with running(materialise=_mem_materialise) as server:
+        assert _call(server, "/jobs/x/archive", method="POST", token=None) == (
+            401, {"error": "unauthorized"})
+        assert _call(server, "/jobs/x/unarchive", method="POST", token=None) == (
+            401, {"error": "unauthorized"})
+
+
+def test_archive_http_route_traversal_id_is_404():
+    # SECURITY: a raw ".." segment splits the URL into more path components
+    # than the {id}/archive route shape expects, so the router itself
+    # rejects it (generic 404) before any workspace path is ever built.
+    with running(materialise=_mem_materialise,
+                 dashboard_workspace=InMemoryWorkspace()) as server:
+        status, payload = _call(
+            server, "/jobs/../../etc/passwd/archive", method="POST")
+        assert (status, payload) == (404, {"error": "not found"})
+        # A traversal-shaped id with no raw "/" (percent-encoded, so it
+        # survives as ONE path segment) reaches Dispatcher.archive_job,
+        # which fails closed via _exists — see
+        # test_archive_traversal_job_id_is_404 for that same guarantee
+        # exercised directly against the core.
+        status, payload = _call(
+            server, "/jobs/%2e%2e%2Fetc%2Fpasswd/archive", method="POST")
+        assert (status, payload) == (404, {"error": "no assessment for that job"})
+
+
+def test_archive_http_route_running_job_is_409():
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    with running(runner=_assess_runner(), materialise=materialise,
+                 dashboard_workspace=InMemoryWorkspace()) as server:
+        _, job = _call(server, "/jobs", method="POST",
+                       body={"mode": "assess", "repo": "a/one"})
+        assert first_in.wait(5)
+        assert _call(server, f"/jobs/{job['id']}/archive", method="POST") == (
+            409, {"error": "job is running"})
+        release.set()
+        server.dispatcher.wait(job["id"], 5)
+
+
+def test_jobs_list_archived_query_param_reveals_archived_jobs():
+    dash = InMemoryWorkspace()
+    with running(runner=_assess_runner(), materialise=_mem_materialise,
+                 dashboard_workspace=dash) as server:
+        _, job = _call(server, "/jobs", method="POST",
+                       body={"mode": "assess", "repo": "a/one"})
+        server.dispatcher.wait(job["id"], 5)
+        _call(server, f"/jobs/{job['id']}/archive", method="POST")
+
+        status, payload = _call(server, "/jobs")
+        assert status == 200
+        assert payload["jobs"] == []
+
+        status, payload = _call(server, "/jobs?archived=1")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == [job["id"]]
 
 
 def test_worker_is_single_flight_and_ordered():
