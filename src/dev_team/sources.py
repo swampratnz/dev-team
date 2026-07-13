@@ -33,6 +33,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, MutableMapping, Optional, Sequence
+from urllib.parse import urlsplit
 
 from .errors import DevTeamError
 from .execution import CommandResult, CommandRunner
@@ -121,6 +122,7 @@ def parse_repo(ref: str) -> RepoRef:
         owner, name = _owner_name_from_path(path, ref)
         return RepoRef(owner=owner, name=name, url=text)
     if "://" in text:
+        _reject_embedded_credentials(text)
         path = text.split("://", 1)[1]
         path = path.split("/", 1)[1] if "/" in path else ""
         owner, name = _owner_name_from_path(path, ref)
@@ -129,6 +131,29 @@ def parse_repo(ref: str) -> RepoRef:
         f"unrecognised repository reference: {ref!r} "
         "(expected owner/name, an https:// URL, or a git@ URL)"
     )
+
+
+def _reject_embedded_credentials(ref: str) -> None:
+    """Refuse a URL that carries credentials in its authority component.
+
+    A ``https://user:pass@host/...`` (or bare ``https://token@host/...``) URL
+    would put the secret straight into git's argv and ``.git/config``, where
+    neither the header-based auth design nor :func:`_scrub` can reach it — so
+    it must be rejected outright rather than silently propagated. A bare
+    ``ssh://git@host`` username is left alone: that is a transport user, not a
+    secret. Credentials belong in an env file, so point the user at
+    ``--env-file``.
+    """
+
+    parts = urlsplit(ref)
+    has_secret = parts.password is not None or (
+        parts.username is not None and parts.scheme in ("http", "https")
+    )
+    if has_secret:
+        raise SourceError(
+            f"refusing a URL with embedded credentials: {ref!r}; "
+            "put the token in --env-file (or ./.env), not in the URL"
+        )
 
 
 def _strip_git_suffix(name: str) -> str:
@@ -199,16 +224,39 @@ def resolve_github_token(
     return inherited
 
 
+#: Hosts a GitHub PAT may be sent to. The token is scoped to GitHub, so the
+#: ``Authorization`` header is attached only for these hosts — never for an
+#: arbitrary ``--repo https://other-host/...``, which would leak the token to
+#: whoever runs that host. git simply falls back to anonymous access there.
+_GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "api.github.com"})
+
+
+def _is_github_https(url: str) -> bool:
+    """Whether ``url`` is an HTTPS URL served by a GitHub host.
+
+    The host is parsed with :func:`urllib.parse.urlsplit` (so any userinfo or
+    ``:port`` is ignored) and compared against :data:`_GITHUB_HOSTS`;
+    ``hostname`` is already lower-cased, so the match is case-insensitive.
+    """
+
+    parts = urlsplit(url)
+    if parts.scheme != "https":
+        return False
+    return (parts.hostname or "") in _GITHUB_HOSTS
+
+
 def _auth_env(ref: RepoRef, token: Optional[str]) -> Dict[str, str]:
     """Per-command git environment: never prompt; header-based auth.
 
     The basic-auth header rides in ``GIT_CONFIG_*`` variables scoped to this
-    one subprocess — the token stays out of argv and ``.git/config``. Only
-    HTTPS transports get the header; a token cannot help SSH or file URLs.
+    one subprocess — the token stays out of argv and ``.git/config``. The
+    header is attached only for GitHub HTTPS remotes: a token cannot help SSH
+    or file URLs, and sending it to a non-GitHub HTTPS host would hand the
+    credential to an arbitrary third party.
     """
 
     env = {"GIT_TERMINAL_PROMPT": "0"}
-    if token and ref.url.startswith("https://"):
+    if token and _is_github_https(ref.url):
         basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
         env.update(
             {
@@ -221,9 +269,17 @@ def _auth_env(ref: RepoRef, token: Optional[str]) -> Dict[str, str]:
 
 
 def _scrub(text: str, token: Optional[str]) -> str:
-    if token:
-        return text.replace(token, "***")
-    return text
+    """Redact the token *and* the basic-auth header value derived from it.
+
+    A verbose/``GIT_TRACE`` line can echo the ``AUTHORIZATION: basic <base64>``
+    header rather than the raw token, so the exact base64 value :func:`_auth_env`
+    would compute is redacted alongside the token itself.
+    """
+
+    if not token:
+        return text
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return text.replace(token, "***").replace(basic, "***")
 
 
 def clone_or_update(

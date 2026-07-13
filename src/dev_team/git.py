@@ -214,15 +214,28 @@ class GitRepo:
         ``-uall`` expands untracked directories into individual files so new
         files inside new directories are reported (and reviewable) one by one.
         Renames report the new path.
+
+        ``-z`` is essential, not cosmetic: without it, ``git status
+        --porcelain`` C-quotes any path containing a space or non-ASCII byte
+        (e.g. ``?? "my file.py"``), and staging that quoted string later
+        (``git add -- '"my file.py"'``) exits 128 and aborts delivery. With
+        ``-z`` the output is NUL-separated and paths are emitted verbatim, so
+        they round-trip straight back into ``git add``.
         """
 
-        lines = self._git("status", "--porcelain", "-uall").stdout.splitlines()
-        paths = []
-        for line in lines:
-            if not line.strip():
+        # Records are NUL-separated (no trailing newline noise). Each record is
+        # a two-char XY status, a space, then the path. A rename/copy (X in
+        # {R, C}) is followed by its OLD path in the *next* NUL field, which we
+        # consume and discard, keeping the NEW path from the status record.
+        records = self._git("status", "--porcelain", "-uall", "-z").stdout.split("\0")
+        paths: List[str] = []
+        i = 0
+        while i < len(records):
+            record = records[i]
+            i += 1
+            if not record:
                 continue
-            path = line[3:]
-            if " -> " in path:
-                path = path.split(" -> ")[-1]
-            paths.append(path)
+            paths.append(record[3:])
+            if record[0] in ("R", "C"):
+                i += 1  # skip the old-path field that follows a rename/copy
         return paths

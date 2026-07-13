@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dev_team.execution import CommandResult, FakeCommandRunner
+from dev_team.execution import CommandResult, DryRunCommandRunner, FakeCommandRunner
 from dev_team.verification import (
     CommandGate,
     CoverageGate,
@@ -90,6 +90,26 @@ def test_definition_of_done_empty_is_not_passed():
     assert report.passed is False
 
 
+def test_command_gate_over_dry_run_is_marked_not_executed():
+    # A dry run exits 0, so .passed stays True (the engine's "nothing blocked"
+    # contract is unchanged), but the result must be flagged not-executed.
+    result = CommandGate("tests", ["pytest"]).evaluate(_ctx(DryRunCommandRunner()))
+    assert result.passed is True
+    assert result.executed is False
+    assert "not executed" in result.detail
+
+
+def test_summary_flags_dry_run_gates_as_not_executed():
+    dod = DefinitionOfDone().add(CommandGate("a", ["x"])).add(CommandGate("b", ["y"]))
+    report = dod.evaluate(_ctx(DryRunCommandRunner()))
+    assert report.passed is True
+    summary = report.summary()
+    # Passing count is still reported, but the dry run is called out so the
+    # line cannot read as real verification.
+    assert "2/2 gates passed" in summary
+    assert "dry-run: not executed" in summary
+
+
 def test_coverage_gate_prefers_total_line():
     # A stray percentage after the TOTAL row must not win.
     output = "TOTAL    120   6   95%\nwarning: 3% of runs were slow"
@@ -107,6 +127,16 @@ def test_coverage_gate_total_line_without_percent_falls_back():
     result = gate.evaluate(GateContext(runner=runner))
     assert result.passed is False
     assert "88.0%" in result.detail
+
+
+def test_coverage_gate_ignores_trailing_unrelated_percent():
+    # No coverage-summary line at all — a bare trailing percentage must not be
+    # mistaken for coverage; the gate fails closed instead of reading "50%".
+    output = "3 tests passed\nnote: retried 50% of flaky steps"
+    runner = FakeCommandRunner().add_rule("cov", CommandResult(["cov"], 0, output, ""))
+    result = CoverageGate("coverage", ["cov"]).evaluate(GateContext(runner=runner))
+    assert result.passed is False
+    assert "no coverage percentage found" in result.detail
 
 
 class _SequenceRunner:

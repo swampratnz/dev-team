@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Protocol, Sequence, runtime_checkable
 
-from .execution import CommandRunner, Workspace
+from .execution import CommandRunner, DryRunCommandRunner, Workspace
 from .models import Task
 
 
@@ -31,11 +31,19 @@ class GateContext:
 
 @dataclass
 class GateResult:
-    """The pass/fail outcome of a single gate."""
+    """The pass/fail outcome of a single gate.
+
+    ``executed`` is ``False`` when the gate did not actually run its command —
+    a dry run over a :class:`~dev_team.execution.DryRunCommandRunner`, which
+    reports exit 0 without doing anything. ``passed`` stays ``True`` in that
+    case (the engine's "no gate blocked this" contract is unchanged), but the
+    aggregate summary uses ``executed`` to make clear that nothing was verified.
+    """
 
     name: str
     passed: bool
     detail: str = ""
+    executed: bool = True
 
 
 @runtime_checkable
@@ -60,7 +68,11 @@ class CommandGate:
         result = context.runner.run(
             list(self.command), cwd=context.cwd, timeout=context.timeout
         )
-        return GateResult(self.name, result.ok, result.output)
+        # A dry-run runner exits 0 without running anything; flag the result as
+        # not-executed (its output already says so) so an aggregate "N/N gates
+        # passed" cannot pass a dry run off as real verification.
+        executed = not isinstance(context.runner, DryRunCommandRunner)
+        return GateResult(self.name, result.ok, result.output, executed=executed)
 
 
 _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
@@ -69,20 +81,30 @@ _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 def _coverage_percent(output: str) -> Optional[float]:
     """Extract the overall coverage percentage from tool output.
 
-    Prefers a percentage on a line containing ``TOTAL`` (coverage.py's summary
-    row) so that stray percentages in warnings or test names cannot win; falls
-    back to the last percentage found anywhere.
+    A percentage is trusted only when it sits on a line that also names a
+    coverage summary: coverage.py's ``TOTAL`` row (preferred), or failing that
+    a ``coverage``-labelled line. A bare percentage anywhere else — a
+    slow-test warning, a progress readout, a citation — is ignored, and when no
+    anchored line carries a percentage the function fails *closed* (returns
+    ``None``) so :class:`CoverageGate` blocks rather than passing on a number
+    it grabbed at random. This keeps real coverage.py output working while
+    refusing to be fooled by a stray trailing ``%``.
     """
 
+    total: Optional[float] = None
+    labelled: Optional[float] = None
     for line in output.splitlines():
-        if "TOTAL" in line.upper():
-            matches = _PERCENT.findall(line)
-            if matches:
-                return float(matches[-1])
-    matches = _PERCENT.findall(output)
-    if matches:
-        return float(matches[-1])
-    return None
+        matches = _PERCENT.findall(line)
+        if not matches:
+            continue
+        upper = line.upper()
+        if "TOTAL" in upper:
+            total = float(matches[-1])
+        elif "COVERAGE" in upper:
+            labelled = float(matches[-1])
+    if total is not None:
+        return total
+    return labelled
 
 
 @dataclass
@@ -187,10 +209,19 @@ class DoDReport:
         return [r for r in self.results if not r.passed]
 
     def summary(self) -> str:
-        """One-line human summary."""
+        """One-line human summary.
+
+        Dry-run gates (``executed is False``) are counted separately and
+        called out, so a report can never claim "N/N gates passed" while
+        quietly having run nothing.
+        """
 
         passed = sum(1 for r in self.results if r.passed)
-        return f"{passed}/{len(self.results)} gates passed"
+        line = f"{passed}/{len(self.results)} gates passed"
+        dry = sum(1 for r in self.results if not r.executed)
+        if dry:
+            line += f" ({dry} dry-run: not executed)"
+        return line
 
 
 @dataclass

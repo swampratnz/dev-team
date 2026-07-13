@@ -10,11 +10,12 @@ told and what it said.
 Two things to keep in mind about this surface:
 
 - **It is sensitive.** A transcript contains the raw content of the assessed
-  repository (including any secrets committed to it) and the model's verbatim
-  reply. The dashboard is unauthenticated and tailnet-only today, so recording
-  is opt-in and the read helpers are written as a clearly-delimited guarded
-  surface (strict input sanitisation + workspace-membership traversal guard),
-  ready for an auth layer to wrap the routes later.
+  repository and the model's verbatim reply. The dashboard is unauthenticated
+  and tailnet-only today, so recording is opt-in, each captured field is run
+  through a secret-redaction pass (see :func:`_redact`) before it is stored,
+  and the read helpers are written as a clearly-delimited guarded surface
+  (strict input sanitisation + workspace-membership traversal guard), ready for
+  an auth layer to wrap the routes later.
 - **It stays bounded.** Each captured field is truncated to ``max_chars`` so a
   runaway prompt/response cannot fill the disk.
 
@@ -43,6 +44,52 @@ _PREVIEW_CHARS = 140
 
 #: A run/role token is only ever a plain filename segment.
 _FILENAME = re.compile(r"[A-Za-z0-9._-]+")
+
+#: A fixed marker substituted for any secret-shaped span in a captured field.
+#: Recording is opt-in and the dashboard is unauthenticated by default, so a
+#: transcript can outlive the run and be read by anyone with dashboard access;
+#: a secret committed to the assessed repo (or echoed in a prompt/response)
+#: must therefore never be persisted here verbatim.
+_REDACTED = "[REDACTED]"
+
+#: Secret shapes redacted from every captured field before truncation. Kept
+#: deliberately small and specific — high-signal token formats only, so
+#: ordinary repository text is not mangled. Each pattern maps its whole match
+#: to :data:`_REDACTED`.
+_SECRET_PATTERNS = (
+    # GitHub fine-grained personal access token.
+    re.compile(r"github_pat_[A-Za-z0-9_]+"),
+    # GitHub classic tokens: PAT (p), OAuth (o), user (u), server (s), refresh (r).
+    re.compile(r"gh[pousr]_[A-Za-z0-9]+"),
+    # Anthropic API keys.
+    re.compile(r"sk-ant-[A-Za-z0-9_-]+"),
+    # AWS access key id.
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    # PEM-encoded private key blocks (any key type), spanning lines.
+    re.compile(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+)
+
+#: The ``Authorization: Bearer <token>`` header: keep the header name so the
+#: transcript still reads sensibly, redact only the credential that follows.
+_BEARER = re.compile(r"(?i)(Authorization:\s*Bearer\s+)\S+")
+
+
+def _redact(text: Optional[str]) -> Optional[str]:
+    """Replace secret-shaped spans in ``text`` with :data:`_REDACTED`.
+
+    Applied to every captured field *before* truncation so a secret can never
+    be written into a transcript (see :data:`_REDACTED` for why this matters).
+    ``None`` passes through untouched.
+    """
+
+    if text is None:
+        return None
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(_REDACTED, text)
+    return _BEARER.sub(r"\g<1>" + _REDACTED, text)
 
 
 def _truncate(text: Optional[str], limit: int) -> Optional[str]:
@@ -98,9 +145,9 @@ class TranscriptRecorder:
             "run": self.run,
             "role": role,
             "seq": seq,
-            "system_prompt": _truncate(system_prompt, self.max_chars),
-            "prompt": _truncate(prompt, self.max_chars),
-            "response": _truncate(result.text, self.max_chars),
+            "system_prompt": _truncate(_redact(system_prompt), self.max_chars),
+            "prompt": _truncate(_redact(prompt), self.max_chars),
+            "response": _truncate(_redact(result.text), self.max_chars),
             "cost_usd": result.cost_usd,
             "is_error": result.is_error,
         }

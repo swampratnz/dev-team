@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from dev_team.backlog import Backlog, BacklogStore, ItemStatus
+from dev_team.errors import DevTeamError
 from dev_team.execution import InMemoryWorkspace
 
 
@@ -108,3 +111,60 @@ def test_backlog_json_written_before_provenance_still_loads():
     restored = Backlog.from_dict(data)
     assert restored.stories[0].source_job is None
     assert restored.stories[0].finding_id is None
+
+
+def test_from_dict_ignores_unknown_keys():
+    # A backlog.json from a newer build (or a hand-edit / renamed field) can
+    # carry keys this build does not know; they must be dropped, not raise
+    # TypeError from Story(**payload)/Epic(**payload).
+    data = {
+        "epics": [{"id": "E1", "title": "Auth", "description": "", "colour": "red"}],
+        "stories": [
+            {"id": "S1", "title": "Login", "estimate": 2, "status": "todo",
+             "owner": "alice"}
+        ],
+    }
+    restored = Backlog.from_dict(data)
+    assert restored.epics[0].id == "E1"
+    assert restored.stories[0].id == "S1"
+    assert restored.stories[0].estimate == 2
+
+
+def test_store_load_raises_devteamerror_on_corrupt_json():
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    ws.write_text(store.path, "{not valid json")
+    with pytest.raises(DevTeamError):
+        store.load()
+
+
+def test_store_load_raises_devteamerror_on_missing_required_field():
+    # After filtering unknown keys, a required field (title) is absent, so
+    # construction fails — surfaced as a typed DevTeamError, not a raw
+    # TypeError the CLI would let escape as a traceback.
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    ws.write_text(store.path, json.dumps({"stories": [{"renamed_id": "S1"}]}))
+    with pytest.raises(DevTeamError):
+        store.load()
+
+
+def test_store_load_raises_devteamerror_on_bad_status():
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    ws.write_text(
+        store.path,
+        json.dumps({"stories": [{"id": "S1", "title": "Login", "status": "bogus"}]}),
+    )
+    with pytest.raises(DevTeamError):
+        store.load()
+
+
+def test_store_load_raises_devteamerror_on_non_object_json():
+    # Valid JSON of the wrong shape (a list at top level): ``.get`` on it
+    # raises AttributeError, which must also become a typed DevTeamError.
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    ws.write_text(store.path, json.dumps([1, 2, 3]))
+    with pytest.raises(DevTeamError):
+        store.load()

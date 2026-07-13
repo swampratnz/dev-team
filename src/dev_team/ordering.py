@@ -46,7 +46,40 @@ def lint_plan(plan: Plan) -> List[str]:
                 issues.append(f"task {task.id} depends on itself")
             elif dep not in ids:
                 issues.append(f"task {task.id} depends on unknown task {dep!r}")
+    # Self-deps and unknown deps are caught above, but a *multi-node* cycle
+    # (A→B→A) is not — and it sinks the run later: schedule() raises
+    # DependencyCycleError with no ready tasks left. Surface it here so the
+    # PM's revision pass can break the cycle instead.
+    cyclic = _tasks_in_cycle(plan.tasks, ids)
+    if cyclic:
+        issues.append(
+            f"tasks form a dependency cycle: {', '.join(cyclic)}"
+        )
     return issues
+
+
+def _tasks_in_cycle(tasks: List[Task], ids: set[str]) -> List[str]:
+    """Return the ids of tasks that can never be ordered (in input order).
+
+    Considers only *valid* dependencies (known ids, no self-edges), matching
+    how :func:`topological_order` and the scheduler resolve them, so an
+    unknown or self dependency never masquerades as a cycle. Uses Kahn's
+    algorithm: any task left once no more tasks can be resolved lies on — or
+    downstream of — a cycle.
+    """
+
+    deps: Dict[str, List[str]] = {
+        task.id: [dep for dep in task.dependencies if dep in ids and dep != task.id]
+        for task in tasks
+    }
+    resolved: set[str] = set()
+    remaining = [task.id for task in tasks]
+    while True:
+        ready = [tid for tid in remaining if all(d in resolved for d in deps[tid])]
+        if not ready:
+            return remaining
+        resolved.update(ready)
+        remaining = [tid for tid in remaining if tid not in resolved]
 
 
 def topological_order(tasks: List[Task]) -> List[Task]:

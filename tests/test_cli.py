@@ -21,6 +21,12 @@ def test_build_parser_parses_constraints():
     assert args.constraints == ["one", "two"]
 
 
+def test_min_coverage_default_is_pragmatic():
+    # F3: 100 is strict and marks most first runs INCOMPLETE; default to 80.
+    parser = build_parser()
+    assert parser.parse_args(["Title", "Desc"]).min_coverage == 80.0
+
+
 def test_version_flag_prints_version(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["--version"])
@@ -87,11 +93,13 @@ def test_main_invalid_config_returns_error_on_stderr(capsys):
 
 
 def test_main_deliver_only_flag_without_deliver_exits_2(capsys):
+    # --budget-usd is no longer deliver-only (the simulation meters cost too);
+    # --no-commit still is, so it is what the rejection should name here.
     with pytest.raises(SystemExit) as excinfo:
-        main(["Login", "Add login", "--budget-usd", "5"], runner=ScriptedRunner([]))
+        main(["Login", "Add login", "--no-commit"], runner=ScriptedRunner([]))
     err = capsys.readouterr().err
     assert excinfo.value.code == 2
-    assert "--budget-usd" in err
+    assert "--no-commit" in err
     assert "--deliver" in err
 
 
@@ -104,7 +112,6 @@ def test_main_deliver_only_flags_all_reported(capsys):
         "--branch", "custom",
         "--allow-dirty-baseline",
         "--proceed-on-red-baseline",
-        "--budget-usd", "5",
         "--max-concurrency", "2",
         "--no-commit",
     ]
@@ -115,9 +122,64 @@ def test_main_deliver_only_flags_all_reported(capsys):
     for flag in (
         "--workspace", "--verify-command", "--setup-command", "--branch",
         "--allow-dirty-baseline", "--proceed-on-red-baseline",
-        "--budget-usd", "--max-concurrency", "--no-commit",
+        "--max-concurrency", "--no-commit",
     ):
         assert flag in err
+
+
+def test_main_simulation_accepts_budget_and_reports_cost(monkeypatch, capsys):
+    # F1: the simulation is not free — --budget-usd is now accepted, threaded
+    # into the workflow per the G contract, and the metered cost is reported.
+    import dev_team.cli as cli_module
+    from dev_team.models import Design, Plan, ProjectResult
+
+    captured = {}
+
+    class _FakeTeam:
+        def __init__(self, *a, **k):
+            self.interaction = None
+
+        async def develop(self, request, *, budget=None):
+            captured["budget"] = budget
+            result = ProjectResult(
+                request=request,
+                plan=Plan(summary="p"),
+                design=Design(overview="o"),
+                task_results=[],
+            )
+            result.cost_usd = 0.1234  # G's backend populates this from the meter
+            return result
+
+    monkeypatch.setattr(cli_module, "DevTeam", _FakeTeam)
+    code = main(["Login", "Add login", "--budget-usd", "5"], runner=ScriptedRunner([]))
+    out = capsys.readouterr().out
+    assert code == 1  # no tasks succeeded, but the run was accepted (not exit 2)
+    assert captured["budget"].limit_usd == 5.0
+    assert "Cost:    $0.1234" in out
+
+
+def test_main_min_coverage_rejected_with_deliver(capsys):
+    # F2: --min-coverage is a simulation-mode gate; the delivery engine ignores
+    # it, so passing both is an error rather than a silent no-op.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["T", "D", "--deliver", "--min-coverage", "90"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--min-coverage" in err
+    assert "definition-of-done" in err
+
+
+def test_main_budget_usd_rejected_in_unmetered_modes(tmp_path, capsys):
+    # F1 corollary: modes that run no metered agents have no cost ceiling to
+    # enforce, so --budget-usd there is a user error, not a silent no-op.
+    for extra in (
+        ["--dashboard", "--workspace", str(tmp_path)],
+        ["--make-backlog", str(tmp_path)],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main([*extra, "--budget-usd", "5"], runner=ScriptedRunner([]))
+        assert excinfo.value.code == 2
+        assert "--budget-usd" in capsys.readouterr().err
 
 
 # --- real delivery mode -----------------------------------------------------
@@ -203,6 +265,22 @@ def test_main_deliver_auto_detects_verify_command(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 1
     assert "Halted:" in out
+
+
+def test_main_deliver_default_progress_and_quiet_suppresses(tmp_path, capsys):
+    # F6: --deliver shows a lightweight running-cost progress line on stderr by
+    # default; --quiet silences it. (-v prints the full stream instead — the
+    # two are mutually exclusive, so events are never double-printed.)
+    from helpers import engine_responses
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    assert main(_deliver_args(tmp_path), runner=runner) == 0
+    err = capsys.readouterr().err
+    assert "$0.0000" in err  # the running cost went to stderr
+
+    runner2 = ScriptedRunner(by_system_prompt=engine_responses())
+    assert main(_deliver_args(tmp_path, "--quiet"), runner=runner2) == 0
+    assert "$" not in capsys.readouterr().err  # --quiet suppresses the progress
 
 
 # --- credential preflight -----------------------------------------------------
@@ -775,12 +853,24 @@ def test_main_make_backlog_uses_job_meta_for_per_repo_epic(tmp_path, capsys):
 
 
 def test_main_make_backlog_missing_assessment_exits_2(tmp_path, capsys):
-    code = main(["--make-backlog", str(tmp_path / "empty")])
+    empty = tmp_path / "empty"
+    empty.mkdir()  # the dir exists (so the isdir guard passes); it just has no assessment
+    code = main(["--make-backlog", str(empty)])
     captured = capsys.readouterr()
     assert code == 2
     assert "no assessment.json" in captured.err
     assert "--assess" in captured.err
     assert captured.out == ""
+
+
+def test_main_make_backlog_missing_directory_exits_2(tmp_path, capsys):
+    # F5: a mistyped --make-backlog path fails loudly instead of mkdir-ing it.
+    missing = tmp_path / "nope"
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--make-backlog", str(missing)], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "no such directory" in capsys.readouterr().err
+    assert not missing.exists()
 
 
 def test_main_make_backlog_is_standalone():
@@ -904,8 +994,10 @@ def test_main_verify_agent_failure_exits_1(tmp_path, capsys):
 
 
 def test_main_verify_missing_assessment_exits_2(tmp_path, capsys):
+    empty = tmp_path / "empty"
+    empty.mkdir()  # the dir exists (so the isdir guard passes); it just has no assessment
     code = main(
-        ["--verify", str(tmp_path / "empty"), "--finding", "x"],
+        ["--verify", str(empty), "--finding", "x"],
         runner=ScriptedRunner([]),
     )
     captured = capsys.readouterr()
@@ -925,6 +1017,17 @@ def test_main_verify_unmatched_finding_exits_2(tmp_path, capsys):
     assert code == 2
     assert "no finding matches" in captured.err
     assert "risk.secrets[0]" in captured.err  # the error teaches the id shape
+
+
+def test_main_verify_missing_directory_exits_2(tmp_path, capsys):
+    # F5: a mistyped --verify path must fail loudly, not silently mkdir an
+    # empty workspace and then report a misleading "no assessment" error.
+    missing = tmp_path / "nope"
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--verify", str(missing), "--finding", "x"], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "no such directory" in capsys.readouterr().err
+    assert not missing.exists()  # the typo did not create it
 
 
 def test_main_verify_flag_validation():
@@ -1205,6 +1308,35 @@ def test_main_dashboard_local_bind_without_token_is_quiet(
         assert "UNAUTHENTICATED" not in capsys.readouterr().err
 
 
+def test_main_dashboard_missing_workspace_exits_2(tmp_path, capsys):
+    # F5: --dashboard is a viewer; a mistyped --workspace must fail loudly
+    # rather than silently create an empty directory to serve.
+    missing = tmp_path / "nope"
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--dashboard", "--workspace", str(missing)], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "no such directory" in capsys.readouterr().err
+    assert not missing.exists()
+
+
+def test_main_dashboard_warns_when_transcripts_present_without_token(
+    tmp_path, monkeypatch, capsys
+):
+    # F9: even on loopback, an unauthenticated dashboard over a workspace that
+    # already holds transcripts exposes raw prompts/responses — warn (no fail).
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    monkeypatch.delenv("DEV_TEAM_DASHBOARD_TOKEN", raising=False)
+    tdir = tmp_path / ".dev_team" / "transcripts" / "deliver-x"
+    tdir.mkdir(parents=True)
+    (tdir / "engineer-001.json").write_text("{}")
+    code = main(["--dashboard", "--workspace", str(tmp_path)], runner=None)
+    assert code == 0  # a warning, not a hard failure
+    err = capsys.readouterr().err
+    assert "UNAUTHENTICATED" in err
+    assert "transcript" in err.lower()
+
+
 def test_main_dashboard_flag_validation():
     for argv in (
         ["--dashboard", "--assess"],
@@ -1312,6 +1444,18 @@ def test_main_record_transcripts_requires_a_run_mode():
         main(["--record-transcripts", "--dashboard", "--workspace", "."],
              runner=ScriptedRunner([]))
     assert excinfo.value.code == 2
+
+
+def test_main_record_transcripts_rejected_with_chat(capsys):
+    # F4: a chat has no run id / event log, so recording captures nothing —
+    # reject it rather than silently accept and record nothing.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--chat", "--record-transcripts"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--record-transcripts" in err
+    # the message names the modes that actually support it, and not --chat
+    assert "--assess/--deliver/--dispatch" in err
 
 
 def test_main_dispatch_requires_token(monkeypatch, capsys):

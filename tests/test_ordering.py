@@ -86,6 +86,47 @@ def test_lint_plan_catches_defects():
     assert any("depends on itself" in i for i in issues)
 
 
+def test_lint_plan_detects_multi_node_cycle():
+    from dev_team.models import Plan
+    from dev_team.ordering import lint_plan
+
+    # A -> B -> C -> A: no self-dep, no unknown dep, but unschedulable.
+    plan = Plan(
+        summary="s",
+        tasks=[
+            Task(id="A", title="a", description="", acceptance_criteria=["x"],
+                 dependencies=["C"]),
+            Task(id="B", title="b", description="", acceptance_criteria=["x"],
+                 dependencies=["A"]),
+            Task(id="C", title="c", description="", acceptance_criteria=["x"],
+                 dependencies=["B"]),
+        ],
+    )
+    issues = lint_plan(plan)
+    assert any("dependency cycle" in i for i in issues)
+    # every cyclic task is named
+    cycle_issue = next(i for i in issues if "dependency cycle" in i)
+    assert "A" in cycle_issue and "B" in cycle_issue and "C" in cycle_issue
+
+
+def test_lint_plan_no_false_cycle_from_self_or_unknown_deps():
+    from dev_team.models import Plan
+    from dev_team.ordering import lint_plan
+
+    # A depends on itself and on an unknown id; neither is a real cycle.
+    plan = Plan(
+        summary="s",
+        tasks=[
+            Task(id="A", title="a", description="", acceptance_criteria=["x"],
+                 dependencies=["A", "ghost"]),
+            Task(id="B", title="b", description="", acceptance_criteria=["x"],
+                 dependencies=["A"]),
+        ],
+    )
+    issues = lint_plan(plan)
+    assert not any("dependency cycle" in i for i in issues)
+
+
 def test_lint_plan_empty_and_oversized():
     from dev_team.models import Plan
     from dev_team.ordering import MAX_PLAN_TASKS, lint_plan

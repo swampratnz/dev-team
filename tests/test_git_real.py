@@ -101,6 +101,22 @@ def test_has_changes_and_changed_files(repo, tmp_path):
     assert "pkg/inner.txt" in files
 
 
+def test_changed_files_handles_spaces_and_non_ascii_and_stages(repo, tmp_path):
+    # Regression: the old newline-parsed ``git status --porcelain`` C-quoted
+    # these names, so the quoted strings failed to stage (exit 128). With
+    # ``-z`` the names come back verbatim and round-trip into ``git add``.
+    repo.ensure_repo()
+    _commit_file(repo, tmp_path, "seed.txt", "seed\n")
+    _write(tmp_path, "my file.txt", "spaces\n")
+    _write(tmp_path, "café.txt", "unicode\n")
+    files = repo.changed_files()
+    assert "my file.txt" in files
+    assert "café.txt" in files
+    repo.add_paths(files)
+    repo.commit("add tricky names")
+    assert repo.has_changes() is False
+
+
 def test_add_all_stages_everything(repo, tmp_path):
     repo.ensure_repo()
     _commit_file(repo, tmp_path, "a.txt", "one\n")

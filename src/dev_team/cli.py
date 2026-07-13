@@ -30,7 +30,7 @@ from .dispatch import DispatchServer
 from .engine import EngineConfig
 from .errors import DevTeamError
 from .eventlog import EventLog, compose
-from .events import AgentEvent
+from .events import AgentEvent, Listener
 from .execution import DEFAULT_EXCLUDED_DIRS, LocalWorkspace, SubprocessCommandRunner
 from .interaction import ChannelApprovalGate, ConsoleChannel
 from .models import FeatureRequest
@@ -49,7 +49,7 @@ from .sources import (
     resolve_github_token,
 )
 from .team import DevTeam
-from .transcripts import TranscriptRecorder
+from .transcripts import TRANSCRIPTS_DIR, TranscriptRecorder
 
 # Any one of these satisfies the credential preflight. The Claude CLI (which
 # the Agent SDK spawns) resolves them itself; dev-team only checks presence so
@@ -135,8 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-coverage",
         type=float,
-        default=100.0,
-        help="Minimum test coverage QA must report to pass a task (simulation mode).",
+        default=80.0,
+        help="Minimum test coverage percent QA must report for a task to pass "
+        "in the default simulation mode (default 80; 100 is strict and tends "
+        "to mark first runs INCOMPLETE). Ignored by --deliver, which gates on "
+        "its definition-of-done instead — passing both is an error.",
     )
     parser.add_argument(
         "-i",
@@ -169,7 +172,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--deliver",
         action="store_true",
         help="Run the real delivery engine (writes files, runs gates, commits) "
-        "instead of the side-effect-free simulation.",
+        "instead of the default simulation. Note the simulation is not free: it "
+        "runs the same real, paid agents, it just makes no filesystem or git "
+        "changes.",
     )
     parser.add_argument(
         "--assess",
@@ -256,7 +261,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-osv-scan",
         action="store_true",
         help="Skip the live OSV.dev vulnerability scan of pinned "
-        "dependencies (with --assess).",
+        "dependencies (with --assess). The scan is ON by default; when it "
+        "runs, each pinned dependency's NAME and version is sent to "
+        "api.osv.dev to look up known vulnerabilities. Pass this to keep the "
+        "dependency list off the network.",
     )
     parser.add_argument(
         "--backlog",
@@ -321,8 +329,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="OWNER/NAME",
         help="Clone this GitHub repository (owner/name or a git URL) and use "
-        "the clone as the workspace (with --assess or --deliver). Private "
-        "repositories authenticate with a GITHUB_TOKEN/GH_TOKEN found "
+        "the clone as the workspace (with --assess, --deliver, or --chat). "
+        "Private repositories authenticate with a GITHUB_TOKEN/GH_TOKEN found "
         "automatically in ./.env, ~/.config/dev-team/dev-team.env, or "
         "/etc/dev-team/dev-team.env (override with --env-file). An existing "
         "clone is fast-forwarded instead of re-cloned.",
@@ -412,7 +420,14 @@ def build_parser() -> argparse.ArgumentParser:
         "-v",
         "--verbose",
         action="store_true",
-        help="Print progress events as the team works.",
+        help="Print the full progress event stream as the team works.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress the default one-line-per-event progress shown on "
+        "--deliver/--assess. No effect with -v/--verbose (which prints the "
+        "full event stream).",
     )
     parser.add_argument(
         "--record-transcripts",
@@ -476,8 +491,10 @@ def _validate_args(
     if args.report is not None and not args.assess:
         parser.error("--report: only valid with --assess")
     if args.record_transcripts and not (
-        args.assess or args.deliver or args.dispatch or args.chat
+        args.assess or args.deliver or args.dispatch
     ):
+        # --chat is deliberately excluded: a chat has no run id / event log to
+        # correlate transcripts with, so recording there captures nothing.
         parser.error(
             "--record-transcripts: only valid with --assess/--deliver/--dispatch"
         )
@@ -496,7 +513,7 @@ def _validate_args(
     if args.roster is not None and args.no_personas:
         parser.error("--roster and --no-personas are mutually exclusive")
     if args.repo is not None and not (args.assess or args.deliver or args.chat):
-        parser.error("--repo: only valid with --assess or --deliver")
+        parser.error("--repo: only valid with --assess, --deliver, or --chat")
     if args.env_file is not None and args.repo is None:
         parser.error("--env-file: only valid with --repo")
     if args.remote_verify_trigger is not None and args.remote_verify_status is None:
@@ -514,6 +531,34 @@ def _validate_args(
         passed = [flag for flag, is_set in assess_only if is_set]
         if passed:
             parser.error(f"{', '.join(passed)}: only valid with --assess")
+    if args.deliver and args.min_coverage != parser.get_default("min_coverage"):
+        # --min-coverage is a simulation-mode QA gate; the delivery engine has
+        # no such field and would silently ignore it. Point at the model that
+        # actually gates a delivery so the coverage intent is not lost.
+        parser.error(
+            "--min-coverage is a simulation-mode QA gate and is ignored by "
+            "--deliver, which gates on its definition-of-done "
+            "(--verify-command / --remote-verify-status) instead"
+        )
+    if args.budget_usd is not None and (
+        args.dashboard or args.dispatch or args.make_backlog is not None
+    ):
+        # A cost ceiling only means something when metered agents run; these
+        # modes run none (or, for --dispatch, meter each job separately).
+        parser.error(
+            "--budget-usd: no metered agents run in "
+            "--dashboard/--dispatch/--make-backlog, so a cost ceiling has "
+            "nothing to enforce"
+        )
+    # Read/consume modes must point at a directory that already exists.
+    # LocalWorkspace would otherwise mkdir a mistyped path and then present an
+    # empty dashboard or a misleading "no assessment" error that hides the typo.
+    if args.dashboard and not os.path.isdir(args.workspace):
+        parser.error(f"--dashboard: no such directory: {args.workspace}")
+    if args.verify is not None and not os.path.isdir(args.verify):
+        parser.error(f"--verify: no such directory: {args.verify}")
+    if args.make_backlog is not None and not os.path.isdir(args.make_backlog):
+        parser.error(f"--make-backlog: no such directory: {args.make_backlog}")
     _reject_deliver_only_flags(parser, args)
 
 
@@ -523,10 +568,10 @@ def _reject_deliver_only_flags(
     """Error out (exit code 2) on deliver-only flags passed without --deliver.
 
     These flags only affect the delivery engine; silently ignoring them in
-    simulation mode would let e.g. ``--budget-usd`` go unenforced. A chat
-    session may end in ``/deliver``, so chat mode accepts them too, and an
-    assessment shares the flags that scope any real-workspace run
-    (``--workspace``, ``--budget-usd``).
+    simulation mode would let e.g. ``--no-commit`` go unheeded. A chat session
+    may end in ``/deliver``, so chat mode accepts them too. (``--budget-usd``
+    is NOT deliver-only — the simulation, assessment, and verification all run
+    metered agents — so it is validated separately.)
     """
 
     if args.deliver or args.chat:
@@ -542,10 +587,6 @@ def _reject_deliver_only_flags(
         ("--remote-verify-status", args.remote_verify_status is not None),
         ("--remote-verify-trigger", args.remote_verify_trigger is not None),
     ]
-    if not (args.assess or args.verify is not None):
-        # An assessment and a finding re-verification both run metered agents
-        # against a real workspace, so a cost ceiling is legitimate for them.
-        checks += [("--budget-usd", args.budget_usd is not None)]
     if not (args.assess or args.dashboard):
         checks += [
             ("--workspace", args.workspace != parser.get_default("workspace")),
@@ -605,8 +646,33 @@ def _transcript_recorder(args, run: Optional[str]) -> Optional[TranscriptRecorde
     return TranscriptRecorder(LocalWorkspace(args.workspace), run=run)
 
 
+def _progress_printer(budget: Budget) -> Listener:
+    """A concise one-line-per-event progress display for stderr.
+
+    The default feedback for --deliver/--assess when -v (the full event
+    stream) is off and --quiet has not silenced it: an unattended run should
+    still show which phase/agent is active and how much it has spent. The
+    running cost is read live off the shared budget meter, so it climbs as the
+    agents work.
+    """
+
+    def printer(event: AgentEvent) -> None:
+        who = f"{event.name} ({event.role})" if event.name else event.role
+        print(
+            f"[{who}/{event.stage}] {event.message} (${budget.spent:.4f})",
+            file=sys.stderr,
+        )
+
+    return printer
+
+
 async def _deliver(
-    team: DevTeam, request: FeatureRequest, args, run: Optional[str] = None
+    team: DevTeam,
+    request: FeatureRequest,
+    args,
+    run: Optional[str] = None,
+    *,
+    budget: Budget,
 ) -> int:
     """Run real delivery and print the result; returns the exit code."""
 
@@ -621,7 +687,7 @@ async def _deliver(
     outcome = await team.deliver(
         request,
         workspace=LocalWorkspace(args.workspace),
-        budget=Budget(limit_usd=args.budget_usd),
+        budget=budget,
         config=_engine_config(args),
         **kwargs,
     )
@@ -632,7 +698,9 @@ async def _deliver(
     return 0 if outcome.success else 1
 
 
-async def _assess(team: DevTeam, args, run: Optional[str] = None) -> int:
+async def _assess(
+    team: DevTeam, args, run: Optional[str] = None, *, budget: Budget
+) -> int:
     """Run a read-only repository assessment; returns the exit code."""
 
     focus_parts = [p for p in (args.title, args.description) if p]
@@ -659,7 +727,7 @@ async def _assess(team: DevTeam, args, run: Optional[str] = None) -> int:
         kwargs["transcript_recorder"] = recorder
     outcome = await team.assess(
         workspace=LocalWorkspace(args.workspace),
-        budget=Budget(limit_usd=args.budget_usd),
+        budget=budget,
         config=AssessConfig(**config_kwargs),
         **kwargs,
     )
@@ -670,10 +738,18 @@ async def _assess(team: DevTeam, args, run: Optional[str] = None) -> int:
     return 0 if outcome.success else 1
 
 
-async def _simulate(team: DevTeam, request: FeatureRequest, args) -> int:
-    """Run the simulation workflow and print the result; returns the exit code."""
+async def _simulate(
+    team: DevTeam, request: FeatureRequest, args, *, budget: Budget
+) -> int:
+    """Run the simulation workflow and print the result; returns the exit code.
 
-    result = await team.develop(request)
+    "Simulation" means no filesystem/git side effects — it still drives the
+    same real, paid agents. The shared budget is always handed to the workflow
+    so it meters spend (surfaced as ``ProjectResult.cost_usd``); a
+    ``--budget-usd`` ceiling additionally stops the run gracefully at the line.
+    """
+
+    result = await team.develop(request, budget=budget)
     if args.json:
         print(json.dumps(result_to_dict(result), indent=2))
     else:
@@ -685,6 +761,8 @@ async def _chat(
     team: DevTeam,
     args: argparse.Namespace,
     backend: Optional[ChatBackend],
+    *,
+    budget: Budget,
 ) -> int:
     """Run the ``--chat`` session; returns the last run's exit code."""
 
@@ -696,8 +774,8 @@ async def _chat(
 
     async def run_feature(request: FeatureRequest, deliver: bool) -> int:
         if deliver:
-            return await _deliver(team, request, args)
-        return await _simulate(team, request, args)
+            return await _deliver(team, request, args, budget=budget)
+        return await _simulate(team, request, args, budget=budget)
 
     session = ChatSession(
         backend=backend,
@@ -756,6 +834,7 @@ def _serve_dashboard(args) -> int:
 
     token = os.environ.get(DASHBOARD_TOKEN_ENV, "")
     host = args.host if args.host is not None else "127.0.0.1"
+    workspace = LocalWorkspace(args.workspace, excluded_dirs=_DASHBOARD_EXCLUDED_DIRS)
     if not token and host not in ("127.0.0.1", "localhost"):
         print(
             f"WARNING: the dashboard on {host} is UNAUTHENTICATED - anyone "
@@ -763,8 +842,20 @@ def _serve_dashboard(args) -> int:
             f"transcripts). Set ${DASHBOARD_TOKEN_ENV} to require a token.",
             file=sys.stderr,
         )
+    elif not token and workspace.exists(TRANSCRIPTS_DIR):
+        # Even bound to loopback, an unauthenticated dashboard over a workspace
+        # that already holds recorded transcripts exposes raw prompts and model
+        # replies (which can echo repository secrets). Warn, but don't hard-fail
+        # — localhost dev must keep working (see the module note on the token).
+        print(
+            f"WARNING: {args.workspace} holds recorded agent transcripts and "
+            f"the dashboard is UNAUTHENTICATED - anyone who can reach it can "
+            "read raw agent prompts/responses (which may echo repository "
+            f"secrets). Set ${DASHBOARD_TOKEN_ENV} to require a token.",
+            file=sys.stderr,
+        )
     server = DashboardServer(
-        LocalWorkspace(args.workspace, excluded_dirs=_DASHBOARD_EXCLUDED_DIRS),
+        workspace,
         host=host,
         port=args.port if args.port is not None else 8737,
         token=token or None,
@@ -980,12 +1071,22 @@ def _run(
         min_coverage=args.min_coverage,
     )
 
+    # One meter for the whole run: the CLI stop-line (--budget-usd), the cost
+    # the summary prints, and the live cost the default progress printer shows
+    # all read from it. Uncapped (limit_usd=None) still meters spend.
+    budget = Budget(limit_usd=args.budget_usd)
+
+    # Progress goes to stderr so stdout stays a clean result document (text
+    # summary or JSON), safe to pipe into e.g. ``jq``. -v prints the full event
+    # stream; without it, --deliver/--assess still show a lightweight
+    # running-cost line unless --quiet silences it. The two are mutually
+    # exclusive, so no event is ever printed twice.
     printer = None
     if args.verbose:
-        # Progress goes to stderr so stdout stays a clean result document
-        # (text summary or JSON), safe to pipe into e.g. ``jq``.
         def printer(event: AgentEvent) -> None:  # noqa: E306
             print(str(event), file=sys.stderr)
+    elif not args.quiet and (args.deliver or args.assess):
+        printer = _progress_printer(budget)
 
     event_log = None
     if args.deliver or args.assess:
@@ -1012,9 +1113,9 @@ def _run(
     run_id = event_log.run if event_log is not None else None
 
     if args.chat:
-        return asyncio.run(_chat(team, args, chat_backend))
+        return asyncio.run(_chat(team, args, chat_backend, budget=budget))
     if args.assess:
-        return asyncio.run(_assess(team, args, run_id))
+        return asyncio.run(_assess(team, args, run_id, budget=budget))
 
     request = FeatureRequest(
         title=args.title,
@@ -1022,8 +1123,8 @@ def _run(
         constraints=list(args.constraints),
     )
     if args.deliver:
-        return asyncio.run(_deliver(team, request, args, run_id))
-    return asyncio.run(_simulate(team, request, args))
+        return asyncio.run(_deliver(team, request, args, run_id, budget=budget))
+    return asyncio.run(_simulate(team, request, args, budget=budget))
 
 
 def main(

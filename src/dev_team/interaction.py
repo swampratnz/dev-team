@@ -57,6 +57,11 @@ class Question:
         context: Supporting evidence (a rendered plan, failure output),
             shown before the prompt.
         asked_by: Persona/role name of the agent surfacing the question.
+        fail_safe_key: Key of the choice a channel must take when input is
+            *unavailable* (a closed/non-TTY stdin, a dead servicer) — distinct
+            from :attr:`default`, which a present human selects by pressing
+            enter. Left ``None`` for questions where failing closed and the
+            interactive default coincide.
     """
 
     topic: str
@@ -64,6 +69,7 @@ class Question:
     choices: Sequence[Choice]
     context: str = ""
     asked_by: str = "workflow"
+    fail_safe_key: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.choices:
@@ -74,6 +80,23 @@ class Question:
         """The choice taken by non-interactive channels."""
 
         return self.choices[0]
+
+    @property
+    def fail_safe(self) -> Choice:
+        """The choice to take when no human input is available (EOF).
+
+        A detached interactive run (piped stdin, CI, ``nohup``) must fail
+        *closed* — deny an approval, abort a plan review — rather than fall
+        through to the convenience :attr:`default`, which for an approval is
+        "yes" and would auto-approve the very commits and risky commands the
+        interactive mode exists to gate. When :attr:`fail_safe_key` is unset,
+        or names no known choice, the default is used unchanged so questions
+        that need no distinct safe answer are unaffected.
+        """
+
+        if self.fail_safe_key is None:
+            return self.default
+        return self.find(self.fail_safe_key) or self.default
 
     def find(self, key: str) -> Optional[Choice]:
         """The choice matching ``key`` (case-insensitive), if any."""
@@ -115,8 +138,10 @@ class ConsoleChannel:
 
     Concurrent questioners (parallel task workers) are serialised by a lock so
     two prompts never interleave on the terminal. Unknown input re-prompts;
-    EOF (stdin closed) falls back to the default choice so a detached run
-    degrades to autonomous instead of crashing.
+    EOF (stdin closed — a piped/CI/``nohup`` run that was nonetheless handed an
+    interactive channel) falls back to the question's *fail-safe* choice, not
+    its default, so a detached run degrades to the safe answer (deny, abort)
+    instead of auto-approving or crashing.
     """
 
     input_fn: Callable[[str], str] = input
@@ -143,12 +168,15 @@ class ConsoleChannel:
                 try:
                     raw = self.input_fn(f"{menu} > ")
                 except (EOFError, OSError):
-                    # EOF or a closed stream: degrade to autonomous rather
-                    # than crash a run that has agent work banked.
+                    # EOF or a closed stream: no human is on the other end, so
+                    # fail closed to the question's safe answer rather than
+                    # crash — or, worse, take a permissive default that would
+                    # auto-approve unattended.
+                    safe = question.fail_safe
                     self._write(
-                        f"(no input available; defaulting to '{question.default.key}')"
+                        f"(no input available; failing safe to '{safe.key}')"
                     )
-                    return Reply(choice=question.default.key)
+                    return Reply(choice=safe.key)
                 if not raw.strip():
                     choice = question.default
                 else:
@@ -225,6 +253,8 @@ class ChannelApprovalGate:
                 Choice("no", "deny", accepts_text=True),
             ),
             context=f"risk: {request.risk} — {request.detail}",
+            # No input available (detached stdin) must deny, never approve.
+            fail_safe_key="no",
         )
         reply = self.channel.ask(question)
         if reply.choice == "yes":
@@ -252,7 +282,12 @@ def render_plan(plan: Plan) -> str:
 
 
 def plan_review_question(plan: Plan, *, asked_by: str) -> Question:
-    """The plan-approval question. Default (unattended) answer: approve."""
+    """The plan-approval question.
+
+    Default (unattended :class:`AutoChannel`) answer: approve. But when an
+    interactive channel finds no input available (EOF), it fails safe to
+    ``abort`` — a detached run must not silently start work no human blessed.
+    """
 
     return Question(
         topic="plan-review",
@@ -264,6 +299,7 @@ def plan_review_question(plan: Plan, *, asked_by: str) -> Question:
         ),
         context=render_plan(plan),
         asked_by=asked_by,
+        fail_safe_key="abort",
     )
 
 
@@ -274,7 +310,9 @@ def task_failure_question(
 
     ``skip`` preserves the autonomous behaviour — the task stays failed and
     the run carries on; ``retry`` grants a fresh round of attempts with the
-    human's guidance folded into the engineer's feedback.
+    human's guidance folded into the engineer's feedback. With no input
+    available (EOF) the fail-safe is ``skip``: retrying blind would burn
+    attempts without the guidance ``retry`` exists to carry.
     """
 
     return Question(
@@ -286,4 +324,5 @@ def task_failure_question(
         ),
         context=evidence,
         asked_by=asked_by,
+        fail_safe_key="skip",
     )

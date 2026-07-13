@@ -8,10 +8,11 @@ This module models an Epic → Story hierarchy, greedy capacity-based iteration
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from .errors import DevTeamError
 from .execution import Workspace
 
 
@@ -151,7 +152,7 @@ class Backlog:
     def from_dict(cls, data: Dict[str, Any]) -> "Backlog":
         """Rebuild a backlog from :meth:`to_dict` output."""
 
-        epics = [Epic(**e) for e in data.get("epics", [])]
+        epics = [Epic(**_known_only(Epic, e)) for e in data.get("epics", [])]
         stories = [_story_from_dict(s) for s in data.get("stories", [])]
         return cls(epics=epics, stories=stories)
 
@@ -167,8 +168,24 @@ def _story_to_dict(story: Story) -> Dict[str, Any]:
     return data
 
 
+def _known_only(cls: type, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only ``data`` keys that name a field of the dataclass ``cls``.
+
+    A backlog.json can drift from the current schema — a newer build's extra
+    key, a renamed field, a hand-edit. Splatting such a dict straight into the
+    dataclass (``Story(**payload)``) raises ``TypeError`` on the first unknown
+    key, which the CLI surfaces as an uncaught traceback. Dropping unknown keys
+    lets a drifted file load into the fields this build understands; a missing
+    *required* field still raises (and is turned into a DevTeamError by
+    :meth:`BacklogStore.load`) rather than fabricating data.
+    """
+
+    allowed = {f.name for f in fields(cls)}
+    return {k: v for k, v in data.items() if k in allowed}
+
+
 def _story_from_dict(data: Dict[str, Any]) -> Story:
-    payload = dict(data)
+    payload = _known_only(Story, data)
     payload["status"] = ItemStatus(payload.get("status", "todo"))
     # Absent provenance keys (older backlog.json files) default to None.
     return Story(**payload)
@@ -190,8 +207,23 @@ class BacklogStore:
         self.workspace.write_text(self.path, json.dumps(backlog.to_dict(), indent=2))
 
     def load(self) -> Backlog:
-        """Load the backlog, or return an empty one if none is stored."""
+        """Load the backlog, or return an empty one if none is stored.
+
+        Unlike a checkpoint (safe to discard — work is merely redone), a
+        corrupt or schema-drifted backlog is the user's whole product plan;
+        silently returning an empty one would lose it. So a malformed file
+        fails loud but *typed*: raw ``JSONDecodeError``/``TypeError``/
+        ``ValueError`` are wrapped in :class:`DevTeamError`, which the CLI
+        catches and reports, instead of escaping as an uncaught traceback.
+        """
 
         if not self.workspace.exists(self.path):
             return Backlog()
-        return Backlog.from_dict(json.loads(self.workspace.read_text(self.path)))
+        raw = self.workspace.read_text(self.path)
+        try:
+            return Backlog.from_dict(json.loads(raw))
+        except (ValueError, TypeError, AttributeError) as exc:
+            # ValueError covers json.JSONDecodeError and a bad ItemStatus;
+            # TypeError a missing required field; AttributeError a top-level
+            # JSON value that is not an object (``.get`` on a list/scalar).
+            raise DevTeamError(f"corrupt backlog file at {self.path}: {exc}") from exc

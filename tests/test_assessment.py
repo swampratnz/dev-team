@@ -577,6 +577,47 @@ def test_render_report_failed_phase_without_data_has_no_body():
     assert "### Dependencies" not in report
 
 
+def test_render_report_failed_recommendation_hides_rejected_classification():
+    """A recommendation phase that failed validation must not have its
+    unvalidated classification surfaced as the audit's verdict."""
+
+    from dev_team.assessment import AssessmentOutcome, render_report
+    from dev_team.profile import ProjectProfile
+    from dev_team.trace import Tracer
+
+    outcome = AssessmentOutcome(
+        profile=ProjectProfile(kind="unknown", verify_command=("pytest",)),
+        stats=InventoryStats(),
+        phases={
+            # The validator rejected the phase (error set), but an out-of-contract
+            # value still sits in data; the failure must win over it.
+            "recommendation": PhaseResult(
+                phase="recommendation",
+                role="product-manager",
+                data={"classification": "archive", "rationale": "unvetted"},
+                error="rejected classification 'archive'",
+            )
+        },
+        executive_summary="",
+        report_markdown="",
+        report_path=None,
+        budget=Budget(),
+        tracer=Tracer(),
+    )
+    # The verdict property is None for a failed phase...
+    assert outcome.classification is None
+    report = render_report(outcome)
+    # ...and the rendered report must state the failure, not present the
+    # rejected classification (nor its unvetted rationale) as the verdict.
+    assert "## Recommendation" in report
+    assert (
+        "_Phase failed (product-manager): rejected classification 'archive'_"
+        in report
+    )
+    assert "**Classification:" not in report
+    assert "unvetted" not in report
+
+
 def test_cited_handles_items_without_fields():
     from dev_team.assessment import _cited
 

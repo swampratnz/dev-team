@@ -250,13 +250,20 @@ class TaskResult:
 
 @dataclass
 class ProjectResult:
-    """The aggregate result of a full development run."""
+    """The aggregate result of a full development run.
+
+    ``cost_usd`` is the total metered agent spend for the run (populated from
+    the simulation's :class:`~dev_team.budget.UsageMeter`); it defaults to
+    ``0.0`` so results built without cost metering — and existing callers that
+    never set it — stay valid.
+    """
 
     request: FeatureRequest
     plan: Plan
     design: Design
     task_results: List[TaskResult] = field(default_factory=list)
     deployment: Optional[DeploymentPlan] = None
+    cost_usd: float = 0.0
 
     @property
     def success(self) -> bool:

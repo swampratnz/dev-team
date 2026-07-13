@@ -65,8 +65,16 @@ def test_extract_object_beats_later_array():
     assert extract_json(text) == {"ok": True}
 
 
-def test_extract_falls_back_to_last_array():
-    assert extract_json("start [1] middle [2, 3] end") == [2, 3]
+def test_extract_falls_back_to_first_array():
+    # The FIRST top-level array wins; a later array does not clobber it.
+    assert extract_json("start [1] middle [2, 3] end") == [1]
+
+
+def test_extract_prefers_first_array_over_trailing_citation():
+    # A real array answer followed by a prose citation like "see [1]" must not
+    # be replaced by the citation.
+    text = "The ids are [10, 20, 30]. See [1] for the source."
+    assert extract_json(text) == [10, 20, 30]
 
 
 def test_extract_rejects_bare_scalars():

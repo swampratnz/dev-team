@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import dev_team.eventlog as eventlog
 from dev_team.eventlog import EVENTS_PATH, EventLog, compose, read_events
@@ -60,6 +62,33 @@ def test_read_events_handles_absent_and_unreadable_logs():
 
     ws = ExplodingWorkspace({EVENTS_PATH: "{}"})
     assert read_events(ws) == []
+
+
+def test_event_log_append_is_thread_safe_under_concurrency():
+    # The append is read-modify-write; concurrent delivery agents journalling
+    # at once would lose events (last writer wins) without the instance lock.
+    # A workspace that yields the GIL between the read and the write widens
+    # that race window: unlocked, most of the 12 events would be clobbered;
+    # locked, every one survives because the whole RMW is serialised.
+    class _SlowWorkspace(InMemoryWorkspace):
+        def read_text(self, path):
+            text = super().read_text(path)
+            time.sleep(0.002)  # hand off to another delivery thread mid-RMW
+            return text
+
+    ws = _SlowWorkspace()
+    log = EventLog(ws, run="r", clock=lambda: 1.0)
+    threads = [
+        threading.Thread(target=lambda i=i: log(_event(message=f"m{i}")))
+        for i in range(12)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    lines = [line for line in ws.read_text(EVENTS_PATH).splitlines() if line.strip()]
+    messages = sorted(json.loads(line)["message"] for line in lines)
+    assert messages == sorted(f"m{i}" for i in range(12))
 
 
 def test_compose_listener_fan_out():

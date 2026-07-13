@@ -50,10 +50,25 @@ def test_has_changes_true_and_false():
 
 
 def test_changed_files():
+    # git status -z is NUL-separated (each record terminated by NUL), so the
+    # fake emits that shape rather than newline-delimited lines.
     runner = FakeCommandRunner().add_rule(
-        "status", CommandResult(["git"], 0, " M a.py\n?? b.py\n\n", "")
+        "status --porcelain -uall -z",
+        CommandResult(["git"], 0, " M a.py\x00?? b.py\x00", ""),
     )
     assert GitRepo(runner).changed_files() == ["a.py", "b.py"]
+    # the -z flag must actually be issued, else paths would come back C-quoted
+    assert ["git", "status", "--porcelain", "-uall", "-z"] in runner.calls
+
+
+def test_changed_files_returns_spaced_and_non_ascii_paths_unquoted():
+    # Under -z, paths with spaces or non-ASCII bytes are emitted verbatim
+    # (not C-quoted), so they feed straight back into ``git add`` unchanged.
+    runner = FakeCommandRunner().add_rule(
+        "status --porcelain -uall -z",
+        CommandResult(["git"], 0, "?? my file.py\x00?? café.py\x00", ""),
+    )
+    assert GitRepo(runner).changed_files() == ["my file.py", "café.py"]
 
 
 def test_failed_command_raises():
@@ -130,10 +145,13 @@ def test_add_paths_skips_empty_list():
 
 
 def test_changed_files_expands_untracked_and_renames():
+    # Under -z a rename is "R  <new>\0<old>\0": the new path rides the status
+    # record and the old path follows in the next NUL field (order reversed
+    # from the non-z "old -> new" form). The old field must be consumed.
     cmd = FakeCommandRunner()
     cmd.add_rule(
-        "status --porcelain -uall",
-        CommandResult(["git"], 0, "R  old.py -> new.py\n?? sub/added.py\n\n", ""),
+        "status --porcelain -uall -z",
+        CommandResult(["git"], 0, "R  new.py\x00old.py\x00?? sub/added.py\x00", ""),
     )
     assert GitRepo(cmd).changed_files() == ["new.py", "sub/added.py"]
 

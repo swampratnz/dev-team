@@ -132,6 +132,11 @@ def probe_unreferenced_sources(
         return [], "unreferenced-sources: no .csproj files found"
     referenced: Set[str] = set()
     owned_dirs: List[str] = []
+    # A project at the repo root owns only root-level files. Recording its base
+    # as "" and using startswith("") would match *every* path in the repo —
+    # flagging files compiled by other, unanalysable projects — so root
+    # ownership is tracked with this dedicated flag instead of a prefix.
+    owns_root = False
     analysable = 0
     for project in csprojs:
         try:
@@ -142,7 +147,10 @@ def probe_unreferenced_sources(
             continue
         analysable += 1
         base = posixpath.dirname(project)
-        owned_dirs.append(f"{base}/" if base else "")
+        if base:
+            owned_dirs.append(f"{base}/")
+        else:
+            owns_root = True
         referenced.update(_norm_relative(base, item) for item in items)
     if not analysable:
         return [], (
@@ -155,7 +163,12 @@ def probe_unreferenced_sources(
             continue
         if path in referenced:
             continue
-        if any(path.startswith(prefix) for prefix in owned_dirs):
+        if "/" in path:
+            owned = any(path.startswith(prefix) for prefix in owned_dirs)
+        else:
+            # A root-level file (no "/") is owned only by a root-level project.
+            owned = owns_root
+        if owned:
             findings.append(
                 DeadCodeFinding(
                     probe="unreferenced-sources",

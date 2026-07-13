@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dev_team.context import build_repo_context
-from dev_team.execution import InMemoryWorkspace
+from dev_team.execution import InMemoryWorkspace, LocalWorkspace
 
 
 def test_empty_workspace_renders_nothing():
@@ -62,3 +62,19 @@ def test_context_fences_manifest_heads():
     rendered = ctx.render()
     assert '<manifest-content name="README.md">' in rendered
     assert "</manifest-content>" in rendered
+
+
+def test_context_skips_unreadable_manifest(tmp_path):
+    # A non-UTF-8 (or otherwise unreadable) root manifest must not unwind the
+    # whole read-only assess() run: the bad file is skipped and the remaining
+    # manifests and tree still build.
+    (tmp_path / "README.md").write_bytes(b"\xff\xfe\x00\x01 not utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='svc'")
+    (tmp_path / "app.py").write_text("x = 1")
+    ctx = build_repo_context(LocalWorkspace(str(tmp_path)))
+    # The unreadable manifest is dropped from the heads, without raising...
+    assert "README.md" not in ctx.manifest_heads
+    # ...while readable manifests are still captured.
+    assert "pyproject.toml" in ctx.manifest_heads
+    # ...and the file still appears in the tree listing.
+    assert "README.md" in ctx.files

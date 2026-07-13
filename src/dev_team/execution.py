@@ -9,7 +9,9 @@ and its tests — never need to touch a real filesystem or spawn processes.
 
 from __future__ import annotations
 
+import itertools
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,7 +60,10 @@ def _normalise(path: str) -> str:
     if path.startswith("/"):
         raise WorkspaceError(f"absolute paths are not allowed: {path!r}")
     parts: List[str] = []
-    for part in path.split("/"):
+    # Split on both separators so a Windows-style ``..\..\x`` is decomposed
+    # into ``..`` segments and rejected, rather than passing through as one
+    # opaque component that would later escape the root.
+    for part in re.split(r"[\\/]", path):
         if part in ("", "."):
             continue
         if part == "..":
@@ -117,6 +122,12 @@ DEFAULT_EXCLUDED_DIRS = frozenset(
 )
 
 
+# Process-local counter for staging-file names. Combined with the PID it makes
+# each in-flight write use a distinct temp path, so two writers targeting the
+# same file cannot clobber each other's staging file before the atomic replace.
+_STAGING_COUNTER = itertools.count()
+
+
 class LocalWorkspace:
     """A :class:`Workspace` rooted at a real directory on disk.
 
@@ -131,8 +142,24 @@ class LocalWorkspace:
             excluded_dirs if excluded_dirs is not None else DEFAULT_EXCLUDED_DIRS
         )
 
+    def _within_root(self, target: Path) -> bool:
+        """Whether ``target`` resolves to a location inside the workspace root.
+
+        Textual normalisation in :func:`_normalise` stops ``..`` and absolute
+        paths, but a *symlink* inside the root can still point outside it. The
+        only way to catch that is to resolve the real path and confirm it is
+        still under the (real) root.
+        """
+
+        root_real = os.path.realpath(self.root)
+        real = os.path.realpath(target)
+        return os.path.commonpath([root_real, real]) == root_real
+
     def _path(self, path: str) -> Path:
-        return self.root / _normalise(path)
+        target = self.root / _normalise(path)
+        if not self._within_root(target):
+            raise WorkspaceError(f"path escapes the workspace: {path!r}")
+        return target
 
     def read_text(self, path: str) -> str:
         target = self._path(path)
@@ -146,7 +173,11 @@ class LocalWorkspace:
         # half-written checkpoint would brick the resume it exists for.
         target = self._path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        staging = target.with_name(target.name + ".dev-team-tmp")
+        # A per-write unique staging name (PID + counter): a fixed name would
+        # let two concurrent writers to the same target share one staging file
+        # and race on ``replace``, corrupting one of the two writes.
+        suffix = f".{os.getpid()}.{next(_STAGING_COUNTER)}.dev-team-tmp"
+        staging = target.with_name(target.name + suffix)
         staging.write_text(content)
         staging.replace(target)
 
@@ -161,6 +192,10 @@ class LocalWorkspace:
     def list_files(self) -> List[str]:
         results = []
         for p in self.root.rglob("*"):
+            # Skip symlinks and anything whose real path escapes the root: a
+            # symlink to /etc/passwd must never surface as workspace content.
+            if p.is_symlink() or not self._within_root(p):
+                continue
             if not p.is_file():
                 continue
             relative = p.relative_to(self.root)
@@ -223,6 +258,40 @@ EXIT_NOT_FOUND = 127
 EXIT_TIMEOUT = 124
 
 
+# Environment variables that carry provider/repo credentials for the
+# orchestrator. Gate and test commands run agent-authored code, so the child
+# environment must never expose these — otherwise a test could exfiltrate the
+# Anthropic key or a GitHub token. They are stripped from the inherited
+# environment (but an explicit per-command ``env`` value still wins, so a
+# caller can hand a scoped credential to one subprocess deliberately).
+SECRET_ENV_KEYS = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+    }
+)
+
+
+# Upper bound on captured stdout/stderr kept per command. A runaway gate can
+# emit hundreds of MB; storing that verbatim would push the giant string into
+# reports, exceptions, and memory. Beyond this many characters the capture is
+# truncated with a visible marker (streaming-level OOM protection is out of
+# scope — this only caps what we retain).
+MAX_CAPTURE_CHARS = 5_000_000
+
+
+def _truncate(text: str) -> str:
+    """Cap ``text`` at :data:`MAX_CAPTURE_CHARS`, marking any elision."""
+
+    if len(text) <= MAX_CAPTURE_CHARS:
+        return text
+    dropped = len(text) - MAX_CAPTURE_CHARS
+    return text[:MAX_CAPTURE_CHARS] + f"\n...[dev-team truncated {dropped} chars]"
+
+
 @dataclass
 class SubprocessCommandRunner:
     """A :class:`CommandRunner` backed by :mod:`subprocess`."""
@@ -239,6 +308,11 @@ class SubprocessCommandRunner:
         env: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
         args = list(command)
+        # Build the child environment from a scrubbed copy of the parent's,
+        # never a live reference — os.environ must stay intact so the
+        # orchestrator's own SDK calls keep their Anthropic credentials.
+        base = {k: v for k, v in os.environ.items() if k not in SECRET_ENV_KEYS}
+        child_env = base if env is None else {**base, **env}
         try:
             proc = subprocess.run(
                 args,
@@ -247,7 +321,7 @@ class SubprocessCommandRunner:
                 text=True,
                 errors="replace",
                 timeout=timeout if timeout is not None else self.timeout,
-                env=None if env is None else {**os.environ, **env},
+                env=child_env,
             )
         except FileNotFoundError as exc:
             return CommandResult(args, EXIT_NOT_FOUND, "", str(exc))
@@ -257,8 +331,10 @@ class SubprocessCommandRunner:
             partial = exc.stdout or ""
             if isinstance(partial, bytes):
                 partial = partial.decode("utf-8", errors="replace")
-            return CommandResult(args, EXIT_TIMEOUT, partial, "command timed out")
-        return CommandResult(args, proc.returncode, proc.stdout, proc.stderr)
+            return CommandResult(args, EXIT_TIMEOUT, _truncate(partial), "command timed out")
+        return CommandResult(
+            args, proc.returncode, _truncate(proc.stdout), _truncate(proc.stderr)
+        )
 
 
 @dataclass

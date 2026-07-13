@@ -115,6 +115,42 @@ def test_root_level_project_owns_root_sources():
     assert [f.path for f in findings] == ["Dead.cs"]
 
 
+def test_root_level_project_does_not_own_other_projects_sources():
+    # A root-level analysable project owns only root-level files. It must not
+    # claim files under a sibling project's directory — here an unanalysable
+    # (wildcard/SDK-style) project whose sources it cannot see. The old ""
+    # prefix matched startswith("") for every path and mis-flagged them.
+    ws = InMemoryWorkspace(
+        {
+            "App.csproj": _legacy_csproj("Program.cs"),
+            "Program.cs": "class P {}",
+            "Dead.cs": "class D {}",
+            "Other/Other.csproj": _legacy_csproj("**/*.cs"),
+            "Other/Compiled.cs": "class C {}",
+        }
+    )
+    findings, skipped = probe_unreferenced_sources(ws, ws.list_files())
+    assert skipped is None
+    # Only the truly unreferenced root file; Other/Compiled.cs belongs to a
+    # project this probe cannot analyse and is left alone.
+    assert [f.path for f in findings] == ["Dead.cs"]
+
+
+def test_subdir_project_does_not_own_stray_root_source():
+    # The mirror case: only a root-level project owns root-level files, so a
+    # subdirectory project leaves a stray root source alone (owns_root False).
+    ws = InMemoryWorkspace(
+        {
+            "Lib/Lib.csproj": _legacy_csproj("Used.cs"),
+            "Lib/Used.cs": "class U {}",
+            "Stray.cs": "class S {}",
+        }
+    )
+    findings, skipped = probe_unreferenced_sources(ws, ws.list_files())
+    assert skipped is None
+    assert findings == []
+
+
 def test_orphaned_projects_found():
     ws = InMemoryWorkspace(
         {

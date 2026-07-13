@@ -65,6 +65,20 @@ def test_question_find_unknown_returns_none():
     assert _question().find("nope") is None
 
 
+def test_question_fail_safe_defaults_to_default():
+    # No distinct fail-safe declared: fall back to the default choice.
+    assert _question().fail_safe.key == "approve"
+
+
+def test_question_fail_safe_uses_declared_key():
+    assert _question(fail_safe_key="abort").fail_safe.key == "abort"
+
+
+def test_question_fail_safe_unknown_key_falls_back_to_default():
+    # A misdeclared fail-safe key must not raise; degrade to the default.
+    assert _question(fail_safe_key="does-not-exist").fail_safe.key == "approve"
+
+
 # --- channels ----------------------------------------------------------------
 
 
@@ -117,10 +131,28 @@ def test_console_channel_reprompts_on_unknown():
     assert "unrecognised" in out.getvalue()
 
 
-def test_console_channel_eof_takes_default():
+def test_console_channel_eof_without_fail_safe_uses_default():
+    # A question that declares no distinct fail-safe still degrades to its
+    # default on EOF (backward-compatible), announced as a fail-safe fallback.
     channel, out = _console([])
     assert channel.ask(_question()).choice == "approve"
-    assert "defaulting" in out.getvalue()
+    assert "failing safe" in out.getvalue()
+
+
+def test_console_channel_eof_uses_fail_safe_not_default():
+    # A detached (EOF) run must take the safe answer, never the permissive
+    # default: here the default is "approve" but the fail-safe is "abort".
+    channel, out = _console([])
+    reply = channel.ask(_question(fail_safe_key="abort"))
+    assert reply.choice == "abort"
+    assert "failing safe to 'abort'" in out.getvalue()
+
+
+def test_console_channel_empty_line_still_takes_default_not_fail_safe():
+    # A present human pressing enter picks the default — the fail-safe only
+    # applies when input is unavailable, not when a human actually chooses.
+    channel, _ = _console([""])
+    assert channel.ask(_question(fail_safe_key="abort")).choice == "approve"
 
 
 def test_console_channel_collects_text_for_choice():
@@ -142,7 +174,7 @@ def test_console_channel_broken_pipe_takes_default():
     out = io.StringIO()
     channel = ConsoleChannel(input_fn=broken, output=out)
     assert channel.ask(_question()).choice == "approve"
-    assert "defaulting" in out.getvalue()
+    assert "failing safe" in out.getvalue()
 
 
 def test_console_channel_broken_pipe_during_text_gives_empty():
@@ -240,6 +272,24 @@ def test_channel_approval_gate_question_carries_risk():
     assert "risk: medium" in question.context
 
 
+def test_channel_approval_gate_question_fails_safe_to_deny():
+    channel = ScriptedChannel(script=[Reply(choice="yes")])
+    ChannelApprovalGate(channel).review(_approval_request())
+    assert channel.questions[0].fail_safe.key == "no"
+
+
+def test_channel_approval_gate_denies_on_eof():
+    # A non-TTY interactive run (piped/CI/nohup) must NOT auto-approve: with no
+    # input available the console fails safe to deny.
+    console = ConsoleChannel(input_fn=_raise_eof, output=io.StringIO())
+    decision = ChannelApprovalGate(console).review(_approval_request())
+    assert decision.approved is False
+
+
+def _raise_eof(prompt):
+    raise EOFError
+
+
 # --- question builders ----------------------------------------------------------
 
 
@@ -266,12 +316,22 @@ def test_plan_review_question_defaults_to_approve():
     assert "2 task(s)" in question.prompt
 
 
+def test_plan_review_question_fails_safe_to_abort():
+    # Detached (EOF) plan review must abort, not silently start the work.
+    assert plan_review_question(_plan(), asked_by="Priya").fail_safe.key == "abort"
+
+
 def test_task_failure_question_defaults_to_skip():
     question = task_failure_question("T1", "tests: boom", asked_by="Sam")
     assert question.default.key == "skip"
     assert question.find("retry").accepts_text is True
     assert question.context == "tests: boom"
     assert question.asked_by == "Sam"
+
+
+def test_task_failure_question_fails_safe_to_skip():
+    question = task_failure_question("T1", "tests: boom", asked_by="Sam")
+    assert question.fail_safe.key == "skip"
 
 
 def test_queue_channel_is_importable_from_package_root():
