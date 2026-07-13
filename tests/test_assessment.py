@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 
 from helpers import run
 
 from dev_team.assessment import (
+    ASSESSMENT_JSON_PATH,
     CLASSIFICATIONS,
     AssessConfig,
     AssessmentEngine,
@@ -20,6 +22,7 @@ from dev_team.assessment import (
     _mentions,
     audit_blind_spots,
     detect_components,
+    dict_to_backlog,
     inventory_stats,
     outcome_to_backlog,
     outcome_to_dict,
@@ -259,8 +262,13 @@ def test_assess_is_read_only_apart_from_report():
     engine = _engine(runner, workspace=ws)
     run(engine.assess())
     after = set(ws.list_files())
-    # The report and the conventions profile are the only sanctioned writes.
-    assert after - before == {"audit/assessment.md", ".dev_team/conventions.json"}
+    # The report, the conventions profile, and the persisted structured
+    # result are the only sanctioned writes.
+    assert after - before == {
+        "audit/assessment.md",
+        ".dev_team/conventions.json",
+        ASSESSMENT_JSON_PATH,
+    }
 
 
 def test_assess_agents_get_read_only_tools():
@@ -780,8 +788,9 @@ def test_effort_points_mapping():
     assert _effort_points("") == 2
 
 
-def test_outcome_to_backlog_converts_findings_to_stories():
-    from dev_team.backlog import Backlog
+def _findings_outcome():
+    """A bare outcome rich in convertible findings (and junk to skip)."""
+
     from dev_team.deadcode import DeadCodeFinding, DeadCodeReport
     from dev_team.depscan import Dependency, DependencyScan, Vulnerability
 
@@ -842,20 +851,29 @@ def test_outcome_to_backlog_converts_findings_to_stories():
         vulnerabilities=[Vulnerability("GHSA-1", dep)],
         queried=True,
     )
-    outcome = _bare_outcome(phases=phases, dead_code=dead, dependency_scan=scan)
+    return _bare_outcome(phases=phases, dead_code=dead, dependency_scan=scan)
 
+
+#: What _findings_outcome converts to, in order.
+_FINDINGS_TITLES = [
+    "Pin build chain",
+    "Fix build blocker: needs Windows",
+    "Upgrade or replace dependency Moq",
+    "Remove hardcoded secret: license committed",
+    "Remove dead code (orphaned-projects: 1 path(s))",
+    "Remove dead code (unreferenced-sources: 25 path(s))",
+    "Patch Moq 4.2.1409.1722: GHSA-1",
+]
+
+
+def test_outcome_to_backlog_converts_findings_to_stories():
+    from dev_team.backlog import Backlog
+
+    outcome = _findings_outcome()
     backlog = Backlog()
     stories = outcome_to_backlog(outcome, backlog)
     titles = [s.title for s in stories]
-    assert titles == [
-        "Pin build chain",
-        "Fix build blocker: needs Windows",
-        "Upgrade or replace dependency Moq",
-        "Remove hardcoded secret: license committed",
-        "Remove dead code (orphaned-projects: 1 path(s))",
-        "Remove dead code (unreferenced-sources: 25 path(s))",
-        "Patch Moq 4.2.1409.1722: GHSA-1",
-    ]
+    assert titles == _FINDINGS_TITLES
     assert backlog.epics[0].title == "Assessment remediation"
     assert "dependency-surgery" in backlog.epics[0].description
     by_title = {s.title: s for s in stories}
@@ -882,6 +900,84 @@ def test_outcome_to_backlog_skips_failed_phases():
         ),
     }
     assert outcome_to_backlog(_bare_outcome(phases=phases), Backlog()) == []
+
+
+def test_dict_to_backlog_matches_outcome_to_backlog():
+    """The dict core is lossless: both entry points yield identical stories."""
+
+    from dev_team.backlog import Backlog
+
+    outcome = _findings_outcome()
+    from_outcome = outcome_to_backlog(outcome, Backlog())
+    from_dict = dict_to_backlog(outcome_to_dict(outcome), Backlog())
+    assert from_dict == from_outcome
+    # the empty-findings edge agrees too
+    assert dict_to_backlog(outcome_to_dict(_bare_outcome()), Backlog()) == []
+
+
+def test_dict_to_backlog_from_a_json_round_trip():
+    """The persisted-then-reloaded JSON produces the same backlog."""
+
+    from dev_team.backlog import Backlog
+
+    outcome = _findings_outcome()
+    payload = json.loads(json.dumps(outcome_to_dict(outcome)))
+    backlog = Backlog()
+    stories = dict_to_backlog(payload, backlog)
+    assert [s.title for s in stories] == _FINDINGS_TITLES
+    assert backlog.epics[0].title == "Assessment remediation"
+    assert "dependency-surgery" in backlog.epics[0].description
+    # regenerating from the same payload dedupes by title
+    assert dict_to_backlog(payload, backlog) == []
+
+
+# --- persisted structured result ---------------------------------------------------
+
+
+def test_assess_persists_structured_result():
+    events = []
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    ws = _workspace()
+    engine = _engine(runner, workspace=ws, listener=events.append)
+    outcome = run(engine.assess())
+    assert ASSESSMENT_JSON_PATH in ws.list_files()
+    data = json.loads(ws.read_text(ASSESSMENT_JSON_PATH))
+    # exactly the outcome_to_dict shape (modulo JSON's tuple->list coercion)
+    assert data == json.loads(json.dumps(outcome_to_dict(outcome)))
+    assert data["classification"] == "dependency-surgery"
+    assert any(e.stage == "persist" for e in events)
+
+
+def test_assess_persist_result_can_be_disabled():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    ws = _workspace()
+    engine = _engine(runner, workspace=ws, config=AssessConfig(persist_result=False))
+    outcome = run(engine.assess())
+    assert outcome.success is True
+    assert ASSESSMENT_JSON_PATH not in ws.list_files()
+
+
+def test_persisted_result_regenerates_the_backlog_later_without_agents():
+    """Assess once (persist on), then build the backlog purely from disk."""
+
+    from dev_team.backlog import Backlog, BacklogStore
+
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    ws = InMemoryWorkspace(dict(_DEAD_WORKSPACE))
+    engine = _engine(runner, workspace=ws, osv_fetch=_vuln_fetch)
+    outcome = run(engine.assess())
+    assert ".dev_team/backlog.json" not in ws.list_files()  # update_backlog off
+
+    # Later — no engine, no runner: read the persisted JSON, merge, save.
+    data = json.loads(ws.read_text(ASSESSMENT_JSON_PATH))
+    store = BacklogStore(ws)
+    backlog = store.load()
+    stories = dict_to_backlog(data, backlog)
+    store.save(backlog)
+    inline = outcome_to_backlog(outcome, Backlog())
+    assert [s.title for s in stories] == [s.title for s in inline]
+    assert stories, "the fixture repository yields remediation stories"
+    assert {s.title for s in store.load().stories} == {s.title for s in stories}
 
 
 def test_assess_update_backlog_persists_stories():

@@ -691,6 +691,108 @@ def test_deliver_remote_verify_builds_remote_gate(tmp_path, monkeypatch):
     assert isinstance(engine.definition_of_done.gates[0], RemoteCIGate)
 
 
+# --- --make-backlog ---------------------------------------------------------------
+
+
+def _persisted_assessment(tmp_path):
+    """A workspace holding a minimal persisted assessment (one plan step)."""
+
+    ws = tmp_path / "repo"
+    (ws / ".dev_team").mkdir(parents=True)
+    payload = {
+        "classification": "dependency-surgery",
+        "phases": {
+            "recommendation": {
+                "role": "product-manager",
+                "ok": True,
+                "error": None,
+                "data": {
+                    "plan": [
+                        {"step": "Pin build chain", "effort": "2 days", "detail": "CI"}
+                    ]
+                },
+            }
+        },
+        "dead_code": {"findings": []},
+        "dependency_scan": {"vulnerabilities": []},
+    }
+    (ws / ".dev_team" / "assessment.json").write_text(json.dumps(payload))
+    return ws
+
+
+def test_main_make_backlog_generates_stories_without_credentials(
+    monkeypatch, tmp_path, capsys
+):
+    _no_credentials(monkeypatch, tmp_path)
+    called = []
+    monkeypatch.setattr(
+        "dev_team.cli.ensure_credentials", lambda *a, **k: called.append(1)
+    )
+    ws = _persisted_assessment(tmp_path)
+    code = main(["--make-backlog", str(ws)])  # no injected runner
+    out = capsys.readouterr().out
+    assert code == 0
+    assert called == []  # the offline transform never checks credentials
+    assert "1 story(ies) added" in out
+    assert ".dev_team/backlog.json" in out
+    stored = json.loads((ws / ".dev_team" / "backlog.json").read_text())
+    assert [s["title"] for s in stored["stories"]] == ["Pin build chain"]
+    assert stored["epics"][0]["title"] == "Assessment remediation"
+
+
+def test_main_make_backlog_json_output_and_dedupe(tmp_path, capsys):
+    ws = _persisted_assessment(tmp_path)
+    assert main(["--make-backlog", str(ws), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "stories_added": 1,
+        "stories_total": 1,
+    }
+    # re-running dedupes by title: free to repeat, never floods
+    assert main(["--make-backlog", str(ws), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "stories_added": 0,
+        "stories_total": 1,
+    }
+
+
+def test_main_make_backlog_missing_assessment_exits_2(tmp_path, capsys):
+    code = main(["--make-backlog", str(tmp_path / "empty")])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "no assessment.json" in captured.err
+    assert "--assess" in captured.err
+    assert captured.out == ""
+
+
+def test_main_make_backlog_is_standalone():
+    for extra in (
+        ["--assess"],
+        ["--deliver"],
+        ["--chat"],
+        ["--dashboard"],
+        ["--dispatch"],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--make-backlog", ".", *extra], runner=ScriptedRunner([]))
+        assert excinfo.value.code == 2
+
+
+def test_main_assess_persists_result_then_make_backlog_generates(tmp_path, capsys):
+    from test_assessment import assess_responses
+
+    repo = _dotnet_repo(tmp_path)
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    assert main(["--assess", "--workspace", str(repo)], runner=runner) == 0
+    assert (repo / ".dev_team" / "assessment.json").exists()
+    capsys.readouterr()  # drop the printed report
+    # later, credential-free and $0: turn the persisted audit into stories
+    code = main(["--make-backlog", str(repo), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["stories_added"] > 0
+    assert payload["stories_total"] == payload["stories_added"]
+
+
 # --- --repo / --env-file ----------------------------------------------------------
 
 

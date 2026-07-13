@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import List, Mapping, Optional
 
 from . import __version__
-from .assessment import AssessConfig, outcome_to_dict
+from .assessment import (
+    ASSESSMENT_JSON_PATH,
+    AssessConfig,
+    dict_to_backlog,
+    outcome_to_dict,
+)
+from .backlog import BacklogStore
 from .budget import Budget
 from .chat import ChatSession, chat_system_prompt
 from .config import TeamConfig
@@ -258,6 +264,17 @@ def build_parser() -> argparse.ArgumentParser:
         "off (with --assess).",
     )
     parser.add_argument(
+        "--make-backlog",
+        default=None,
+        metavar="DIR",
+        help="Convert the assessment persisted in DIR "
+        "(.dev_team/assessment.json, written by every --assess run) into "
+        "stories in DIR/.dev_team/backlog.json, deduplicated by title. A "
+        "pure local transform: no agents run, no credentials are needed, "
+        "and it costs $0 — assess once, generate the backlog any time "
+        "later. Standalone: not combined with other modes.",
+    )
+    parser.add_argument(
         "--no-conventions",
         action="store_true",
         help="Do not persist the captured house-conventions profile "
@@ -408,6 +425,13 @@ def _validate_args(
             "--dispatch is a standalone service; run it as its own process, "
             "not alongside --assess/--deliver/--chat/--dashboard"
         )
+    if args.make_backlog is not None and (
+        args.assess or args.deliver or args.chat or args.dashboard or args.dispatch
+    ):
+        parser.error(
+            "--make-backlog is a standalone offline transform; it cannot be "
+            "combined with --assess/--deliver/--chat/--dashboard/--dispatch"
+        )
     if args.port is not None and not (args.dashboard or args.dispatch):
         parser.error("--port: only valid with --dashboard or --dispatch")
     if args.host is not None and not (args.dashboard or args.dispatch):
@@ -428,7 +452,10 @@ def _validate_args(
                          "the title/description arguments")
         if args.json:
             parser.error("--json: not available with --chat (stdout is the conversation)")
-    elif not (args.assess or args.dashboard or args.dispatch):
+    elif not (
+        args.assess or args.dashboard or args.dispatch
+        or args.make_backlog is not None
+    ):
         if args.title is None or args.description is None:
             parser.error("title and description are required (or use --chat)")
     if args.roster is not None and args.no_personas:
@@ -719,6 +746,46 @@ def _serve_dashboard(args) -> int:
     return 0
 
 
+def _make_backlog(args) -> int:
+    """Generate backlog stories from a persisted assessment; returns exit code.
+
+    Reads ``<DIR>/.dev_team/assessment.json`` (written by every ``--assess``
+    run) and merges its findings into ``<DIR>/.dev_team/backlog.json`` — the
+    same transform ``--assess --backlog`` applies inline, decoupled so an
+    operator can assess once and generate (or refresh) the backlog any time
+    later. No agents run and no credentials are needed: this is a pure disk
+    transform that costs $0.
+    """
+
+    workspace = LocalWorkspace(args.make_backlog)
+    if not workspace.exists(ASSESSMENT_JSON_PATH):
+        raise DevTeamError(
+            f"no assessment.json in {args.make_backlog}/.dev_team — "
+            "run --assess there first"
+        )
+    data = json.loads(workspace.read_text(ASSESSMENT_JSON_PATH))
+    store = BacklogStore(workspace)
+    backlog = store.load()
+    added = dict_to_backlog(data, backlog)
+    store.save(backlog)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "stories_added": len(added),
+                    "stories_total": len(backlog.stories),
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(
+            f"{len(added)} story(ies) added; "
+            f"{len(backlog.stories)} total in {store.path}"
+        )
+    return 0
+
+
 #: Environment variable holding the dispatch service's bearer token.
 DISPATCH_TOKEN_ENV = "DEV_TEAM_DISPATCH_TOKEN"
 
@@ -789,6 +856,11 @@ def _run(
     if args.dashboard:
         # A read-only viewer: no agents run, so no Claude credentials needed.
         return _serve_dashboard(args)
+
+    if args.make_backlog is not None:
+        # A pure disk transform over a persisted assessment: no agents run,
+        # so no Claude credentials (and no repo/team/runner) are needed.
+        return _make_backlog(args)
 
     if runner is None:
         # Only the real SDK runner needs credentials; an injected runner

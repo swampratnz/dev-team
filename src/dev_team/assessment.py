@@ -11,8 +11,10 @@ Unlike delivery, assessment **never mutates the repository**: no branch, no
 baseline commit, no gates, no ``.dev_team/`` bookkeeping. Auditing roles get
 read-only tools (`Read`/`Grep`/`Glob`) rooted at the workspace so claims come
 from the actual files, and every phase's contract demands a file-path
-citation per claim — ambiguity is stated, not guessed away. The only write is
-the report itself, and only when a ``report_path`` is configured.
+citation per claim — ambiguity is stated, not guessed away. The only writes
+are the audit's own outputs: the report (when a ``report_path`` is
+configured) and the persisted structured result at
+:data:`ASSESSMENT_JSON_PATH` (unless ``persist_result`` is off).
 
 One opt-in exception: :class:`AssessConfig.build_probe` executes the detected
 profile's setup/verify commands so buildability rests on real exit codes.
@@ -23,6 +25,7 @@ side effects on the working tree — which is why it is off by default.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Mapping, Optional, Sequence
@@ -99,6 +102,14 @@ _COMPONENT_MANIFESTS = frozenset(
 
 #: Enrichment phases: their failure degrades the report, not the audit.
 _ADVISORY_PHASES = frozenset({"conventions", "components"})
+
+#: Where an assessment persists its structured result (the exact
+#: :func:`outcome_to_dict` shape). Written on every run unless
+#: :attr:`AssessConfig.persist_result` is off, it decouples the expensive
+#: LLM audit from cheap downstream transforms: :func:`dict_to_backlog` (via
+#: ``--make-backlog`` or the dispatch service's ``POST /jobs/{id}/backlog``)
+#: reads this file later, with no model and at no cost.
+ASSESSMENT_JSON_PATH = ".dev_team/assessment.json"
 
 CLASSIFICATIONS = (
     "revive-in-place",
@@ -445,7 +456,13 @@ class AssessConfig:
             from manifests (degrades gracefully offline).
         save_conventions: Persist the captured house-conventions profile to
             ``.dev_team/conventions.json`` so later delivery runs follow it.
-            This and the report are the assessment's only writes.
+            This, the report, and the persisted result are the assessment's
+            only writes.
+        persist_result: Write the structured outcome
+            (:func:`outcome_to_dict`) to :data:`ASSESSMENT_JSON_PATH` so
+            backlog generation — and any other transform — can run later
+            without re-assessing. On by default: it is what makes
+            "assess once, generate the backlog anytime, for free" possible.
         update_backlog: Convert findings into stories in the persistent
             backlog (``.dev_team/backlog.json``) so delivery runs can work
             them off. Off by default: it writes to the workspace.
@@ -470,6 +487,7 @@ class AssessConfig:
     max_components: int = 12
     osv_scan: bool = True
     save_conventions: bool = True
+    persist_result: bool = True
     update_backlog: bool = False
     dormancy_days: int = 365
     build_probe: bool = False
@@ -943,6 +961,17 @@ class AssessmentEngine:
         if self.config.report_path is not None:
             self.workspace.write_text(self.config.report_path, outcome.report_markdown)
             self._event("report", f"Report written to {self.config.report_path}")
+        if self.config.persist_result:
+            # The structured result outlives this process so backlog
+            # generation (dict_to_backlog) can run later — no re-assess,
+            # no model, $0.
+            self.workspace.write_text(
+                ASSESSMENT_JSON_PATH,
+                json.dumps(outcome_to_dict(outcome), indent=2),
+            )
+            self._event(
+                "persist", f"Structured result written to {ASSESSMENT_JSON_PATH}"
+            )
         if self.config.update_backlog:
             self._update_backlog(outcome)
         verdict = outcome.classification or "unclassified"
@@ -1163,6 +1192,25 @@ def outcome_to_backlog(outcome: AssessmentOutcome, backlog: Backlog) -> List[Sto
     hits, and live vulnerability records each become a story under one
     "Assessment remediation" epic. Stories deduplicate by title, so re-running
     an assessment refreshes the backlog instead of flooding it.
+
+    A thin wrapper over :func:`dict_to_backlog`: the conversion reads only
+    fields :func:`outcome_to_dict` serialises, so the live-object and
+    persisted-JSON paths cannot drift.
+    """
+
+    return dict_to_backlog(outcome_to_dict(outcome), backlog)
+
+
+def dict_to_backlog(data: Dict, backlog: Backlog) -> List[Story]:
+    """Convert a serialised assessment (:func:`outcome_to_dict`) into stories.
+
+    The dict-shaped core of :func:`outcome_to_backlog`. Because it takes the
+    exact JSON persisted at :data:`ASSESSMENT_JSON_PATH`, backlog generation
+    is a pure disk transform that can run any time after the assessment — via
+    ``--make-backlog`` or the dispatch service's ``POST /jobs/{id}/backlog``
+    — with no agents, no LLM calls, and no cost. Semantics are identical to
+    the outcome path: one "Assessment remediation" epic, stories deduplicated
+    by title against ``backlog``, and the newly added stories returned.
     """
 
     epic_title = "Assessment remediation"
@@ -1171,7 +1219,7 @@ def outcome_to_backlog(outcome: AssessmentOutcome, backlog: Backlog) -> List[Sto
         epic = backlog.add_epic(
             epic_title,
             f"From repository assessment (classification: "
-            f"{outcome.classification or 'unclassified'})",
+            f"{data.get('classification') or 'unclassified'})",
         )
     existing = {s.title for s in backlog.stories}
     added: List[Story] = []
@@ -1185,60 +1233,67 @@ def outcome_to_backlog(outcome: AssessmentOutcome, backlog: Backlog) -> List[Sto
             backlog.add_story(title, description, estimate=estimate, epic_id=epic.id)
         )
 
-    recommendation = outcome.phases.get("recommendation")
-    if recommendation is not None and recommendation.ok:
-        for step in recommendation.data.get("plan", []):
-            if not isinstance(step, dict):
-                continue
-            name = str(step.get("step", "")).strip()
-            if name:
-                add(
-                    name,
-                    str(step.get("detail", "")),
-                    _effort_points(str(step.get("effort", ""))),
-                )
-    buildability = outcome.phases.get("buildability")
-    if buildability is not None and buildability.ok:
-        for blocker in buildability.data.get("blockers", []):
-            if not isinstance(blocker, dict):
-                continue
-            if blocker.get("category") != "must-fix-to-build":
-                continue
-            claim = str(blocker.get("claim", "")).strip()
-            if claim:
-                add(
-                    f"Fix build blocker: {claim}",
-                    f"Evidence: {blocker.get('evidence', '')}",
-                    3,
-                )
-    risk = outcome.phases.get("risk")
-    if risk is not None and risk.ok:
-        for dep in risk.data.get("dependencies", []):
-            if isinstance(dep, dict) and dep.get("action") == "must-fix":
-                add(
-                    f"Upgrade or replace dependency {dep.get('name', '?')}",
-                    f"{dep.get('version', '')} {dep.get('status', '')} "
-                    f"(evidence: {dep.get('evidence', '')})".strip(),
-                    3,
-                )
-        for secret in risk.data.get("secrets", []):
-            if isinstance(secret, dict) and secret.get("claim"):
-                add(
-                    f"Remove hardcoded secret: {secret['claim']}",
-                    f"Evidence: {secret.get('evidence', '')}",
-                    1,
-                )
+    phases = data.get("phases") or {}
+
+    def phase_data(name: str) -> Dict:
+        """The phase's payload, or ``{}`` when it is absent or failed."""
+
+        entry = phases.get(name) or {}
+        if not entry.get("ok"):
+            return {}
+        return entry.get("data") or {}
+
+    for step in phase_data("recommendation").get("plan", []):
+        if not isinstance(step, dict):
+            continue
+        name = str(step.get("step", "")).strip()
+        if name:
+            add(
+                name,
+                str(step.get("detail", "")),
+                _effort_points(str(step.get("effort", ""))),
+            )
+    for blocker in phase_data("buildability").get("blockers", []):
+        if not isinstance(blocker, dict):
+            continue
+        if blocker.get("category") != "must-fix-to-build":
+            continue
+        claim = str(blocker.get("claim", "")).strip()
+        if claim:
+            add(
+                f"Fix build blocker: {claim}",
+                f"Evidence: {blocker.get('evidence', '')}",
+                3,
+            )
+    risk = phase_data("risk")
+    for dep in risk.get("dependencies", []):
+        if isinstance(dep, dict) and dep.get("action") == "must-fix":
+            add(
+                f"Upgrade or replace dependency {dep.get('name', '?')}",
+                f"{dep.get('version', '')} {dep.get('status', '')} "
+                f"(evidence: {dep.get('evidence', '')})".strip(),
+                3,
+            )
+    for secret in risk.get("secrets", []):
+        if isinstance(secret, dict) and secret.get("claim"):
+            add(
+                f"Remove hardcoded secret: {secret['claim']}",
+                f"Evidence: {secret.get('evidence', '')}",
+                1,
+            )
     by_probe: Dict[str, List[str]] = {}
-    for finding in outcome.dead_code.findings:
-        by_probe.setdefault(finding.probe, []).append(finding.path)
+    for finding in (data.get("dead_code") or {}).get("findings", []):
+        by_probe.setdefault(str(finding.get("probe")), []).append(
+            str(finding.get("path"))
+        )
     for probe, paths in sorted(by_probe.items()):
         listed = ", ".join(paths[:20]) + (" …" if len(paths) > 20 else "")
         add(f"Remove dead code ({probe}: {len(paths)} path(s))", listed, 3)
-    for vulnerability in outcome.dependency_scan.vulnerabilities:
-        dep = vulnerability.dependency
+    for vulnerability in (data.get("dependency_scan") or {}).get("vulnerabilities", []):
+        dep = vulnerability.get("dependency") or {}
         add(
-            f"Patch {dep.name} {dep.version}: {vulnerability.id}",
-            f"{vulnerability.url} (manifest: {dep.manifest})",
+            f"Patch {dep.get('name')} {dep.get('version')}: {vulnerability.get('id')}",
+            f"{vulnerability.get('url')} (manifest: {dep.get('manifest')})",
         )
     return added
 

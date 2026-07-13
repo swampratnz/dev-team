@@ -7,6 +7,7 @@ change. Assessment is **read-only by construction**: no delivery branch, no
 baseline commit, no quality gates, no `.dev_team/` bookkeeping. The auditing
 agents get read-only tools (`Read`/`Grep`/`Glob`) rooted at the workspace,
 and the audit's writes are limited to its own outputs: the report, the
+persisted structured result (`.dev_team/assessment.json`), the
 conventions profile, and (from the CLI) the `.dev_team/events.jsonl`
 progress journal the dashboard reads. The code under audit is never
 touched. (One opt-in exception: `--build-probe` runs the project's own
@@ -170,6 +171,38 @@ tree, statistics, and component detection. `--backlog` converts the audit's
 findings into estimated stories in `.dev_team/backlog.json`, deduplicated by
 title, under an "Assessment remediation" epic — the input queue for later
 `--deliver` runs.
+
+## Assess once, backlog anytime, free
+
+Every assessment persists its full structured outcome (the exact `--json`
+shape) to `.dev_team/assessment.json` in the workspace
+(`AssessConfig.persist_result`, on by default). Backlog generation is a pure
+transform over that file — no agents, no LLM calls, $0 — so it is decoupled
+from the expensive audit and can run (or re-run) any time later:
+
+```bash
+dev-team --assess --workspace /path/to/repo          # pay for the audit once
+dev-team --make-backlog /path/to/repo                # free, whenever, repeatable
+dev-team --make-backlog /path/to/repo --json         # {"stories_added":…,"stories_total":…}
+```
+
+`--make-backlog DIR` is standalone (not combined with other modes) and needs
+**no Claude credentials**: it reads `DIR/.dev_team/assessment.json` and
+merges the stories into `DIR/.dev_team/backlog.json`, deduplicated by title,
+so re-running refreshes instead of flooding. `--assess --backlog` still does
+the same conversion inline; the flag is now just a convenience for when you
+already know you want the stories. In code the same split is
+`outcome_to_backlog(outcome, backlog)` (live object) over
+`dict_to_backlog(data, backlog)` (persisted JSON) — the former delegates to
+the latter, so the two paths cannot drift. The dispatch service exposes the
+same late transform as `POST /jobs/{id}/backlog`
+(see [`docs/DISPATCH.md`](DISPATCH.md)).
+
+**Retroactivity caveat:** only runs made since this feature persist
+`assessment.json`. A workspace assessed by an older version has nothing to
+transform — `--make-backlog` exits with "no assessment.json … run --assess
+there first"; re-assess once to create the file. Opting out
+(`persist_result=False`) likewise forfeits the later, free path.
 
 ## Library use
 
