@@ -69,6 +69,19 @@ sections below are reconstructed from the repository history.
   gap left after per-job re-verification (PR #25) shipped. No agent calls;
   an out-of-contract verdict or non-string `finding_id` is dropped, not
   trusted, same as the write-time fail-secure posture.
+- **`POST /jobs/{id}/cancel`** (`docs/DISPATCH.md`): the missing rung on
+  the job lifecycle — a still-`queued` job can now be pulled out of the
+  single-flight queue (`queued → cancelled`, refused with `409` once a job
+  is `running` or already terminal) instead of the only prior options
+  (wait for it to run anyway, or restart the whole service and lose every
+  other queued job). Cancelling is $0 and strictly cheaper than letting a
+  job run: the targeted job never reaches `run_job`, so no clone, no
+  workspace, no agent call happens for it, and it stops counting toward
+  the queue cap. `GET /jobs/{id}/result` on a cancelled job answers
+  `{"kind":<mode>,"success":false,"error":"cancelled","cost_usd":0}`. No
+  new auth surface, no new store — reuses the existing bearer gate and the
+  in-memory registry's lock, shared with the worker's `queued → running`
+  flip so the two transitions are mutually exclusive.
 
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the

@@ -707,6 +707,197 @@ def test_archive_refuses_queued_and_running_jobs():
         disp.stop()
 
 
+# --- cancel (job lifecycle) ----------------------------------------------
+
+
+def test_cancel_a_queued_job_transitions_to_cancelled():
+    disp = Dispatcher(token="x", clock=lambda: 42.0)  # worker never started
+    job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+    assert disp.cancel_job(job_id) == (200, {"id": job_id, "state": "cancelled"})
+    record = disp.get(job_id)
+    assert record.state == "cancelled"
+    assert record.ended == 42.0
+
+
+def test_cancel_unknown_job_is_404():
+    disp = Dispatcher(token="x")
+    assert disp.cancel_job("ghost") == (404, {"error": "unknown job"})
+
+
+def test_cancel_a_running_job_is_409():
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    disp = Dispatcher(token="x", runner=_assess_runner(), materialise=materialise)
+    disp.start()
+    try:
+        running_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+        assert disp.cancel_job(running_id) == (
+            409, {"error": "job is not queued", "state": "running"})
+    finally:
+        release.set()
+        disp.wait(running_id, 5)
+        disp.stop()
+
+
+def test_cancel_an_already_terminal_job_is_409_per_state():
+    def boom(spec, dest):
+        raise RuntimeError("boom")
+
+    disp = Dispatcher(token="x", runner=_assess_runner(), materialise=_mem_materialise)
+    disp.start()
+    try:
+        succeeded_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        disp.wait(succeeded_id, 5)
+        assert disp.get(succeeded_id).state == "succeeded"
+        assert disp.cancel_job(succeeded_id) == (
+            409, {"error": "job is not queued", "state": "succeeded"})
+    finally:
+        disp.stop()
+
+    disp = Dispatcher(token="x", materialise=boom)
+    disp.start()
+    try:
+        failed_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/two"}))
+        disp.wait(failed_id, 5)
+        assert disp.get(failed_id).state == "failed"
+        assert disp.cancel_job(failed_id) == (
+            409, {"error": "job is not queued", "state": "failed"})
+    finally:
+        disp.stop()
+
+    disp = Dispatcher(token="x")  # worker never started
+    cancelled_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/three"}))
+    disp.cancel_job(cancelled_id)
+    assert disp.cancel_job(cancelled_id) == (
+        409, {"error": "job is not queued", "state": "cancelled"})
+
+
+def test_cancelled_job_is_never_executed():
+    calls = []
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        calls.append(spec.id)
+        if len(calls) == 1:
+            first_in.set()
+            release.wait(5)
+        return InMemoryWorkspace()
+
+    disp = Dispatcher(token="x", runner=_assess_runner(), materialise=materialise)
+    disp.start()
+    try:
+        running_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+        queued_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/two"}))
+        assert disp.get(queued_id).state == "queued"
+        assert disp.cancel_job(queued_id) == (
+            200, {"id": queued_id, "state": "cancelled"})
+        release.set()
+        disp.wait(running_id, 5)
+        disp.wait(queued_id, 5)
+        assert queued_id not in calls  # materialise never called for it
+        assert disp.get(queued_id).state == "cancelled"  # not overwritten by _execute
+    finally:
+        release.set()
+        disp.stop()
+
+
+def test_cancel_running_race_is_deterministic_and_consistent():
+    """AC11: cancel_job() and _execute()'s queued->running flip share
+    self._lock, so whichever wins a race resolves to exactly one outcome —
+    either the job never ran (materialise never called, state stays
+    "cancelled"), or cancel is refused with 409 because the job is already
+    past "queued" — never both, never neither.
+    """
+
+    calls = []
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        calls.append(spec.id)
+        if len(calls) == 1:
+            first_in.set()
+            release.wait(5)
+        return InMemoryWorkspace()
+
+    disp = Dispatcher(token="x", runner=_assess_runner(), materialise=materialise)
+    disp.start()
+    try:
+        running_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+        queued_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/two"}))
+        release.set()  # free the worker to race straight for job 2
+        status, payload = disp.cancel_job(queued_id)
+        disp.wait(queued_id, 5)
+        record = disp.get(queued_id)
+        if status == 200:
+            assert payload == {"id": queued_id, "state": "cancelled"}
+            assert record.state == "cancelled"
+            assert queued_id not in calls
+        else:
+            assert status == 409
+            assert payload["error"] == "job is not queued"
+            assert record.state in ("running", "succeeded")
+    finally:
+        disp.wait(running_id, 5)
+        disp.stop()
+
+
+def test_cancel_result_and_status_shape():
+    disp = Dispatcher(token="x", clock=lambda: 7.0)  # worker never started
+    job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+    disp.cancel_job(job_id)
+    record = disp.get(job_id)
+    status_payload = disp.status(record)
+    assert status_payload["state"] == "cancelled"
+    assert status_payload["ended"] == 7.0
+    assert status_payload["cost_usd"] is None
+    assert status_payload["error"] is None
+    assert disp.result(record) == (
+        200,
+        {"kind": "assess", "success": False, "error": "cancelled", "cost_usd": 0},
+    )
+
+
+def test_cancelled_job_is_listed_but_not_archivable():
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(token="x", dashboard_workspace=dash)  # worker never started
+    job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+    disp.cancel_job(job_id)
+    assert [r.spec.id for r in disp.recent()] == [job_id]
+    # A cancelled job is cancelled before run_job ever runs, so its
+    # audit/<id>/meta.json is never written — archive_job 404s exactly like
+    # it already does for any job whose assessment was never mirrored.
+    assert disp.archive_job(job_id) == (404, {"error": "no assessment for that job"})
+
+
+def test_cancel_frees_a_queue_cap_slot():
+    disp = Dispatcher(token="x", queue_cap=2)  # worker never started
+    id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+    disp.submit(disp.build_spec({"mode": "assess", "repo": "a/two"}))
+    with pytest.raises(QueueFull):
+        disp.submit(disp.build_spec({"mode": "assess", "repo": "a/three"}))
+    disp.cancel_job(id1)
+    id3, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/three"}))
+    assert disp.get(id3).state == "queued"
+
+
 def test_recent_excludes_archived_jobs_by_default():
     dash = InMemoryWorkspace()
     disp = Dispatcher(
@@ -841,6 +1032,64 @@ def test_archive_http_route_running_job_is_409():
             409, {"error": "job is running"})
         release.set()
         server.dispatcher.wait(job["id"], 5)
+
+
+def test_cancel_http_route_blocks_a_still_queued_job():
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    with running(runner=_assess_runner(), materialise=materialise) as server:
+        _, running_job = _call(server, "/jobs", method="POST",
+                               body={"mode": "assess", "repo": "a/one"})
+        assert first_in.wait(5)
+        _, queued_job = _call(server, "/jobs", method="POST",
+                              body={"mode": "assess", "repo": "a/two"})
+        assert _call(server, f"/jobs/{queued_job['id']}/cancel", method="POST") == (
+            200, {"id": queued_job["id"], "state": "cancelled"})
+        assert _call(server, f"/jobs/{queued_job['id']}/result") == (
+            200,
+            {"kind": "assess", "success": False, "error": "cancelled", "cost_usd": 0},
+        )
+        release.set()
+        server.dispatcher.wait(running_job["id"], 5)
+
+
+def test_cancel_http_route_unknown_and_running_and_double_cancel():
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    with running(runner=_assess_runner(), materialise=materialise) as server:
+        assert _call(server, "/jobs/ghost/cancel", method="POST") == (
+            404, {"error": "unknown job"})
+
+        _, job = _call(server, "/jobs", method="POST",
+                       body={"mode": "assess", "repo": "a/one"})
+        assert first_in.wait(5)
+        assert _call(server, f"/jobs/{job['id']}/cancel", method="POST") == (
+            409, {"error": "job is not queued", "state": "running"})
+        release.set()
+        server.dispatcher.wait(job["id"], 5)
+        # already succeeded -> still refused, not idempotent
+        assert _call(server, f"/jobs/{job['id']}/cancel", method="POST") == (
+            409, {"error": "job is not queued", "state": "succeeded"})
+
+
+def test_cancel_http_route_requires_auth():
+    # SECURITY: unauthenticated cancel answers 401, matching every other
+    # authenticated dispatch route.
+    with running(materialise=_mem_materialise) as server:
+        assert _call(server, "/jobs/x/cancel", method="POST", token=None) == (
+            401, {"error": "unauthorized"})
 
 
 def test_jobs_list_archived_query_param_reveals_archived_jobs():

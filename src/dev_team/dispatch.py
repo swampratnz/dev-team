@@ -111,7 +111,7 @@ _PROGRESS_LIMIT = 12
 _MODES = ("assess", "deliver", "verify")
 
 #: Terminal job states.
-_TERMINAL = frozenset({"succeeded", "failed"})
+_TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 
 # A sentinel the worker loop treats as "stop draining and exit".
 _SHUTDOWN = object()
@@ -460,6 +460,12 @@ class Dispatcher:
 
         record = self._registry[job_id]
         with self._lock:
+            if record.state == "cancelled":
+                # Cancelled while queued (cancel_job shares this lock) —
+                # never ran, no cost. Whichever call wins the race decides
+                # the outcome deterministically; no re-set of the
+                # completion event needed, cancel_job already set it.
+                return
             record.state = "running"
             record.started = self._clock()
         try:
@@ -661,6 +667,36 @@ class Dispatcher:
         self._dashboard_workspace.write_text(
             path, existing + json.dumps(entry) + "\n"
         )
+
+    # -- cancel (job lifecycle) -----------------------------------------------
+
+    def cancel_job(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /jobs/{id}/cancel`` core: pull a still-queued job out.
+
+        Reachable only from ``queued`` — the one rung the documented state
+        machine (``queued -> running -> succeeded | failed``) is otherwise
+        missing: once a job is ``running`` it is out of scope (an in-flight
+        clone/agent session, same boundary ``archive_job`` already draws).
+        Non-idempotent by design (409 on every other state, including an
+        already-cancelled job) — every other transition here is one-way, so
+        mixing an idempotent cancel into this route table would be less
+        consistent than a 409 on a redundant call. Shares ``self._lock``
+        with :meth:`_execute`'s queued->running flip, so the two transitions
+        are mutually exclusive: whichever call wins the race decides the
+        outcome deterministically, and a job can never end up both running
+        and marked cancelled.
+        """
+
+        with self._lock:
+            record = self._registry.get(job_id)
+            if record is None:
+                return 404, {"error": "unknown job"}
+            if record.state != "queued":
+                return 409, {"error": "job is not queued", "state": record.state}
+            record.state = "cancelled"
+            record.ended = self._clock()
+        self._events[job_id].set()
+        return 200, {"id": job_id, "state": "cancelled"}
 
     # -- archive / unarchive (job lifecycle) ----------------------------------
 
@@ -1122,6 +1158,16 @@ class Dispatcher:
                 "error": record.error,
                 "cost_usd": 0,
             }
+        if record.state == "cancelled":
+            # A cancelled job never ran, so record.outcome stays None —
+            # must not fall through to the outcome-dereferencing branches
+            # below.
+            return 200, {
+                "kind": record.spec.mode,
+                "success": False,
+                "error": "cancelled",
+                "cost_usd": 0,
+            }
         outcome = record.outcome
         if record.spec.mode == "verify":
             return 200, {
@@ -1255,6 +1301,12 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 # Synchronous on purpose: a pure disk transform (no agents,
                 # no queue slot needed) that answers in one round-trip.
                 status, payload = dispatcher.make_backlog(parts[1])
+                self._json(status, payload)
+                return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "cancel":
+                # Same shape as .../backlog above: a pure in-memory
+                # transition, synchronous, no queue slot.
+                status, payload = dispatcher.cancel_job(parts[1])
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] in (
