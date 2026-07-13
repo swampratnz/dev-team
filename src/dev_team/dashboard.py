@@ -32,6 +32,8 @@ from __future__ import annotations
 import hmac
 import json
 import time
+import urllib.error
+import urllib.request
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, List, Optional
@@ -225,6 +227,17 @@ _COOKIE_NAME = "devteam_dash"
 #: Upper bound on a ``/login`` form body; anything larger is rejected unread.
 _MAX_LOGIN_BODY = 4096
 
+#: The one (and only) path prefix whose writes are proxied to the dispatch
+#: service's ``/backlog`` mutation API. Deliberately narrow: the dashboard
+#: holds a dispatch bearer token, and a general passthrough would let any
+#: dashboard session drive the whole dispatch surface (submit jobs, run
+#: agents) with it. Board edits only.
+_BACKLOG_PROXY_PREFIX = "/api/backlog/"
+
+#: How long a proxied board write may take end to end. The dispatch cores are
+#: pure disk transforms, so anything slower means the service is wedged.
+_PROXY_TIMEOUT = 30.0
+
 
 def _tokens_match(provided: str, expected: str) -> bool:
     """Constant-time equality over the full values (as UTF-8 bytes).
@@ -237,13 +250,24 @@ def _tokens_match(provided: str, expected: str) -> bool:
     return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
-def _make_handler(workspace: Workspace, token: Optional[str] = None) -> type:
+def _make_handler(
+    workspace: Workspace,
+    token: Optional[str] = None,
+    dispatch_url: Optional[str] = None,
+    dispatch_token: Optional[str] = None,
+) -> type:
     """A request handler class bound to ``workspace``.
 
     With ``token`` set, every route requires it — as a bearer header or as
     the session cookie minted by ``POST /login``. ``None`` keeps every route
     open (the pre-auth localhost-dev behaviour). ``_authorised`` is the seam
     a later Auth0/IdP integration replaces.
+
+    With BOTH ``dispatch_url`` and ``dispatch_token`` set, authorised writes
+    under ``/api/backlog/`` are forwarded to the dispatch service's
+    ``/backlog`` mutation API (the board's write path); with either unset the
+    board is read-only and those writes answer ``501``. The dispatch token is
+    only ever sent to ``dispatch_url`` — never logged or reflected.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -339,8 +363,79 @@ def _make_handler(workspace: Workspace, token: Optional[str] = None) -> type:
                 self._logout()
             elif not self._authorised():
                 self._reject(path)
+            elif path.startswith(_BACKLOG_PROXY_PREFIX):
+                self._proxy_backlog("POST", path)
             else:
                 self._send(404, "text/plain", "not found")
+
+        def do_PATCH(self) -> None:  # noqa: N802 (http.server API)
+            self._write_route("PATCH")
+
+        def do_DELETE(self) -> None:  # noqa: N802 (http.server API)
+            self._write_route("DELETE")
+
+        def _write_route(self, method: str) -> None:
+            """Auth-gate a PATCH/DELETE: only ``/api/backlog/*`` exists."""
+
+            path = urlsplit(self.path).path
+            if not self._authorised():
+                self._reject(path)
+            elif path.startswith(_BACKLOG_PROXY_PREFIX):
+                self._proxy_backlog(method, path)
+            else:
+                self._send(404, "text/plain", "not found")
+
+        # -- board writes: a narrow proxy to the dispatch service -----------
+        # The dashboard itself never mutates the workspace (it stays a
+        # read-only viewer); board edits are forwarded — same method, same
+        # JSON body — to the dispatch service's /backlog API, authenticated
+        # with the dispatch bearer token this process (not the browser)
+        # holds. Scope is strictly /api/backlog/*: no other dispatch route
+        # is reachable through the dashboard, and the dispatch token is
+        # never logged, echoed, or handed to the client.
+
+        def _proxy_backlog(self, method: str, path: str) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "board editing not configured"}),
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length) if length > 0 else None
+            rest = path[len(_BACKLOG_PROXY_PREFIX):]
+            request = urllib.request.Request(
+                f"{dispatch_url.rstrip('/')}/backlog/{rest}",
+                data=body,
+                method=method,
+                headers={
+                    "Authorization": f"Bearer {dispatch_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=_PROXY_TIMEOUT) as res:
+                    self._send(
+                        res.status, "application/json", res.read().decode("utf-8")
+                    )
+            except urllib.error.HTTPError as exc:
+                # Dispatch rejections (400/401/404/409) are real answers —
+                # relay status and JSON body verbatim.
+                payload = exc.read().decode("utf-8")
+                exc.close()
+                self._send(exc.code, "application/json", payload)
+            except urllib.error.URLError:
+                # Fail securely: no stack traces, no target details beyond
+                # "the write path is down".
+                self._send(
+                    502,
+                    "application/json",
+                    json.dumps({"error": "dispatch service unreachable"}),
+                )
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             parts = urlsplit(self.path)
@@ -425,6 +520,11 @@ class DashboardServer:
     ``token`` (optional) puts every route behind bearer/cookie auth — see
     the module docstring. Pick a URL/cookie-safe token (e.g. from
     ``secrets.token_urlsafe``): the cookie value is the token verbatim.
+
+    ``dispatch_url`` + ``dispatch_token`` (optional, both required together)
+    enable the board's write path: authorised ``/api/backlog/*`` writes are
+    proxied to that dispatch service's ``/backlog`` mutation API. Without
+    them the dashboard stays fully read-only (board writes answer ``501``).
     """
 
     def __init__(
@@ -434,10 +534,13 @@ class DashboardServer:
         host: str = "127.0.0.1",
         port: int = 8737,
         token: Optional[str] = None,
+        dispatch_url: Optional[str] = None,
+        dispatch_token: Optional[str] = None,
     ) -> None:
         self.workspace = workspace
         self.httpd = ThreadingHTTPServer(
-            (host, port), _make_handler(workspace, token)
+            (host, port),
+            _make_handler(workspace, token, dispatch_url, dispatch_token),
         )
 
     @property

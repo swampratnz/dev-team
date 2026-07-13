@@ -100,6 +100,57 @@ This is a stopgap until an IdP (Auth0) integration lands; the seam it
 replaces is `Handler._authorised` (plus the `/login` flow) in
 `dashboard.py`.
 
+## The board write model (backlog editing)
+
+The dashboard stays a **read-only viewer of the workspace** — it never
+writes `backlog.json` itself. Board edits flow through a deliberately
+narrow proxy to the **dispatch service**, which owns every backlog write:
+
+```
+browser ──(dashboard token)──▶ dashboard /api/backlog/* ──(dispatch token)──▶ dispatch /backlog/*
+```
+
+- **The proxy** (`--dashboard` with `--dispatch-url`, default
+  `http://127.0.0.1:8738`): authorised `POST`/`PATCH`/`DELETE` requests
+  under `/api/backlog/` are forwarded — same method, same JSON body — to
+  `<dispatch-url>/backlog/...` with `Authorization: Bearer
+  $DEV_TEAM_DISPATCH_TOKEN`. The dispatch response (status + JSON body,
+  including 400/404/409 rejections) is relayed verbatim; an unreachable
+  dispatch service answers `502`. Scope is **strictly `/api/backlog/*`** —
+  no other dispatch route (job submission, results) is reachable through
+  the dashboard, and the dispatch token is never logged, echoed, or handed
+  to the browser. With `DEV_TEAM_DISPATCH_TOKEN` unset the board is
+  read-only and writes answer `501 {"error": "board editing not
+  configured"}`.
+- **Auth is layered**: the browser authenticates to the dashboard
+  (dashboard token / cookie, checked first); the dashboard process — not
+  the browser — holds the dispatch bearer token. Both comparisons are
+  constant-time.
+
+### The dispatch mutation API (`/backlog`, bearer-authenticated)
+
+| Route | Effect |
+|-------|--------|
+| `GET /backlog` | the full serialised backlog (the board) |
+| `POST /backlog/story` | add a story card (`title` required; optional `description`, `estimate` ≥ 1, `epic_id`, `status`) → `201` + the story |
+| `POST /backlog/story/{id}/status` | set `status` (todo / in_progress / done / blocked / declined) |
+| `POST /backlog/story/{id}/decline` | shorthand for status → `declined` |
+| `POST /backlog/story/{id}/deps` | set `depends_on` edges; unknown/self edges and cycles are `400` |
+| `PATCH /backlog/story/{id}` | edit `title` / `description` / `estimate` (only provided keys) |
+| `DELETE /backlog/story/{id}` | remove the story and strip its id from every other story's `depends_on` |
+
+Every mutation stamps the story's `updated_at`, answers with the affected
+story, and runs **synchronously under a single write lock** shared with the
+assess worker's backlog merge — the dispatch service is the sole writer of
+the dashboard workspace's `backlog.json`, so concurrent edits and job-driven
+merges can never lose each other's updates. Story/epic ids are minted past
+the highest suffix ever used, so a deleted id is never reissued to an
+unrelated new story. Stories bred from an assessment's remediation plan
+arrive pre-chained: each plan story `depends_on` the previous plan story.
+
+The interactive Kanban rendering of this API on the dashboard page is a
+follow-up; today the routes serve API callers and the proxy.
+
 ## API
 
 Everything the page shows is plain JSON, usable by your own tooling (add
@@ -110,3 +161,5 @@ the bearer header when a token is set):
   paths the workspace actually lists are served).
 - `POST /login` (form field `token`) / `POST /logout` — the browser cookie
   session lifecycle described above.
+- `POST|PATCH|DELETE /api/backlog/...` — the board write proxy described
+  above (requires dashboard auth; `501` until a dispatch token is wired).

@@ -1002,6 +1002,76 @@ def test_dict_to_backlog_threads_finding_provenance():
         assert by_title[title].finding_id is None
 
 
+def _plan_payload(*steps):
+    """An outcome_to_dict-shaped payload whose recommendation plan is ``steps``."""
+
+    return {
+        "classification": "dependency-surgery",
+        "phases": {
+            "recommendation": {
+                "role": "product-manager",
+                "ok": True,
+                "error": None,
+                "data": {"plan": [{"step": step, "detail": "", "effort": ""} for step in steps]},
+            }
+        },
+        "dead_code": {"findings": []},
+        "dependency_scan": {"vulnerabilities": []},
+    }
+
+
+def test_dict_to_backlog_chains_plan_stories_by_dependency():
+    """Plan steps are an ordered sequence: each story depends on the previous."""
+
+    from dev_team.backlog import Backlog, validate_dependencies
+
+    backlog = Backlog()
+    first, second, third = dict_to_backlog(
+        _plan_payload("Pin build chain", "Upgrade ORM", "Re-run the suite"), backlog
+    )
+    assert first.depends_on == []
+    assert second.depends_on == [first.id]
+    assert third.depends_on == [second.id]
+    validate_dependencies(backlog)  # the seeded chain is always a valid DAG
+
+
+def test_dict_to_backlog_dep_chain_skips_deduplicated_steps():
+    """A dedup-suppressed step must not break the chain (nor self-refer)."""
+
+    from dev_team.backlog import Backlog
+
+    backlog = Backlog()
+    # "A" appears twice: the second occurrence is suppressed by title dedup,
+    # so "C" chains off "B" — the last story actually added — not off a gap.
+    a, b, c = dict_to_backlog(_plan_payload("A", "B", "A", "C"), backlog)
+    assert [s.title for s in (a, b, c)] == ["A", "B", "C"]
+    assert b.depends_on == [a.id]
+    assert c.depends_on == [b.id]
+
+
+def test_dict_to_backlog_dep_chain_survives_a_blank_leading_step():
+    """Blank steps add nothing and leave the chain anchored on the first real one."""
+
+    from dev_team.backlog import Backlog
+
+    a, b = dict_to_backlog(_plan_payload("  ", "A", "B"), Backlog())
+    assert a.depends_on == []
+    assert b.depends_on == [a.id]
+
+
+def test_dict_to_backlog_only_plan_stories_get_seeded_dependencies():
+    """Non-plan findings are independent work: no dependency edges."""
+
+    from dev_team.backlog import Backlog
+
+    stories = dict_to_backlog(outcome_to_dict(_findings_outcome()), Backlog())
+    by_title = {s.title: s for s in stories}
+    for title in _FINDINGS_TITLES:
+        if title != "Pin build chain":  # the (single-step) plan story
+            assert by_title[title].depends_on == []
+    assert by_title["Pin build chain"].depends_on == []  # first in its chain
+
+
 def test_outcome_to_backlog_keeps_the_single_epic_without_repo_context():
     """The wrapper stays back-compatible: no repo, no source job."""
 
