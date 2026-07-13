@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import threading
 import urllib.error
@@ -94,7 +95,9 @@ def test_collect_state_backlog_epics_points_and_orphans():
 
     state = collect_state(ws)["backlog"]
     assert state["present"] is True
-    assert state["counts"] == {"todo": 1, "in_progress": 0, "done": 1, "blocked": 1}
+    assert state["counts"] == {
+        "todo": 1, "in_progress": 0, "done": 1, "blocked": 1, "declined": 0,
+    }
     (epic_state,) = state["epics"]
     assert epic_state["points_done"] == 3
     assert epic_state["points_total"] == 11
@@ -134,6 +137,93 @@ def test_collect_state_backlog_carries_story_detail_and_provenance():
     # deterministic stories surface None so the page shows the muted note
     assert deterministic["source_job"] is None
     assert deterministic["finding_id"] is None
+
+
+def test_collect_state_backlog_carries_board_fields():
+    """The Kanban board's fields reach the state payload.
+
+    Every story dict now carries ``depends_on`` (the dependency indicator /
+    blocked-by flag) and ``updated_at``; the counts dict gains ``declined``.
+    """
+
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    backlog = store.load()
+    epic = backlog.add_epic("Remediation — acme/rota")
+    first = backlog.add_story("Land the migration", "", estimate=3, epic_id=epic.id)
+    second = backlog.add_story("Cut over reads", "", estimate=2, epic_id=epic.id)
+    second.depends_on = [first.id]
+    second.updated_at = 1700000000.0
+    declined = backlog.add_story("Rewrite in Rust", "", epic_id=epic.id)
+    declined.status = ItemStatus.DECLINED
+    store.save(backlog)
+
+    state = collect_state(ws)["backlog"]
+    assert state["counts"] == {
+        "todo": 2, "in_progress": 0, "done": 0, "blocked": 0, "declined": 1,
+    }
+    (epic_state,) = state["epics"]
+    by_id = {s["id"]: s for s in epic_state["stories"]}
+    assert by_id[second.id]["depends_on"] == [first.id]
+    assert by_id[second.id]["updated_at"] == 1700000000.0
+    assert by_id[first.id]["depends_on"] == []
+    assert by_id[first.id]["updated_at"] is None
+    assert by_id[declined.id]["status"] == "declined"
+
+
+def test_dashboard_page_kanban_board_desk_check():
+    """Static desk-check of the Kanban board JS (CI has no browser).
+
+    The interactive board rides on the PR-A ``/api/backlog/*`` proxy; the
+    load-bearing properties pinned here: the four columns plus a declined
+    section render with counts, every mutation route is called through the
+    single ``backlogWrite`` helper, ids are URL-encoded, every repo-derived
+    card field (titles, dependency titles, echoed input values) flows
+    through ``esc()`` before innerHTML, and error messages surface via
+    ``textContent`` only.
+    """
+
+    # the four columns, in board order, plus the muted declined row
+    assert '["todo", "To do"], ["in_progress", "In progress"]' in DASHBOARD_HTML
+    assert '["blocked", "Blocked"], ["done", "Done"]' in DASHBOARD_HTML
+    assert "Declined (${declined.length})" in DASHBOARD_HTML
+    assert '<span class="cn">${items.length}</span>' in DASHBOARD_HTML  # counts
+    # the declined chip and stat tile
+    assert "declined: chip(" in DASHBOARD_HTML
+    assert '"stories declined"' in DASHBOARD_HTML
+    # every write goes through the one same-origin proxy helper
+    assert '"/api/backlog/" + path' in DASHBOARD_HTML
+    assert '"Content-Type": "application/json"' in DASHBOARD_HTML
+    # ... and each PR-A mutation route is reachable from a control
+    assert '"/status", { status }' in DASHBOARD_HTML                    # move
+    assert '+ "/decline"' in DASHBOARD_HTML                              # decline
+    assert '+ "/deps"' in DASHBOARD_HTML                                 # dependency editor
+    assert 'backlogWrite("POST", "story", payload)' in DASHBOARD_HTML    # add card
+    assert 'backlogWrite("PATCH", "story/"' in DASHBOARD_HTML            # edit
+    assert 'backlogWrite("DELETE", "story/"' in DASHBOARD_HTML           # delete
+    assert "encodeURIComponent(id)" in DASHBOARD_HTML
+    # the reliable move path is a <select> on every card (and in the modal)
+    assert 'select class="cmove" data-move="${esc(st.id)}"' in DASHBOARD_HTML
+    assert "moveStory(sel.dataset.move, sel.value" in DASHBOARD_HTML
+    # dependency indicator + blocked-by flag, titles resolved and ESCAPED
+    assert "\\u26D3 ${deps.length}" in DASHBOARD_HTML
+    assert "blocked by unfinished ${esc(unfinished[0].title)}" in DASHBOARD_HTML
+    assert 'd.status !== "done" && d.status !== "declined"' in DASHBOARD_HTML
+    # escape-first card rendering (titles clamped via .ct)
+    assert '<div class="ct">${esc(st.title)}</div>' in DASHBOARD_HTML
+    # add card per epic; edit form values escaped even though user-typed
+    # (they round-trip through the server before rendering)
+    assert 'data-add="${esc(e.id)}"' in DASHBOARD_HTML
+    assert "\\uFF0B Add card" in DASHBOARD_HTML
+    assert 'value="${esc(st.title)}"' in DASHBOARD_HTML
+    assert '>${esc(st.description ?? "")}</textarea>' in DASHBOARD_HTML
+    # the dependency editor never offers the card itself
+    assert "o.id !== st.id" in DASHBOARD_HTML
+    # delete requires a confirm step
+    assert "confirm delete?" in DASHBOARD_HTML
+    # dispatch error messages reach the DOM via textContent, never innerHTML
+    assert "el.textContent = msg; // SECURITY: textContent, never innerHTML" in DASHBOARD_HTML
+    assert "if (data && data.error) msg = String(data.error);" in DASHBOARD_HTML
 
 
 def test_dashboard_page_story_modal_desk_check():
@@ -625,3 +715,198 @@ def test_open_server_login_lifecycle_is_harmless(server):
     assert "Max-Age=0" in headers["Set-Cookie"]
     status, _, _ = _request(server, "POST", "/nope")
     assert status == 404
+
+
+# --- the board write proxy (/api/backlog/* → the dispatch service) ------------
+
+DISPATCH_URL = "http://dispatch.test:8738"
+DISPATCH_TOKEN = "sekrit-dispatch-token"
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+
+@pytest.fixture
+def proxy_server():
+    ws = InMemoryWorkspace()
+    srv = DashboardServer(
+        ws, port=0, token=TOKEN,
+        dispatch_url=DISPATCH_URL, dispatch_token=DISPATCH_TOKEN,
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield srv
+    srv.shutdown()
+    thread.join(timeout=5)
+
+
+class _FakeDispatchResponse:
+    """The slice of urlopen's response the proxy uses (a context manager)."""
+
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _capture_urlopen(monkeypatch, *, status=200, body=b'{"ok": true}', error=None):
+    """Swap urlopen for a fake that records the outbound Request."""
+
+    seen = []
+
+    def fake_urlopen(request, timeout=None):
+        seen.append(request)
+        if error is not None:
+            raise error
+        return _FakeDispatchResponse(status, body)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return seen
+
+
+def test_proxy_forwards_post_with_the_dispatch_bearer(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch, status=201, body=b'{"id": "S9", "title": "Runbook"}'
+    )
+    payload = json.dumps({"title": "Runbook"})
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/backlog/story",
+        headers={**AUTH, "Content-Type": "application/json"}, body=payload,
+    )
+    # the dispatch answer (status + body) is relayed verbatim
+    assert status == 201
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"id": "S9", "title": "Runbook"}
+    # the outbound request: right URL, method, auth, content type, and body
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/backlog/story"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.get_header("Content-type") == "application/json"
+    assert request.data == payload.encode()
+
+
+def test_proxy_forwards_patch_and_delete_methods(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch, body=b'{"id": "S1"}')
+    status, _, _ = _request(
+        proxy_server, "PATCH", "/api/backlog/story/S1",
+        headers=AUTH, body=json.dumps({"estimate": 2}),
+    )
+    assert status == 200
+    status, _, _ = _request(proxy_server, "DELETE", "/api/backlog/story/S1",
+                            headers=AUTH)
+    assert status == 200
+    patch, delete = seen
+    assert patch.get_method() == "PATCH"
+    assert patch.full_url == f"{DISPATCH_URL}/backlog/story/S1"
+    assert json.loads(patch.data) == {"estimate": 2}
+    assert delete.get_method() == "DELETE"
+    assert delete.data is None  # no body → none forwarded
+    assert delete.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+
+
+def test_proxy_relays_a_dispatch_rejection(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/backlog/story/S1/deps", 400, "Bad Request", None,
+        io.BytesIO(b'{"error": "story S1 depends on itself"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/backlog/story/S1/deps",
+        headers=AUTH, body=json.dumps({"depends_on": ["S1"]}),
+    )
+    assert status == 400
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "story S1 depends on itself"}
+
+
+def test_proxy_unreachable_dispatch_is_502(proxy_server, monkeypatch):
+    _capture_urlopen(monkeypatch, error=urllib.error.URLError("refused"))
+    status, _, body = _request(
+        proxy_server, "POST", "/api/backlog/story", headers=AUTH, body="{}"
+    )
+    assert status == 502
+    assert json.loads(body) == {"error": "dispatch service unreachable"}
+    assert "refused" not in body  # no internals leak
+
+
+def test_proxy_tolerates_a_malformed_content_length(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    status, _, _ = _request(
+        proxy_server, "POST", "/api/backlog/story/S1/decline",
+        headers={**AUTH, "Content-Length": "xyz"},
+    )
+    assert status == 200
+    (request,) = seen
+    assert request.data is None  # unreadable length → treated as no body
+
+
+def test_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    for method in ("POST", "PATCH", "DELETE"):
+        status, headers, body = _request(
+            proxy_server, method, "/api/backlog/story/S1"
+        )
+        assert status == 401
+        assert headers["Content-Type"].startswith("application/json")
+        assert json.loads(body) == {"error": "unauthorized"}
+    # a PATCH/DELETE outside /api/ gets the login page, like GET/POST do
+    status, headers, _ = _request(proxy_server, "PATCH", "/nope")
+    assert status == 401
+    assert headers["Content-Type"].startswith("text/html")
+    assert seen == []  # nothing was ever forwarded
+
+
+def test_proxy_scope_is_strictly_api_backlog(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    # authorised writes anywhere else are 404 — the proxy is not a general
+    # passthrough to the dispatch service
+    for method, path in (
+        ("POST", "/api/state"),
+        ("POST", "/jobs"),
+        ("PATCH", "/api/report"),
+        ("DELETE", "/api/transcripts"),
+        ("POST", "/api/backlogs/story"),  # prefix must match exactly
+    ):
+        status, _, _ = _request(proxy_server, method, path, headers=AUTH)
+        assert status == 404
+    assert seen == []
+
+
+def test_proxy_unconfigured_board_editing_is_501(token_server, monkeypatch):
+    # token_server has no dispatch_url/dispatch_token wired
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "POST", "/api/backlog/story", headers=AUTH, body="{}"
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "board editing not configured"}
+    assert seen == []
+
+
+def test_proxy_url_without_token_stays_read_only(monkeypatch):
+    # A dispatch URL alone (e.g. localhost dev with no DEV_TEAM_DISPATCH_TOKEN)
+    # must not forward unauthenticated writes: still 501.
+    seen = _capture_urlopen(monkeypatch)
+    srv = DashboardServer(
+        InMemoryWorkspace(), port=0, token=TOKEN, dispatch_url=DISPATCH_URL
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, body = _request(
+            srv, "DELETE", "/api/backlog/story/S1", headers=AUTH
+        )
+        assert status == 501
+        assert json.loads(body) == {"error": "board editing not configured"}
+        assert seen == []
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)

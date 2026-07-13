@@ -7,6 +7,7 @@ import contextlib
 import http.client
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -18,6 +19,7 @@ from test_assessment import assess_responses
 
 from dev_team import __version__
 from dev_team import dispatch as dispatch_mod
+from dev_team.backlog import BacklogStore
 from dev_team.dispatch import (
     Dispatcher,
     DispatchServer,
@@ -924,6 +926,340 @@ def test_unknown_routes_are_404():
         assert _call(server, "/nope", method="POST", body={})[0] == 404
         # 2 segments after jobs but not "backlog" -> still 404
         assert _call(server, "/jobs/abc/extra", method="POST", body={})[0] == 404
+
+
+# --- the backlog mutation API (the Kanban board's write path) ------------------
+
+
+def _board_dash():
+    """A dashboard workspace holding a small backlog (S1, S2 under E1)."""
+
+    dash = InMemoryWorkspace()
+    store = BacklogStore(dash)
+    backlog = store.load()
+    epic = backlog.add_epic("Remediation — acme/mono", "")
+    backlog.add_story("Pin build chain", "CI", estimate=3, epic_id=epic.id)
+    backlog.add_story("Upgrade ORM", "big bang", estimate=8, epic_id=epic.id)
+    store.save(backlog)
+    return dash
+
+
+def _board_dispatcher():
+    dash = _board_dash()
+    return Dispatcher(token="x", dashboard_workspace=dash, clock=lambda: 111.0), dash
+
+
+def test_board_returns_the_full_backlog_or_409():
+    disp, _ = _board_dispatcher()
+    status, payload = disp.board()
+    assert status == 200
+    assert [s["id"] for s in payload["stories"]] == ["S1", "S2"]
+    assert [e["id"] for e in payload["epics"]] == ["E1"]
+    assert Dispatcher(token="x").board() == (
+        409, {"error": "backlog needs a dashboard workspace"})
+
+
+def test_set_story_status_mutates_stamps_and_persists():
+    disp, dash = _board_dispatcher()
+    status, payload = disp.set_story_status("S1", "in_progress")
+    assert status == 200
+    assert payload["id"] == "S1"
+    assert payload["status"] == "in_progress"
+    assert payload["updated_at"] == 111.0
+    stored = BacklogStore(dash).load()
+    assert stored.stories[0].status.value == "in_progress"
+    assert stored.stories[0].updated_at == 111.0
+
+
+def test_set_story_status_error_contract():
+    disp, dash = _board_dispatcher()
+    status, payload = disp.set_story_status("S1", "shipped")
+    assert status == 400
+    assert "status must be one of" in payload["error"]
+    assert disp.set_story_status("S99", "done") == (404, {"error": "unknown story"})
+    assert Dispatcher(token="x").set_story_status("S1", "done") == (
+        409, {"error": "backlog needs a dashboard workspace"})
+    # rejected mutations are never persisted
+    assert BacklogStore(dash).load().stories[0].status.value == "todo"
+
+
+def test_decline_story_sets_the_declined_status():
+    disp, dash = _board_dispatcher()
+    status, payload = disp.decline_story("S2")
+    assert status == 200
+    assert payload["status"] == "declined"
+    assert BacklogStore(dash).load().stories[1].status.value == "declined"
+    assert disp.decline_story("S99") == (404, {"error": "unknown story"})
+
+
+def test_edit_story_applies_only_provided_keys():
+    disp, dash = _board_dispatcher()
+    status, payload = disp.edit_story(
+        "S1", {"title": "Pin the build chain", "description": "CI + local"}
+    )
+    assert status == 200
+    assert payload["title"] == "Pin the build chain"
+    assert payload["description"] == "CI + local"
+    assert payload["estimate"] == 3  # untouched
+    status, payload = disp.edit_story("S1", {"estimate": 5})
+    assert status == 200
+    assert payload["estimate"] == 5
+    assert payload["title"] == "Pin the build chain"  # untouched
+    stored = BacklogStore(dash).load()
+    assert stored.stories[0].title == "Pin the build chain"
+    assert stored.stories[0].estimate == 5
+
+
+def test_edit_story_error_contract():
+    disp, dash = _board_dispatcher()
+    for fields in (
+        {"title": ""},
+        {"title": 7},
+        {"description": 7},
+        {"estimate": 0},
+        {"estimate": True},
+        {"estimate": "3"},
+    ):
+        status, payload = disp.edit_story("S1", fields)
+        assert status == 400
+        assert "error" in payload
+    assert disp.edit_story("S99", {"title": "x"}) == (404, {"error": "unknown story"})
+    assert Dispatcher(token="x").edit_story("S1", {"title": "x"}) == (
+        409, {"error": "backlog needs a dashboard workspace"})
+    assert BacklogStore(dash).load().stories[0].title == "Pin build chain"
+
+
+def test_add_story_card_defaults_and_full_fields():
+    disp, dash = _board_dispatcher()
+    status, payload = disp.add_story_card({"title": "Write the runbook"})
+    assert status == 201
+    assert payload["id"] == "S3"
+    assert (payload["estimate"], payload["status"]) == (1, "todo")
+    assert payload["updated_at"] == 111.0
+    status, payload = disp.add_story_card(
+        {"title": "Wire alerts", "description": "pager", "estimate": 2,
+         "epic_id": "E1", "status": "in_progress"}
+    )
+    assert status == 201
+    assert payload["id"] == "S4"
+    assert payload["epic_id"] == "E1"
+    assert payload["status"] == "in_progress"
+    assert len(BacklogStore(dash).load().stories) == 4
+
+
+def test_add_story_card_error_contract():
+    disp, _ = _board_dispatcher()
+    for fields in (
+        {},
+        {"title": "  "},
+        {"title": 7},
+        {"title": "ok", "description": 7},
+        {"title": "ok", "estimate": 0},
+        {"title": "ok", "estimate": True},
+        {"title": "ok", "epic_id": 7},
+        {"title": "ok", "status": "shipped"},
+    ):
+        status, payload = disp.add_story_card(fields)
+        assert status == 400
+        assert "error" in payload
+    assert Dispatcher(token="x").add_story_card({"title": "x"}) == (
+        409, {"error": "backlog needs a dashboard workspace"})
+
+
+def test_delete_story_strips_inbound_edges_and_never_reissues_the_id():
+    disp, dash = _board_dispatcher()
+    assert disp.set_story_deps("S2", ["S1"])[0] == 200
+    status, payload = disp.delete_story("S1")
+    assert status == 200
+    assert payload["id"] == "S1"
+    stored = BacklogStore(dash).load()
+    assert [s.id for s in stored.stories] == ["S2"]
+    assert stored.stories[0].depends_on == []  # the dangling edge is stripped
+    # the freed id is never reused: minting scans past the highest suffix
+    status, payload = disp.add_story_card({"title": "Newcomer"})
+    assert (status, payload["id"]) == (201, "S3")
+    assert disp.delete_story("S1") == (404, {"error": "unknown story"})
+    assert Dispatcher(token="x").delete_story("S1") == (
+        409, {"error": "backlog needs a dashboard workspace"})
+
+
+def test_set_story_deps_validates_and_persists():
+    disp, dash = _board_dispatcher()
+    status, payload = disp.set_story_deps("S2", ["S1"])
+    assert status == 200
+    assert payload["depends_on"] == ["S1"]
+    assert BacklogStore(dash).load().stories[1].depends_on == ["S1"]
+    # clearing the edges is a normal write
+    status, payload = disp.set_story_deps("S2", [])
+    assert status == 200
+    assert "depends_on" not in payload  # empty list is omitted on the wire
+
+
+def test_set_story_deps_error_contract():
+    disp, dash = _board_dispatcher()
+    status, payload = disp.set_story_deps("S2", "S1")
+    assert status == 400
+    assert payload["error"] == "depends_on must be a list of story ids"
+    assert disp.set_story_deps("S2", [7])[0] == 400
+    status, payload = disp.set_story_deps("S2", ["S99"])
+    assert status == 400
+    assert "unknown story 'S99'" in payload["error"]
+    status, payload = disp.set_story_deps("S2", ["S2"])
+    assert status == 400
+    assert "depends on itself" in payload["error"]
+    assert disp.set_story_deps("S99", ["S1"]) == (404, {"error": "unknown story"})
+    assert Dispatcher(token="x").set_story_deps("S1", []) == (
+        409, {"error": "backlog needs a dashboard workspace"})
+    assert BacklogStore(dash).load().stories[1].depends_on == []
+
+
+def test_set_story_deps_rejects_a_cycle_without_persisting_it():
+    disp, dash = _board_dispatcher()
+    assert disp.set_story_deps("S2", ["S1"])[0] == 200
+    status, payload = disp.set_story_deps("S1", ["S2"])
+    assert status == 400
+    assert "Dependency cycle" in payload["error"]
+    # the rejected edge was never saved; the earlier one survives
+    stored = BacklogStore(dash).load()
+    assert stored.stories[0].depends_on == []
+    assert stored.stories[1].depends_on == ["S1"]
+
+
+def test_backlog_write_lock_prevents_lost_updates():
+    """Two handler threads + a worker-style merge on ONE dispatcher.
+
+    Every core (and _merge_backlog) is a read-modify-write of the same
+    backlog.json; the injected clock sleeps INSIDE the critical section, so
+    without the shared lock these writers would overwrite each other and
+    stories would vanish. With it, the final count is exactly the sum.
+    """
+
+    dash = InMemoryWorkspace()
+
+    def slow_clock():
+        time.sleep(0.002)  # widen the load→save window the lock must cover
+        return time.time()
+
+    disp = Dispatcher(token="x", dashboard_workspace=dash, clock=slow_clock)
+    per_thread = 10
+
+    def add_cards(tag):
+        for index in range(per_thread):
+            assert disp.add_story_card({"title": f"{tag}-{index}"})[0] == 201
+
+    def merge_backlogs():
+        for index in range(per_thread):
+            disp._merge_backlog(
+                _assessment_payload(), repo=f"acme/r{index}", source_job=f"job-{index}"
+            )
+
+    threads = [
+        threading.Thread(target=add_cards, args=("a",)),
+        threading.Thread(target=add_cards, args=("b",)),
+        threading.Thread(target=merge_backlogs),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    status, board = disp.board()
+    assert status == 200
+    # 2 threads x 10 cards + 10 merges x 1 plan story each = 30, none lost
+    assert len(board["stories"]) == 3 * per_thread
+    ids = [story["id"] for story in board["stories"]]
+    assert len(set(ids)) == len(ids)  # minting under the lock never collides
+
+
+def test_backlog_http_routes_end_to_end():
+    dash = _board_dash()
+    with running(materialise=_mem_materialise, dashboard_workspace=dash) as server:
+        status, board = _call(server, "/backlog")
+        assert status == 200
+        assert [s["id"] for s in board["stories"]] == ["S1", "S2"]
+
+        status, story = _call(
+            server, "/backlog/story", method="POST",
+            body={"title": "Write the runbook", "estimate": 2},
+        )
+        assert (status, story["id"]) == (201, "S3")
+
+        status, story = _call(
+            server, "/backlog/story/S1/status", method="POST",
+            body={"status": "done"},
+        )
+        assert (status, story["status"]) == (200, "done")
+
+        status, story = _call(server, "/backlog/story/S2/decline", method="POST")
+        assert (status, story["status"]) == (200, "declined")
+
+        status, story = _call(
+            server, "/backlog/story/S3/deps", method="POST",
+            body={"depends_on": ["S1"]},
+        )
+        assert (status, story["depends_on"]) == (200, ["S1"])
+        assert _call(
+            server, "/backlog/story/S3/deps", method="POST",
+            body={"depends_on": ["S3"]},
+        )[0] == 400
+
+        status, story = _call(
+            server, "/backlog/story/S3", method="PATCH",
+            body={"title": "Write THE runbook"},
+        )
+        assert (status, story["title"]) == (200, "Write THE runbook")
+
+        status, story = _call(server, "/backlog/story/S1", method="DELETE")
+        assert (status, story["id"]) == (200, "S1")
+        status, board = _call(server, "/backlog")
+        assert [s["id"] for s in board["stories"]] == ["S2", "S3"]
+        # S3's edge on the deleted S1 was stripped (and, empty, is omitted)
+        assert "depends_on" not in board["stories"][1]
+
+
+def test_backlog_routes_require_auth():
+    dash = _board_dash()
+    with running(materialise=_mem_materialise, dashboard_workspace=dash) as server:
+        unauthorized = (401, {"error": "unauthorized"})
+        assert _call(server, "/backlog", token=None) == unauthorized
+        assert _call(server, "/backlog/story", method="POST", token=None,
+                     body={"title": "x"}) == unauthorized
+        assert _call(server, "/backlog/story/S1/status", method="POST",
+                     token="wrong", body={"status": "done"}) == unauthorized
+        assert _call(server, "/backlog/story/S1", method="PATCH", token=None,
+                     body={"title": "x"}) == unauthorized
+        assert _call(server, "/backlog/story/S1", method="DELETE",
+                     token=None) == unauthorized
+        # nothing above touched the backlog
+        status, board = _call(server, "/backlog")
+        assert [s["title"] for s in board["stories"]] == [
+            "Pin build chain", "Upgrade ORM"]
+
+
+def test_backlog_routes_unknown_paths_and_bad_bodies():
+    dash = _board_dash()
+    with running(materialise=_mem_materialise, dashboard_workspace=dash) as server:
+        # unknown shapes under /backlog are 404 on every method
+        assert _call(server, "/backlog", method="POST", body={})[0] == 404
+        assert _call(server, "/backlog/story/S1", method="POST", body={})[0] == 404
+        assert _call(server, "/backlog/story/S1/promote", method="POST",
+                     body={})[0] == 404
+        assert _call(server, "/backlog/nope/S1/status", method="POST",
+                     body={})[0] == 404
+        assert _call(server, "/nope", method="PATCH", body={})[0] == 404
+        assert _call(server, "/backlog/story", method="PATCH", body={})[0] == 404
+        assert _call(server, "/nope", method="DELETE")[0] == 404
+        assert _call(server, "/backlog/story", method="DELETE")[0] == 404
+        # malformed bodies get the shared 400, per route family
+        assert _call(server, "/backlog/story", method="POST",
+                     body=b"{not json")[0] == 400
+        assert _call(server, "/backlog/story/S1/status", method="POST",
+                     body=b"[1]")[0] == 400
+        assert _call(server, "/backlog/story/S1/deps", method="POST",
+                     body=b"{not json")[0] == 400
+        assert _call(server, "/backlog/story/S1", method="PATCH",
+                     body=b"{not json")[0] == 400
+        # a body-less status change is a plain validation 400, not a crash
+        assert _call(server, "/backlog/story/S1/status", method="POST")[0] == 400
 
 
 # --- finding re-verification (mode "verify" + the read routes) ------------------

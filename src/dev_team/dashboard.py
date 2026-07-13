@@ -32,6 +32,8 @@ from __future__ import annotations
 import hmac
 import json
 import time
+import urllib.error
+import urllib.request
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, List, Optional
@@ -98,7 +100,7 @@ def _run_summaries(events: List[Dict]) -> List[Dict]:
 
 def _backlog_state(workspace: Workspace) -> Dict:
     backlog = BacklogStore(workspace).load()
-    counts = {"todo": 0, "in_progress": 0, "done": 0, "blocked": 0}
+    counts = {"todo": 0, "in_progress": 0, "done": 0, "blocked": 0, "declined": 0}
     by_epic: Dict[Optional[str], List[Dict]] = {}
     for story in backlog.stories:
         status = story.status.value
@@ -112,6 +114,8 @@ def _backlog_state(workspace: Workspace) -> Dict:
                 "description": story.description,
                 "source_job": story.source_job,
                 "finding_id": story.finding_id,
+                "depends_on": list(story.depends_on),
+                "updated_at": story.updated_at,
             }
         )
     epics = []
@@ -225,6 +229,17 @@ _COOKIE_NAME = "devteam_dash"
 #: Upper bound on a ``/login`` form body; anything larger is rejected unread.
 _MAX_LOGIN_BODY = 4096
 
+#: The one (and only) path prefix whose writes are proxied to the dispatch
+#: service's ``/backlog`` mutation API. Deliberately narrow: the dashboard
+#: holds a dispatch bearer token, and a general passthrough would let any
+#: dashboard session drive the whole dispatch surface (submit jobs, run
+#: agents) with it. Board edits only.
+_BACKLOG_PROXY_PREFIX = "/api/backlog/"
+
+#: How long a proxied board write may take end to end. The dispatch cores are
+#: pure disk transforms, so anything slower means the service is wedged.
+_PROXY_TIMEOUT = 30.0
+
 
 def _session_cookie(value: str, *, secure: bool, max_age: Optional[int] = None) -> str:
     """Build the ``Set-Cookie`` header for the session cookie.
@@ -257,7 +272,12 @@ def _tokens_match(provided: str, expected: str) -> bool:
 
 
 def _make_handler(
-    workspace: Workspace, token: Optional[str] = None, *, secure: bool = False
+    workspace: Workspace,
+    token: Optional[str] = None,
+    dispatch_url: Optional[str] = None,
+    dispatch_token: Optional[str] = None,
+    *,
+    secure: bool = False,
 ) -> type:
     """A request handler class bound to ``workspace``.
 
@@ -269,6 +289,12 @@ def _make_handler(
     ``secure`` marks the session cookie ``Secure`` (TLS-only); leave it off for
     the plain-HTTP localhost default, turn it on when the dashboard is served
     over HTTPS (see :class:`DashboardServer`).
+
+    With BOTH ``dispatch_url`` and ``dispatch_token`` set, authorised writes
+    under ``/api/backlog/`` are forwarded to the dispatch service's
+    ``/backlog`` mutation API (the board's write path); with either unset the
+    board is read-only and those writes answer ``501``. The dispatch token is
+    only ever sent to ``dispatch_url`` — never logged or reflected.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -362,8 +388,79 @@ def _make_handler(
                 self._logout()
             elif not self._authorised():
                 self._reject(path)
+            elif path.startswith(_BACKLOG_PROXY_PREFIX):
+                self._proxy_backlog("POST", path)
             else:
                 self._send(404, "text/plain", "not found")
+
+        def do_PATCH(self) -> None:  # noqa: N802 (http.server API)
+            self._write_route("PATCH")
+
+        def do_DELETE(self) -> None:  # noqa: N802 (http.server API)
+            self._write_route("DELETE")
+
+        def _write_route(self, method: str) -> None:
+            """Auth-gate a PATCH/DELETE: only ``/api/backlog/*`` exists."""
+
+            path = urlsplit(self.path).path
+            if not self._authorised():
+                self._reject(path)
+            elif path.startswith(_BACKLOG_PROXY_PREFIX):
+                self._proxy_backlog(method, path)
+            else:
+                self._send(404, "text/plain", "not found")
+
+        # -- board writes: a narrow proxy to the dispatch service -----------
+        # The dashboard itself never mutates the workspace (it stays a
+        # read-only viewer); board edits are forwarded — same method, same
+        # JSON body — to the dispatch service's /backlog API, authenticated
+        # with the dispatch bearer token this process (not the browser)
+        # holds. Scope is strictly /api/backlog/*: no other dispatch route
+        # is reachable through the dashboard, and the dispatch token is
+        # never logged, echoed, or handed to the client.
+
+        def _proxy_backlog(self, method: str, path: str) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "board editing not configured"}),
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length) if length > 0 else None
+            rest = path[len(_BACKLOG_PROXY_PREFIX):]
+            request = urllib.request.Request(
+                f"{dispatch_url.rstrip('/')}/backlog/{rest}",
+                data=body,
+                method=method,
+                headers={
+                    "Authorization": f"Bearer {dispatch_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=_PROXY_TIMEOUT) as res:
+                    self._send(
+                        res.status, "application/json", res.read().decode("utf-8")
+                    )
+            except urllib.error.HTTPError as exc:
+                # Dispatch rejections (400/401/404/409) are real answers —
+                # relay status and JSON body verbatim.
+                payload = exc.read().decode("utf-8")
+                exc.close()
+                self._send(exc.code, "application/json", payload)
+            except urllib.error.URLError:
+                # Fail securely: no stack traces, no target details beyond
+                # "the write path is down".
+                self._send(
+                    502,
+                    "application/json",
+                    json.dumps({"error": "dispatch service unreachable"}),
+                )
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             parts = urlsplit(self.path)
@@ -454,6 +551,11 @@ class DashboardServer:
     HTTP, which would break the login flow); set it when the dashboard is
     fronted by HTTPS/TLS so the session cookie cannot leak over a plain
     connection.
+
+    ``dispatch_url`` + ``dispatch_token`` (optional, both required together)
+    enable the board's write path: authorised ``/api/backlog/*`` writes are
+    proxied to that dispatch service's ``/backlog`` mutation API. Without
+    them the dashboard stays fully read-only (board writes answer ``501``).
     """
 
     def __init__(
@@ -463,11 +565,14 @@ class DashboardServer:
         host: str = "127.0.0.1",
         port: int = 8737,
         token: Optional[str] = None,
+        dispatch_url: Optional[str] = None,
+        dispatch_token: Optional[str] = None,
         secure: bool = False,
     ) -> None:
         self.workspace = workspace
         self.httpd = ThreadingHTTPServer(
-            (host, port), _make_handler(workspace, token, secure=secure)
+            (host, port),
+            _make_handler(workspace, token, dispatch_url, dispatch_token, secure=secure),
         )
 
     @property
@@ -673,6 +778,51 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
 .story[data-story]:hover .st { color: var(--accent); }
 .story[data-story]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
+.board { display: flex; gap: 8px; overflow-x: auto; align-items: flex-start; margin: 4px 0 0; padding-bottom: 4px; }
+.col { flex: 1 0 118px; min-width: 118px; background: var(--inset);
+       border: 1px solid var(--line-soft); border-radius: 8px; padding: 6px; }
+.ch { display: flex; justify-content: space-between; gap: 6px; font-size: 11px;
+      text-transform: uppercase; letter-spacing: .05em; color: var(--ink-3); font-weight: 600; }
+.ch .cn { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+        padding: 6px 8px; margin-top: 6px; cursor: pointer; font-size: 12px;
+        box-shadow: var(--shadow); }
+.card:hover { border-color: var(--accent); }
+.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.card .ct { color: var(--ink); font-weight: 600; overflow-wrap: anywhere;
+            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+            overflow: hidden; }
+.card .cmeta { margin-top: 4px; display: flex; gap: 6px; align-items: center;
+               flex-wrap: wrap; color: var(--ink-3); font-size: 11px; }
+.dep { white-space: nowrap; }
+.depwarn { color: var(--warning); font-weight: 600; overflow-wrap: anywhere; }
+.cmove { width: 100%; margin-top: 6px; font-size: 11px; background: var(--inset);
+         color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
+         padding: 2px 4px; font-family: inherit; }
+.declined-row { margin-top: 8px; opacity: .6; }
+.declined-row .card { display: inline-block; margin-right: 6px; max-width: 220px;
+                      vertical-align: top; }
+.declined-row .card .ct { text-decoration: line-through; font-weight: 500; }
+.addcard { margin-top: 8px; width: 100%; background: none; border: 1px dashed var(--line);
+           border-radius: 8px; color: var(--ink-3); font-size: 12px; padding: 5px 10px;
+           cursor: pointer; }
+.addcard:hover { color: var(--accent); border-color: var(--accent); }
+.board-err, .err { color: var(--critical); font-size: 12px; margin: 6px 0;
+                   overflow-wrap: anywhere; }
+.chip.declined { border-style: dashed; color: var(--ink-3); text-decoration: line-through; }
+.story-form input, .story-form textarea {
+  width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--inset); color: var(--ink); font: inherit; font-size: 13px;
+  margin: 2px 0 8px; }
+.story-form textarea { min-height: 64px; resize: vertical; }
+.story-form button, .modal-actions button {
+  background: none; border: 1px solid var(--line); border-radius: 6px;
+  color: var(--ink-2); font-size: 12px; padding: 5px 10px; cursor: pointer; }
+.story-form button:hover, .modal-actions button:hover { color: var(--ink); border-color: var(--ink-3); }
+.modal-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.modal-actions .cmove { width: auto; margin: 0; }
+.depopt { display: block; font-size: 13px; color: var(--ink-2); padding: 2px 0; }
+
 .story-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
               margin-bottom: 12px; font-size: 12px; color: var(--ink-3); }
 .verify { margin-top: 14px; padding: 10px 12px; background: var(--inset);
@@ -786,6 +936,9 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
 <div class="tiles" id="tiles"></div>
 <h2>The team</h2>
 <div class="agents" id="agents"></div>
+<h2>Backlog</h2>
+<div class="board-err" id="board-error" role="alert" hidden></div>
+<div class="panel" id="backlog"><span class="muted">no backlog yet</span></div>
 <div class="cols">
   <div>
     <h2 id="activity-title">Activity</h2>
@@ -801,8 +954,6 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
     <div class="runs" id="runs"><div class="panel muted">no runs recorded</div></div>
   </div>
   <div>
-    <h2>Backlog</h2>
-    <div class="panel" id="backlog"><span class="muted">no backlog yet</span></div>
     <h2>Memory &amp; conventions</h2>
     <div class="panel" id="memory"><span class="muted">no cross-run memory yet</span></div>
     <h2>Reports</h2>
@@ -875,6 +1026,7 @@ const storyChip = st => ({
   done: chip("\\u2713 done", "done"),
   in_progress: chip("\\u25B6 in progress", "active"),
   blocked: chip("\\u2715 blocked", "blocked"),
+  declined: chip("\\u2298 declined", "declined"),
   todo: chip("todo", ""),
 }[st] || chip(st, ""));
 
@@ -980,6 +1132,7 @@ function tiles(s) {
     ["stories open", open, true],
     ["stories done", c.done, true],
     ["stories blocked", c.blocked, true],
+    ["stories declined", c.declined, true],
     ["last activity", latest ? ago(latest) : "\\u2014", false],
   ];
   put($("tiles"), cells.map(([k, v, dimzero]) =>
@@ -1091,27 +1244,88 @@ function runsPanel(s) {
 }
 
 // Story detail lookup for the modal, rebuilt from every /api/state payload:
-// keyed by story id, carrying the owning epic's title (the repo context).
+// keyed by story id, carrying the owning epic's title (the repo context)
+// and id (the add-card / dependency-editor grouping key).
 let storyIndex = new Map();
+
+// The Kanban columns, in board order; declined renders as its own
+// de-emphasised row under the board rather than a fifth column.
+const COLUMNS = [
+  ["todo", "To do"], ["in_progress", "In progress"],
+  ["blocked", "Blocked"], ["done", "Done"],
+];
+const MOVE_TARGETS = [
+  ["todo", "todo"], ["in_progress", "in progress"], ["done", "done"],
+  ["blocked", "blocked"], ["declined", "declined"],
+];
+
+// The card's dependency indicator. SECURITY: dependency titles are resolved
+// from the same repo-derived state as everything else, so they flow through
+// esc() before innerHTML like every other card field.
+function depBadge(st) {
+  const deps = st.depends_on || [];
+  if (!deps.length) return "";
+  const titles = deps.map(id => (storyIndex.get(id) || { title: id }).title);
+  let html = `<span class="dep" title="depends on: ${esc(titles.join(", "))}">\\u26D3 ${deps.length}</span>`;
+  const unfinished = deps.map(id => storyIndex.get(id)).filter(d =>
+    d && d.status !== "done" && d.status !== "declined");
+  if (unfinished.length)
+    html += `<span class="depwarn">blocked by unfinished ${esc(unfinished[0].title)}</span>`;
+  return html;
+}
+
+// The reliable move control: a <select> posting to .../status on change.
+function moveSelect(st) {
+  return `<select class="cmove" data-move="${esc(st.id)}" aria-label="move ${esc(st.title)}">`
+    + MOVE_TARGETS.map(([v, label]) =>
+      `<option value="${v}"${st.status === v ? " selected" : ""}>${label}</option>`).join("")
+    + "</select>";
+}
+
+// One board card. SECURITY: title/estimate are repo-derived — esc() before
+// innerHTML, always (the title is also clamped to two lines in CSS).
+function card(st) {
+  return `<div class="card" role="button" tabindex="0" data-story="${esc(st.id)}" title="${esc(st.title)} \\u2014 click for detail">
+    <div class="ct">${esc(st.title)}</div>
+    <div class="cmeta"><span class="pts">${esc(st.estimate)}pt</span>${depBadge(st)}</div>
+    ${moveSelect(st)}
+  </div>`;
+}
+
+// One epic's board: the four columns plus the muted declined row.
+function board(stories) {
+  const cols = COLUMNS.map(([key, label]) => {
+    const items = stories.filter(st => st.status === key);
+    return `<div class="col"><div class="ch"><span>${label}</span><span class="cn">${items.length}</span></div>${items.map(card).join("")}</div>`;
+  }).join("");
+  const declined = stories.filter(st => st.status === "declined");
+  return `<div class="board">${cols}</div>` + (declined.length
+    ? `<div class="declined-row"><div class="ch"><span>Declined (${declined.length})</span></div>${declined.map(card).join("")}</div>`
+    : "");
+}
 
 function backlog(s) {
   if (!s.backlog.present) { put($("backlog"), '<span class="muted">no backlog yet</span>'); return; }
   storyIndex = new Map();
   for (const e of s.backlog.epics)
-    for (const st of e.stories) storyIndex.set(st.id, { ...st, epic: e.title });
-  for (const st of s.backlog.orphan_stories) storyIndex.set(st.id, { ...st, epic: "" });
-  const story = st => `<div class="story${st.status === "done" ? " done" : ""}" role="button" tabindex="0" data-story="${esc(st.id)}" title="${esc(st.title)} \\u2014 click for detail">${storyChip(st.status)}<span class="st">${esc(st.title)}</span><span class="pts">${esc(st.estimate)}pt</span></div>`;
-  const epic = e => {
+    for (const st of e.stories) storyIndex.set(st.id, { ...st, epic: e.title, epicId: e.id });
+  for (const st of s.backlog.orphan_stories) storyIndex.set(st.id, { ...st, epic: "", epicId: "" });
+  const epic = (e, stories) => {
     const pct = e.points_total ? Math.round(100 * e.points_done / e.points_total) : 0;
     return `<div class="epic">
       <div class="t"><span title="${esc(e.description)}">${esc(e.title)}</span><span class="pts">${esc(e.points_done)}/${esc(e.points_total)} pts \\u00b7 ${pct}%</span></div>
       <div class="bar"><b style="width:${pct}%"></b></div>
-      ${e.stories.map(story).join("")}
+      ${board(stories)}
+      <button class="addcard" data-add="${esc(e.id)}" data-title="${esc(e.title)}">\\uFF0B Add card</button>
     </div>`;
   };
   const orphans = s.backlog.orphan_stories;
-  put($("backlog"), s.backlog.epics.map(epic).join("")
-    + (orphans.length ? `<div class="epic"><div class="t"><span>Unassigned</span></div>${orphans.map(story).join("")}</div>` : ""));
+  put($("backlog"), s.backlog.epics.map(e => epic(e, e.stories)).join("")
+    + (orphans.length ? epic({
+        id: "", title: "Unassigned", description: "",
+        points_done: orphans.filter(st => st.status === "done").reduce((n, st) => n + st.estimate, 0),
+        points_total: orphans.reduce((n, st) => n + st.estimate, 0),
+      }, orphans) : ""));
 }
 
 function details(key, title, body, open) {
@@ -1329,7 +1543,155 @@ function openStory(id) {
   } else {
     bits.push('<p class="muted" style="margin-top:14px">Deterministic finding (dependency/dead-code scan) \\u2014 re-run the assessment to refresh; not agent-verifiable.</p>');
   }
+  // Board controls: move/decline/delete plus the edit and dependency forms.
+  // SECURITY: input values round-trip through the server, so they are still
+  // escaped on every render (value="${esc(...)}" / escaped textarea body);
+  // the dependency list offers only OTHER cards in the same epic (no self).
+  const deps = st.depends_on || [];
+  const others = [...storyIndex.values()].filter(o => o.epicId === st.epicId && o.id !== st.id);
+  const depBoxes = others.map(o =>
+    `<label class="depopt"><input type="checkbox" name="dep" value="${esc(o.id)}"${deps.includes(o.id) ? " checked" : ""}> ${esc(o.title)} <span class="muted">${esc(o.id)}</span></label>`).join("");
+  bits.push(`<div class="verify">
+    <div class="tx-label">Board actions</div>
+    <div class="modal-actions">${moveSelect(st)}<button data-decline="${esc(st.id)}">decline</button><button data-del="${esc(st.id)}">delete</button></div>
+    <div class="tx-label" style="margin-top:12px">Edit card</div>
+    <form class="story-form" id="story-edit" data-id="${esc(st.id)}">
+      <input name="title" value="${esc(st.title)}" required aria-label="title">
+      <textarea name="description" aria-label="description">${esc(st.description ?? "")}</textarea>
+      <input name="estimate" type="number" min="1" value="${esc(st.estimate)}" aria-label="estimate (points)">
+      <button type="submit">save</button>
+    </form>
+    <div class="tx-label" style="margin-top:12px">Depends on (cards in the same epic)</div>
+    <form class="story-form" id="story-deps" data-id="${esc(st.id)}">
+      ${depBoxes || '<span class="muted">no other cards in this epic</span>'}
+      <button type="submit">save dependencies</button>
+    </form>
+    <div class="err" id="story-error" role="alert" hidden></div>
+  </div>`);
   $("story-body").innerHTML = bits.join("");
+  $("story-overlay").hidden = false;
+  $("story-close").focus();
+}
+
+// ---- board writes (every mutation via the PR-A /api/backlog/* proxy) ----
+// Same-origin fetch: the dashboard session cookie rides along; the dispatch
+// bearer token stays in the dashboard process, never in this page.
+async function backlogWrite(method, path, payload) {
+  const res = await fetch("/api/backlog/" + path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: payload === undefined ? null : JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    // Surface the dispatch rejection ("story S1 depends on itself", ...).
+    // Callers put this message in the DOM via textContent ONLY: it can
+    // quote repo-derived story titles straight from the service.
+    let msg = "write failed (HTTP " + res.status + ")";
+    try {
+      const data = await res.json();
+      if (data && data.error) msg = String(data.error);
+    } catch (e) { /* non-JSON error body: keep the generic message */ }
+    throw new Error(msg);
+  }
+  return res;
+}
+
+let boardErrTimer = null;
+function showBoardError(msg) {
+  const el = $("board-error");
+  el.textContent = msg; // SECURITY: textContent, never innerHTML
+  el.hidden = false;
+  clearTimeout(boardErrTimer);
+  boardErrTimer = setTimeout(() => { el.hidden = true; }, 6000);
+}
+
+function storyError(msg) {
+  const el = document.getElementById("story-error"); // inside the open modal
+  if (!el) { showBoardError(msg); return; }
+  el.textContent = msg; // SECURITY: textContent, never innerHTML
+  el.hidden = false;
+}
+
+async function moveStory(id, status, report) {
+  try {
+    await backlogWrite("POST", "story/" + encodeURIComponent(id) + "/status", { status });
+    await refresh();
+    return true;
+  } catch (err) {
+    report("move failed: " + err.message);
+    // snap the <select> back to the story's real status
+    lastHtml.delete($("backlog"));
+    if (state) backlog(state);
+    return false;
+  }
+}
+
+async function declineStory(id) {
+  try {
+    await backlogWrite("POST", "story/" + encodeURIComponent(id) + "/decline");
+    await refresh();
+    openStory(id);
+  } catch (err) { storyError("decline failed: " + err.message); }
+}
+
+async function deleteStory(id) {
+  try {
+    await backlogWrite("DELETE", "story/" + encodeURIComponent(id));
+    closeStory();
+    await refresh();
+  } catch (err) { storyError("delete failed: " + err.message); }
+}
+
+async function saveStoryEdit(form) {
+  try {
+    await backlogWrite("PATCH", "story/" + encodeURIComponent(form.dataset.id), {
+      title: form.elements.title.value,
+      description: form.elements.description.value,
+      estimate: Number(form.elements.estimate.value) || 1,
+    });
+    await refresh();
+    openStory(form.dataset.id);
+  } catch (err) { storyError("save failed: " + err.message); }
+}
+
+async function saveStoryDeps(form) {
+  const chosen = [...form.querySelectorAll('input[name="dep"]:checked')].map(b => b.value);
+  try {
+    await backlogWrite("POST", "story/" + encodeURIComponent(form.dataset.id) + "/deps",
+                       { depends_on: chosen });
+    await refresh();
+    openStory(form.dataset.id);
+  } catch (err) { storyError("dependencies rejected: " + err.message); }
+}
+
+async function addCard(form) {
+  const payload = { title: form.elements.title.value };
+  if (form.elements.description.value) payload.description = form.elements.description.value;
+  const estimate = Number(form.elements.estimate.value);
+  if (estimate >= 1) payload.estimate = estimate;
+  if (form.dataset.epic) payload.epic_id = form.dataset.epic;
+  try {
+    await backlogWrite("POST", "story", payload);
+    closeStory();
+    await refresh();
+  } catch (err) { storyError("add failed: " + err.message); }
+}
+
+// The "＋ Add card" form, in the story modal (immune to the 2.5s re-render).
+// The title bypasses innerHTML (textContent); the epic id round-trips via an
+// escaped data attribute and the server re-validates it anyway.
+function openAddCard(epicId, epicTitle) {
+  $("story-title").textContent = "add card \\u00b7 " + (epicTitle || "Unassigned");
+  $("story-body").innerHTML = `<form class="story-form" id="story-add" data-epic="${esc(epicId)}">
+    <div class="tx-label">Title</div>
+    <input name="title" required aria-label="title">
+    <div class="tx-label">Description (optional)</div>
+    <textarea name="description" aria-label="description"></textarea>
+    <div class="tx-label">Estimate in points (optional)</div>
+    <input name="estimate" type="number" min="1" placeholder="1" aria-label="estimate (points)">
+    <button type="submit">add card</button>
+    <div class="err" id="story-error" role="alert" hidden></div>
+  </form>`;
   $("story-overlay").hidden = false;
   $("story-close").focus();
 }
@@ -1384,19 +1746,48 @@ $("agents").addEventListener("keydown", e => {
   if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openAgent(card.dataset.role); }
 });
 $("backlog").addEventListener("click", e => {
+  const add = e.target.closest("[data-add]");
+  if (add) { openAddCard(add.dataset.add, add.dataset.title); return; }
+  if (e.target.closest("select")) return; // the move control, not the card
   const row = e.target.closest("[data-story]");
   if (row) openStory(row.dataset.story);
 });
 $("backlog").addEventListener("keydown", e => {
+  if (e.target.closest("select")) return;
   const row = e.target.closest("[data-story]");
   if (row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openStory(row.dataset.story); }
 });
+$("backlog").addEventListener("change", e => {
+  const sel = e.target.closest("select[data-move]");
+  if (sel) moveStory(sel.dataset.move, sel.value, showBoardError);
+});
 $("story-body").addEventListener("click", e => {
+  const dec = e.target.closest("[data-decline]");
+  if (dec) { declineStory(dec.dataset.decline); return; }
+  const del = e.target.closest("[data-del]");
+  if (del) {
+    // two-step confirm: the first click arms the button, the second deletes
+    if (del.dataset.armed) deleteStory(del.dataset.del);
+    else { del.dataset.armed = "1"; del.textContent = "confirm delete?"; }
+    return;
+  }
   const btn = e.target.closest("[data-copy]");
   if (!btn || !navigator.clipboard) return;
   navigator.clipboard.writeText(btn.dataset.copy).then(
     () => { btn.textContent = "copied"; setTimeout(() => { btn.textContent = "copy"; }, 1200); },
     () => {});
+});
+$("story-body").addEventListener("change", e => {
+  const sel = e.target.closest("select[data-move]");
+  if (sel) moveStory(sel.dataset.move, sel.value, storyError)
+    .then(ok => { if (ok) openStory(sel.dataset.move); });
+});
+$("story-body").addEventListener("submit", e => {
+  e.preventDefault();
+  const form = e.target;
+  if (form.id === "story-edit") saveStoryEdit(form);
+  else if (form.id === "story-deps") saveStoryDeps(form);
+  else if (form.id === "story-add") addCard(form);
 });
 $("modal-close").addEventListener("click", closeModal);
 $("overlay").addEventListener("click", e => { if (e.target === $("overlay")) closeModal(); });

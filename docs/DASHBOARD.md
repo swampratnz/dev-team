@@ -23,13 +23,40 @@ workspace on every request.
 | **The team** — one card per agent: persona, current stage, last message, how long ago | `.dev_team/events.jsonl` (journaled by every run) |
 | **Activity** — the newest events across all agents and engines | same journal |
 | **Runs** — recent runs with their last message and event counts | same journal |
-| **Backlog** — one epic **per assessed repository** ("Remediation — \<repo\>") with story-point progress bars and story status chips (todo / ▶ in progress / ✓ done / ✕ blocked); clickable stories (see below) | `.dev_team/backlog.json` |
+| **Backlog** — an interactive **Kanban board** per epic (one epic **per assessed repository**, "Remediation — \<repo\>"): four columns (To do / In progress / Blocked / Done) with per-column counts, a muted Declined row, story-point progress bars, dependency indicators, and clickable cards (see below) | `.dev_team/backlog.json` (writes via the dispatch proxy) |
 | **Memory** — run count, recent retrospectives, ADR titles | `.dev_team/memory.json` |
 | **House conventions** — the captured style summary | `.dev_team/conventions.json` |
 | **Reports** — every `audit/*.md`, viewable in place | the workspace tree |
 
-Stat tiles across the top summarise runs recorded, open/done/blocked
+Stat tiles across the top summarise runs recorded, open/done/blocked/declined
 stories, and time since the last activity.
+
+### The Kanban board
+
+Each epic renders as a horizontal board — **To do / In progress / Blocked /
+Done** columns (counts in the header) plus a de-emphasised **Declined** row.
+A card shows its title, points, and a **dependency indicator**: `⛓ N` when
+the story has `depends_on` edges, and a distinct **"blocked by unfinished
+\<title\>"** flag while any dependency is not yet done or declined.
+
+With the write proxy configured (see below), the board is editable:
+
+- **Move** — the `<select>` on every card (and in the card modal) posts the
+  new status to `/api/backlog/story/{id}/status`.
+- **Decline / Delete** — buttons in the card modal (`.../decline`;
+  `DELETE .../story/{id}` behind a confirm step).
+- **Edit** — the modal's form PATCHes title / description / estimate.
+- **Add card** — the "＋ Add card" button under each epic opens a small
+  form (title required) and POSTs `/api/backlog/story` with that `epic_id`.
+- **Dependencies** — the modal's checkbox list (other cards in the same
+  epic; never itself) posts `.../deps`; the server rejects unknown ids and
+  cycles, and the rejection message is shown inline.
+
+Every card field — titles, descriptions, dependency titles, even the
+dispatch service's error messages — is repo-derived or round-trips through
+the server, so the page escapes all of it before it reaches the DOM
+(`esc()` / `textContent`, never raw `innerHTML`). Without a dispatch token
+the controls answer `501` and the board is effectively read-only.
 
 ### Story detail (click a backlog story)
 
@@ -100,6 +127,57 @@ This is a stopgap until an IdP (Auth0) integration lands; the seam it
 replaces is `Handler._authorised` (plus the `/login` flow) in
 `dashboard.py`.
 
+## The board write model (backlog editing)
+
+The dashboard stays a **read-only viewer of the workspace** — it never
+writes `backlog.json` itself. Board edits flow through a deliberately
+narrow proxy to the **dispatch service**, which owns every backlog write:
+
+```
+browser ──(dashboard token)──▶ dashboard /api/backlog/* ──(dispatch token)──▶ dispatch /backlog/*
+```
+
+- **The proxy** (`--dashboard` with `--dispatch-url`, default
+  `http://127.0.0.1:8738`): authorised `POST`/`PATCH`/`DELETE` requests
+  under `/api/backlog/` are forwarded — same method, same JSON body — to
+  `<dispatch-url>/backlog/...` with `Authorization: Bearer
+  $DEV_TEAM_DISPATCH_TOKEN`. The dispatch response (status + JSON body,
+  including 400/404/409 rejections) is relayed verbatim; an unreachable
+  dispatch service answers `502`. Scope is **strictly `/api/backlog/*`** —
+  no other dispatch route (job submission, results) is reachable through
+  the dashboard, and the dispatch token is never logged, echoed, or handed
+  to the browser. With `DEV_TEAM_DISPATCH_TOKEN` unset the board is
+  read-only and writes answer `501 {"error": "board editing not
+  configured"}`.
+- **Auth is layered**: the browser authenticates to the dashboard
+  (dashboard token / cookie, checked first); the dashboard process — not
+  the browser — holds the dispatch bearer token. Both comparisons are
+  constant-time.
+
+### The dispatch mutation API (`/backlog`, bearer-authenticated)
+
+| Route | Effect |
+|-------|--------|
+| `GET /backlog` | the full serialised backlog (the board) |
+| `POST /backlog/story` | add a story card (`title` required; optional `description`, `estimate` ≥ 1, `epic_id`, `status`) → `201` + the story |
+| `POST /backlog/story/{id}/status` | set `status` (todo / in_progress / done / blocked / declined) |
+| `POST /backlog/story/{id}/decline` | shorthand for status → `declined` |
+| `POST /backlog/story/{id}/deps` | set `depends_on` edges; unknown/self edges and cycles are `400` |
+| `PATCH /backlog/story/{id}` | edit `title` / `description` / `estimate` (only provided keys) |
+| `DELETE /backlog/story/{id}` | remove the story and strip its id from every other story's `depends_on` |
+
+Every mutation stamps the story's `updated_at`, answers with the affected
+story, and runs **synchronously under a single write lock** shared with the
+assess worker's backlog merge — the dispatch service is the sole writer of
+the dashboard workspace's `backlog.json`, so concurrent edits and job-driven
+merges can never lose each other's updates. Story/epic ids are minted past
+the highest suffix ever used, so a deleted id is never reissued to an
+unrelated new story. Stories bred from an assessment's remediation plan
+arrive pre-chained: each plan story `depends_on` the previous plan story.
+
+The dashboard's Kanban board (above) is the interactive rendering of this
+API: every board control calls the proxied `/api/backlog/*` routes.
+
 ## API
 
 Everything the page shows is plain JSON, usable by your own tooling (add
@@ -110,3 +188,5 @@ the bearer header when a token is set):
   paths the workspace actually lists are served).
 - `POST /login` (form field `token`) / `POST /logout` — the browser cookie
   session lifecycle described above.
+- `POST|PATCH|DELETE /api/backlog/...` — the board write proxy described
+  above (requires dashboard auth; `501` until a dispatch token is wired).

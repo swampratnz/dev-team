@@ -1203,9 +1203,12 @@ def test_main_repo_finds_user_level_env_file_without_flags(
 class _FakeDashboardServer:
     instances = []
 
-    def __init__(self, workspace, *, host, port, token=None):
+    def __init__(self, workspace, *, host, port, token=None,
+                 dispatch_url=None, dispatch_token=None):
         self.workspace, self.host, self.port = workspace, host, port
         self.token = token
+        self.dispatch_url = dispatch_url
+        self.dispatch_token = dispatch_token
         self.interrupted = False
         self.shut_down = False
         _FakeDashboardServer.instances.append(self)
@@ -1245,8 +1248,10 @@ def test_main_dashboard_defaults_and_ctrl_c(tmp_path, monkeypatch):
 
     original_init = _FakeDashboardServer.__init__
 
-    def interrupting_init(self, workspace, *, host, port, token=None):
-        original_init(self, workspace, host=host, port=port, token=token)
+    def interrupting_init(self, workspace, *, host, port, token=None,
+                          dispatch_url=None, dispatch_token=None):
+        original_init(self, workspace, host=host, port=port, token=token,
+                      dispatch_url=dispatch_url, dispatch_token=dispatch_token)
         self.interrupted = True
 
     monkeypatch.setattr(_FakeDashboardServer, "__init__", interrupting_init)
@@ -1344,10 +1349,44 @@ def test_main_dashboard_flag_validation():
         ["--dashboard", "--chat"],
         ["T", "D", "--port", "9000"],
         ["T", "D", "--host", "0.0.0.0"],
+        ["T", "D", "--dispatch-url", "http://127.0.0.1:8738"],
+        ["--dispatch", "--dispatch-url", "http://127.0.0.1:8738"],
     ):
         with pytest.raises(SystemExit) as excinfo:
             main(argv, runner=ScriptedRunner([]))
         assert excinfo.value.code == 2
+
+
+def test_main_dashboard_wires_the_board_write_proxy(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "dispatch-tok")
+    code = main(
+        ["--dashboard", "--workspace", str(tmp_path),
+         "--dispatch-url", "http://100.64.0.9:8738"],
+        runner=None,
+    )
+    assert code == 0
+    (server,) = _FakeDashboardServer.instances
+    assert server.dispatch_url == "http://100.64.0.9:8738"
+    assert server.dispatch_token == "dispatch-tok"
+    assert "dispatch-tok" not in capsys.readouterr().err  # never printed
+
+
+def test_main_dashboard_dispatch_url_defaults_and_empty_token_is_none(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "")
+    code = main(["--dashboard", "--workspace", str(tmp_path)], runner=None)
+    assert code == 0
+    (server,) = _FakeDashboardServer.instances
+    # the default dispatch URL is wired, but with no token the proxy stays
+    # disabled (None, never the empty string)
+    assert server.dispatch_url == "http://127.0.0.1:8738"
+    assert server.dispatch_token is None
+    assert "dispatch-tok" not in capsys.readouterr().err
 
 
 # --- dispatch service -------------------------------------------------------------

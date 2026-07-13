@@ -53,11 +53,18 @@ from .assessment import (
     outcome_to_dict,
     verify_finding,
 )
-from .backlog import BacklogStore
+from .backlog import (
+    Backlog,
+    BacklogStore,
+    ItemStatus,
+    Story,
+    _story_to_dict,
+    validate_dependencies,
+)
 from .budget import Budget
 from .config import TeamConfig
 from .engine import EngineConfig
-from .errors import DevTeamError
+from .errors import DependencyCycleError, DevTeamError
 from .eventlog import EventLog, compose, read_events
 from .execution import (
     LocalWorkspace,
@@ -222,6 +229,12 @@ class Dispatcher:
         self._order: List[str] = []
         self._events: Dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        # Serialises every load→mutate→save of the dashboard workspace's
+        # backlog.json. The registry lock above cannot do this job: the
+        # worker thread (assess --backlog merge) and the handler threads
+        # (make_backlog + the /backlog mutation API) all read-modify-write
+        # the same file, and unserialised writers lose each other's updates.
+        self._backlog_lock = threading.Lock()
         self._queue: "queue.Queue[Any]" = queue.Queue()
         self._seq = 0
         self._thread: Optional[threading.Thread] = None
@@ -690,13 +703,17 @@ class Dispatcher:
         ``repo``/``source_job`` flow into :func:`dict_to_backlog`: with a
         repo the stories land under that repository's own epic and carry
         finding provenance. Returns ``(stories_added, stories_total)``.
-        Callers guarantee a dashboard workspace is configured.
+        Callers guarantee a dashboard workspace is configured. The whole
+        read-modify-write runs under the shared backlog lock: this method is
+        called from the worker thread (assess ``--backlog``) and from handler
+        threads (``make_backlog``), which would otherwise clobber each other.
         """
 
         store = BacklogStore(self._dashboard_workspace)
-        backlog = store.load()
-        added = dict_to_backlog(data, backlog, repo=repo, source_job=source_job)
-        store.save(backlog)
+        with self._backlog_lock:
+            backlog = store.load()
+            added = dict_to_backlog(data, backlog, repo=repo, source_job=source_job)
+            store.save(backlog)
         return len(added), len(backlog.stories)
 
     def make_backlog(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
@@ -741,6 +758,182 @@ class Dispatcher:
             "stories_added": added,
             "stories_total": total,
         }
+
+    # -- backlog mutation API (the Kanban board's write path) -----------------
+    # Each core is the (status, payload) behind one /backlog route: load the
+    # dashboard workspace's backlog, mutate, stamp updated_at, save — the
+    # whole read-modify-write under the shared backlog lock, so handler
+    # threads and the worker's _merge_backlog never lose each other's writes.
+    # Synchronous like make_backlog: pure disk transforms, no queue slot.
+
+    def _mutate_backlog(
+        self, mutate: Callable[[Backlog], Tuple[int, Dict[str, Any]]]
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Run one locked load→mutate→save; persist only successful mutations."""
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "backlog needs a dashboard workspace"}
+        store = BacklogStore(self._dashboard_workspace)
+        with self._backlog_lock:
+            backlog = store.load()
+            status, payload = mutate(backlog)
+            if status < 400:
+                store.save(backlog)
+        return status, payload
+
+    def _mutate_story(
+        self,
+        story_id: str,
+        apply: Callable[[Backlog, Story], Optional[Tuple[int, Dict[str, Any]]]],
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Mutate one story by id: 404 unknown ids, stamp + echo on success.
+
+        ``apply`` returns ``None`` on success or its own ``(status, payload)``
+        rejection (nothing is persisted for a rejection).
+        """
+
+        def mutate(backlog: Backlog) -> Tuple[int, Dict[str, Any]]:
+            story = next((s for s in backlog.stories if s.id == story_id), None)
+            if story is None:
+                return 404, {"error": "unknown story"}
+            rejected = apply(backlog, story)
+            if rejected is not None:
+                return rejected
+            story.updated_at = self._clock()
+            return 200, _story_to_dict(story)
+
+        return self._mutate_backlog(mutate)
+
+    def set_story_status(
+        self, story_id: str, status: Any
+    ) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /backlog/story/{id}/status`` core."""
+
+        values = [item.value for item in ItemStatus]
+        if status not in values:
+            return 400, {"error": f"status must be one of: {', '.join(values)}"}
+
+        def apply(backlog: Backlog, story: Story) -> None:
+            story.status = ItemStatus(status)
+
+        return self._mutate_story(story_id, apply)
+
+    def decline_story(self, story_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /backlog/story/{id}/decline`` core: status → declined."""
+
+        return self.set_story_status(story_id, ItemStatus.DECLINED.value)
+
+    def edit_story(
+        self, story_id: str, fields: Dict[str, Any]
+    ) -> Tuple[int, Dict[str, Any]]:
+        """The ``PATCH /backlog/story/{id}`` core: apply only provided keys."""
+
+        title = fields.get("title")
+        if "title" in fields and (not isinstance(title, str) or not title.strip()):
+            return 400, {"error": "title must be a non-empty string"}
+        if "description" in fields and not isinstance(fields["description"], str):
+            return 400, {"error": "description must be a string"}
+        estimate = fields.get("estimate")
+        if "estimate" in fields and (
+            isinstance(estimate, bool) or not isinstance(estimate, int) or estimate < 1
+        ):
+            return 400, {"error": "estimate must be an integer of at least 1"}
+
+        def apply(backlog: Backlog, story: Story) -> None:
+            if "title" in fields:
+                story.title = title
+            if "description" in fields:
+                story.description = fields["description"]
+            if "estimate" in fields:
+                story.estimate = estimate
+
+        return self._mutate_story(story_id, apply)
+
+    def add_story_card(self, fields: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /backlog/story`` core: a hand-written story card."""
+
+        title = fields.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return 400, {"error": "title is required"}
+        description = fields.get("description", "")
+        if not isinstance(description, str):
+            return 400, {"error": "description must be a string"}
+        estimate = fields.get("estimate", 1)
+        if isinstance(estimate, bool) or not isinstance(estimate, int) or estimate < 1:
+            return 400, {"error": "estimate must be an integer of at least 1"}
+        epic_id = fields.get("epic_id")
+        if epic_id is not None and not isinstance(epic_id, str):
+            return 400, {"error": "epic_id must be a string"}
+        status = fields.get("status", ItemStatus.TODO.value)
+        values = [item.value for item in ItemStatus]
+        if status not in values:
+            return 400, {"error": f"status must be one of: {', '.join(values)}"}
+
+        def mutate(backlog: Backlog) -> Tuple[int, Dict[str, Any]]:
+            story = backlog.add_story(
+                title, description, estimate=estimate, epic_id=epic_id
+            )
+            story.status = ItemStatus(status)
+            story.updated_at = self._clock()
+            return 201, _story_to_dict(story)
+
+        return self._mutate_backlog(mutate)
+
+    def delete_story(self, story_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The ``DELETE /backlog/story/{id}`` core: remove + strip its edges.
+
+        Inbound ``depends_on`` edges are stripped from every surviving story
+        so the file never holds a dangling reference — and because ids are
+        minted past the highest suffix ever used, the deleted id can never be
+        reissued to an unrelated future story.
+        """
+
+        def mutate(backlog: Backlog) -> Tuple[int, Dict[str, Any]]:
+            story = next((s for s in backlog.stories if s.id == story_id), None)
+            if story is None:
+                return 404, {"error": "unknown story"}
+            backlog.stories.remove(story)
+            for survivor in backlog.stories:
+                survivor.depends_on = [
+                    dep for dep in survivor.depends_on if dep != story_id
+                ]
+            story.updated_at = self._clock()
+            return 200, _story_to_dict(story)
+
+        return self._mutate_backlog(mutate)
+
+    def set_story_deps(
+        self, story_id: str, depends_on: Any
+    ) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /backlog/story/{id}/deps`` core: set validated edges."""
+
+        if not isinstance(depends_on, list) or not all(
+            isinstance(dep, str) for dep in depends_on
+        ):
+            return 400, {"error": "depends_on must be a list of story ids"}
+
+        def apply(
+            backlog: Backlog, story: Story
+        ) -> Optional[Tuple[int, Dict[str, Any]]]:
+            story.depends_on = list(depends_on)
+            try:
+                validate_dependencies(backlog)
+            except (DependencyCycleError, ValueError) as exc:
+                # Rejected mutations are never saved, so the in-memory edit
+                # is discarded with the loaded backlog.
+                return 400, {"error": str(exc)}
+            return None
+
+        return self._mutate_story(story_id, apply)
+
+    def board(self) -> Tuple[int, Dict[str, Any]]:
+        """The ``GET /backlog`` core: the full serialised backlog."""
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "backlog needs a dashboard workspace"}
+        with self._backlog_lock:
+            backlog = BacklogStore(self._dashboard_workspace).load()
+        return 200, backlog.to_dict()
 
     # -- serialisation -------------------------------------------------------
 
@@ -878,6 +1071,10 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                     {"jobs": [dispatcher.summary(r) for r in dispatcher.recent()]},
                 )
                 return
+            if path == "/backlog":
+                status, payload = dispatcher.board()
+                self._json(status, payload)
+                return
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "jobs":
                 self._job(parts[1])
@@ -911,33 +1108,112 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 status, payload = dispatcher.make_backlog(parts[1])
                 self._json(status, payload)
                 return
+            if parts[0] == "backlog":
+                self._backlog_post(parts)
+                return
             self._json(404, {"error": "not found"})
 
-        def _create(self) -> None:
-            # Content-Length is attacker-controlled: a non-numeric value must
-            # not crash int() (a 500), and an oversized/negative one must not
-            # have us buffer an unbounded body. Mirror the dashboard's _login
-            # guard. A missing/zero length stays valid — it means "empty body",
-            # which build_spec then rejects as a missing mode (400).
+        def do_PATCH(self) -> None:  # noqa: N802 (http.server API)
+            path = urlsplit(self.path).path
+            if not self._authorised():
+                self._json(401, {"error": "unauthorized"})
+                return
+            parts = path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "backlog" and parts[1] == "story":
+                body = self._read_body()
+                if body is None:
+                    return
+                status, payload = dispatcher.edit_story(parts[2], body)
+                self._json(status, payload)
+                return
+            self._json(404, {"error": "not found"})
+
+        def do_DELETE(self) -> None:  # noqa: N802 (http.server API)
+            path = urlsplit(self.path).path
+            if not self._authorised():
+                self._json(401, {"error": "unauthorized"})
+                return
+            parts = path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "backlog" and parts[1] == "story":
+                status, payload = dispatcher.delete_story(parts[2])
+                self._json(status, payload)
+                return
+            self._json(404, {"error": "not found"})
+
+        def _backlog_post(self, parts: List[str]) -> None:
+            """Route an authorised ``POST /backlog/...`` to its core.
+
+            Synchronous like ``make_backlog``: each core is a locked disk
+            transform, so it answers in one round-trip without a queue slot.
+            """
+
+            if len(parts) == 2 and parts[1] == "story":
+                body = self._read_body()
+                if body is None:
+                    return
+                status, payload = dispatcher.add_story_card(body)
+                self._json(status, payload)
+                return
+            if len(parts) == 4 and parts[1] == "story":
+                story_id, action = parts[2], parts[3]
+                if action == "status":
+                    body = self._read_body()
+                    if body is None:
+                        return
+                    status, payload = dispatcher.set_story_status(
+                        story_id, body.get("status")
+                    )
+                    self._json(status, payload)
+                    return
+                if action == "decline":
+                    status, payload = dispatcher.decline_story(story_id)
+                    self._json(status, payload)
+                    return
+                if action == "deps":
+                    body = self._read_body()
+                    if body is None:
+                        return
+                    status, payload = dispatcher.set_story_deps(
+                        story_id, body.get("depends_on")
+                    )
+                    self._json(status, payload)
+                    return
+            self._json(404, {"error": "not found"})
+
+        def _read_body(self) -> Optional[Dict[str, Any]]:
+            """The JSON object body, or ``None`` after answering the 400.
+
+            Content-Length is attacker-controlled: a non-numeric value must
+            not crash int() (a 500), and an oversized/negative one must not
+            have us buffer an unbounded body. Mirror the dashboard's _login
+            guard. A missing/zero length stays valid — it means "empty body".
+            """
+
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 self._json(400, {"error": "malformed Content-Length"})
-                return
+                return None
             if length > _MAX_BODY:
                 self._json(413, {"error": "request body too large"})
-                return
+                return None
             if length < 0:
                 self._json(400, {"error": "malformed Content-Length"})
-                return
+                return None
             raw = self.rfile.read(length) if length > 0 else b""
             try:
                 body = json.loads(raw.decode("utf-8")) if raw else {}
             except (ValueError, UnicodeDecodeError):
                 self._json(400, {"error": "malformed JSON body"})
-                return
+                return None
             if not isinstance(body, dict):
                 self._json(400, {"error": "JSON body must be an object"})
+                return None
+            return body
+
+        def _create(self) -> None:
+            body = self._read_body()
+            if body is None:
                 return
             try:
                 spec = dispatcher.build_spec(body)

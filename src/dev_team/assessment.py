@@ -1283,35 +1283,45 @@ def dict_to_backlog(
         description: str,
         estimate: int = 2,
         finding_id: Optional[str] = None,
-    ) -> None:
+    ) -> Optional[Story]:
         title = title[:200]
         if title in existing:
-            return
+            return None
         existing.add(title)
-        added.append(
-            backlog.add_story(
-                title,
-                description,
-                estimate=estimate,
-                epic_id=epic.id,
-                source_job=source_job,
-                finding_id=finding_id,
-            )
+        story = backlog.add_story(
+            title,
+            description,
+            estimate=estimate,
+            epic_id=epic.id,
+            source_job=source_job,
+            finding_id=finding_id,
         )
+        added.append(story)
+        return story
 
     # Finding ids must line up with list_findings' positional scheme, so the
     # LLM-finding loops below enumerate the same dict-filtered lists
     # (_items) it does — the index counts dict entries, junk excluded.
     phases = data.get("phases") or {}
+    # Plan steps are an ordered remediation sequence, so each newly added
+    # plan story depends on the LAST plan story actually added (a dedup skip
+    # must not break the chain, hence tracking the returned story rather
+    # than index-1). Only plan stories are ordered; other finding types are
+    # independent and get no seeded dependencies.
+    previous: Optional[Story] = None
     for index, step in enumerate(_items(_phase_payload(phases, "recommendation"), "plan")):
         name = str(step.get("step", "")).strip()
         if name:
-            add(
+            story = add(
                 name,
                 str(step.get("detail", "")),
                 _effort_points(str(step.get("effort", ""))),
                 finding_id=f"recommendation.plan[{index}]",
             )
+            if story is not None:
+                if previous is not None:
+                    story.depends_on = [previous.id]
+                previous = story
     for index, blocker in enumerate(
         _items(_phase_payload(phases, "buildability"), "blockers")
     ):
