@@ -5,6 +5,39 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Self-improvement pipeline
+- **A supervised multi-loop development pipeline now extends this repo
+  itself** (`docs/PIPELINE.md`), ported from the community-agent repo's
+  battle-tested pipeline: scheduled research/adversarial/orchestrator
+  routines coordinate through GitHub issue labels
+  (`proposal`/`status:*`/`needs-human` — created by the idempotent
+  `setup-labels` workflow + `scripts/setup-labels.sh`), and event-driven
+  GitHub Actions do the code work — a build worker
+  (`pipeline-build.yml`, fires on `status:approved`, runs the exact CI
+  gate — `ruff check .` + the 100% branch-coverage `pytest` — before
+  opening a "Closes #N" PR, with a deterministic PR-produced verify step),
+  a read-only security-focused PR reviewer (`pipeline-pr-review.yml`,
+  verdict posted deterministically from the execution log), and three
+  bounded push-exception loops: autofix on CI failure
+  (`pipeline-pr-autofix.yml`, from run_attempt ≥ 2, 2 attempts), a
+  Changes-requested reviser (`pipeline-pr-revise.yml`, 2 attempts,
+  dispatched by the reviewer), and a two-hop merge-conflict resolver
+  (`pipeline-pr-conflict.yml`, one attempt, payload carries PR numbers
+  only with eligibility re-verified from the API). `pipeline-build-retry`
+  and `ci-retry` give failed runs bounded machine reruns before any agent
+  or human is spent; everything else escalates `needs-human`.
+- **Guardrails are structural**: least-privilege `--allowedTools` (exact
+  `git push origin HEAD`, no blanket `git:*`/`gh:*`/`python:*`, no
+  `gh pr merge`/`gh api`), `persist-credentials: false` + per-step
+  GH_TOKEN so agents reading untrusted content never hold a repo token,
+  fork PRs excluded everywhere, attempt caps via marker comments, and
+  **no loop merges — humans merge** (reinforcing the BPG standards, which
+  also gained a "Multi-loop pipeline" section in `CLAUDE.md`).
+  `docs/VISION.md` defines the proposal rubric and the explicit
+  do-not-propose list (no merge autonomy, no credential-handling changes,
+  no weakening the coverage gate). All agent workflows are inert until the
+  `CLAUDE_CODE_OAUTH_TOKEN` secret and Claude GitHub App exist.
+
 ### Finding re-verification
 - **A fresh skeptical agent can re-check any ONE persisted assessment
   finding** against the code (`docs/ASSESSMENT.md`): `list_findings`

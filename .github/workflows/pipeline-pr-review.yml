@@ -1,0 +1,199 @@
+name: Pipeline PR review worker
+
+# Event-driven PR-REVIEW loop (see docs/PIPELINE.md). Reviews pull requests as
+# they open/update — no live Claude session needed. Subscription auth via
+# CLAUDE_CODE_OAUTH_TOKEN. Comments only; never merges.
+#
+# Design: the action runs the review READ-ONLY (it produces the verdict as its
+# final message and is given no write/comment tools), then a deterministic step
+# posts that text with `gh pr comment`. This deliberately does NOT rely on the
+# action's own comment posting, which is unreliable in agent mode on
+# pull_request events (anthropics/claude-code-action#1087 empty-result on a
+# final tool call, #1108 sticky-comment no-op) and which caused permission-
+# denial thrash -> error_max_turns when comment tools weren't pre-allowed.
+# Read-only => no denials; the post step => a comment on every run, even clean.
+#
+# PREREQUISITES (until then inert): install the Claude GitHub App and add the
+# CLAUDE_CODE_OAUTH_TOKEN secret. See docs/PIPELINE.md.
+#
+# Fork-PR safety: GitHub withholds secrets from fork pull requests, so on a fork
+# PR HAS_TOKEN is empty and the review is skipped — the token is never exposed.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pipeline-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write # dispatch pipeline-pr-revise.yml on a Changes-requested verdict
+  id-token: write # claude-code-action mints its GitHub App token via OIDC
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Inert notice (token not set)
+        if: env.HAS_TOKEN != 'true'
+        run: echo "CLAUDE_CODE_OAUTH_TOKEN not set — PR review worker is inert. Add the secret + install the Claude GitHub App to enable."
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: env.HAS_TOKEN == 'true'
+        with:
+          # The review agent reads untrusted PR content and its final text is
+          # posted publicly, so don't leave the job's GITHUB_TOKEN readable in
+          # .git/config; nothing here needs a persisted git credential (the
+          # post step uses GH_TOKEN env).
+          persist-credentials: false
+
+      # Read-only review: produce the verdict as the FINAL text message. Only
+      # read tools are allowed, so there are no permission denials. The model is
+      # explicitly told NOT to post anything.
+      # Turn cap: 20 was too low for a large PR — reviewing a big diff means
+      # reading the diff + many changed files, and a ~15-file/~1200-line PR
+      # exhausted 20 turns and finished with `error_max_turns` and NO review
+      # text, failing the check. 60 gives large PRs room; the review is
+      # read-only + posts once, so it can't run away.
+      - id: analyze
+        if: env.HAS_TOKEN == 'true'
+        continue-on-error: true # a bad run must still reach the post step below
+        uses: anthropics/claude-code-action@e90deca47693f9457b72f2b53c17d7c445a87342 # v1.0.171
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The build worker opens its PRs as the `claude[bot]` GitHub App, and
+          # claude-code-action refuses to run on a bot-authored PR unless the
+          # bot is allow-listed ("Workflow initiated by non-human actor").
+          # Without this, EVERY build-worker PR fails review before the model
+          # even starts. `*` is safe here: this review job is strictly
+          # read-only (its allowedTools are gh pr diff/view + Read/Grep/Glob),
+          # it only posts a comment and can never merge or push, and fork PRs
+          # get no token (HAS_TOKEN empty -> inert) so this can't be abused
+          # from outside the repo.
+          allowed_bots: "*"
+          prompt: |
+            You are the PR-REVIEW worker for dev-team (swampratnz/dev-team), a
+            multi-agent SDLC system that clones and audits UNTRUSTED third-party
+            repositories. Review pull request #${{ env.PR }}. Use
+            `gh pr diff ${{ env.PR }}` and `gh pr view ${{ env.PR }}` to read
+            it, and read CLAUDE.md (the BPG Engineering Standards — the security
+            posture) plus any changed source files you need.
+
+            Scrutinise correctness and especially SECURITY — this system has a
+            large untrusted-input and credential surface:
+            - dispatch/dashboard HTTP auth: bearer-token checks must stay
+              byte-safe constant-time compares; the dispatch token must NEVER
+              reach a browser (no token in dashboard HTML/JS or URLs);
+            - subprocess env secret hygiene: GITHUB_TOKEN/GH_TOKEN and
+              ANTHROPIC_*/CLAUDE_* must be scrubbed from the environment of
+              commands the engines execute; git credentials go via per-command
+              config, never argv/URLs/.git/config;
+            - the argv-semantic command policy (SideEffectPolicy) — no
+              string-matching bypasses, no new unvetted argv shapes;
+            - workspace containment: path traversal / symlink escapes out of
+              the workspace;
+            - prompt injection from audited third-party repo content (code,
+              READMEs, issue text reaching agent prompts must stay delimited,
+              untrusted DATA);
+            - transcript/log secret redaction.
+            Also check test coverage: CI enforces ruff plus a 100% BRANCH
+            coverage gate on Python 3.11/3.12/3.13, so flag untested branches
+            or coverage-gaming (`pragma: no cover` on logic that should be
+            tested, tests that assert nothing).
+
+            Produce your review as your FINAL text message. Do NOT try to post a
+            comment, create a review, or push anything — a later automated step
+            posts your final message verbatim, so it must contain ONLY the
+            review itself: no preamble, no narration (e.g. never "Now I'll
+            write the review"). Structure it as:
+            - First line: "PR review (automated):"
+            - A one-line verdict: "LGTM, looks good and ready for a human to merge",
+              or "Changes requested", or "Needs a human decision".
+            - Then the findings as short bullets, or "No issues found." if clean.
+          # --model pinned explicitly (like every other agent workflow here)
+          # so the reviewer matches the documented model plan in
+          # docs/PIPELINE.md instead of floating on the action's default.
+          claude_args: |
+            --max-turns 60
+            --model sonnet
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob,TodoWrite"
+
+      # Deterministic: extract the review text from the action's execution log
+      # and post it. Always runs (even if analyze errored) so the PR always gets
+      # a verdict; if no text was produced, post a visible failure and fail the
+      # job so silence can never masquerade as a green check.
+      - name: Post review verdict
+        # !cancelled() (not always()): a superseding push cancels the in-flight
+        # review, and always() would then run this step on the cancelled run —
+        # posting a spurious "no review output" failure on a healthy PR. The
+        # analyze step has continue-on-error, so a genuine analyze failure
+        # still reaches this step; only cancellation is excluded.
+        if: ${{ !cancelled() && env.HAS_TOKEN == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXEC_FILE: ${{ steps.analyze.outputs.execution_file }}
+        run: |
+          set -o pipefail
+          review=""
+          if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
+            # The log is a JSON array of SDK messages. Prefer the `result` text;
+            # fall back to the concatenated final assistant text (covers the
+            # "final turn was a tool call" empty-result case). `-s` slurp also
+            # handles a newline-delimited variant.
+            review=$(jq -r 'if type=="array" then . else [.] end | [.[]|select(.type=="result" and (.result//"")!="")][-1].result // empty' "$EXEC_FILE" 2>/dev/null || true)
+            if [ -z "$review" ]; then
+              review=$(jq -rs '[.[]|select(.type=="result" and (.result//"")!="")][-1].result // empty' "$EXEC_FILE" 2>/dev/null || true)
+            fi
+            if [ -z "$review" ]; then
+              review=$(jq -r 'if type=="array" then . else [.] end | [.[]|select(.type=="assistant")|.message.content[]?|select(.type=="text")|.text] | join("\n")' "$EXEC_FILE" 2>/dev/null || true)
+            fi
+          fi
+
+          if [ -z "$review" ]; then
+            # NB: first line deliberately does NOT start with "PR review
+            # (automated)" — the revise precheck selects the latest comment
+            # matching that marker as the pending verdict, and a no-output
+            # notice must never be mistaken for one.
+            gh pr comment "$PR" --body "Automated review: no output captured this run. If this PR modifies the review workflow itself, that's expected — the action only runs the workflow version on the default branch, so it will review normally once merged. Otherwise the reviewer genuinely produced nothing; see the workflow logs. Failing the check so this is never silent."
+            echo "::error::PR review produced no text output"
+            exit 1
+          fi
+
+          # GitHub comment bodies cap ~65535 chars; keep well under.
+          printf '%s' "$review" | head -c 60000 > review.txt
+          gh pr comment "$PR" --body-file review.txt
+
+          # Route on the verdict (the state machine's missing edge — see
+          # pipeline-pr-revise.yml's header): "Changes requested" dispatches
+          # the revise worker via workflow_dispatch, the one event a
+          # GITHUB_TOKEN write CAN trigger (this very comment can't — GitHub
+          # never starts workflows off GITHUB_TOKEN-created events). "Needs a
+          # human decision" labels needs-human so it's visible and every
+          # pipeline loop skips the PR. Failures are warnings, never a red
+          # check — the review itself was posted successfully.
+          #
+          # Verdict extraction: the mandated format is a header line then a
+          # one-line verdict, with findings as `-`/`*` bullets after. Look only
+          # at the first few lines AND drop bullet lines, so a phrase like
+          # "previous changes requested were addressed" inside a finding can't
+          # misroute an LGTM into the revise loop (which then finds nothing,
+          # pushes no commit, and mislabels the PR needs-human — the exact
+          # stall the loop exists to prevent). Evaluate "needs a human
+          # decision" BEFORE "changes requested" so a needs-human verdict that
+          # happens to mention changes isn't sent to revise instead.
+          verdict="$(head -n 4 review.txt | grep -vE '^[[:space:]]*[-*]')"
+          if printf '%s' "$verdict" | grep -qiE 'needs a human decision'; then
+            gh pr edit "$PR" --add-label needs-human ||
+              echo "::warning::Could not add needs-human label"
+          elif printf '%s' "$verdict" | grep -qiE 'changes requested'; then
+            echo "Verdict requests changes — dispatching the revise worker."
+            gh workflow run pipeline-pr-revise.yml -R "${{ github.repository }}" -f pr_number="$PR" ||
+              echo "::warning::Could not dispatch pipeline-pr-revise.yml (missing on the default branch yet?)"
+          fi
