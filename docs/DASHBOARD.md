@@ -23,13 +23,40 @@ workspace on every request.
 | **The team** — one card per agent: persona, current stage, last message, how long ago | `.dev_team/events.jsonl` (journaled by every run) |
 | **Activity** — the newest events across all agents and engines | same journal |
 | **Runs** — recent runs with their last message and event counts | same journal |
-| **Backlog** — one epic **per assessed repository** ("Remediation — \<repo\>") with story-point progress bars and story status chips (todo / ▶ in progress / ✓ done / ✕ blocked); clickable stories (see below) | `.dev_team/backlog.json` |
+| **Backlog** — an interactive **Kanban board** per epic (one epic **per assessed repository**, "Remediation — \<repo\>"): four columns (To do / In progress / Blocked / Done) with per-column counts, a muted Declined row, story-point progress bars, dependency indicators, and clickable cards (see below) | `.dev_team/backlog.json` (writes via the dispatch proxy) |
 | **Memory** — run count, recent retrospectives, ADR titles | `.dev_team/memory.json` |
 | **House conventions** — the captured style summary | `.dev_team/conventions.json` |
 | **Reports** — every `audit/*.md`, viewable in place | the workspace tree |
 
-Stat tiles across the top summarise runs recorded, open/done/blocked
+Stat tiles across the top summarise runs recorded, open/done/blocked/declined
 stories, and time since the last activity.
+
+### The Kanban board
+
+Each epic renders as a horizontal board — **To do / In progress / Blocked /
+Done** columns (counts in the header) plus a de-emphasised **Declined** row.
+A card shows its title, points, and a **dependency indicator**: `⛓ N` when
+the story has `depends_on` edges, and a distinct **"blocked by unfinished
+\<title\>"** flag while any dependency is not yet done or declined.
+
+With the write proxy configured (see below), the board is editable:
+
+- **Move** — the `<select>` on every card (and in the card modal) posts the
+  new status to `/api/backlog/story/{id}/status`.
+- **Decline / Delete** — buttons in the card modal (`.../decline`;
+  `DELETE .../story/{id}` behind a confirm step).
+- **Edit** — the modal's form PATCHes title / description / estimate.
+- **Add card** — the "＋ Add card" button under each epic opens a small
+  form (title required) and POSTs `/api/backlog/story` with that `epic_id`.
+- **Dependencies** — the modal's checkbox list (other cards in the same
+  epic; never itself) posts `.../deps`; the server rejects unknown ids and
+  cycles, and the rejection message is shown inline.
+
+Every card field — titles, descriptions, dependency titles, even the
+dispatch service's error messages — is repo-derived or round-trips through
+the server, so the page escapes all of it before it reaches the DOM
+(`esc()` / `textContent`, never raw `innerHTML`). Without a dispatch token
+the controls answer `501` and the board is effectively read-only.
 
 ### Story detail (click a backlog story)
 
@@ -148,8 +175,8 @@ the highest suffix ever used, so a deleted id is never reissued to an
 unrelated new story. Stories bred from an assessment's remediation plan
 arrive pre-chained: each plan story `depends_on` the previous plan story.
 
-The interactive Kanban rendering of this API on the dashboard page is a
-follow-up; today the routes serve API callers and the proxy.
+The dashboard's Kanban board (above) is the interactive rendering of this
+API: every board control calls the proxied `/api/backlog/*` routes.
 
 ## API
 

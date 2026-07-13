@@ -95,7 +95,9 @@ def test_collect_state_backlog_epics_points_and_orphans():
 
     state = collect_state(ws)["backlog"]
     assert state["present"] is True
-    assert state["counts"] == {"todo": 1, "in_progress": 0, "done": 1, "blocked": 1}
+    assert state["counts"] == {
+        "todo": 1, "in_progress": 0, "done": 1, "blocked": 1, "declined": 0,
+    }
     (epic_state,) = state["epics"]
     assert epic_state["points_done"] == 3
     assert epic_state["points_total"] == 11
@@ -135,6 +137,93 @@ def test_collect_state_backlog_carries_story_detail_and_provenance():
     # deterministic stories surface None so the page shows the muted note
     assert deterministic["source_job"] is None
     assert deterministic["finding_id"] is None
+
+
+def test_collect_state_backlog_carries_board_fields():
+    """The Kanban board's fields reach the state payload.
+
+    Every story dict now carries ``depends_on`` (the dependency indicator /
+    blocked-by flag) and ``updated_at``; the counts dict gains ``declined``.
+    """
+
+    ws = InMemoryWorkspace()
+    store = BacklogStore(ws)
+    backlog = store.load()
+    epic = backlog.add_epic("Remediation — acme/rota")
+    first = backlog.add_story("Land the migration", "", estimate=3, epic_id=epic.id)
+    second = backlog.add_story("Cut over reads", "", estimate=2, epic_id=epic.id)
+    second.depends_on = [first.id]
+    second.updated_at = 1700000000.0
+    declined = backlog.add_story("Rewrite in Rust", "", epic_id=epic.id)
+    declined.status = ItemStatus.DECLINED
+    store.save(backlog)
+
+    state = collect_state(ws)["backlog"]
+    assert state["counts"] == {
+        "todo": 2, "in_progress": 0, "done": 0, "blocked": 0, "declined": 1,
+    }
+    (epic_state,) = state["epics"]
+    by_id = {s["id"]: s for s in epic_state["stories"]}
+    assert by_id[second.id]["depends_on"] == [first.id]
+    assert by_id[second.id]["updated_at"] == 1700000000.0
+    assert by_id[first.id]["depends_on"] == []
+    assert by_id[first.id]["updated_at"] is None
+    assert by_id[declined.id]["status"] == "declined"
+
+
+def test_dashboard_page_kanban_board_desk_check():
+    """Static desk-check of the Kanban board JS (CI has no browser).
+
+    The interactive board rides on the PR-A ``/api/backlog/*`` proxy; the
+    load-bearing properties pinned here: the four columns plus a declined
+    section render with counts, every mutation route is called through the
+    single ``backlogWrite`` helper, ids are URL-encoded, every repo-derived
+    card field (titles, dependency titles, echoed input values) flows
+    through ``esc()`` before innerHTML, and error messages surface via
+    ``textContent`` only.
+    """
+
+    # the four columns, in board order, plus the muted declined row
+    assert '["todo", "To do"], ["in_progress", "In progress"]' in DASHBOARD_HTML
+    assert '["blocked", "Blocked"], ["done", "Done"]' in DASHBOARD_HTML
+    assert "Declined (${declined.length})" in DASHBOARD_HTML
+    assert '<span class="cn">${items.length}</span>' in DASHBOARD_HTML  # counts
+    # the declined chip and stat tile
+    assert "declined: chip(" in DASHBOARD_HTML
+    assert '"stories declined"' in DASHBOARD_HTML
+    # every write goes through the one same-origin proxy helper
+    assert '"/api/backlog/" + path' in DASHBOARD_HTML
+    assert '"Content-Type": "application/json"' in DASHBOARD_HTML
+    # ... and each PR-A mutation route is reachable from a control
+    assert '"/status", { status }' in DASHBOARD_HTML                    # move
+    assert '+ "/decline"' in DASHBOARD_HTML                              # decline
+    assert '+ "/deps"' in DASHBOARD_HTML                                 # dependency editor
+    assert 'backlogWrite("POST", "story", payload)' in DASHBOARD_HTML    # add card
+    assert 'backlogWrite("PATCH", "story/"' in DASHBOARD_HTML            # edit
+    assert 'backlogWrite("DELETE", "story/"' in DASHBOARD_HTML           # delete
+    assert "encodeURIComponent(id)" in DASHBOARD_HTML
+    # the reliable move path is a <select> on every card (and in the modal)
+    assert 'select class="cmove" data-move="${esc(st.id)}"' in DASHBOARD_HTML
+    assert "moveStory(sel.dataset.move, sel.value" in DASHBOARD_HTML
+    # dependency indicator + blocked-by flag, titles resolved and ESCAPED
+    assert "\\u26D3 ${deps.length}" in DASHBOARD_HTML
+    assert "blocked by unfinished ${esc(unfinished[0].title)}" in DASHBOARD_HTML
+    assert 'd.status !== "done" && d.status !== "declined"' in DASHBOARD_HTML
+    # escape-first card rendering (titles clamped via .ct)
+    assert '<div class="ct">${esc(st.title)}</div>' in DASHBOARD_HTML
+    # add card per epic; edit form values escaped even though user-typed
+    # (they round-trip through the server before rendering)
+    assert 'data-add="${esc(e.id)}"' in DASHBOARD_HTML
+    assert "\\uFF0B Add card" in DASHBOARD_HTML
+    assert 'value="${esc(st.title)}"' in DASHBOARD_HTML
+    assert '>${esc(st.description ?? "")}</textarea>' in DASHBOARD_HTML
+    # the dependency editor never offers the card itself
+    assert "o.id !== st.id" in DASHBOARD_HTML
+    # delete requires a confirm step
+    assert "confirm delete?" in DASHBOARD_HTML
+    # dispatch error messages reach the DOM via textContent, never innerHTML
+    assert "el.textContent = msg; // SECURITY: textContent, never innerHTML" in DASHBOARD_HTML
+    assert "if (data && data.error) msg = String(data.error);" in DASHBOARD_HTML
 
 
 def test_dashboard_page_story_modal_desk_check():
