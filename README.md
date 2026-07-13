@@ -413,6 +413,10 @@ workspace ([`docs/DASHBOARD.md`](docs/DASHBOARD.md)):
 dev-team --dashboard --workspace ./build     # http://127.0.0.1:8737/
 ```
 
+Set `DEV_TEAM_DASHBOARD_TOKEN` to put every dashboard route behind a token
+(browser login cookie or `Authorization: Bearer`) — do this whenever the bind
+is non-local or transcripts are enabled (see `docs/DASHBOARD.md`).
+
 Exit codes: `0` success, `1` completed with failed tasks, `2` invalid input
 (including an interactive abort at plan review).
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import urllib.error
@@ -13,6 +14,7 @@ from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.conventions import ConventionsProfile, ConventionsStore
 from dev_team.dashboard import (
     DASHBOARD_HTML,
+    LOGIN_HTML,
     DashboardServer,
     agent_history,
     collect_state,
@@ -331,3 +333,184 @@ def test_transcript_detail_unknown_or_guarded_is_404(transcript_server):
             _get(transcript_server, bad)
         assert excinfo.value.code == 404
         excinfo.value.close()
+
+
+# --- token auth (opt-in stopgap) ---------------------------------------------
+
+TOKEN = "sekrit-dash-token"
+FORM = {"Content-Type": "application/x-www-form-urlencoded"}
+
+
+@pytest.fixture
+def token_server():
+    ws = InMemoryWorkspace(
+        {"audit/assessment.md": "# the report\n\nClassification: rebuild"}
+    )
+    _journal(ws, AgentEvent("engineer", "implement", "building"))
+    srv = DashboardServer(ws, port=0, token=TOKEN)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield srv
+    srv.shutdown()
+    thread.join(timeout=5)
+
+
+def _request(server, method, path, *, headers=None, body=None):
+    """One raw request; unlike urllib it never follows the 303 redirects."""
+
+    host, port = server.httpd.server_address[:2]
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        res = conn.getresponse()
+        return res.status, dict(res.getheaders()), res.read().decode()
+    finally:
+        conn.close()
+
+
+def test_token_server_401s_every_route_without_auth(token_server):
+    # page routes get the login form (a browser can render it) ...
+    for page in ("/", "/nope"):
+        status, headers, body = _request(token_server, "GET", page)
+        assert status == 401
+        assert headers["Content-Type"].startswith("text/html")
+        assert body == LOGIN_HTML
+        assert "<title>dev-team login</title>" in body
+        assert TOKEN not in body
+    # ... API routes get bare JSON, never HTML
+    for api in (
+        "/api/state",
+        "/api/report?path=audit/assessment.md",
+        "/api/agent?role=engineer",
+        "/api/transcripts?run=deliver-1&role=engineer",
+        "/api/transcript?run=deliver-1&role=engineer&seq=1",
+    ):
+        status, headers, body = _request(token_server, "GET", api)
+        assert status == 401
+        assert headers["Content-Type"].startswith("application/json")
+        assert json.loads(body) == {"error": "unauthorized"}
+
+
+def test_token_server_accepts_the_bearer_header(token_server):
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+    status, _, body = _request(token_server, "GET", "/", headers=auth)
+    assert status == 200
+    assert "<title>dev-team dashboard</title>" in body
+    status, _, body = _request(token_server, "GET", "/api/state", headers=auth)
+    assert status == 200
+    assert json.loads(body)["activity"][0]["message"] == "building"
+
+
+def test_token_server_accepts_the_session_cookie(token_server):
+    cookie = {"Cookie": f"devteam_dash={TOKEN}"}
+    status, _, body = _request(token_server, "GET", "/api/state", headers=cookie)
+    assert status == 200
+    assert json.loads(body)["activity"][0]["message"] == "building"
+
+
+def test_token_server_rejects_bad_credentials(token_server):
+    for headers in (
+        {"Authorization": "Bearer wrong"},
+        {"Authorization": f"bearer {TOKEN}"},        # exact scheme, like dispatch
+        {"Authorization": "Bearer wrongÿ"},     # non-ASCII → 401, never a 500
+        {"Cookie": "devteam_dash=wrong"},
+        {"Cookie": f"other={TOKEN}"},                # right value, wrong cookie
+        {"Cookie": "not a cookie;; ="},              # malformed header
+    ):
+        status, _, _ = _request(token_server, "GET", "/api/state", headers=headers)
+        assert status == 401
+
+
+def test_login_correct_token_sets_cookie_and_redirects(token_server):
+    status, headers, _ = _request(
+        token_server, "POST", "/login", body=f"token={TOKEN}", headers=FORM
+    )
+    assert status == 303
+    assert headers["Location"] == "/"
+    cookie = headers["Set-Cookie"]
+    assert f"devteam_dash={TOKEN}" in cookie
+    assert "HttpOnly" in cookie
+    assert "SameSite=Strict" in cookie
+    assert "Path=/" in cookie
+    # the browser replays the cookie and is in
+    status, _, body = _request(
+        token_server, "GET", "/", headers={"Cookie": f"devteam_dash={TOKEN}"}
+    )
+    assert status == 200
+    assert "<title>dev-team dashboard</title>" in body
+
+
+def test_login_wrong_token_shows_the_form_again(token_server):
+    status, headers, body = _request(
+        token_server, "POST", "/login", body="token=wrong", headers=FORM
+    )
+    assert status == 401
+    assert "Set-Cookie" not in headers
+    assert "<title>dev-team login</title>" in body
+    assert "Invalid token." in body
+    assert TOKEN not in body  # nothing about the expected value leaks
+
+
+def test_login_bodies_are_bounded_and_validated(token_server):
+    # no body at all (Content-Length: 0)
+    status, _, body = _request(token_server, "POST", "/login")
+    assert status == 401
+    assert "Invalid token." in body
+    # a malformed Content-Length reads as no body
+    status, _, _ = _request(
+        token_server, "POST", "/login", headers={"Content-Length": "xyz"}
+    )
+    assert status == 401
+    # an oversized body is rejected without being read
+    status, _, _ = _request(
+        token_server, "POST", "/login",
+        body="token=" + "x" * 5000, headers=FORM,
+    )
+    assert status == 401
+    # a well-formed body without a token field fails closed
+    status, _, _ = _request(
+        token_server, "POST", "/login", body="user=me", headers=FORM
+    )
+    assert status == 401
+
+
+def test_logout_clears_the_cookie(token_server):
+    status, headers, _ = _request(
+        token_server, "POST", "/logout",
+        headers={"Cookie": f"devteam_dash={TOKEN}"},
+    )
+    assert status == 303
+    assert headers["Location"] == "/"
+    cookie = headers["Set-Cookie"]
+    assert "devteam_dash=;" in cookie
+    assert "Max-Age=0" in cookie
+
+
+def test_post_routing_respects_auth(token_server):
+    # unknown POSTs are gated exactly like GETs ...
+    status, _, body = _request(token_server, "POST", "/api/state")
+    assert status == 401
+    assert json.loads(body) == {"error": "unauthorized"}
+    status, _, body = _request(token_server, "POST", "/nope")
+    assert status == 401
+    assert "<title>dev-team login</title>" in body
+    # ... and with credentials an unknown POST is a plain 404
+    status, _, _ = _request(
+        token_server, "POST", "/nope",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert status == 404
+
+
+def test_open_server_login_lifecycle_is_harmless(server):
+    # No token configured: /login grants nothing (no cookie), /logout still
+    # clears, unknown POSTs 404, and every GET stays open — exact back-compat.
+    status, headers, _ = _request(server, "POST", "/login")
+    assert status == 303
+    assert headers["Location"] == "/"
+    assert "Set-Cookie" not in headers
+    status, headers, _ = _request(server, "POST", "/logout")
+    assert status == 303
+    assert "Max-Age=0" in headers["Set-Cookie"]
+    status, _, _ = _request(server, "POST", "/nope")
+    assert status == 404
