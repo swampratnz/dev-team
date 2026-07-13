@@ -94,6 +94,12 @@ DEFAULT_JOBS_ROOT = "/opt/dev-team/jobs"
 #: Reject a SUBMIT once this many jobs are already waiting (queued).
 DEFAULT_QUEUE_CAP = 16
 
+#: Upper bound on a POST body; a larger Content-Length is rejected unread (a
+#: SUBMIT body is a small JSON object, so 1 MiB is generous headroom). Without
+#: it an oversized or lying Content-Length would have us buffer the whole
+#: request into memory — an unauthenticated-adjacent resource-exhaustion path.
+_MAX_BODY = 1 << 20
+
 #: How many of the newest jobs ``GET /jobs`` lists, and how many progress
 #: events ``GET /jobs/{id}`` carries.
 _LIST_LIMIT = 25
@@ -361,11 +367,19 @@ class Dispatcher:
             # verify landed; a job missing either file predates the feature
             # (re-assess to record it) or never assessed at all.
             raise SubmitRejected(404, "no assessment for that job")
-        data = json.loads(self._dashboard_workspace.read_text(assessment_path))
+        # Corrupt on-disk state (a half-written or hand-edited mirror) must
+        # surface as a controlled 404, never an unhandled 500.
+        try:
+            data = json.loads(self._dashboard_workspace.read_text(assessment_path))
+        except (OSError, ValueError, WorkspaceError):
+            raise SubmitRejected(404, "no assessment for that job")
         finding = find_finding(data, finding_id.strip())
         if finding is None:
             raise SubmitRejected(404, "finding not found")
-        meta = json.loads(self._dashboard_workspace.read_text(meta_path))
+        try:
+            meta = json.loads(self._dashboard_workspace.read_text(meta_path))
+        except (OSError, ValueError, WorkspaceError):
+            raise SubmitRejected(404, "no assessment for that job")
         return JobSpec(
             mode="verify",
             repo=str(meta.get("repo", "")),
@@ -644,7 +658,11 @@ class Dispatcher:
         path = f"audit/{job_id}/assessment.json"
         if not self._exists(path):
             return 404, {"error": "no assessment for that job"}
-        data = json.loads(self._dashboard_workspace.read_text(path))
+        # A corrupt mirror is answered 404, not a 500 (see _verify_spec).
+        try:
+            data = json.loads(self._dashboard_workspace.read_text(path))
+        except (OSError, ValueError, WorkspaceError):
+            return 404, {"error": "no assessment for that job"}
         return 200, {"job_id": job_id, "findings": list_findings(data)}
 
     def verifications(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
@@ -662,8 +680,15 @@ class Dispatcher:
         entries: List[Dict[str, Any]] = []
         if self._exists(path):
             for line in self._dashboard_workspace.read_text(path).splitlines():
-                if line.strip():
+                if not line.strip():
+                    continue
+                # Skip a corrupt line (partial append, hand-edit) rather than
+                # letting it 500 the whole endpoint — same forgiveness as
+                # eventlog.read_events.
+                try:
                     entries.append(json.loads(line))
+                except ValueError:
+                    continue
         return 200, {"job_id": job_id, "verifications": entries}
 
     def _merge_backlog(
@@ -705,16 +730,27 @@ class Dispatcher:
         if self._dashboard_workspace is None:
             return 409, {"error": "backlog generation needs a dashboard workspace"}
         path = f"audit/{job_id}/assessment.json"
-        if not self._dashboard_workspace.exists(path):
+        # Route through _exists (fails closed) like the sibling readers so a
+        # traversal-shaped job id answers 404 instead of raising out of the
+        # workspace's path guard (a 500).
+        if not self._exists(path):
             return 404, {"error": "no assessment for that job"}
-        data = json.loads(self._dashboard_workspace.read_text(path))
+        # A corrupt mirror is answered 404, not a 500 (see _verify_spec).
+        try:
+            data = json.loads(self._dashboard_workspace.read_text(path))
+        except (OSError, ValueError, WorkspaceError):
+            return 404, {"error": "no assessment for that job"}
         # meta.json (mirrored beside every assessment since verify landed)
         # names the audited repo — that keys the per-repository epic. Older
-        # mirrors without it fall back to the single shared epic.
+        # mirrors without it (or a corrupt one) fall back to the single shared
+        # epic rather than failing the whole request.
         repo = None
         meta_path = f"audit/{job_id}/meta.json"
-        if self._dashboard_workspace.exists(meta_path):
-            meta = json.loads(self._dashboard_workspace.read_text(meta_path))
+        if self._exists(meta_path):
+            try:
+                meta = json.loads(self._dashboard_workspace.read_text(meta_path))
+            except (OSError, ValueError, WorkspaceError):
+                meta = {}
             repo = meta.get("repo")
         added, total = self._merge_backlog(data, repo=repo, source_job=job_id)
         return 200, {
@@ -995,11 +1031,22 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             self.wfile.write(body)
 
         def _authorised(self) -> bool:
-            """Constant-time bearer check over the whole header value."""
+            """Constant-time bearer check over the whole header value.
+
+            Compares UTF-8 *bytes*, not str: headers decode as latin-1, so a
+            non-ASCII ``Authorization`` value is a valid str that
+            :func:`hmac.compare_digest` refuses (it raises on non-ASCII text).
+            The header is attacker-controlled and reached before auth, so a
+            stray byte must read as "no match", never crash the handler
+            (which would be a pre-auth 500/connection-reset DoS). Mirrors the
+            dashboard's ``_tokens_match``.
+            """
 
             expected = f"Bearer {dispatcher.token}"
             provided = self.headers.get("Authorization", "")
-            return hmac.compare_digest(provided, expected)
+            return hmac.compare_digest(
+                provided.encode("utf-8"), expected.encode("utf-8")
+            )
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             path = urlsplit(self.path).path
@@ -1134,9 +1181,25 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             self._json(404, {"error": "not found"})
 
         def _read_body(self) -> Optional[Dict[str, Any]]:
-            """The JSON object body, or ``None`` after answering the 400."""
+            """The JSON object body, or ``None`` after answering the 400.
 
-            length = int(self.headers.get("Content-Length") or 0)
+            Content-Length is attacker-controlled: a non-numeric value must
+            not crash int() (a 500), and an oversized/negative one must not
+            have us buffer an unbounded body. Mirror the dashboard's _login
+            guard. A missing/zero length stays valid — it means "empty body".
+            """
+
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._json(400, {"error": "malformed Content-Length"})
+                return None
+            if length > _MAX_BODY:
+                self._json(413, {"error": "request body too large"})
+                return None
+            if length < 0:
+                self._json(400, {"error": "malformed Content-Length"})
+                return None
             raw = self.rfile.read(length) if length > 0 else b""
             try:
                 body = json.loads(raw.decode("utf-8")) if raw else {}

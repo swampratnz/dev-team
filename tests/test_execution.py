@@ -35,6 +35,14 @@ def test_normalise_rejects_bad_paths(bad):
         _normalise(bad)
 
 
+def test_normalise_rejects_windows_style_escape():
+    # Splitting on backslash too means a Windows-style ``..\..\x`` decomposes
+    # into ``..`` segments and is rejected, not passed through as one opaque
+    # component that would escape the root.
+    with pytest.raises(WorkspaceError):
+        _normalise("..\\..\\x")
+
+
 # --- InMemoryWorkspace --------------------------------------------------
 
 
@@ -75,6 +83,13 @@ def test_local_workspace_missing_read_raises(tmp_path):
     ws = LocalWorkspace(str(tmp_path))
     with pytest.raises(WorkspaceError):
         ws.read_text("nope.py")
+
+
+def test_local_workspace_list_files_skips_excluded_dirs(tmp_path):
+    ws = LocalWorkspace(str(tmp_path))
+    ws.write_text("src/mod.py", "code")
+    ws.write_text(".git/config", "junk")  # a tooling-internal dir, never listed
+    assert ws.list_files() == ["src/mod.py"]
 
 
 # --- CommandResult ------------------------------------------------------
@@ -213,3 +228,99 @@ def test_dry_run_and_fake_runner_accept_env():
     fake.run(["x"], env={"A": "1"})
     fake.run(["y"])
     assert fake.envs == [{"A": "1"}, None]
+
+
+# --- secret env scrubbing (A2) ------------------------------------------
+
+
+def test_subprocess_scrubs_secret_env_keys_from_child(monkeypatch):
+    from dev_team.execution import SECRET_ENV_KEYS, SubprocessCommandRunner
+
+    secret = next(iter(SECRET_ENV_KEYS))
+    monkeypatch.setenv(secret, "top-secret")
+    runner = SubprocessCommandRunner()
+    code = f"import os; print(os.environ.get({secret!r}, 'ABSENT'))"
+    # env=None still runs against a *scrubbed* copy of the parent environment,
+    # so agent-authored gate/test code cannot read the credential.
+    result = runner.run([sys.executable, "-c", code])
+    assert result.ok
+    assert result.stdout.strip() == "ABSENT"
+
+
+def test_subprocess_explicitly_passed_secret_is_visible(monkeypatch):
+    from dev_team.execution import SECRET_ENV_KEYS, SubprocessCommandRunner
+
+    secret = next(iter(SECRET_ENV_KEYS))
+    monkeypatch.setenv(secret, "from-parent")
+    runner = SubprocessCommandRunner()
+    code = f"import os; print(os.environ.get({secret!r}, 'ABSENT'))"
+    # An explicit per-command value (e.g. a scoped git auth header) still wins
+    # over the scrub — the caller opted in deliberately.
+    result = runner.run([sys.executable, "-c", code], env={secret: "explicit"})
+    assert result.ok
+    assert result.stdout.strip() == "explicit"
+
+
+# --- symlink containment (A3) -------------------------------------------
+
+
+def test_local_workspace_refuses_symlink_escape(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret outside data")
+    ws = LocalWorkspace(str(root))
+    (root / "escape.txt").symlink_to(outside)
+    # a symlink whose real target is outside the root is refused for reads ...
+    with pytest.raises(WorkspaceError):
+        ws.read_text("escape.txt")
+    # ... and excluded from listing entirely
+    assert ws.list_files() == []
+
+
+# --- unique staging paths (A5) ------------------------------------------
+
+
+def test_local_workspace_uses_unique_staging_paths(tmp_path, monkeypatch):
+    import pathlib
+
+    ws = LocalWorkspace(str(tmp_path))
+    seen = []
+    real_replace = pathlib.Path.replace
+
+    def spy_replace(self, target):
+        seen.append(str(self))  # ``self`` is the staging file being renamed in
+        return real_replace(self, target)
+
+    monkeypatch.setattr(pathlib.Path, "replace", spy_replace)
+    ws.write_text("data.txt", "one")
+    ws.write_text("data.txt", "two")
+    assert len(seen) == 2
+    # a fixed staging name would collide here; concurrent writers must not
+    assert seen[0] != seen[1]
+    assert ws.read_text("data.txt") == "two"
+
+
+# --- capture truncation (A6) --------------------------------------------
+
+
+def test_truncate_caps_output_and_marks_elision(monkeypatch):
+    from dev_team import execution
+
+    monkeypatch.setattr(execution, "MAX_CAPTURE_CHARS", 10)
+    capped = execution._truncate("x" * 50)
+    assert capped.startswith("x" * 10)
+    assert "truncated 40 chars" in capped
+    # short output is returned verbatim
+    assert execution._truncate("short") == "short"
+
+
+def test_subprocess_truncates_captured_stdout(monkeypatch):
+    from dev_team import execution
+
+    monkeypatch.setattr(execution, "MAX_CAPTURE_CHARS", 20)
+    runner = execution.SubprocessCommandRunner()
+    result = runner.run([sys.executable, "-c", "print('y' * 1000)"])
+    assert result.ok
+    assert "truncated" in result.stdout
+    assert len(result.stdout) < 200

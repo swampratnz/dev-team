@@ -61,6 +61,24 @@ def test_parse_repo_rejects_junk():
             parse_repo(bad)
 
 
+def test_parse_repo_rejects_embedded_credentials():
+    # A URL carrying credentials would leak them into argv and .git/config,
+    # out of reach of the header-auth design and the scrubber; refuse it.
+    for bad in (
+        "https://user:pass@github.com/acme/thing.git",
+        "https://ghp_token@github.com/acme/thing.git",
+    ):
+        with pytest.raises(SourceError, match="embedded credentials"):
+            parse_repo(bad)
+
+
+def test_parse_repo_allows_ssh_scheme_transport_user():
+    # A bare ssh:// transport username (no password) is not a secret.
+    ref = parse_repo("ssh://git@github.com/acme/thing.git")
+    assert (ref.owner, ref.name) == ("acme", "thing")
+    assert ref.url == "ssh://git@github.com/acme/thing.git"
+
+
 # --- env file & token resolution ---------------------------------------------------
 
 
@@ -155,6 +173,26 @@ def test_clone_without_token_or_on_non_https_sends_no_header(tmp_path):
     assert runner.envs[1]["GIT_TERMINAL_PROMPT"] == "0"
 
 
+def test_clone_non_github_https_sends_no_header(tmp_path):
+    # A GitHub token must never be attached to some other host just because the
+    # transport is https — that would hand the credential to a third party.
+    runner = FakeCommandRunner()
+    other = RepoRef(
+        owner="group", name="thing", url="https://gitlab.example.com/group/thing.git"
+    )
+    clone_or_update(other, str(tmp_path / "g"), runner=runner, token="tok")
+    assert "GIT_CONFIG_KEY_0" not in runner.envs[0]
+    assert runner.envs[0]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_clone_attaches_header_for_github_api_and_www_hosts(tmp_path):
+    runner = FakeCommandRunner()
+    for i, host in enumerate(("api.github.com", "www.github.com", "GitHub.com")):
+        ref = RepoRef(owner="o", name="n", url=f"https://{host}/o/n.git")
+        clone_or_update(ref, str(tmp_path / f"h{i}"), runner=runner, token="tok")
+        assert runner.envs[i]["GIT_CONFIG_VALUE_0"] == _expected_header("tok")
+
+
 def test_clone_into_empty_existing_directory_is_fine(tmp_path):
     dest = tmp_path / "empty"
     dest.mkdir()
@@ -184,6 +222,25 @@ def test_clone_failure_scrubs_token_and_hints_on_404(tmp_path):
     message = str(excinfo.value)
     assert "404" in message or "cannot read" in message  # the private-repo hint
     assert "tok-123" not in message
+    assert "***" in message
+
+
+def test_clone_failure_scrubs_the_basic_auth_header_too(tmp_path):
+    # A verbose/GIT_TRACE line can echo the computed AUTHORIZATION header, not
+    # just the raw token; the base64 value must be redacted as well.
+    token = "tok-xyz"
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    runner = FakeCommandRunner()
+    runner.add_rule(
+        "git clone",
+        CommandResult(
+            ["git", "clone"], 128, "", f"trace: AUTHORIZATION: basic {basic}"
+        ),
+    )
+    with pytest.raises(SourceError) as excinfo:
+        clone_or_update(_REF, str(tmp_path / "c"), runner=runner, token=token)
+    message = str(excinfo.value)
+    assert basic not in message
     assert "***" in message
 
 

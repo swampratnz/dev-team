@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from helpers import run
 
@@ -103,3 +105,44 @@ def test_duplicate_task_ids_are_rejected():
 
     with pytest.raises(ValueError, match="duplicate task id"):
         run(schedule([_task("T1"), _task("T1")], worker))
+
+
+def test_fast_task_unblocks_dependent_without_waiting_for_slow_sibling():
+    # "slow" and "fast" launch together; "dep" depends only on "fast". A wave
+    # barrier would hold "dep" until "slow" also finished — and here "slow"
+    # blocks until "dep" runs, so a barrier would deadlock. The event-driven
+    # scheduler launches "dep" the instant "fast" finishes, so this completes.
+    dep_ran = asyncio.Event()
+
+    async def worker(task):
+        if task.id == "slow":
+            await dep_ran.wait()  # only clears once the dependent has run
+        elif task.id == "dep":
+            dep_ran.set()
+        return True
+
+    tasks = [_task("slow"), _task("fast"), _task("dep", ["fast"])]
+    results = run(
+        asyncio.wait_for(schedule(tasks, worker, max_concurrency=4), timeout=5.0)
+    )
+    assert all(r.status is ScheduleStatus.DONE for r in results)
+
+
+def test_respects_max_concurrency_bound():
+    # Five independent tasks with a bound of 2: never more than two run at once,
+    # and the launch loop exercises its capacity `break`.
+    active = 0
+    peak = 0
+
+    async def worker(task):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)  # yield so any waiting siblings could run
+        active -= 1
+        return True
+
+    tasks = [_task(f"T{i}") for i in range(5)]
+    results = run(schedule(tasks, worker, max_concurrency=2))
+    assert peak <= 2
+    assert all(r.status is ScheduleStatus.DONE for r in results)

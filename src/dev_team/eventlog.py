@@ -16,6 +16,7 @@ concurrent append) is skipped, never fatal.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Callable, Dict, List, Optional
 
@@ -44,6 +45,13 @@ class EventLog:
         self.run = run
         self.clock = clock
         self.path = path
+        # The delivery engine runs agents concurrently, so several threads can
+        # deliver an event at once. The journal is appended read-modify-write
+        # (Workspace has no append primitive), which is a lost-update race: two
+        # writers read the same file, each appends its line, and the second
+        # write clobbers the first's event. Serialise the whole RMW per log so
+        # concurrent deliveries cannot lose each other's events.
+        self._lock = threading.Lock()
 
     def __call__(self, event: AgentEvent) -> None:
         record = {
@@ -55,14 +63,15 @@ class EventLog:
             "detail": event.detail,
             "name": event.name,
         }
-        existing = ""
-        if self.workspace.exists(self.path):
-            existing = self.workspace.read_text(self.path)
-        lines = existing.splitlines()
-        lines.append(json.dumps(record))
-        if len(lines) > MAX_EVENTS:
-            lines = lines[-(MAX_EVENTS // 2):]
-        self.workspace.write_text(self.path, "\n".join(lines) + "\n")
+        with self._lock:
+            existing = ""
+            if self.workspace.exists(self.path):
+                existing = self.workspace.read_text(self.path)
+            lines = existing.splitlines()
+            lines.append(json.dumps(record))
+            if len(lines) > MAX_EVENTS:
+                lines = lines[-(MAX_EVENTS // 2):]
+            self.workspace.write_text(self.path, "\n".join(lines) + "\n")
 
 
 def read_events(

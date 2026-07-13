@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import http.client
 import json
 import threading
 import time
@@ -474,6 +475,61 @@ def test_make_backlog_without_dashboard_workspace_is_409():
     )
 
 
+# --- corrupt / traversal-shaped on-disk state answers cleanly, never 500 ------
+
+
+def test_list_job_findings_corrupt_assessment_is_404():
+    dash = InMemoryWorkspace()
+    dash.write_text("audit/assess-bad/assessment.json", "{not json")
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.list_job_findings("assess-bad") == (
+        404, {"error": "no assessment for that job"})
+
+
+def test_make_backlog_corrupt_assessment_is_404():
+    dash = InMemoryWorkspace()
+    dash.write_text("audit/assess-bad/assessment.json", "{not json")
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.make_backlog("assess-bad") == (
+        404, {"error": "no assessment for that job"})
+
+
+def test_make_backlog_traversal_job_id_is_404():
+    # A traversal-shaped id routes through _exists (fails closed) -> 404,
+    # instead of raising out of the workspace's path guard as a 500.
+    disp = Dispatcher(token="x", dashboard_workspace=InMemoryWorkspace())
+    assert disp.make_backlog("../escape") == (
+        404, {"error": "no assessment for that job"})
+
+
+def test_make_backlog_tolerates_corrupt_meta_and_falls_back():
+    from dev_team.backlog import BacklogStore
+
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-cm/assessment.json", json.dumps(_assessment_payload())
+    )
+    dash.write_text("audit/assess-cm/meta.json", "{not json")  # unreadable meta
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.make_backlog("assess-cm")
+    assert status == 200
+    assert payload["stories_added"] == 1
+    # a corrupt meta yields no repo -> the shared epic, not a per-repo one
+    assert BacklogStore(dash).load().epics[0].title == "Assessment remediation"
+
+
+def test_verifications_reader_skips_a_corrupt_line():
+    dash = _seeded_dash()
+    dash.write_text(
+        "audit/assess-old/verifications.jsonl",
+        '{"finding_id": "a"}\n{not json\n{"finding_id": "b"}\n',
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.verifications("assess-old")
+    assert status == 200
+    assert [e["finding_id"] for e in payload["verifications"]] == ["a", "b"]
+
+
 def test_worker_is_single_flight_and_ordered():
     order = []
     first_in = threading.Event()
@@ -582,6 +638,70 @@ def test_unauthorized_without_and_with_wrong_token():
             body={"mode": "assess", "repo": "a/b"},
         )
         assert (status, payload) == (401, {"error": "unauthorized"})
+
+
+def _raw_request(server, method, path, *, headers=None, body=None):
+    """One raw request via http.client — urllib mangles odd header bytes and
+    validates Content-Length, so it cannot exercise the malformed-header paths."""
+
+    host, port = server.httpd.server_address[:2]
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        res = conn.getresponse()
+        return res.status, res.read().decode()
+    finally:
+        conn.close()
+
+
+def test_non_ascii_bearer_is_a_clean_401():
+    # Headers decode latin-1, so a non-ASCII Authorization value is a valid str
+    # that hmac.compare_digest refuses on str — comparing bytes turns that into
+    # a clean 401 instead of an unhandled 500/connection reset (a pre-auth DoS).
+    with running(materialise=_mem_materialise) as server:
+        status, body = _raw_request(
+            server, "GET", "/jobs",
+            headers={"Authorization": "Bearer wrongÿ"},
+        )
+    assert status == 401
+    assert json.loads(body) == {"error": "unauthorized"}
+
+
+def test_create_rejects_non_numeric_content_length():
+    # A non-numeric Content-Length must not crash int() into a 500.
+    with running(materialise=_mem_materialise) as server:
+        status, body = _raw_request(
+            server, "POST", "/jobs",
+            headers={"Authorization": f"Bearer {TOKEN}",
+                     "Content-Length": "not-a-number"},
+        )
+    assert status == 400
+    assert json.loads(body) == {"error": "malformed Content-Length"}
+
+
+def test_create_rejects_negative_content_length():
+    # A negative length parses fine but would drive rfile.read(-1) to slurp the
+    # whole stream; it is rejected up front instead.
+    with running(materialise=_mem_materialise) as server:
+        status, body = _raw_request(
+            server, "POST", "/jobs",
+            headers={"Authorization": f"Bearer {TOKEN}", "Content-Length": "-1"},
+        )
+    assert status == 400
+    assert json.loads(body) == {"error": "malformed Content-Length"}
+
+
+def test_create_rejects_oversized_body():
+    # An oversized (or lying) Content-Length is rejected without buffering the
+    # body — no unbounded read.
+    with running(materialise=_mem_materialise) as server:
+        status, body = _raw_request(
+            server, "POST", "/jobs",
+            headers={"Authorization": f"Bearer {TOKEN}",
+                     "Content-Length": str((1 << 20) + 1)},
+        )
+    assert status == 413
+    assert json.loads(body) == {"error": "request body too large"}
 
 
 def test_submit_assess_flows_to_a_result():
@@ -1220,6 +1340,40 @@ def test_build_spec_verify_unresolvable_finding_is_404():
         )
     assert excinfo.value.status == 404
     assert str(excinfo.value) == "finding not found"
+
+
+def test_build_spec_verify_corrupt_assessment_is_404():
+    dash = InMemoryWorkspace()
+    dash.write_text("audit/assess-bad/assessment.json", "{not json")
+    dash.write_text(
+        "audit/assess-bad/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-bad"}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    with pytest.raises(SubmitRejected) as excinfo:
+        disp.build_spec(
+            {"mode": "verify", "source_job": "assess-bad", "finding_id": "x"}
+        )
+    assert excinfo.value.status == 404
+    assert str(excinfo.value) == "no assessment for that job"
+
+
+def test_build_spec_verify_corrupt_meta_is_404():
+    # assessment.json resolves the finding, but a corrupt meta.json (which
+    # names the repo to re-clone) is a broken mirror -> 404, not a 500.
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-cm/assessment.json", json.dumps(_assessment_payload())
+    )
+    dash.write_text("audit/assess-cm/meta.json", "{not json")
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    with pytest.raises(SubmitRejected) as excinfo:
+        disp.build_spec(
+            {"mode": "verify", "source_job": "assess-cm",
+             "finding_id": "recommendation.plan[0]"}
+        )
+    assert excinfo.value.status == 404
+    assert str(excinfo.value) == "no assessment for that job"
 
 
 def test_build_spec_verify_resolves_repo_and_finding_from_disk():

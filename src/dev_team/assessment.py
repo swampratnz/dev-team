@@ -7,19 +7,23 @@ and a classification with a sequenced remediation plan (product manager) —
 then the technical writer distils an executive summary and the findings are
 rendered into a single cited markdown report.
 
-Unlike delivery, assessment **never mutates the repository**: no branch, no
-baseline commit, no gates, no ``.dev_team/`` bookkeeping. Auditing roles get
-read-only tools (`Read`/`Grep`/`Glob`) rooted at the workspace so claims come
-from the actual files, and every phase's contract demands a file-path
-citation per claim — ambiguity is stated, not guessed away. The only writes
-are the audit's own outputs: the report (when a ``report_path`` is
-configured) and the persisted structured result at
-:data:`ASSESSMENT_JSON_PATH` (unless ``persist_result`` is off).
+Unlike delivery, assessment does no delivery-style mutation: no branch, no
+baseline commit, no gates. The auditing roles' *LLM tools*
+(`Read`/`Grep`/`Glob`) are read-only and rooted at the workspace, so claims
+come from the actual files and every phase's contract demands a file-path
+citation per claim — ambiguity is stated, not guessed away. The **engine
+itself**, however, does write into the workspace: the markdown report
+(``report_path``, default ``audit/assessment.md``) and its ``.dev_team/``
+bookkeeping — the structured result at :data:`ASSESSMENT_JSON_PATH` (unless
+``persist_result`` is off) and, when convention detection is saved,
+``.dev_team/conventions.json``. Against a :class:`~.execution.LocalWorkspace`
+those land in the repository on disk.
 
-One opt-in exception: :class:`AssessConfig.build_probe` executes the detected
-profile's setup/verify commands so buildability rests on real exit codes.
-That runs the repository's own build — arbitrary code, with a build's usual
-side effects on the working tree — which is why it is off by default.
+One opt-in setting goes further still: :class:`AssessConfig.build_probe`
+executes the detected profile's setup/verify commands so buildability rests
+on real exit codes. That runs the repository's own build — arbitrary code,
+with a build's usual side effects on the working tree — which is why it is
+off by default.
 """
 
 from __future__ import annotations
@@ -1700,23 +1704,30 @@ def render_report(outcome: AssessmentOutcome) -> str:
         lines += ["", "## Executive summary", "", outcome.executive_summary]
 
     rec = outcome.phases.get("recommendation")
-    if rec is not None and rec.data:
+    if rec is not None and (rec.data or not rec.ok):
         lines += ["", "## Recommendation", ""]
-        classification = rec.data.get("classification", "unclassified")
-        lines.append(f"**Classification: {classification}**")
-        rationale = rec.data.get("rationale")
-        if rationale:
-            lines.append(str(rationale))
-        highest = rec.data.get("highest_risk")
-        if highest:
-            lines += ["", f"**Highest-risk item blocking a first build:** {highest}"]
-        plan = _items(rec.data, "plan")
-        if plan:
-            lines += ["", "### Remediation plan", ""]
-            for i, step in enumerate(plan, 1):
-                effort = step.get("effort", "?")
-                detail = step.get("detail", "")
-                lines.append(f"{i}. {step.get('step', '(step)')} — *{effort}*. {detail}".rstrip())
+        if not rec.ok:
+            # A failed recommendation never produced a validated classification
+            # (outcome.classification is None here). Its unvalidated data must
+            # not be rendered as the verdict, so mirror the phase-section loop:
+            # state the failure instead of presenting a rejected classification.
+            lines.append(f"_Phase failed ({rec.role}): {rec.error}_")
+        else:
+            classification = rec.data.get("classification", "unclassified")
+            lines.append(f"**Classification: {classification}**")
+            rationale = rec.data.get("rationale")
+            if rationale:
+                lines.append(str(rationale))
+            highest = rec.data.get("highest_risk")
+            if highest:
+                lines += ["", f"**Highest-risk item blocking a first build:** {highest}"]
+            plan = _items(rec.data, "plan")
+            if plan:
+                lines += ["", "### Remediation plan", ""]
+                for i, step in enumerate(plan, 1):
+                    effort = step.get("effort", "?")
+                    detail = step.get("detail", "")
+                    lines.append(f"{i}. {step.get('step', '(step)')} — *{effort}*. {detail}".rstrip())
 
     sections = (
         ("inventory", "Phase 1 — Inventory"),

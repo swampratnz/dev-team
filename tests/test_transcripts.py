@@ -69,6 +69,46 @@ def test_record_assigns_a_per_role_sequence():
     assert f"{TRANSCRIPTS_DIR}/deliver-1/qa-001.json" in files
 
 
+def test_record_redacts_secret_shapes_before_writing():
+    # Recording is opt-in and the dashboard is unauthenticated by default, so a
+    # secret in the assessed repo (or echoed in a prompt/response) must never be
+    # persisted verbatim: planted tokens of each covered shape are redacted.
+    ws = InMemoryWorkspace()
+    rec = _recorder(ws)
+    fine_grained = "github_pat_11ABCDE0123456789_abcdefGHIJKLxyz"
+    rec.record(
+        role="engineer",
+        system_prompt="anthropic sk-ant-api03-DEADBEEFsecret and classic ghp_abc123DEF456",
+        prompt=f"clone with {fine_grained}\nAuthorization: Bearer supersecretbearer",
+        result=AgentResult(
+            text=(
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIsecretKEYbytes\n"
+                "-----END RSA PRIVATE KEY-----\naws key AKIAIOSFODNN7EXAMPLE"
+            )
+        ),
+    )
+    data = json.loads(ws.read_text(f"{TRANSCRIPTS_DIR}/deliver-1/engineer-001.json"))
+    blob = json.dumps(data)
+    for planted in (
+        fine_grained,
+        "sk-ant-api03-DEADBEEFsecret",
+        "ghp_abc123DEF456",
+        "supersecretbearer",
+        "AKIAIOSFODNN7EXAMPLE",
+        "MIIsecretKEYbytes",
+    ):
+        assert planted not in blob, planted
+    assert "[REDACTED]" in data["system_prompt"]
+    assert "[REDACTED]" in data["prompt"]
+    assert "[REDACTED]" in data["response"]
+    # the Authorization header keeps its name; only the credential is gone
+    assert "Authorization: Bearer [REDACTED]" in data["prompt"]
+    # a None field is left untouched by the redaction pass
+    rec.record(role="qa", system_prompt=None, prompt="ok", result=AgentResult(text="x"))
+    qa = json.loads(ws.read_text(f"{TRANSCRIPTS_DIR}/deliver-1/qa-001.json"))
+    assert qa["system_prompt"] is None
+
+
 def test_record_truncates_oversized_fields_and_keeps_none():
     ws = InMemoryWorkspace()
     rec = _recorder(ws, max_chars=10)

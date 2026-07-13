@@ -18,8 +18,66 @@ def test_parse_pytest_failures():
 
 
 def test_parse_go_and_cargo_failures():
+    # No package/crate marker: the bare name survives as a best-effort fallback.
     assert parse_failed_tests("--- FAIL: TestLogin (0.01s)") == frozenset({"TestLogin"})
     assert parse_failed_tests("test auth::login ... FAILED") == frozenset({"auth::login"})
+
+
+def test_go_failures_qualified_by_package():
+    output = (
+        "--- FAIL: TestSync (0.00s)\n"
+        "FAIL\n"
+        "FAIL\tgithub.com/org/alpha\t0.01s\n"
+        "--- FAIL: TestSync (0.00s)\n"
+        "FAIL\tgithub.com/org/beta\t0.02s\n"
+        "ok  \tgithub.com/org/gamma\t0.03s\n"
+    )
+    assert parse_failed_tests(output) == frozenset(
+        {"github.com/org/alpha::TestSync", "github.com/org/beta::TestSync"}
+    )
+
+
+def test_go_same_name_in_different_package_is_a_new_failure():
+    # The regression this fix prevents: a NEW failure named TestSync in package
+    # beta must not read as inherited from the baseline TestSync in package alpha.
+    baseline = parse_failed_tests(
+        "--- FAIL: TestSync (0.0s)\nFAIL\tgithub.com/org/alpha\t0.01s\n"
+    )
+    current = parse_failed_tests(
+        "--- FAIL: TestSync (0.0s)\nFAIL\tgithub.com/org/alpha\t0.01s\n"
+        "--- FAIL: TestSync (0.0s)\nFAIL\tgithub.com/org/beta\t0.02s\n"
+    )
+    assert new_failures(current, baseline) == frozenset({"github.com/org/beta::TestSync"})
+
+
+def test_go_package_summary_without_failures_yields_nothing():
+    # A package that failed to build emits a FAIL summary with no per-test
+    # "--- FAIL:" line, so there is no test identity to attribute.
+    assert parse_failed_tests("FAIL\tgithub.com/org/pkg [build failed]\n") is None
+
+
+def test_cargo_failures_qualified_by_crate():
+    output = (
+        "     Running unittests src/lib.rs (target/debug/deps/alpha-9f8e7d6c5b4a3210)\n"
+        "running 1 test\n"
+        "test auth::login ... FAILED\n"
+        "     Running unittests src/lib.rs (target/debug/deps/beta-0011223344556677)\n"
+        "running 1 test\n"
+        "test auth::login ... FAILED\n"
+    )
+    assert parse_failed_tests(output) == frozenset(
+        {"alpha::auth::login", "beta::auth::login"}
+    )
+
+
+def test_cargo_same_name_in_different_crate_is_a_new_failure():
+    banner = "     Running unittests src/lib.rs (target/debug/deps/{}-0011223344556677)\n"
+    baseline = parse_failed_tests(banner.format("alpha") + "test auth::login ... FAILED\n")
+    current = parse_failed_tests(
+        banner.format("alpha") + "test auth::login ... FAILED\n"
+        + banner.format("beta") + "test auth::login ... FAILED\n"
+    )
+    assert new_failures(current, baseline) == frozenset({"beta::auth::login"})
 
 
 def test_parse_unrecognised_output_returns_none():

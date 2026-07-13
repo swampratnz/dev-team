@@ -7,6 +7,7 @@ import json
 from dev_team.depscan import (
     Dependency,
     DependencyScan,
+    Vulnerability,
     _exact_version,
     _MAX_DEPENDENCIES,
     collect_dependencies,
@@ -189,6 +190,93 @@ def test_scan_handles_null_result_entries():
     scan = scan_dependencies(ws, fetch=lambda _p: {"results": [None]})
     assert scan.queried is True
     assert scan.vulnerabilities == []
+
+
+def test_collect_dependencies_drops_range_lowerbound_superseded_by_lockfile():
+    ws = InMemoryWorkspace(
+        {
+            "package.json": json.dumps({"dependencies": {"left-pad": "^1.3.0"}}),
+            "package-lock.json": json.dumps(
+                {"packages": {"node_modules/left-pad": {"version": "1.3.5"}}}
+            ),
+        }
+    )
+    deps = collect_dependencies(ws)
+    # Only the lockfile-resolved 1.3.5 survives; the ^1.3.0 floor (1.3.0) is
+    # dropped, so OSV is never asked about a version that is not installed and
+    # a CVE can't be attributed to it.
+    assert [(d.name, d.version, d.approximate) for d in deps] == [
+        ("left-pad", "1.3.5", False)
+    ]
+
+
+def test_collect_dependencies_keeps_unresolved_range_lowerbound():
+    # With no lockfile the ^ range's floor is all we have; keep it (flagged
+    # approximate) rather than dropping a scannable dependency entirely.
+    ws = InMemoryWorkspace(
+        {"package.json": json.dumps({"dependencies": {"left-pad": "^1.3.0"}})}
+    )
+    deps = collect_dependencies(ws)
+    assert [(d.name, d.version, d.approximate) for d in deps] == [
+        ("left-pad", "1.3.0", True)
+    ]
+
+
+def test_render_does_not_call_range_derived_entries_exact_pins():
+    scan = DependencyScan(
+        dependencies=[
+            Dependency("left-pad", "1.3.0", "npm", "package.json", approximate=True),
+            Dependency("requests", "2.31.0", "PyPI", "requirements.txt"),
+        ]
+    )
+    rendered = scan.render()
+    assert "exactly-pinned" not in rendered
+    assert "1 exactly pinned" in rendered
+    assert "1 from a version range" in rendered
+
+
+def test_render_annotates_range_derived_vulnerability():
+    dep = Dependency("left-pad", "1.3.0", "npm", "package.json", approximate=True)
+    scan = DependencyScan(
+        dependencies=[dep],
+        vulnerabilities=[Vulnerability("GHSA-range", dep)],
+        queried=True,
+    )
+    rendered = scan.render()
+    assert "left-pad >= 1.3.0" in rendered
+    assert "GHSA-range" in rendered
+
+
+def test_scan_skips_vuln_entries_without_id():
+    ws = InMemoryWorkspace({"requirements.txt": "requests==2.31.0"})
+
+    def fetch(_payload):
+        # a well-formed advisory alongside one missing its id
+        return {"results": [{"vulns": [{"id": "GHSA-real"}, {"aliases": ["x"]}]}]}
+
+    scan = scan_dependencies(ws, fetch=fetch)
+    assert scan.queried is True
+    assert [v.id for v in scan.vulnerabilities] == ["GHSA-real"]
+
+
+def test_scan_discards_partial_vulns_when_response_malformed():
+    ws = InMemoryWorkspace({"requirements.txt": "a==1.0\nb==2.0"})
+
+    def fetch(_payload):
+        # first dep parses fine, second dep's vulns entry is not a dict and
+        # raises while parsing — the partial "GHSA-a" must not survive.
+        return {
+            "results": [
+                {"vulns": [{"id": "GHSA-a"}]},
+                {"vulns": ["not-a-dict"]},
+            ]
+        }
+
+    scan = scan_dependencies(ws, fetch=fetch)
+    assert scan.queried is False
+    assert scan.vulnerabilities == []
+    assert scan.error is not None
+    assert "unavailable" in scan.render()
 
 
 def test_dependency_scan_render_without_query_or_error():

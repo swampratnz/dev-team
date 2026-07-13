@@ -3,8 +3,9 @@
 Models often wrap JSON in prose or Markdown code fences, and agentic
 transcripts frequently narrate (including prose fragments like ``[1]``)
 before the final answer. These helpers therefore prefer the LAST well-formed
-JSON object in the text, falling back to the last array; bare scalars never
-qualify.
+JSON object in the text, falling back to the FIRST array; bare scalars never
+qualify. The array fallback takes the first (not last) match so a real array
+answer cannot be clobbered by a trailing citation such as ``see [1]``.
 """
 
 from __future__ import annotations
@@ -57,15 +58,17 @@ def extract_json(text: str) -> Any:
 
     Scans for top-level balanced JSON values (skipping past each parsed value
     so nested objects are not considered on their own) and returns the last
-    parseable object, or — when no object is present — the last parseable
-    array.
+    parseable object, or — when no object is present — the FIRST parseable
+    array. Objects prefer the last match (the final answer follows any drafts);
+    arrays prefer the first so a trailing citation like ``see [1]`` cannot
+    clobber a real array answer that came before it.
 
     Raises:
         JSONExtractionError: If no valid JSON object or array is present.
     """
 
     last_object: Any = _MISSING
-    last_array: Any = _MISSING
+    first_array: Any = _MISSING
     index = 0
     while index < len(text):
         if text[index] in _OPENERS:
@@ -78,13 +81,15 @@ def extract_json(text: str) -> Any:
                 else:
                     if isinstance(value, dict):
                         last_object = value
-                    else:
-                        last_array = value
+                    elif first_array is _MISSING:
+                        # Keep only the first array; a later ``[1]`` citation
+                        # must not overwrite the real array answer.
+                        first_array = value
                     index = end
                     continue
         index += 1
     if last_object is not _MISSING:
         return last_object
-    if last_array is not _MISSING:
-        return last_array
+    if first_array is not _MISSING:
+        return first_array
     raise JSONExtractionError(text)

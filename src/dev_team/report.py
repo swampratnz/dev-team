@@ -35,6 +35,9 @@ def result_to_dict(result: ProjectResult) -> Dict[str, Any]:
             "constraints": list(result.request.constraints),
         },
         "success": result.success,
+        # The simulation makes real, paid agent calls; surface what it spent
+        # (metered into ProjectResult.cost_usd by the workflow's usage meter).
+        "cost_usd": result.cost_usd,
         "plan_summary": result.plan.summary,
         "design_overview": result.design.overview,
         "tech_stack": list(result.design.tech_stack),
@@ -59,6 +62,9 @@ def render_summary(result: ProjectResult) -> str:
     lines.append(f"Feature: {result.request.title}")
     verdict = "SUCCESS" if result.success else "INCOMPLETE"
     lines.append(f"Result:  {verdict}")
+    # The simulation runs real, paid agents — always report what it spent so
+    # the "simulation" label never reads as "free" (metered into cost_usd).
+    lines.append(f"Cost:    ${result.cost_usd:.4f}")
     lines.append("")
     lines.append(f"Plan: {result.plan.summary}")
     lines.append(f"Design: {result.design.overview}")

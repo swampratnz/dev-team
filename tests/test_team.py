@@ -44,6 +44,39 @@ def test_devteam_develop_feature_without_constraints():
     assert result.request.constraints == []
 
 
+def test_develop_feature_threads_budget_and_surfaces_cost():
+    from dev_team.budget import Budget
+    from dev_team.sdk import AgentResult
+    from dev_team.testing import json_response
+    from helpers import (
+        deploy_dict,
+        design_dict,
+        impl_dict,
+        plan_dict,
+        qa_report_dict,
+        review_dict,
+    )
+
+    def priced(payload, cost):
+        return AgentResult(text=json_response(payload), cost_usd=cost, num_turns=1)
+
+    budget = Budget(limit_usd=100.0)
+    responses = [
+        priced(plan_dict(1), 0.5),
+        priced(design_dict(), 0.5),
+        priced(impl_dict(), 0.5),
+        priced(review_dict(True), 0.5),
+        priced(qa_report_dict(True), 0.5),
+        priced(deploy_dict(), 0.5),
+    ]
+    team = DevTeam(ScriptedRunner(responses))
+    result = run(team.develop_feature("Login", "Add login", budget=budget))
+    assert result.success is True
+    assert result.cost_usd == 3.0
+    # The caller's own budget instance was the one metered end-to-end.
+    assert budget.spent == 3.0
+
+
 def test_devteam_defaults_to_claude_runner():
     team = DevTeam(config=TeamConfig(model="claude-x", working_dir="/srv"))
     assert isinstance(team.runner, ClaudeAgentRunner)

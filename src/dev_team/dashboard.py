@@ -241,6 +241,25 @@ _BACKLOG_PROXY_PREFIX = "/api/backlog/"
 _PROXY_TIMEOUT = 30.0
 
 
+def _session_cookie(value: str, *, secure: bool, max_age: Optional[int] = None) -> str:
+    """Build the ``Set-Cookie`` header for the session cookie.
+
+    Always ``HttpOnly`` (JS cannot read it) and ``SameSite=Strict`` (never sent
+    cross-site). ``secure`` adds the ``Secure`` attribute so the cookie is only
+    ever sent over TLS — it is opt-in because the default localhost/dev bind is
+    plain HTTP, where a Secure cookie would simply never be stored (breaking the
+    login flow). ``max_age=0`` expires it, which is how logout clears it.
+    """
+
+    parts = [f"{_COOKIE_NAME}={value}", "HttpOnly", "SameSite=Strict"]
+    if secure:
+        parts.append("Secure")
+    if max_age is not None:
+        parts.append(f"Max-Age={max_age}")
+    parts.append("Path=/")
+    return "; ".join(parts)
+
+
 def _tokens_match(provided: str, expected: str) -> bool:
     """Constant-time equality over the full values (as UTF-8 bytes).
 
@@ -257,6 +276,8 @@ def _make_handler(
     token: Optional[str] = None,
     dispatch_url: Optional[str] = None,
     dispatch_token: Optional[str] = None,
+    *,
+    secure: bool = False,
 ) -> type:
     """A request handler class bound to ``workspace``.
 
@@ -264,6 +285,10 @@ def _make_handler(
     the session cookie minted by ``POST /login``. ``None`` keeps every route
     open (the pre-auth localhost-dev behaviour). ``_authorised`` is the seam
     a later Auth0/IdP integration replaces.
+
+    ``secure`` marks the session cookie ``Secure`` (TLS-only); leave it off for
+    the plain-HTTP localhost default, turn it on when the dashboard is served
+    over HTTPS (see :class:`DashboardServer`).
 
     With BOTH ``dispatch_url`` and ``dispatch_token`` set, authorised writes
     under ``/api/backlog/`` are forwarded to the dispatch service's
@@ -346,16 +371,14 @@ def _make_handler(
             if not _tokens_match(submitted, token):
                 self._send(401, "text/html", LOGIN_FAILED_HTML)
                 return
-            self._redirect(
-                f"{_COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path=/"
-            )
+            self._redirect(_session_cookie(token, secure=secure))
 
         def _logout(self) -> None:
             """Drop the session cookie; ``/`` then shows the login form."""
 
-            self._redirect(
-                f"{_COOKIE_NAME}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/"
-            )
+            # Match the login cookie's attributes (incl. Secure) so the browser
+            # actually overwrites it rather than keeping a stale session.
+            self._redirect(_session_cookie("", secure=secure, max_age=0))
 
         def do_POST(self) -> None:  # noqa: N802 (http.server API)
             path = urlsplit(self.path).path
@@ -523,6 +546,12 @@ class DashboardServer:
     the module docstring. Pick a URL/cookie-safe token (e.g. from
     ``secrets.token_urlsafe``): the cookie value is the token verbatim.
 
+    ``secure`` marks the session cookie ``Secure`` (TLS-only). Leave it off for
+    the plain-HTTP localhost default (a Secure cookie is never stored over
+    HTTP, which would break the login flow); set it when the dashboard is
+    fronted by HTTPS/TLS so the session cookie cannot leak over a plain
+    connection.
+
     ``dispatch_url`` + ``dispatch_token`` (optional, both required together)
     enable the board's write path: authorised ``/api/backlog/*`` writes are
     proxied to that dispatch service's ``/backlog`` mutation API. Without
@@ -538,11 +567,12 @@ class DashboardServer:
         token: Optional[str] = None,
         dispatch_url: Optional[str] = None,
         dispatch_token: Optional[str] = None,
+        secure: bool = False,
     ) -> None:
         self.workspace = workspace
         self.httpd = ThreadingHTTPServer(
             (host, port),
-            _make_handler(workspace, token, dispatch_url, dispatch_token),
+            _make_handler(workspace, token, dispatch_url, dispatch_token, secure=secure),
         )
 
     @property

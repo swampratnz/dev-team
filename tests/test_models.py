@@ -73,6 +73,19 @@ def test_project_result_mixed_outcomes():
     assert len(result.failed_tasks) == 1
 
 
+def test_project_result_cost_defaults_to_zero_and_is_settable():
+    # Additive, backward-compatible: results built the old way still work.
+    assert _project([]).cost_usd == 0.0
+    priced = ProjectResult(
+        request=FeatureRequest(title="t", description="d"),
+        plan=Plan(summary="p"),
+        design=Design(overview="o"),
+        task_results=[],
+        cost_usd=4.25,
+    )
+    assert priced.cost_usd == 4.25
+
+
 def test_security_report_blocking_findings():
     from dev_team.models import SecurityFinding, SecurityReport, Severity
 

@@ -81,12 +81,31 @@ def test_result_to_dict_without_review_or_deployment():
     assert data["deployment"] is None
 
 
+def test_result_to_dict_includes_cost_usd():
+    result = _full_result()
+    result.cost_usd = 0.5  # metered agent spend for the simulation run
+    data = result_to_dict(result)
+    assert data["cost_usd"] == 0.5
+
+
+def test_result_to_dict_cost_usd_defaults_to_zero():
+    # A run that recorded nothing still carries the field (default 0.0).
+    assert result_to_dict(_full_result())["cost_usd"] == 0.0
+
+
 def test_render_summary_full():
     text = render_summary(_full_result())
     assert "SUCCESS" in text
     assert "Stack: python" in text
     assert "✓ T1 Build" in text
     assert "Deployment (production)" in text
+
+
+def test_render_summary_shows_cost():
+    result = _full_result()
+    result.cost_usd = 0.25
+    text = render_summary(result)
+    assert "Cost:    $0.2500" in text
 
 
 def test_render_summary_empty_and_incomplete():

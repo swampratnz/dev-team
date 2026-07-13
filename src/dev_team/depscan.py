@@ -38,12 +38,20 @@ Fetch = Callable[[Dict], Dict]
 
 @dataclass(frozen=True)
 class Dependency:
-    """One exactly-pinned dependency found in a manifest."""
+    """One dependency found in a manifest or lockfile.
+
+    ``approximate`` marks a version that was *derived* from a caret/tilde range
+    (see :func:`_exact_version`) rather than pinned exactly: it is the range's
+    lower bound, a floor, not necessarily the version actually installed. A
+    lockfile pin for the same package supersedes it (:func:`collect_dependencies`),
+    and :meth:`DependencyScan.render` never presents it as an exact pin.
+    """
 
     name: str
     version: str
     ecosystem: str
     manifest: str
+    approximate: bool = False
 
 
 @dataclass
@@ -73,10 +81,23 @@ class DependencyScan:
 
         if not self.dependencies:
             return ""
-        lines = [
-            f"Dependency scan: {len(self.dependencies)} exactly-pinned "
-            "dependencies parsed from manifests and lockfiles."
-        ]
+        count = len(self.dependencies)
+        approximate = sum(1 for dep in self.dependencies if dep.approximate)
+        if approximate:
+            # A range-derived entry is a lower bound, not the installed
+            # version; never let the summary pass it off as an exact pin.
+            summary = (
+                f"Dependency scan: {count} dependencies parsed from manifests "
+                f"and lockfiles ({count - approximate} exactly pinned, "
+                f"{approximate} from a version range — lower bound only, not "
+                "necessarily the installed version)."
+            )
+        else:
+            summary = (
+                f"Dependency scan: {count} exactly-pinned dependencies parsed "
+                "from manifests and lockfiles."
+            )
+        lines = [summary]
         if self.queried:
             lines.append(
                 f"Live OSV.dev scan: {len(self.vulnerabilities)} known "
@@ -84,8 +105,11 @@ class DependencyScan:
             )
             for vuln in self.vulnerabilities:
                 dep = vuln.dependency
+                # ">= x" flags a lower-bound query so the reader knows OSV was
+                # asked about the range floor, not a confirmed installed pin.
+                version = f">= {dep.version}" if dep.approximate else dep.version
                 lines.append(
-                    f"- {dep.name} {dep.version} ({dep.ecosystem}, {dep.manifest}): "
+                    f"- {dep.name} {version} ({dep.ecosystem}, {dep.manifest}): "
                     f"{vuln.id} — {vuln.url}"
                 )
         else:
@@ -131,6 +155,18 @@ def _exact_version(spec: str) -> Optional[str]:
     return None
 
 
+def _is_range_spec(spec: str) -> bool:
+    """Whether ``spec`` is a caret/tilde range rather than an exact pin.
+
+    :func:`_exact_version` reduces ``^1.2.3``/``~1.2`` to their lower bound so
+    the package stays scannable, but that lower bound is only a floor — the
+    resolved (lockfile) version is what is actually installed. Flagging these
+    lets a concrete pin supersede them and keeps the rendering honest.
+    """
+
+    return spec.strip()[:1] in ("^", "~")
+
+
 def parse_packages_config(text: str, manifest: str) -> List[Dependency]:
     """NuGet ``packages.config``: ``<package id=... version=... />`` entries."""
 
@@ -165,7 +201,12 @@ def parse_package_json(text: str, manifest: str) -> List[Dependency]:
         for name, spec in sorted(entries.items()):
             version = _exact_version(str(spec))
             if version is not None:
-                deps.append(Dependency(name, version, "npm", manifest))
+                deps.append(
+                    Dependency(
+                        name, version, "npm", manifest,
+                        approximate=_is_range_spec(str(spec)),
+                    )
+                )
     return deps
 
 
@@ -203,7 +244,12 @@ def parse_cargo_toml(text: str, manifest: str) -> List[Dependency]:
             )
             version = _exact_version(str(raw)) if raw else None
             if version is not None:
-                deps.append(Dependency(name, version, "crates.io", manifest))
+                deps.append(
+                    Dependency(
+                        name, version, "crates.io", manifest,
+                        approximate=_is_range_spec(str(raw)),
+                    )
+                )
     return deps
 
 
@@ -341,7 +387,15 @@ _PARSERS = {
 
 
 def collect_dependencies(workspace: Workspace) -> List[Dependency]:
-    """Parse every recognised manifest and lockfile, deduplicated."""
+    """Parse every recognised manifest and lockfile, deduplicated.
+
+    A caret/tilde range in a manifest yields only an approximate lower bound
+    (see :func:`_exact_version`); when a lockfile — or any exact pin — resolves
+    the same ``(ecosystem, name)`` to a concrete version, that lower-bound
+    entry is dropped. Otherwise dedup on ``(ecosystem, name, version)`` would
+    keep both the floor and the resolved version, and OSV would be queried
+    about — and a CVE attributed to — a version that is not installed.
+    """
 
     seen = set()
     deps: List[Dependency] = []
@@ -359,7 +413,15 @@ def collect_dependencies(workspace: Workspace) -> List[Dependency]:
                 continue
             seen.add(key)
             deps.append(dep)
-    return deps
+    # An exact pin for an (ecosystem, name) supersedes any approximate,
+    # range-derived lower bound for the same package: keep only the version
+    # actually resolved so it can never be double-counted.
+    pinned = {(dep.ecosystem, dep.name) for dep in deps if not dep.approximate}
+    return [
+        dep
+        for dep in deps
+        if not (dep.approximate and (dep.ecosystem, dep.name) in pinned)
+    ]
 
 
 def _http_fetch(payload: Dict) -> Dict:
@@ -412,11 +474,21 @@ def scan_dependencies(
             raise ValueError(
                 f"OSV returned {len(results)} results for {len(queryable)} queries"
             )
+        # Accumulate locally: a half-parsed response must never leave partial
+        # vulnerabilities on the scan while queried stays False — that state
+        # renders as "scan unavailable" yet still emits the records to
+        # to_dict()/dict_to_backlog. Nothing is published until the whole
+        # response parses cleanly below.
+        found: List[Vulnerability] = []
         for dep, result in zip(queryable, results):
             for vuln in (result or {}).get("vulns") or []:
-                scan.vulnerabilities.append(Vulnerability(str(vuln["id"]), dep))
+                vuln_id = vuln.get("id")
+                if not vuln_id:
+                    continue  # advisory with no id is unciteable; skip it
+                found.append(Vulnerability(str(vuln_id), dep))
     except Exception as exc:  # network, JSON shape, key errors: degrade, never raise
         scan.error = f"{type(exc).__name__}: {exc}"
         return scan
+    scan.vulnerabilities = found
     scan.queried = True
     return scan

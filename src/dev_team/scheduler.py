@@ -69,7 +69,6 @@ async def schedule(
     }
 
     status: Dict[str, ScheduleStatus] = {}
-    semaphore = asyncio.Semaphore(max_concurrency)
 
     def resolve(task_id: str, outcome: ScheduleStatus, error: Optional[str] = None) -> None:
         status[task_id] = outcome
@@ -81,38 +80,57 @@ async def schedule(
         # instead of unwinding the whole run and losing every result.
         error: Optional[str] = None
         try:
-            async with semaphore:
-                ok = await worker(task)
+            ok = await worker(task)
         except Exception as exc:  # noqa: BLE001 - contain per-task failures
             ok = False
             error = f"{type(exc).__name__}: {exc}"
         resolve(task.id, ScheduleStatus.DONE if ok else ScheduleStatus.FAILED, error)
 
-    while len(status) < len(tasks):
-        pending = [t for t in tasks if t.id not in status]
+    # Tasks whose asyncio task has been launched (running or finished). A wave
+    # barrier (gather over a whole ready set) would pin every newly-unblocked
+    # task behind the *slowest* task in its wave; instead we launch each ready
+    # task as capacity frees up and re-scan the moment any in-flight task
+    # finishes, so a fast task's dependents start without waiting for a slow
+    # sibling. ``max_concurrency`` is enforced by never launching past the
+    # bound; result ordering, cascade-skip, and cycle detection are unchanged.
+    started: set[str] = set()
+    in_flight: set["asyncio.Task[None]"] = set()
 
-        # Cascade-skip any task that depends on a failed/skipped task.
-        blocked = [
-            t
-            for t in pending
+    while len(status) < len(tasks):
+        # Cascade-skip any not-yet-launched task depending on a failed/skipped
+        # one. Doing this first can retire the last tasks without launching.
+        newly_skipped = False
+        for t in tasks:
+            if t.id in status or t.id in started:
+                continue
             if any(
                 status.get(d) in (ScheduleStatus.FAILED, ScheduleStatus.SKIPPED)
                 for d in deps[t.id]
-            )
-        ]
-        if blocked:
-            for task in blocked:
-                resolve(task.id, ScheduleStatus.SKIPPED)
+            ):
+                resolve(t.id, ScheduleStatus.SKIPPED)
+                newly_skipped = True
+        if newly_skipped:
             continue
 
-        ready = [
-            t
-            for t in pending
-            if all(status.get(d) is ScheduleStatus.DONE for d in deps[t.id])
-        ]
-        if not ready:
-            raise DependencyCycleError([t.id for t in pending])
+        # Launch every dependency-satisfied task we still have capacity for.
+        for t in tasks:
+            if len(in_flight) >= max_concurrency:
+                break
+            if t.id in status or t.id in started:
+                continue
+            if all(status.get(d) is ScheduleStatus.DONE for d in deps[t.id]):
+                in_flight.add(asyncio.ensure_future(run_one(t)))
+                started.add(t.id)
 
-        await asyncio.gather(*(run_one(task) for task in ready))
+        if not in_flight:
+            # Nothing running and nothing launchable, yet tasks remain: the
+            # rest depend on each other and can never become ready.
+            raise DependencyCycleError(
+                [t.id for t in tasks if t.id not in status and t.id not in started]
+            )
+
+        _, in_flight = await asyncio.wait(
+            in_flight, return_when=asyncio.FIRST_COMPLETED
+        )
 
     return [ScheduledResult(t.id, status[t.id]) for t in tasks]

@@ -28,6 +28,7 @@ Where :class:`~dev_team.workflow.DevelopmentWorkflow` *simulates* a run, the
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -48,7 +49,7 @@ from .budget import Budget, BudgetExceededError
 from .changes import ChangeApplier
 from .context import build_repo_context
 from .conventions import ConventionsStore
-from .errors import DevTeamError
+from .errors import DependencyCycleError, DevTeamError
 from .events import AgentEvent, Listener, emit
 from .failures import new_failures, parse_failed_tests
 from .execution import (
@@ -244,7 +245,10 @@ class DeliveryOutcome:
 
         if not self.tasks_complete:
             return False
-        if self.security is not None and not self.security.approved:
+        # Fail closed: a missing security verdict (the security stage died)
+        # means nothing was vetted or committed, so it can never count as a
+        # success — the same treatment a block gets at commit time.
+        if self.security is None or not self.security.approved:
             return False
         if self.reliability is not None and not self.reliability.production_ready:
             return False
@@ -336,7 +340,36 @@ __pycache__/
 node_modules/
 .venv/
 venv/
+.env
+*.env
 """
+
+# Paths the engine must keep out of every delivery's git history: its own
+# bookkeeping (rollbacks `git clean` it) and local credential files (an
+# untracked .env otherwise gets swept into the allow_dirty_baseline commit).
+_REQUIRED_IGNORES = (".dev_team/", ".env")
+
+
+def _gitignore_ignores(existing: str, entry: str) -> bool:
+    """Whether ``entry`` is already ignored by a real line in ``existing``.
+
+    Scans non-comment, non-blank lines and treats each as an exact match or a
+    glob (via :mod:`fnmatch`) against ``entry`` — and against ``entry`` without
+    a trailing slash, so ``.dev_team`` covers ``.dev_team/`` and ``*.env``
+    covers ``.env``. Unlike a substring scan it never mistakes a comment or an
+    unrelated path for a genuine ignore.
+    """
+
+    targets = {entry, entry.rstrip("/")}
+    for raw in existing.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        pattern = line.rstrip("/")
+        for target in targets:
+            if pattern == target or fnmatch.fnmatch(target, pattern):
+                return True
+    return False
 
 
 def _branch_slug(title: str) -> str:
@@ -736,12 +769,24 @@ class DeliveryEngine:
             results[task.id] = outcome
             return outcome.succeeded
 
-        await schedule(
-            pending,
-            worker,
-            max_concurrency=self.config.max_concurrency,
-            listener=self._on_scheduled,
-        )
+        try:
+            await schedule(
+                pending,
+                worker,
+                max_concurrency=self.config.max_concurrency,
+                listener=self._on_scheduled,
+            )
+        except DependencyCycleError as exc:
+            # lint_plan catches cycles pre-flight, but a plan can still slip
+            # through (a revision that stays cyclic, or a resumed checkpoint).
+            # A cycle must not unwind deliver() and lose the outcome, trace,
+            # and checkpoint: mark the un-run tasks FAILED (handled by the
+            # task_results loop below), record it, and finish gracefully.
+            self._event(
+                "cycle",
+                "Plan has a dependency cycle; remaining tasks cannot run",
+                detail=str(exc),
+            )
 
         task_results: List[TaskResult] = []
         for task in plan.tasks:
@@ -838,11 +883,13 @@ class DeliveryEngine:
         return None
 
     def _ensure_gitignore(self) -> None:
-        """Make sure ``.dev_team/`` is ignored, whoever authored .gitignore.
+        """Make sure ``.dev_team/`` and ``.env`` are ignored, whoever authored it.
 
         Rollbacks run ``git clean -fd``; if the bookkeeping directory is not
         ignored, every rollback deletes the checkpoint and memory files
         mid-run, and the leftovers read as a dirty tree on the next run.
+        Ignoring ``.env`` keeps a stray local secret file out of the baseline
+        commit (this runs before the allow_dirty_baseline ``add_all()``).
         """
 
         if not self.config.write_gitignore:
@@ -851,11 +898,17 @@ class DeliveryEngine:
             self.workspace.write_text(".gitignore", _DEFAULT_GITIGNORE)
             return
         existing = self.workspace.read_text(".gitignore")
-        if ".dev_team" not in existing:
+        # A substring scan ('.dev_team' in existing) is fragile: it matches a
+        # comment or an unrelated path and misses nothing being genuinely
+        # ignored. Check real ignore lines instead.
+        missing = [e for e in _REQUIRED_IGNORES if not _gitignore_ignores(existing, e)]
+        if missing:
             separator = "" if existing.endswith("\n") else "\n"
+            added = "".join(f"{entry}\n" for entry in missing)
             self.workspace.write_text(
                 ".gitignore",
-                f"{existing}{separator}# dev-team internal bookkeeping\n.dev_team/\n",
+                f"{existing}{separator}# dev-team: internal bookkeeping and local secrets\n"
+                f"{added}",
             )
 
     def _resolve_gates(self) -> None:

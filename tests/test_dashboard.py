@@ -644,6 +644,49 @@ def test_logout_clears_the_cookie(token_server):
     assert "Max-Age=0" in cookie
 
 
+def test_login_cookie_is_not_secure_by_default(token_server):
+    # Default bind is plain-HTTP localhost, where a Secure cookie would never
+    # be stored — so back-compat means no Secure attribute unless opted in.
+    status, headers, _ = _request(
+        token_server, "POST", "/login", body=f"token={TOKEN}", headers=FORM
+    )
+    assert status == 303
+    assert "Secure" not in headers["Set-Cookie"]
+
+
+def test_login_cookie_is_secure_when_tls_enabled():
+    # Opt-in Secure path: when the dashboard is fronted by TLS, the session
+    # cookie is marked Secure (never sent over a plain connection) while
+    # keeping HttpOnly and SameSite=Strict. Logout matches the attributes so
+    # the browser actually overwrites it.
+    ws = InMemoryWorkspace()
+    _journal(ws, AgentEvent("engineer", "implement", "building"))
+    srv = DashboardServer(ws, port=0, token=TOKEN, secure=True)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, headers, _ = _request(
+            srv, "POST", "/login", body=f"token={TOKEN}", headers=FORM
+        )
+        assert status == 303
+        cookie = headers["Set-Cookie"]
+        assert f"devteam_dash={TOKEN}" in cookie
+        assert "Secure" in cookie
+        assert "HttpOnly" in cookie
+        assert "SameSite=Strict" in cookie
+        assert "Path=/" in cookie
+        status, headers, _ = _request(
+            srv, "POST", "/logout", headers={"Cookie": f"devteam_dash={TOKEN}"}
+        )
+        assert status == 303
+        logout_cookie = headers["Set-Cookie"]
+        assert "Secure" in logout_cookie
+        assert "Max-Age=0" in logout_cookie
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
+
+
 def test_post_routing_respects_auth(token_server):
     # unknown POSTs are gated exactly like GETs ...
     status, _, body = _request(token_server, "POST", "/api/state")

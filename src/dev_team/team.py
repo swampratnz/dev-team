@@ -13,9 +13,11 @@ from .agents import (
     ReviewerAgent,
 )
 from .assessment import AssessmentEngine, AssessmentOutcome
+from .budget import Budget
 from .config import TeamConfig
 from .engine import DeliveryEngine, DeliveryOutcome
 from .events import Listener
+from .instrument import InstrumentedRunner
 from .interaction import InteractionChannel
 from .models import FeatureRequest, ProjectResult
 from .persona import Roster
@@ -30,16 +32,30 @@ def build_workflow(
     listener: Optional[Listener] = None,
     roster: Optional[Roster] = None,
     interaction: Optional[InteractionChannel] = None,
+    budget: Optional[Budget] = None,
 ) -> DevelopmentWorkflow:
-    """Construct a :class:`DevelopmentWorkflow` with the full agent roster."""
+    """Construct a :class:`DevelopmentWorkflow` with the full agent roster.
+
+    Every agent's runner is wrapped in an
+    :class:`~dev_team.instrument.InstrumentedRunner` bound to ``budget`` so the
+    simulation meters cost (and enforces a ceiling) the same way the delivery
+    engine does. ``budget`` defaults to a fresh, uncapped :class:`Budget` — it
+    still accumulates cost for ``ProjectResult.cost_usd`` but never stops the
+    run — and is shared with the returned workflow so both sides see the same
+    meter.
+    """
 
     config = config or TeamConfig()
     model = config.model
     cast = roster if roster is not None else Roster.default()
+    budget = budget if budget is not None else Budget()
 
     def make(agent_cls):
+        # Meter at the runner seam so the agents stay oblivious to budgeting,
+        # exactly as DeliveryEngine wires its own agents.
+        metered = InstrumentedRunner(runner, agent_cls.role, budget=budget)
         return agent_cls(
-            runner,
+            metered,
             model=model,
             listener=listener,
             persona=cast.get(agent_cls.role),
@@ -55,6 +71,7 @@ def build_workflow(
         config=config,
         listener=listener,
         interaction=interaction,
+        budget=budget,
     )
 
 
@@ -86,24 +103,43 @@ class DevTeam:
             cwd=self.config.working_dir,
             max_turns=self.config.max_turns,
         )
-        self.workflow = build_workflow(
+
+    def _build_workflow(self, budget: Optional[Budget]) -> DevelopmentWorkflow:
+        """Build a workflow for a single run, bound to ``budget``.
+
+        A fresh workflow per run gives each run its own meter (an uncapped one
+        when no ``budget`` is supplied), so cost never bleeds across runs.
+        """
+
+        return build_workflow(
             self.runner,
             config=self.config,
-            listener=listener,
+            listener=self.listener,
             roster=self.roster,
-            interaction=interaction,
+            interaction=self.interaction,
+            budget=budget,
         )
 
-    async def develop(self, request: FeatureRequest) -> ProjectResult:
-        """Run the full development lifecycle for ``request``."""
+    async def develop(
+        self, request: FeatureRequest, *, budget: Optional[Budget] = None
+    ) -> ProjectResult:
+        """Run the full development lifecycle for ``request``.
 
-        return await self.workflow.run(request)
+        An optional ``budget`` meters agent cost and caps the run: the
+        simulation stops at the ceiling gracefully rather than crashing (see
+        :meth:`DevelopmentWorkflow.run`). Its spend is surfaced on the
+        returned :attr:`ProjectResult.cost_usd`.
+        """
+
+        return await self._build_workflow(budget).run(request)
 
     async def develop_feature(
         self,
         title: str,
         description: str,
         constraints: Optional[List[str]] = None,
+        *,
+        budget: Optional[Budget] = None,
     ) -> ProjectResult:
         """Convenience wrapper building a :class:`FeatureRequest` inline."""
 
@@ -112,7 +148,7 @@ class DevTeam:
             description=description,
             constraints=list(constraints) if constraints else [],
         )
-        return await self.develop(request)
+        return await self.develop(request, budget=budget)
 
     def make_engine(self, **kwargs) -> DeliveryEngine:
         """Build a :class:`DeliveryEngine` for real, gated, side-effecting runs.

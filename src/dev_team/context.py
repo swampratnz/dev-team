@@ -94,7 +94,14 @@ def build_repo_context(
     heads: Dict[str, str] = {}
     for name in _MANIFESTS:
         if name in files:
-            content = workspace.read_text(name)
+            try:
+                content = workspace.read_text(name)
+            except (UnicodeDecodeError, OSError, ValueError):
+                # A non-UTF-8 or otherwise unreadable manifest must not unwind
+                # the whole read-only assess() run over one bad file; skip it,
+                # matching the guarded readers in assessment.inventory_stats
+                # and depscan.
+                continue
             head = content[:manifest_head_chars]
             if len(head) < len(content):
                 head += "\n... (truncated)"

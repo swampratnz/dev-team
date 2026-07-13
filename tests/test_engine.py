@@ -930,15 +930,59 @@ def test_agentic_keeps_existing_gitignore(tmp_path):
     # the user's entries are kept; the engine appends its bookkeeping ignore
     assert content.startswith("custom\n")
     assert ".dev_team/" in content
+    # and ensures local secrets never get swept into the baseline commit
+    assert ".env" in content
+
+
+def test_default_gitignore_covers_bookkeeping_and_secrets():
+    ws = InMemoryWorkspace()
+    engine = _engine(ScriptedRunner([]), workspace=ws)
+    engine._ensure_gitignore()
+    content = ws.read_text(".gitignore")
+    assert ".dev_team/" in content
+    assert ".env" in content
+    assert "*.env" in content
+
+
+def test_ensure_gitignore_uses_line_based_membership():
+    ws = InMemoryWorkspace()
+    # '.dev_team' appears only in a comment and an unrelated path (a substring
+    # scan would wrongly think it is ignored); '*.env' genuinely globs '.env'.
+    ws.write_text(
+        ".gitignore",
+        "# keep .dev_team notes tidy\n\nlogs/app.dev_team.log\n*.env\n",
+    )
+    engine = _engine(ScriptedRunner([]), workspace=ws)
+    engine._ensure_gitignore()
+    content = ws.read_text(".gitignore")
+    # a real ignore line is appended for .dev_team/...
+    assert "\n.dev_team/\n" in content
+    # ...but '.env' is not duplicated, since '*.env' already covers it
+    assert [ln.strip() for ln in content.splitlines()].count(".env") == 0
+
+
+def test_ensure_gitignore_adds_missing_env_only():
+    ws = InMemoryWorkspace()
+    ws.write_text(".gitignore", ".dev_team/\n")
+    engine = _engine(ScriptedRunner([]), workspace=ws)
+    engine._ensure_gitignore()
+    content = ws.read_text(".gitignore")
+    # .dev_team/ already ignored (not re-added), .env was missing and is added
+    assert content.count(".dev_team/") == 1
+    assert ".env" in content
 
 
 def test_agentic_unreported_changes_are_reviewed(tmp_path):
     ws = LocalWorkspace(str(tmp_path))
     cmd = FakeCommandRunner()
-    # git reports an extra file the engineer never mentioned, plus internal noise
+    # git reports an extra file the engineer never mentioned, plus internal noise.
+    # status -z is NUL-separated (each record NUL-terminated), so the fake emits
+    # that shape rather than newline-delimited lines.
     cmd.add_rule(
-        "status --porcelain -uall",
-        CommandResult(["git"], 0, "M  src/x.py\n?? src/sneaky.py\n?? .dev_team/checkpoint.json", ""),
+        "status --porcelain -uall -z",
+        CommandResult(
+            ["git"], 0, "M  src/x.py\x00?? src/sneaky.py\x00?? .dev_team/checkpoint.json\x00", ""
+        ),
     )
     cmd.add_rule("diff HEAD", CommandResult(["git"], 0, "+++ the-diff-body", ""))
     mapping = engine_responses()
@@ -1748,6 +1792,34 @@ def test_specialist_failure_degrades_gracefully():
     assert outcome.tasks_complete is True
     assert outcome.security is None  # no verdict...
     assert outcome.committed is False  # ...fails closed at commit time
+    # a run with nothing vetted is never a success, however green the tasks
+    assert outcome.success is False
+
+
+def test_deliver_cyclic_plan_halts_gracefully():
+    # A plan whose tasks form a cycle stays cyclic through the lint-revision
+    # pass, reaches the scheduler, and raises DependencyCycleError. deliver()
+    # must catch it: mark the un-run tasks FAILED and return a full outcome
+    # (trace, cost, specialists) rather than unwind and lose everything.
+    cyclic = {
+        "summary": "cyclic",
+        "tasks": [
+            {"id": "A", "title": "a", "description": "", "acceptance_criteria": ["x"],
+             "dependencies": ["B"]},
+            {"id": "B", "title": "b", "description": "", "acceptance_criteria": ["y"],
+             "dependencies": ["A"]},
+        ],
+    }
+    mapping = engine_responses()
+    mapping["product manager"] = json_response(cyclic)
+    runner = ScriptedRunner(by_system_prompt=mapping)
+    engine = _engine(runner)
+    outcome = run(engine.deliver(_request()))  # does not raise
+    assert outcome.success is False
+    assert outcome.tasks_complete is False
+    assert len(outcome.task_results) == 2
+    assert all(tr.task.status is TaskStatus.FAILED for tr in outcome.task_results)
+    assert outcome.committed is False
 
 
 def test_backlog_reuses_epic_and_stories_across_runs():
