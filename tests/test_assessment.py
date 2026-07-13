@@ -19,8 +19,11 @@ from dev_team.assessment import (
     ProbeCommandResult,
     _components_block,
     _effort_points,
+    _looks_like_bare_path,
     _mentions,
+    _strip_locator,
     audit_blind_spots,
+    broken_citations,
     detect_components,
     dict_to_backlog,
     inventory_stats,
@@ -1587,6 +1590,125 @@ def test_root_level_report_path_ignores_nothing():
     outcome = run(engine.assess())
     # with the report at the root, the leftover audit/ dir is a real blind spot
     assert outcome.blind_spots == ["audit"]
+
+
+# --- broken citations --------------------------------------------------------------
+
+
+def test_looks_like_bare_path_flags_real_paths():
+    assert _looks_like_bare_path("Web.config") is True
+    assert _looks_like_bare_path("src/app.py") is True
+    assert _looks_like_bare_path("package.json") is True
+
+
+def test_looks_like_bare_path_rejects_ambiguous_strings():
+    assert _looks_like_bare_path("Web.config, see connection string") is False
+    assert _looks_like_bare_path("looked at the auth module") is False
+    assert _looks_like_bare_path("http://example.com/foo.js") is False
+    assert _looks_like_bare_path("") is False
+
+
+def test_strip_locator_removes_trailing_line_anchor():
+    assert _strip_locator("Program.cs:42") == "Program.cs"
+    assert _strip_locator("app.py#L10") == "app.py"
+    assert _strip_locator("app.py") == "app.py"
+
+
+def test_broken_citations_empty_phases():
+    assert broken_citations({}, ["a.py"]) == {}
+
+
+def test_broken_citations_no_false_positive_when_citation_exists():
+    phases = {
+        "risk": PhaseResult(
+            phase="risk",
+            role="security engineer",
+            data={"secrets": [{"claim": "x", "evidence": "src/real.py"}]},
+        )
+    }
+    assert broken_citations(phases, ["src/real.py"]) == {}
+
+
+def test_broken_citations_flags_a_fabricated_path():
+    phases = {
+        "risk": PhaseResult(
+            phase="risk",
+            role="security engineer",
+            data={"secrets": [{"claim": "x", "evidence": "Web.config"}]},
+        )
+    }
+    assert broken_citations(phases, ["src/real.py"]) == {"risk": ["Web.config"]}
+
+
+def test_broken_citations_suppresses_prose_citations():
+    phases = {
+        "risk": PhaseResult(
+            phase="risk",
+            role="security engineer",
+            data={"secrets": [{"claim": "x", "evidence": "looked at the auth module"}]},
+        )
+    }
+    assert broken_citations(phases, []) == {}
+
+
+def test_broken_citations_is_case_sensitive():
+    phases = {
+        "risk": PhaseResult(
+            phase="risk",
+            role="security engineer",
+            data={"secrets": [{"claim": "x", "evidence": "SRC/real.py"}]},
+        )
+    }
+    assert broken_citations(phases, ["src/real.py"]) == {"risk": ["SRC/real.py"]}
+
+
+def test_broken_citations_never_reads_the_filesystem_for_a_traversal_citation():
+    class NoReadWorkspace(InMemoryWorkspace):
+        def read_text(self, path):
+            raise AssertionError("broken_citations must never read a cited path")
+
+    ws = NoReadWorkspace()
+    phases = {
+        "risk": PhaseResult(
+            phase="risk",
+            role="security engineer",
+            data={"secrets": [{"claim": "x", "evidence": "../../etc/passwd"}]},
+        )
+    }
+    assert broken_citations(phases, ws.list_files()) == {"risk": ["../../etc/passwd"]}
+
+
+def test_outcome_populates_broken_citations_from_workspace():
+    responses = assess_responses(
+        **{
+            "application security engineer": {
+                "summary": "ok",
+                "dependencies": [],
+                "secrets": [{"claim": "hardcoded secret", "evidence": "Web.config"}],
+                "data_layer": [],
+                "external_services": [],
+            }
+        }
+    )
+    runner = ScriptedRunner(by_system_prompt=responses)
+    outcome = run(_engine(runner).assess())
+    assert outcome.broken_citations["risk"] == ["Web.config"]
+
+
+def test_broken_citations_round_trips_through_outcome_to_dict():
+    outcome = _bare_outcome(broken_citations={"risk": ["Web.config", "src/Api/Pay.cs"]})
+    assert outcome_to_dict(outcome)["broken_citations"] == dict(outcome.broken_citations)
+
+
+def test_report_names_broken_citations():
+    report = render_report(_bare_outcome(broken_citations={"risk": ["Web.config"]}))
+    assert "Citations that don't resolve to a real file" in report
+    assert "risk: `Web.config`" in report
+
+
+def test_report_omits_broken_citations_when_everything_resolves():
+    report = render_report(_bare_outcome())
+    assert "Citations that don't resolve to a real file" not in report
 
 
 # --- finding enumeration + re-verification ------------------------------------

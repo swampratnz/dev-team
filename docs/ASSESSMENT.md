@@ -158,6 +158,16 @@ involved, so their findings are exact and citable:
 - **Audit blind spots** — the exact set of top-level directories no phase
   finding (nor dead-code probe) cited, listed in the report appendix so
   sampling gaps are named instead of implied clean.
+- **Broken citations** — the opposite failure mode: a finding that cites a
+  bare file path (`Web.config`, `src/Api/Program.cs:42`) that doesn't exist
+  in the repository, cross-checked against the same file list the inventory
+  already enumerated. A citation this precise that still doesn't resolve is
+  strong evidence the underlying claim is unreliable, not just imprecisely
+  cited — the same insight the `--verify` re-check already surfaces one
+  finding at a time ("a citation that doesn't exist is itself a result"),
+  applied automatically, at $0, to every finding on every run. Prose and
+  multi-part citations are deliberately left unchecked to keep the heuristic
+  false-positive-free; listed in the report appendix when non-empty.
 - **Component detection** — one component per directory holding a manifest;
   `--component-fanout` runs a parallel per-component deep-dive
   (`max_components` caps it).
