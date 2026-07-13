@@ -245,6 +245,32 @@ Chronological (append order under the single-flight worker); empty list for
 an assessed job never verified; `404 {"error":"no assessment for that
 job"}` for an unknown id.
 
+### `GET /calibration` (auth) — verdict calibration rollup, across every job
+
+A pure, $0, disk-only aggregate over **every** persisted verification, not
+just one job's: walks `audit/*/verifications.jsonl` in the dashboard
+workspace, groups entries by the phase prefix of their `finding_id`
+(`"risk.secrets[0]"` → `risk`), and counts `confirmed`/`refuted`/
+`needs_context` per phase and overall.
+
+```json
+{"phases":{"risk":{"confirmed":6,"refuted":1,"needs_context":1,
+                     "total":8,"confirm_rate":0.75}},
+ "overall":{"confirmed":6,"refuted":1,"needs_context":1,
+            "total":8,"confirm_rate":0.75},
+ "jobs_counted":3}
+```
+
+`confirm_rate` is `confirmed / total` (`null` when `total` is 0). An entry
+whose verdict falls outside the closed `confirmed|refuted|needs-context` set,
+or whose `finding_id` is missing/non-string, is dropped rather than trusted —
+the same fail-secure posture the `verify` write path applies, re-applied
+here at read time. A corrupt (non-JSON) line is skipped, not a 500 — same
+tolerant parse as `GET /jobs/{id}/verifications`. `jobs_counted` is the
+number of `verifications.jsonl` files that contributed at least one
+parseable line. `409 {"error":"calibration needs a dashboard workspace"}`
+when the service was started without `--dashboard-workspace`.
+
 ## Deployment
 
 `deploy/dev-team-dispatch.service` is a hardened, singleton systemd unit

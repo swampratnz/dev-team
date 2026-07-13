@@ -1752,6 +1752,86 @@ def test_find_finding_by_exact_id_then_claim_substring():
     assert find_finding({}, "anything") is None
 
 
+def test_phase_from_finding_id_splits_on_first_dot():
+    from dev_team.assessment import phase_from_finding_id
+
+    assert phase_from_finding_id("risk.secrets[0]") == "risk"
+    assert (
+        phase_from_finding_id("components.components[0].findings[1]")
+        == "components"
+    )
+    assert phase_from_finding_id("no-dot-here") == "no-dot-here"
+
+
+def test_calibration_summary_empty():
+    from dev_team.assessment import calibration_summary
+
+    assert calibration_summary([]) == {
+        "phases": {},
+        "overall": {
+            "confirmed": 0, "refuted": 0, "needs_context": 0,
+            "total": 0, "confirm_rate": None,
+        },
+    }
+
+
+def test_calibration_summary_mixed_verdicts_across_phases():
+    from dev_team.assessment import calibration_summary
+
+    entries = [
+        {"finding_id": "risk.secrets[0]", "verdict": "confirmed"},
+        {"finding_id": "risk.secrets[1]", "verdict": "confirmed"},
+        {"finding_id": "risk.dependencies[0]", "verdict": "refuted"},
+        {"finding_id": "risk.external_services[0]", "verdict": "needs-context"},
+        {"finding_id": "buildability.blockers[0]", "verdict": "confirmed"},
+        {"finding_id": "buildability.blockers[1]", "verdict": "confirmed"},
+        {"finding_id": "buildability.blockers[2]", "verdict": "confirmed"},
+        {"finding_id": "buildability.blockers[3]", "verdict": "confirmed"},
+    ]
+    summary = calibration_summary(entries)
+    assert summary["phases"]["risk"] == {
+        "confirmed": 2, "refuted": 1, "needs_context": 1,
+        "total": 4, "confirm_rate": 0.5,
+    }
+    assert summary["phases"]["buildability"] == {
+        "confirmed": 4, "refuted": 0, "needs_context": 0,
+        "total": 4, "confirm_rate": 1.0,
+    }
+    assert summary["overall"] == {
+        "confirmed": 6, "refuted": 1, "needs_context": 1,
+        "total": 8, "confirm_rate": 0.75,
+    }
+
+
+def test_calibration_summary_drops_out_of_contract_verdicts():
+    from dev_team.assessment import calibration_summary
+
+    summary = calibration_summary(
+        [{"finding_id": "risk.secrets[0]", "verdict": "maybe"}]
+    )
+    assert summary == {
+        "phases": {},
+        "overall": {
+            "confirmed": 0, "refuted": 0, "needs_context": 0,
+            "total": 0, "confirm_rate": None,
+        },
+    }
+
+
+def test_calibration_summary_drops_missing_or_non_string_finding_id():
+    from dev_team.assessment import calibration_summary
+
+    summary = calibration_summary(
+        [
+            {"verdict": "confirmed"},
+            {"finding_id": 7, "verdict": "confirmed"},
+            {"finding_id": None, "verdict": "confirmed"},
+            "not even a dict",
+        ]
+    )
+    assert summary["overall"]["total"] == 0
+
+
 def _security_verdict(payload):
     from dev_team.testing import json_response as _json_response
 

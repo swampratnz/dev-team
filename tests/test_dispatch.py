@@ -530,6 +530,99 @@ def test_verifications_reader_skips_a_corrupt_line():
     assert [e["finding_id"] for e in payload["verifications"]] == ["a", "b"]
 
 
+def test_calibration_without_dashboard_workspace_is_409():
+    disp = Dispatcher(token="x")
+    assert disp.calibration() == (
+        409, {"error": "calibration needs a dashboard workspace"})
+
+
+def test_calibration_with_no_verification_files_is_zeroed():
+    disp = Dispatcher(token="x", dashboard_workspace=InMemoryWorkspace())
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload == {
+        "phases": {},
+        "overall": {
+            "confirmed": 0, "refuted": 0, "needs_context": 0,
+            "total": 0, "confirm_rate": None,
+        },
+        "jobs_counted": 0,
+    }
+
+
+def test_calibration_aggregates_across_multiple_jobs():
+    dash = InMemoryWorkspace()
+    # a sibling assessment.json (no "/verifications.jsonl" suffix) must be
+    # skipped by the file filter, not mistaken for a verdict log
+    dash.write_text("audit/assess-a/assessment.json", "{}")
+    dash.write_text(
+        "audit/assess-a/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[0]", "verdict": "confirmed"}) + "\n"
+        + "\n"  # a blank line (trailing newline artifact) is tolerated
+        + json.dumps({"finding_id": "risk.secrets[1]", "verdict": "refuted"}) + "\n",
+    )
+    dash.write_text(
+        "audit/assess-b/verifications.jsonl",
+        json.dumps(
+            {"finding_id": "buildability.blockers[0]", "verdict": "confirmed"}
+        ) + "\n",
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload["jobs_counted"] == 2
+    assert payload["phases"]["risk"]["total"] == 2
+    assert payload["phases"]["buildability"]["total"] == 1
+    assert payload["overall"]["total"] == 3
+
+
+def test_calibration_skips_a_corrupt_line_without_crashing():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-old/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[0]", "verdict": "confirmed"}) + "\n"
+        + "{not json\n"
+        + json.dumps({"finding_id": "risk.secrets[1]", "verdict": "refuted"}) + "\n",
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload["jobs_counted"] == 1
+    assert payload["phases"]["risk"] == {
+        "confirmed": 1, "refuted": 1, "needs_context": 0,
+        "total": 2, "confirm_rate": 0.5,
+    }
+
+
+def test_calibration_only_counts_files_that_contributed_a_parseable_line():
+    dash = InMemoryWorkspace()
+    dash.write_text("audit/assess-empty/verifications.jsonl", "{not json\n")
+    dash.write_text(
+        "audit/assess-good/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[0]", "verdict": "confirmed"}) + "\n",
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload["jobs_counted"] == 1
+    assert payload["overall"]["total"] == 1
+
+
+def test_calibration_http_route_end_to_end():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-a/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[0]", "verdict": "confirmed"}) + "\n",
+    )
+    with running(materialise=_mem_materialise, dashboard_workspace=dash) as server:
+        assert _call(server, "/calibration", token=None) == (
+            401, {"error": "unauthorized"})
+        status, payload = _call(server, "/calibration")
+        assert status == 200
+        assert set(payload) == {"phases", "overall", "jobs_counted"}
+        assert payload["jobs_counted"] == 1
+
+
 def test_worker_is_single_flight_and_ordered():
     order = []
     first_in = threading.Event()
