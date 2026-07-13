@@ -168,9 +168,20 @@ involved, so their findings are exact and citable:
 
 Excludes (`--exclude`, default: vendored/build-output globs) apply to the
 tree, statistics, and component detection. `--backlog` converts the audit's
-findings into estimated stories in `.dev_team/backlog.json`, deduplicated by
-title, under an "Assessment remediation" epic — the input queue for later
-`--deliver` runs.
+findings into estimated stories in `.dev_team/backlog.json` — the input
+queue for later `--deliver` runs. When the converter knows which repository
+was audited (the dispatch service always does; `--make-backlog` does when
+job metadata sits beside the assessment) each repository gets its **own
+epic** ("Remediation — \<repo\>"), so assessments of different repos never
+merge; without that context the single "Assessment remediation" epic is
+kept. Stories are deduplicated by title **within their epic**: re-assessing
+a repo refreshes its epic instead of flooding it, while an identical
+finding title from another repo still files under that repo's epic. Stories
+bred from LLM findings also carry `source_job` and `finding_id` (the exact
+`list_findings` id, e.g. `risk.secrets[0]`) so each one can be traced back
+to — and independently re-verified against — the claim it came from;
+deterministic dead-code/dependency-scan stories carry no finding id (they
+are program output, not model claims).
 
 ## Assess once, backlog anytime, free
 

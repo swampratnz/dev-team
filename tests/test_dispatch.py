@@ -362,6 +362,13 @@ def test_run_job_assess_with_backlog_updates_job_and_dashboard_backlogs():
     assert {s.title for s in dash_backlog.stories} == {
         s.title for s in job_backlog.stories
     }
+    # The dashboard merge knows the job's repo and id, so its stories file
+    # under the repo's own epic and carry finding provenance ...
+    assert dash_backlog.epics[0].title == "Remediation — acme/mono"
+    assert all(s.source_job == "assess-bl" for s in dash_backlog.stories)
+    # ... while the job workspace's own backlog (written by the engine,
+    # which has no job context) keeps the historical single epic.
+    assert job_backlog.epics[0].title == "Assessment remediation"
 
 
 def test_run_job_assess_with_backlog_but_no_dashboard_workspace():
@@ -422,6 +429,32 @@ def test_make_backlog_survives_a_restart_by_reading_disk():
         200,
         {"job_id": "assess-old", "stories_added": 0, "stories_total": 1},
     )
+
+
+def test_make_backlog_reads_meta_for_per_repo_epic_and_provenance():
+    from dev_team.backlog import BacklogStore
+
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-meta/assessment.json", json.dumps(_assessment_payload())
+    )
+    dash.write_text(
+        "audit/assess-meta/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-meta"}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.make_backlog("assess-meta")
+    assert (status, payload) == (
+        200,
+        {"job_id": "assess-meta", "stories_added": 1, "stories_total": 1},
+    )
+    stored = BacklogStore(dash).load()
+    # meta.json names the audited repo -> the repo's own epic, and the
+    # story can be traced (and re-verified) via source_job + finding_id.
+    assert stored.epics[0].title == "Remediation — acme/mono"
+    (story,) = stored.stories
+    assert story.source_job == "assess-meta"
+    assert story.finding_id == "recommendation.plan[0]"
 
 
 def test_make_backlog_missing_assessment_is_404():

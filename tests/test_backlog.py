@@ -68,3 +68,43 @@ def test_store_save_and_load():
     store.save(_backlog())
     loaded = store.load()
     assert len(loaded.stories) == 3
+
+
+def test_story_provenance_fields_roundtrip():
+    bl = Backlog()
+    epic = bl.add_epic("Remediation — acme/rota", "from audit")
+    bl.add_story(
+        "Remove hardcoded secret",
+        "Evidence: Web.config",
+        estimate=1,
+        epic_id=epic.id,
+        source_job="assess-1",
+        finding_id="risk.secrets[0]",
+    )
+    bl.add_story("Plain story", "no provenance")
+    data = bl.to_dict()
+    tracked, plain = data["stories"]
+    assert tracked["source_job"] == "assess-1"
+    assert tracked["finding_id"] == "risk.secrets[0]"
+    # unset provenance is omitted — the pre-provenance on-disk shape is kept
+    assert "source_job" not in plain
+    assert "finding_id" not in plain
+    restored = Backlog.from_dict(data)
+    assert restored.stories[0].source_job == "assess-1"
+    assert restored.stories[0].finding_id == "risk.secrets[0]"
+    assert restored.stories[1].source_job is None
+    assert restored.stories[1].finding_id is None
+
+
+def test_backlog_json_written_before_provenance_still_loads():
+    # A backlog.json persisted by an older version has no provenance keys.
+    data = {
+        "epics": [{"id": "E1", "title": "Auth", "description": ""}],
+        "stories": [
+            {"id": "S1", "title": "Login", "description": "", "estimate": 1,
+             "status": "todo", "epic_id": "E1"}
+        ],
+    }
+    restored = Backlog.from_dict(data)
+    assert restored.stories[0].source_job is None
+    assert restored.stories[0].finding_id is None

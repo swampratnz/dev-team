@@ -1191,12 +1191,16 @@ def outcome_to_backlog(outcome: AssessmentOutcome, backlog: Backlog) -> List[Sto
     This is the bridge from "audited" to "remediated": remediation-plan steps,
     build blockers, must-fix dependencies, hardcoded secrets, dead-code probe
     hits, and live vulnerability records each become a story under one
-    "Assessment remediation" epic. Stories deduplicate by title, so re-running
-    an assessment refreshes the backlog instead of flooding it.
+    "Assessment remediation" epic. Stories deduplicate by title within that
+    epic, so re-running an assessment refreshes the backlog instead of
+    flooding it.
 
     A thin wrapper over :func:`dict_to_backlog`: the conversion reads only
     fields :func:`outcome_to_dict` serialises, so the live-object and
-    persisted-JSON paths cannot drift.
+    persisted-JSON paths cannot drift. Callers who know which repository the
+    assessment audited (dispatch, ``--make-backlog`` with job metadata)
+    should call :func:`dict_to_backlog` directly with ``repo``/``source_job``
+    to get a per-repository epic and finding provenance on each story.
     """
 
     return dict_to_backlog(outcome_to_dict(outcome), backlog)
@@ -1216,52 +1220,97 @@ def _phase_payload(phases: Mapping, name: str) -> Dict:
     return entry.get("data") or {}
 
 
-def dict_to_backlog(data: Dict, backlog: Backlog) -> List[Story]:
+def dict_to_backlog(
+    data: Dict,
+    backlog: Backlog,
+    *,
+    repo: Optional[str] = None,
+    source_job: Optional[str] = None,
+) -> List[Story]:
     """Convert a serialised assessment (:func:`outcome_to_dict`) into stories.
 
     The dict-shaped core of :func:`outcome_to_backlog`. Because it takes the
     exact JSON persisted at :data:`ASSESSMENT_JSON_PATH`, backlog generation
     is a pure disk transform that can run any time after the assessment — via
     ``--make-backlog`` or the dispatch service's ``POST /jobs/{id}/backlog``
-    — with no agents, no LLM calls, and no cost. Semantics are identical to
-    the outcome path: one "Assessment remediation" epic, stories deduplicated
-    by title against ``backlog``, and the newly added stories returned.
+    — with no agents, no LLM calls, and no cost.
+
+    With ``repo`` the stories file under a per-repository epic
+    ("Remediation — <repo>"), so different repositories never merge into one
+    epic and re-assessing a repository refreshes *its* epic only. Without
+    ``repo`` the historical single "Assessment remediation" epic is kept
+    (the :func:`outcome_to_backlog` / metadata-less ``--make-backlog`` path).
+    Dedup-by-title is scoped to the target epic: the same finding title under
+    a different repository's epic is a different story.
+
+    Stories bred from LLM findings carry ``finding_id`` — the exact
+    positional id :func:`list_findings` assigns (``recommendation.plan[0]``,
+    ``risk.secrets[1]``, …) — plus ``source_job``, so each one can be traced
+    to, and independently re-verified against, the claim it came from.
+    Deterministic dead-code/dependency-scan stories are exact program output,
+    not model claims, so they carry no ``finding_id``.
+
+    Returns the newly added stories.
     """
 
-    epic_title = "Assessment remediation"
+    if repo is not None:
+        epic_title = f"Remediation — {repo}"
+        epic_description = (
+            f"From assessment of {repo} (classification: "
+            f"{data.get('classification') or 'unclassified'})"
+        )
+    else:
+        epic_title = "Assessment remediation"
+        epic_description = (
+            f"From repository assessment (classification: "
+            f"{data.get('classification') or 'unclassified'})"
+        )
     epic = next((e for e in backlog.epics if e.title == epic_title), None)
     if epic is None:
-        epic = backlog.add_epic(
-            epic_title,
-            f"From repository assessment (classification: "
-            f"{data.get('classification') or 'unclassified'})",
-        )
-    existing = {s.title for s in backlog.stories}
+        epic = backlog.add_epic(epic_title, epic_description)
+    # Dedup is scoped to THIS epic: re-running the same assessment refreshes
+    # its own epic, while an identical finding title from a different
+    # repository's assessment still becomes that repository's own story.
+    existing = {s.title for s in backlog.stories if s.epic_id == epic.id}
     added: List[Story] = []
 
-    def add(title: str, description: str, estimate: int = 2) -> None:
+    def add(
+        title: str,
+        description: str,
+        estimate: int = 2,
+        finding_id: Optional[str] = None,
+    ) -> None:
         title = title[:200]
         if title in existing:
             return
         existing.add(title)
         added.append(
-            backlog.add_story(title, description, estimate=estimate, epic_id=epic.id)
+            backlog.add_story(
+                title,
+                description,
+                estimate=estimate,
+                epic_id=epic.id,
+                source_job=source_job,
+                finding_id=finding_id,
+            )
         )
 
+    # Finding ids must line up with list_findings' positional scheme, so the
+    # LLM-finding loops below enumerate the same dict-filtered lists
+    # (_items) it does — the index counts dict entries, junk excluded.
     phases = data.get("phases") or {}
-    for step in _phase_payload(phases, "recommendation").get("plan", []):
-        if not isinstance(step, dict):
-            continue
+    for index, step in enumerate(_items(_phase_payload(phases, "recommendation"), "plan")):
         name = str(step.get("step", "")).strip()
         if name:
             add(
                 name,
                 str(step.get("detail", "")),
                 _effort_points(str(step.get("effort", ""))),
+                finding_id=f"recommendation.plan[{index}]",
             )
-    for blocker in _phase_payload(phases, "buildability").get("blockers", []):
-        if not isinstance(blocker, dict):
-            continue
+    for index, blocker in enumerate(
+        _items(_phase_payload(phases, "buildability"), "blockers")
+    ):
         if blocker.get("category") != "must-fix-to-build":
             continue
         claim = str(blocker.get("claim", "")).strip()
@@ -1270,22 +1319,25 @@ def dict_to_backlog(data: Dict, backlog: Backlog) -> List[Story]:
                 f"Fix build blocker: {claim}",
                 f"Evidence: {blocker.get('evidence', '')}",
                 3,
+                finding_id=f"buildability.blockers[{index}]",
             )
     risk = _phase_payload(phases, "risk")
-    for dep in risk.get("dependencies", []):
-        if isinstance(dep, dict) and dep.get("action") == "must-fix":
+    for index, dep in enumerate(_items(risk, "dependencies")):
+        if dep.get("action") == "must-fix":
             add(
                 f"Upgrade or replace dependency {dep.get('name', '?')}",
                 f"{dep.get('version', '')} {dep.get('status', '')} "
                 f"(evidence: {dep.get('evidence', '')})".strip(),
                 3,
+                finding_id=f"risk.dependencies[{index}]",
             )
-    for secret in risk.get("secrets", []):
-        if isinstance(secret, dict) and secret.get("claim"):
+    for index, secret in enumerate(_items(risk, "secrets")):
+        if secret.get("claim"):
             add(
                 f"Remove hardcoded secret: {secret['claim']}",
                 f"Evidence: {secret.get('evidence', '')}",
                 1,
+                finding_id=f"risk.secrets[{index}]",
             )
     by_probe: Dict[str, List[str]] = {}
     for finding in (data.get("dead_code") or {}).get("findings", []):

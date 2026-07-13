@@ -109,6 +109,9 @@ def _backlog_state(workspace: Workspace) -> Dict:
                 "title": story.title,
                 "status": status,
                 "estimate": story.estimate,
+                "description": story.description,
+                "source_job": story.source_job,
+                "finding_id": story.finding_id,
             }
         )
     epics = []
@@ -630,11 +633,29 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
        overflow: hidden; }
 .bar b { display: block; height: 100%; background: var(--accent); border-radius: 999px;
          transition: width .6s ease; }
-.story { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; font-size: 13px; }
+.story { display: flex; gap: 8px; align-items: baseline; padding: 3px 4px; font-size: 13px; }
 .story .st { flex: 1; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis;
              white-space: nowrap; }
 .story.done .st { color: var(--ink-3); }
 .story .pts { color: var(--ink-3); font-size: 12px; }
+.story[data-story] { cursor: pointer; border-radius: 6px; }
+.story[data-story]:hover { background: var(--accent-soft); }
+.story[data-story]:hover .st { color: var(--accent); }
+.story[data-story]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.story-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+              margin-bottom: 12px; font-size: 12px; color: var(--ink-3); }
+.verify { margin-top: 14px; padding: 10px 12px; background: var(--inset);
+          border: 1px solid var(--line-soft); border-radius: 8px; }
+.verify .cmd { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+.verify .cmd code { flex: 1; background: var(--card); border: 1px solid var(--line-soft);
+                    border-radius: 6px; padding: 6px 8px; font-size: 12px;
+                    overflow-x: auto; white-space: nowrap; }
+.verify button { background: none; border: 1px solid var(--line); border-radius: 6px;
+                 color: var(--ink-2); font-size: 12px; padding: 5px 10px; cursor: pointer;
+                 white-space: nowrap; }
+.verify button:hover { color: var(--ink); border-color: var(--ink-3); }
+.verify .note { margin-top: 6px; font-size: 12px; color: var(--ink-3); }
 
 details { border-top: 1px solid var(--line-soft); padding: 8px 0; }
 details:first-of-type { border-top: 0; }
@@ -774,6 +795,15 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
       <button id="agent-close" aria-label="close agent history">&#x2715;</button>
     </div>
     <div class="modal-body" id="agent-body"></div>
+  </div>
+</div>
+<div class="overlay" id="story-overlay" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="story-title">
+    <div class="modal-head">
+      <code id="story-title"></code>
+      <button id="story-close" aria-label="close story detail">&#x2715;</button>
+    </div>
+    <div class="modal-body" id="story-body"></div>
   </div>
 </div>
 <script>
@@ -1030,13 +1060,21 @@ function runsPanel(s) {
   }).join(""));
 }
 
+// Story detail lookup for the modal, rebuilt from every /api/state payload:
+// keyed by story id, carrying the owning epic's title (the repo context).
+let storyIndex = new Map();
+
 function backlog(s) {
   if (!s.backlog.present) { put($("backlog"), '<span class="muted">no backlog yet</span>'); return; }
-  const story = st => `<div class="story${st.status === "done" ? " done" : ""}">${storyChip(st.status)}<span class="st" title="${esc(st.title)}">${esc(st.title)}</span><span class="pts">${esc(st.estimate)}pt</span></div>`;
+  storyIndex = new Map();
+  for (const e of s.backlog.epics)
+    for (const st of e.stories) storyIndex.set(st.id, { ...st, epic: e.title });
+  for (const st of s.backlog.orphan_stories) storyIndex.set(st.id, { ...st, epic: "" });
+  const story = st => `<div class="story${st.status === "done" ? " done" : ""}" role="button" tabindex="0" data-story="${esc(st.id)}" title="${esc(st.title)} \\u2014 click for detail">${storyChip(st.status)}<span class="st">${esc(st.title)}</span><span class="pts">${esc(st.estimate)}pt</span></div>`;
   const epic = e => {
     const pct = e.points_total ? Math.round(100 * e.points_done / e.points_total) : 0;
     return `<div class="epic">
-      <div class="t"><span>${esc(e.title)}</span><span class="pts">${esc(e.points_done)}/${esc(e.points_total)} pts \\u00b7 ${pct}%</span></div>
+      <div class="t"><span title="${esc(e.description)}">${esc(e.title)}</span><span class="pts">${esc(e.points_done)}/${esc(e.points_total)} pts \\u00b7 ${pct}%</span></div>
       <div class="bar"><b style="width:${pct}%"></b></div>
       ${e.stories.map(story).join("")}
     </div>`;
@@ -1236,6 +1274,38 @@ async function openAgent(role) {
 
 function closeAgent() { $("agent-overlay").hidden = true; }
 
+// ---- story detail modal ----
+// SECURITY: every story field is repo-derived (assessment findings quote
+// repository content), so ALL of it goes through esc() before touching
+// innerHTML — a <script> in a story description renders inert as text. The
+// title goes via textContent, which never parses HTML at all.
+function openStory(id) {
+  const st = storyIndex.get(id);
+  if (!st) return;
+  $("story-title").textContent = st.id + " \\u00b7 " + st.title;
+  const bits = [
+    `<div class="story-meta">${storyChip(st.status)}<span>${esc(st.estimate)}pt</span>${st.epic ? `<span>\\u00b7 ${esc(st.epic)}</span>` : ""}${st.source_job ? `<span>\\u00b7 job <code>${esc(st.source_job)}</code></span>` : ""}</div>`,
+    '<div class="tx-label">Description</div>',
+    `<pre class="tx-pre">${st.description ? esc(st.description) : "(no description)"}</pre>`,
+  ];
+  if (st.finding_id && st.source_job) {
+    const cmd = "dev_team_verify " + st.source_job + " " + st.finding_id;
+    bits.push(`<div class="verify"><div class="tx-label">Re-verify this finding</div>
+      <div class="cmd"><code>${esc(cmd)}</code><button data-copy="${esc(cmd)}">copy</button></div>
+      <div class="note">Re-checks this claim (finding <code>${esc(st.finding_id)}</code>) with a fresh, skeptical agent against a clean clone \\u2014 independent of the auditor that wrote it.</div></div>`);
+  } else if (st.finding_id) {
+    bits.push(`<div class="verify"><div class="tx-label">Re-verify this finding</div>
+      <div class="note">LLM finding <code>${esc(st.finding_id)}</code> \\u2014 assessed outside the dispatch service, so there is no source job to re-verify against.</div></div>`);
+  } else {
+    bits.push('<p class="muted" style="margin-top:14px">Deterministic finding (dependency/dead-code scan) \\u2014 re-run the assessment to refresh; not agent-verifiable.</p>');
+  }
+  $("story-body").innerHTML = bits.join("");
+  $("story-overlay").hidden = false;
+  $("story-close").focus();
+}
+
+function closeStory() { $("story-overlay").hidden = true; }
+
 // ---- run -> feed cross-filter ----
 function toggleRun(id) {
   filters.run = filters.run === id ? "" : id;
@@ -1283,11 +1353,28 @@ $("agents").addEventListener("keydown", e => {
   const card = e.target.closest("[data-role]");
   if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openAgent(card.dataset.role); }
 });
+$("backlog").addEventListener("click", e => {
+  const row = e.target.closest("[data-story]");
+  if (row) openStory(row.dataset.story);
+});
+$("backlog").addEventListener("keydown", e => {
+  const row = e.target.closest("[data-story]");
+  if (row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openStory(row.dataset.story); }
+});
+$("story-body").addEventListener("click", e => {
+  const btn = e.target.closest("[data-copy]");
+  if (!btn || !navigator.clipboard) return;
+  navigator.clipboard.writeText(btn.dataset.copy).then(
+    () => { btn.textContent = "copied"; setTimeout(() => { btn.textContent = "copy"; }, 1200); },
+    () => {});
+});
 $("modal-close").addEventListener("click", closeModal);
 $("overlay").addEventListener("click", e => { if (e.target === $("overlay")) closeModal(); });
 $("agent-close").addEventListener("click", closeAgent);
 $("agent-overlay").addEventListener("click", e => { if (e.target === $("agent-overlay")) closeAgent(); });
-document.addEventListener("keydown", e => { if (e.key === "Escape") { closeModal(); closeAgent(); } });
+$("story-close").addEventListener("click", closeStory);
+$("story-overlay").addEventListener("click", e => { if (e.target === $("story-overlay")) closeStory(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") { closeModal(); closeAgent(); closeStory(); } });
 
 // ---- poll loop ----
 let fails = 0;
