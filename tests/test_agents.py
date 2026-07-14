@@ -447,6 +447,42 @@ def test_engineer_implement_in_place_uses_tools_and_cwd():
     assert "Read" in call["allowed_tools"] and "Bash" in call["allowed_tools"]
 
 
+def test_engineer_continuation_prompt_warns_edits_were_rolled_back():
+    # Session continuity's retry prompt must not let the model assume its
+    # previous attempt's edits are still on disk: the engine hard-resets the
+    # workdir on every rejected attempt before the retry runs (see
+    # DeliveryEngine._rollback), so the persisted SDK session's own memory of
+    # writing those files is stale by the time this prompt is sent.
+    payload = {
+        "summary": "s",
+        "files": [{"path": "x.py", "change_type": "create", "summary": "s"}],
+        "notes": "",
+    }
+    runner = _runner(payload)
+    agent = EngineerAgent(runner)
+    task = Task(id="T1", title="t", description="d", acceptance_criteria=["works"])
+    feedback = Review(
+        approved=False,
+        summary="needs work",
+        comments=[ReviewComment(severity=Severity.MAJOR, message="fix x")],
+    )
+    run(
+        agent.implement_in_place(
+            task,
+            Design(overview="o"),
+            feedback,
+            cwd="/w",
+            continuation=True,
+        )
+    )
+    prompt = runner.calls[0]["prompt"]
+    assert "rolled back" in prompt
+    assert "re-read" in prompt.lower()
+    assert "fix x" in prompt
+    # the compact continuation prompt must not re-send the full task context
+    assert "Acceptance criteria" not in prompt
+
+
 # --- evidence-based review prompts -----------------------------------------
 
 

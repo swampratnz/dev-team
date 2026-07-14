@@ -353,6 +353,87 @@ def test_session_runner_reconnects_on_model_mismatch():
     assert client_cls.instances[1].queries == ["full context\n\njust feedback"]
 
 
+def test_session_runner_reconnect_query_failure_preserves_history_for_next_call():
+    # A reconnect whose own replay query fails (not just the original, already
+    # -stale client) must not lose the task's accumulated history: the failed
+    # reconnect leaves a placeholder session (no live client, history intact)
+    # behind instead of dropping it, so the NEXT call can retry the recovery
+    # with full context rather than silently starting over from just that
+    # turn's compact prompt — or worse, reusing the just-failed client.
+    client_cls = _session_client_factory(
+        [
+            "first",
+            ProcessError("dropped", exit_code=1),
+            ProcessError("reconnect query also failed", exit_code=1),
+            "recovered",
+        ]
+    )
+    runner = SessionAgentRunner(client_factory=client_cls)
+
+    first = run(runner.run("full context", task_key="T1"))
+    second = run(runner.run("turn two", task_key="T1"))
+    third = run(runner.run("turn three", task_key="T1"))
+
+    assert first.text == "first"
+    assert second.is_error is True
+    assert third.text == "recovered"
+    assert len(client_cls.instances) == 3
+    # the client whose reconnect query failed is disconnected, not reused
+    assert client_cls.instances[1].connected is False
+    # the third call's fresh client replayed the ORIGINAL history plus this
+    # turn's prompt — "turn two" (the failed reconnect attempt) never made it
+    # into history, since its query never succeeded
+    assert client_cls.instances[2].queries == ["full context\n\nturn three"]
+    assert runner._sessions["T1"].client is client_cls.instances[2]
+
+
+def test_session_runner_reconnect_connect_failure_preserves_history_for_next_call():
+    # Same guarantee as above, but for connect() itself failing (the other
+    # half of _reconnect that can fail) rather than the replay query.
+    instances = []
+
+    class _Client:
+        def __init__(self, options):
+            self.options = options
+            self.connected = False
+            self.queries = []
+            instances.append(self)
+
+        async def connect(self):
+            if len(instances) == 2:
+                # the SECOND client (the reconnect attempt) can't connect
+                raise ProcessError("connect failed", exit_code=1)
+            self.connected = True
+
+        async def query(self, text):
+            self.queries.append(text)
+            if self is instances[0] and len(self.queries) == 2:
+                # the FIRST client's second turn is a dropped connection
+                raise ProcessError("dropped", exit_code=1)
+
+        async def receive_response(self):
+            yield _SessionMessage(["ok"])
+
+        async def disconnect(self):
+            self.connected = False
+
+    runner = SessionAgentRunner(client_factory=_Client)
+
+    first = run(runner.run("full context", task_key="T1"))
+    second = run(runner.run("turn two", task_key="T1"))
+    third = run(runner.run("turn three", task_key="T1"))
+
+    assert first.text == "ok"
+    assert second.is_error is True
+    assert third.text == "ok"
+    assert len(instances) == 3  # the never-connected 2nd client still counts
+    assert instances[0].connected is False  # discarded, not reused
+    # the third call's fresh (3rd) client replayed the ORIGINAL history plus
+    # this turn's prompt, not "turn two" (which never reached a live session)
+    assert instances[2].queries == ["full context\n\nturn three"]
+    assert runner._sessions["T1"].client is instances[2]
+
+
 def test_session_runner_without_task_key_is_one_shot():
     client_cls = _session_client_factory(["solo"])
     runner = SessionAgentRunner(client_factory=client_cls)

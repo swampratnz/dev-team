@@ -17,7 +17,15 @@ sections below are reconstructed from the repository history.
   today. Fail-secure: a dropped connection or a model change
   (`escalation_model` on the final attempt) discards the stale session and
   reconnects fresh, replaying the task's full prompt history rather than
-  silently continuing on stale state.
+  silently continuing on stale state. The reconnect's own failure (a
+  connect or replay-query fault, not just the original one) no longer loses
+  that history either — a failed reconnect leaves a placeholder session
+  behind so the next call retries with full context intact instead of
+  starting over compact-only. The compact retry prompt now also tells the
+  engineer explicitly that its previous attempt's edits were rolled back
+  (the engine hard-resets the workdir on every rejected attempt), so it
+  re-reads files before touching them instead of trusting the connected
+  session's own stale memory of writing them.
 
 ### Self-improvement pipeline
 - **A supervised multi-loop development pipeline now extends this repo

@@ -156,14 +156,29 @@ Respond with JSON of the form:
         resending it would waste the exact cost continuity exists to avoid.
         ``task_key`` is passed through regardless so a session-holding runner
         can key its session even on the first (full-context) attempt.
+
+        A rejected attempt has its edits rolled back before the retry (see
+        ``DeliveryEngine._rollback``), so the continuation prompt explicitly
+        tells the model its previous edits are gone — the session's own
+        conversational memory of writing them is now stale, and treating it
+        as still true risks a stale ``Edit`` (old string no longer present)
+        or a blind ``Write`` that drops content the model only *thinks* is
+        still on disk.
         """
 
         if continuation:
             prompt = f"""\
+Your previous attempt at this task was rejected and its changes were rolled \
+back: the working directory has been reset to the state it was in before \
+that attempt, so none of the files you created or edited then are on disk \
+any more. Do not assume any earlier edit of yours is still there — re-read \
+the current contents of anything you plan to touch before changing it.
+
 {_feedback_section(feedback)}
 
-Address this feedback directly in the current working directory using your \
-tools, then respond with JSON of the same form as before:
+Re-implement the task, addressing this feedback, directly in the current \
+working directory using your tools, then respond with JSON of the same \
+form as before:
 {{
   "summary": "what you built",
   "files": [

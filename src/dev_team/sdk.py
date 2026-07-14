@@ -265,7 +265,12 @@ class ClaudeChatBackend:
 
 @dataclass
 class _Session:
-    """One task's live conversation: the connected client and what it heard.
+    """One task's conversation: its client (if connected) and what it heard.
+
+    ``client`` is ``None`` for a placeholder session — one that has never
+    connected yet, or one recovering from a fault (see
+    :meth:`SessionAgentRunner._reconnect`) — as opposed to a live, queryable
+    connection.
 
     ``history`` holds every prompt sent on this session (in order). It exists
     only to rebuild full context if the session ever has to be discarded
@@ -274,7 +279,7 @@ class _Session:
     so once a client drops there is nowhere else full context could come from.
     """
 
-    client: Any
+    client: Optional[Any]
     model: Optional[str]
     system_prompt: Optional[str]
     allowed_tools: Optional[Sequence[str]]
@@ -309,7 +314,11 @@ class SessionAgentRunner:
     absorbed. The stale client is discarded and a fresh one is connected,
     replaying the task's full prompt history so the attempt still carries
     full context even though only this turn's compact prompt was handed to
-    :meth:`run`.
+    :meth:`run`. That accumulated history survives even a *failed* recovery —
+    a reconnect whose own ``connect()`` or replay ``query()`` fails leaves a
+    placeholder session (no live client) holding everything recorded so far,
+    so the next call retries the same recovery with full context intact
+    rather than silently starting over from just that turn's compact prompt.
 
     Attributes:
         permission_mode: Permission mode for every connected client (see
@@ -384,69 +393,56 @@ class SessionAgentRunner:
 
         session = self._sessions.get(task_key)
 
-        if session is None:
-            client = await self._connect(
-                system_prompt=system_prompt,
-                allowed_tools=allowed_tools,
-                model=model,
-                cwd=cwd,
-            )
-            # Registered before the query runs (not after): a task whose
-            # first call fails must still leave a session close() can find
-            # and disconnect — otherwise a failed first attempt would leak
-            # this connected client past the task's own attempt loop.
-            new_session = _Session(
-                client=client,
-                model=model,
-                system_prompt=system_prompt,
-                allowed_tools=allowed_tools,
-                cwd=cwd,
-            )
-            self._sessions[task_key] = new_session
-            result = await self._query(client, prompt)
-            new_session.history.append(prompt)
+        if (
+            session is not None
+            and session.client is not None
+            and session.model == model
+        ):
+            # NOTE: allowed_tools/system_prompt/cwd are just as fixed at
+            # connect() time as model but are deliberately NOT compared here
+            # — both call sites in engine.py pass the same values on every
+            # attempt for a given task_key, so a mismatch can't currently
+            # happen. If that ever changes (e.g. a narrower allowlist
+            # introduced between attempts), this check needs to grow to cover
+            # them too, or a narrowed-tools attempt would silently keep
+            # running with the wider, connect-time allowlist.
+            try:
+                result = await self._query(session.client, prompt)
+            except (ClaudeSDKError, OSError, UnicodeDecodeError, TimeoutError):
+                return await self._reconnect(
+                    task_key,
+                    session,
+                    prompt,
+                    system_prompt=system_prompt,
+                    allowed_tools=allowed_tools,
+                    model=model,
+                    cwd=cwd,
+                )
+            session.history.append(prompt)
             return result
 
-        if session.model != model:
-            # A connected client's model is fixed at connect() time; silently
-            # continuing on the stale model would defeat escalation_model.
-            # NOTE: allowed_tools/system_prompt/cwd are just as fixed at
-            # connect() time but are deliberately NOT compared here — both
-            # call sites in engine.py pass the same values on every attempt
-            # for a given task_key, so a mismatch can't currently happen. If
-            # that ever changes (e.g. a narrower allowlist introduced between
-            # attempts), this check needs to grow to cover them too, or a
-            # narrowed-tools attempt would silently keep running with the
-            # wider, connect-time allowlist.
-            return await self._reconnect(
-                task_key,
-                session,
-                prompt,
-                system_prompt=system_prompt,
-                allowed_tools=allowed_tools,
-                model=model,
-                cwd=cwd,
-            )
-
-        try:
-            result = await self._query(session.client, prompt)
-        except (ClaudeSDKError, OSError, UnicodeDecodeError, TimeoutError):
-            return await self._reconnect(
-                task_key,
-                session,
-                prompt,
-                system_prompt=system_prompt,
-                allowed_tools=allowed_tools,
-                model=model,
-                cwd=cwd,
-            )
-        session.history.append(prompt)
-        return result
+        # No live client for this task_key — either it has never been opened,
+        # or a previous _reconnect's own connect()/query() failed and left
+        # only its accumulated history behind (see _reconnect) — or the
+        # requested model no longer matches the connected one (fixed at
+        # connect() time; silently continuing on the stale model would defeat
+        # escalation_model). Either way, (re)open fresh through the same path
+        # so a session that has never even connected once and a session
+        # recovering from a fault are handled identically.
+        return await self._reconnect(
+            task_key,
+            session,
+            prompt,
+            system_prompt=system_prompt,
+            allowed_tools=allowed_tools,
+            model=model,
+            cwd=cwd,
+        )
 
     async def _reconnect(
         self,
         task_key: str,
-        stale: "_Session",
+        stale: Optional["_Session"],
         prompt: str,
         *,
         system_prompt: Optional[str],
@@ -454,34 +450,61 @@ class SessionAgentRunner:
         model: Optional[str],
         cwd: Optional[str],
     ) -> AgentResult:
-        """Discard ``stale`` and replay its full history fresh, on ``model``.
+        """(Re)open ``task_key`` and replay ``stale``'s history fresh, on ``model``.
 
         The caller may have sent only this turn's compact follow-up (session
-        continuity's whole point), so the task's own recorded history is the
-        only place full context can still come from.
+        continuity's whole point), so ``stale``'s recorded history — if
+        any — is the only place full context can still come from. ``stale``
+        is ``None`` on a task's very first call.
+
+        A placeholder session (``client=None``, carrying ``stale``'s history
+        but not yet this turn's prompt) is registered *before* the stale
+        client is disconnected or a new one connected, so that if any of the
+        steps below fails — disconnecting the old client, connecting a new
+        one, or the replay query itself — the accumulated history is not
+        lost with it: the next call for this ``task_key`` finds this
+        placeholder (no live client, same history) and retries the same
+        recovery instead of silently falling back to a bare, context-free
+        session.
         """
 
-        await self._drop(task_key)
-        replay = "\n\n".join(stale.history + [prompt])
+        history = list(stale.history) if stale is not None else []
+        replay = "\n\n".join(history + [prompt]) if history else prompt
+        session = _Session(
+            client=None,
+            model=model,
+            system_prompt=system_prompt,
+            allowed_tools=allowed_tools,
+            cwd=cwd,
+            history=history,
+        )
+        self._sessions[task_key] = session
+        if stale is not None and stale.client is not None:
+            await stale.client.disconnect()
         client = await self._connect(
             system_prompt=system_prompt,
             allowed_tools=allowed_tools,
             model=model,
             cwd=cwd,
         )
-        # Registered before the query runs, same reasoning as the first-open
-        # path above: a failed reconnect must still leave something close()
-        # can disconnect.
-        new_session = _Session(
-            client=client,
-            model=model,
-            system_prompt=system_prompt,
-            allowed_tools=allowed_tools,
-            cwd=cwd,
-        )
-        self._sessions[task_key] = new_session
-        result = await self._query(client, replay)
-        new_session.history.append(replay)
+        # Registered before the query runs, same reasoning as the docstring
+        # above: a query that fails with something outside the fail-secure
+        # catch below (e.g. cancellation) must still leave a connected client
+        # close()/_drop() can find, exactly like the very first open used to.
+        session.client = client
+        try:
+            result = await self._query(client, replay)
+        except (ClaudeSDKError, OSError, UnicodeDecodeError, TimeoutError):
+            # A client that fails its very first query is just as unsafe to
+            # reuse as one that fails mid-continuation (see the timeout fix
+            # above) — disconnect it and clear it from the session (but keep
+            # the placeholder and its history) so the next call retries the
+            # recovery with a fresh connect instead of reusing this
+            # half-consumed client.
+            await client.disconnect()
+            session.client = None
+            raise
+        session.history.append(replay)
         return result
 
     async def _connect(
@@ -548,7 +571,7 @@ class SessionAgentRunner:
 
     async def _drop(self, task_key: str) -> None:
         session = self._sessions.pop(task_key, None)
-        if session is not None:
+        if session is not None and session.client is not None:
             await session.client.disconnect()
 
     async def close(self, task_key: str) -> None:
