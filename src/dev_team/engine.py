@@ -43,6 +43,7 @@ from .agents import (
     SREAgent,
     TechnicalWriterAgent,
 )
+from .agents.techwriter import doc_claim_issues
 from .approval import ApprovalGate, ApprovalRequest, AutoApprover
 from .backlog import BacklogStore, ItemStatus
 from .budget import Budget, BudgetExceededError
@@ -1808,6 +1809,11 @@ class DeliveryEngine:
             file_contents=self._contents(aggregate),
             existing_docs=existing_docs,
         )
+        # Captured before ChangeApplier below writes doc_files into the
+        # workspace, so a new doc's citation of another new doc it
+        # introduces is correctly evaluated against pre-existing state.
+        known_files = self.workspace.list_files()
+        documentation.unverified_claims = doc_claim_issues(doc_files.files, known_files)
         if doc_files.files:
             ChangeApplier(self.workspace).apply(doc_files)
             self.blackboard.post_artifact(

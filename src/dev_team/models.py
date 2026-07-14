@@ -218,6 +218,7 @@ class Documentation:
 
     summary: str
     sections: List[DocSection] = field(default_factory=list)
+    unverified_claims: List[str] = field(default_factory=list)
 
 
 @dataclass
