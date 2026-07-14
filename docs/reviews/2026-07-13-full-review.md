@@ -4,6 +4,32 @@
 (security / engine correctness / usability & outputs / vision gap), each verified
 against source before inclusion. All file:line references are to main @ `7242909`.*
 
+> **Resolution status — updated 2026-07-14 (PR #58, merged).**
+> These findings were re-verified against then-current `main` (31 commits past this
+> review's `7242909` base) and the still-open ones were fixed and merged in **PR #58**.
+> This banner records the outcome; the original review text below is left unchanged.
+>
+> - **Fixed & merged (PR #58):** S1, S3, S5 · E1, E2, E3, E4/U6, E5(a), E6, E7, E8, E9 ·
+>   U1, U2, U3, U5, U7, U8, U9, U10(c), U11, U12, U13, plus the non-breaking part of U4
+>   (argparse argument groups + accurate `--workspace` help). Suite green at 100% branch
+>   coverage; the automated PR review returned LGTM.
+> - **Partially resolved (remaining sub-parts deferred):** **E5** — per-job timeout
+>   shipped; cancel of a *running* job, crash-safe queue persistence, and automatic
+>   GC/retention are still open (queued-job cancel #41 and manual purge #45 had landed
+>   earlier). **U10** — pagination shipped; the `/v1` prefix and the restart-split status
+>   gap remain. **U4** — argument groups shipped; the full subcommand restructure was
+>   deliberately not done (it would be a breaking CLI change).
+> - **Deferred — vision/infra roadmap (not attempted here):** **S2** (container
+>   sandboxing) and **S4** (per-job runtime isolation) — these need real container/VM
+>   isolation, which an argv-level policy cannot provide — and **Part 4 pillars 1–8**
+>   (container sandboxing, PR-delivery target, dynamic re-planning, retrieval + context
+>   budgeting, session continuity, LLM retrospectives + benchmark history, richer
+>   interaction surfaces, MCP tools + group review).
+> - **Already shipped by the self-improvement pipeline before PR #58:** several Part-4
+>   cross-cutting items — cost rollup + dashboard Spend panel (#47/#53), dispatch
+>   cancel/purge (#41/#45), the bounded access log (#55), and the calibration
+>   endpoints/panel (#34/#38).
+
 ## Executive summary
 
 dev-team is in unusually good shape for a system of this ambition. The test suite
