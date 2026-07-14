@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import http.client
 import json
+import socket
 import threading
 import time
 import urllib.error
@@ -19,6 +20,7 @@ from test_assessment import assess_responses
 
 from dev_team import __version__
 from dev_team import dispatch as dispatch_mod
+from dev_team.accesslog import read_access_log
 from dev_team.backlog import BacklogStore
 from dev_team.dispatch import (
     Dispatcher,
@@ -2715,3 +2717,105 @@ def test_findings_and_verifications_routes_require_auth():
         # authorised: an assessed job with no verifications yet answers empty
         assert _call(server, "/jobs/assess-old/verifications") == (
             200, {"job_id": "assess-old", "verifications": []})
+
+
+# --- access log ----------------------------------------------------------
+
+
+def test_access_log_records_unauthenticated_health_get(tmp_path):
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        _call(server, "/health", token=None)
+    records = read_access_log(str(tmp_path))
+    assert records[-1] == {**records[-1], "method": "GET", "path": "/health", "status": 200}
+
+
+def test_access_log_records_authorised_get_jobs(tmp_path):
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        _call(server, "/jobs")
+    records = read_access_log(str(tmp_path))
+    assert records[-1] == {**records[-1], "method": "GET", "path": "/jobs", "status": 200}
+
+
+def test_access_log_records_401_and_never_leaks_the_bad_token(tmp_path):
+    fake_token = "definitely-not-the-real-token-xyz789"
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        status, _ = _call(server, "/jobs", token=fake_token)
+    assert status == 401
+    records = read_access_log(str(tmp_path))
+    assert records[-1] == {**records[-1], "status": 401}
+    raw = (Path(tmp_path) / "access.jsonl").read_text()
+    assert fake_token not in raw
+
+
+def test_access_log_never_persists_a_post_body_marker(tmp_path):
+    marker = "marker-xyzzy-do-not-persist"
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        _call(
+            server, "/jobs", method="POST",
+            body={"mode": "deliver", "repo": "acme/mono", "title": "t",
+                  "description": marker},
+        )
+    raw = (Path(tmp_path) / "access.jsonl").read_text()
+    assert marker not in raw
+
+
+def test_access_log_records_404_for_an_unknown_path(tmp_path):
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        _call(server, "/nope")
+    records = read_access_log(str(tmp_path))
+    assert records[-1] == {**records[-1], "method": "GET", "path": "/nope", "status": 404}
+
+
+def test_access_log_write_failure_never_breaks_the_response(tmp_path, monkeypatch):
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        def boom(*args, **kwargs):
+            raise OSError("disk gone")
+
+        monkeypatch.setattr(server.dispatcher.access_log, "append", boom)
+        status, payload = _call(server, "/health", token=None)
+    assert status == 200
+    assert payload["status"] == "ok"
+
+
+def test_access_log_lives_at_jobs_root_and_is_created_lazily(tmp_path):
+    target = Path(tmp_path) / "access.jsonl"
+    assert not target.exists()
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        _call(server, "/health", token=None)
+        _call(server, "/jobs", token=None)  # 401
+        _call(server, "/nope")  # 404
+        _call(server, "/jobs")  # 200
+    assert target.exists()
+    lines = target.read_text().splitlines()
+    assert len(lines) >= 4
+    for line in lines:
+        json.loads(line)  # every persisted line is valid, parseable JSON
+
+
+def test_access_log_skips_a_connection_closed_before_any_response(tmp_path):
+    # A client that opens a connection and closes it without sending
+    # anything never reaches send_response, so handle_one_request's finally
+    # block must see _access_log_status still None and skip the append —
+    # never fabricate a record for a request that was never actually served.
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        host, port = server.httpd.server_address[:2]
+        sock = socket.create_connection((host, port), timeout=5)
+        sock.close()
+        status, payload = _call(server, "/health", token=None)
+        assert status == 200
+    records = read_access_log(str(tmp_path))
+    assert [r["path"] for r in records] == ["/health"]
+
+
+def test_access_log_concurrent_requests_never_lose_an_entry(tmp_path):
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        threads = [
+            threading.Thread(target=lambda: _call(server, "/health", token=None))
+            for _ in range(20)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    records = read_access_log(str(tmp_path), limit=1000)
+    assert len(records) == 20

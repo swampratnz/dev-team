@@ -107,6 +107,19 @@ sections below are reconstructed from the repository history.
   would silently under-report. Respects the same archived-exclusion
   (`?archived=1`) as `GET /jobs`, and needs no dashboard workspace to
   answer (archived-exclusion simply no-ops without one).
+- **Access log** (`docs/DISPATCH.md`, `dev_team.accesslog.AccessLog`): the
+  dispatch service now persists a bounded, retained request/auth trail —
+  closing the CLAUDE.md section 7 log-gap left by `Handler.log_message`'s
+  deliberate no-op. Every request — `/health`, authorised, `401`, unknown-
+  path `404` — appends exactly one `{ts,method,path,status}` record to
+  `<jobs_root>/access.jsonl`, created lazily on first request and rewritten
+  past 4000 lines to keep the newest half, mirroring
+  `dev_team.eventlog.EventLog`'s bound. Never logs the `Authorization`
+  header value or any request/response body; the persisted `path` is
+  truncated to 2048 bytes independent of the HTTP server's own request-line
+  cap. A log-write failure (disk full, unwritable jobs root) is swallowed
+  at the handler level and never affects a response already sent to the
+  caller.
 
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the

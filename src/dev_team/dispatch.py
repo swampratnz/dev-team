@@ -10,7 +10,7 @@ STATUS, and fetch the RESULT. It wraps exactly the same code paths the CLI's ``-
 
 The design mirrors :mod:`dev_team.dashboard`: stdlib
 :class:`~http.server.ThreadingHTTPServer`, no dependencies, a request handler
-class bound to a core object, and per-request stderr silenced. Three
+class bound to a core object, and per-request stderr silenced. Four
 guardrails matter for a service that holds Claude credentials and runs agent
 code on a shared box:
 
@@ -24,6 +24,13 @@ code on a shared box:
 - **Tailnet-bound.** The CLI binds the unit to the tailnet IP only (see
   ``deploy/dev-team-dispatch.service``); nothing here is exposed to the public
   internet.
+- **Access-logged.** ``Handler.log_message`` silences the stdlib's default
+  per-request stderr line, but every request — ``/health``, authorised,
+  ``401``, and unknown-path ``404`` alike — still appends exactly one record
+  (method, path, status; never the bearer token or a request/response body)
+  to a bounded journal via :class:`~dev_team.accesslog.AccessLog`, so a
+  suspected-compromised token or an unrecognised-path probe leaves a
+  retained, reviewable trace (CLAUDE.md section 7).
 
 The seams the constructor exposes (``runner``, ``materialise``, ``clock``,
 ``jobs_root``) exist so the whole executor can run offline in tests with an
@@ -46,6 +53,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
+from .accesslog import AccessLog
 from .assessment import (
     AssessConfig,
     calibration_summary,
@@ -219,6 +227,11 @@ class Dispatcher:
         self._materialise = materialise or _default_materialise
         self._clock = clock
         self._jobs_root = jobs_root
+        # Constructing this touches no filesystem state (see AccessLog's
+        # docstring) — safe to do unconditionally here even though most
+        # Dispatcher instances (every non-HTTP unit test) never end up
+        # appending to it.
+        self.access_log = AccessLog(jobs_root, clock=clock)
         # Off by default: capturing raw agent I/O is opt-in (the operator
         # enables it via --record-transcripts or DEV_TEAM_RECORD_TRANSCRIPTS).
         self._record_transcripts = record_transcripts
@@ -1333,6 +1346,43 @@ def _make_handler(dispatcher: Dispatcher) -> type:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:  # noqa: A002
             """Silence per-request stderr noise; the CLI prints the URL once."""
+
+        def handle_one_request(self) -> None:  # noqa: N802 (http.server API)
+            """Append one access-log record after every request, unconditionally.
+
+            Every ``do_GET``/``do_POST``/``do_PATCH``/``do_DELETE`` branch —
+            and the stdlib's own pre-dispatch error handling (a malformed
+            request line, an unsupported method) — funnels its response
+            through :meth:`send_response`, so overriding it below to record
+            the status actually sent, then reading that back here in a
+            ``finally``, captures every request's outcome regardless of which
+            branch (if any) handled it. Nothing is logged if the connection
+            dropped before any response was ever sent.
+
+            The log write is best-effort: an ``OSError`` (disk full,
+            unwritable jobs root) is swallowed here so it can never turn an
+            otherwise-successful response already sent to the caller into a
+            handler crash.
+            """
+
+            self._access_log_status: Optional[int] = None
+            try:
+                super().handle_one_request()
+            finally:
+                status = self._access_log_status
+                if status is not None:
+                    try:
+                        dispatcher.access_log.append(
+                            method=getattr(self, "command", None) or "-",
+                            request_path=urlsplit(getattr(self, "path", "") or "").path,
+                            status=status,
+                        )
+                    except OSError:
+                        pass
+
+        def send_response(self, code: int, message: Optional[str] = None) -> None:
+            self._access_log_status = code
+            super().send_response(code, message)
 
         def _json(self, status: int, payload: Dict[str, Any]) -> None:
             body = json.dumps(payload).encode("utf-8")

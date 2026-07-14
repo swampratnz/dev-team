@@ -456,6 +456,57 @@ needs **no** dashboard-workspace guard — it works standalone off the
 registry, and archived-exclusion simply no-ops (never excludes anything)
 until `--dashboard-workspace` is configured.
 
+## Access log
+
+Every HTTP request the service receives — `GET /health`, an authorised
+route, a `401` auth miss, or a `404` on an unrecognised path — appends
+exactly one record to a bounded JSONL journal at `<jobs_root>/access.jsonl`
+(`/opt/dev-team/jobs/access.jsonl` by default), created lazily on the first
+request. This closes CLAUDE.md section 7's log-gap requirement ("every agent
+authentication and call must produce a retained, reviewable log") for the
+one HTTP surface in this repo that otherwise silences its per-request
+logging entirely (`Handler.log_message` is a deliberate no-op — the CLI
+prints the bind URL once instead of a line per request).
+
+```json
+{"ts":1789345678.0,"method":"GET","path":"/jobs","status":200}
+```
+
+Fields are deliberately minimal:
+
+- `ts` — the record's wall-clock time (`time.time()`, or the dispatcher's
+  injected `clock` in tests).
+- `method` — the HTTP method (`GET`, `POST`, `PATCH`, `DELETE`).
+- `path` — the request's URL path only (no query string), truncated to at
+  most 2048 bytes so a maximal-length request line cannot inflate a single
+  entry disproportionately — independent of the HTTP server's own implicit
+  request-line cap.
+- `status` — the HTTP status code actually sent for that request.
+
+**Deliberately never logged**: the `Authorization` header value (or any
+other header), and any request or response body. A `deliver` job's
+`title`/`description` is caller-supplied free text that could carry
+anything the caller pastes — logging *that* a call happened, on what path,
+with what outcome, is the goal; logging its payload is explicitly out of
+scope for this journal (a future authenticated read route could add
+correlation with a job id, but the log itself never stores bodies).
+
+Bounded like `.dev_team/events.jsonl` (`dev_team.eventlog.EventLog`): once
+the file exceeds 4000 lines it is rewritten keeping the newest half, so a
+long-running service never accretes an unbounded file, including under
+sustained hostile traffic (even just repeated auth misses). Appends are
+lock-serialised (`dev_team.accesslog.AccessLog`), so concurrent requests —
+this is a `ThreadingHTTPServer` — never lose an entry to a lost-update race.
+A log-write failure (disk full, unwritable `jobs_root`) is swallowed at the
+handler level and never turns an otherwise-successful response into a
+crash; it also never affects the response already sent to the caller,
+since the record is appended only after `send_response` has been called.
+
+There is no HTTP route to read this log in v1 — it is reviewed the same way
+an operator already reviews `events.jsonl`/`verifications.jsonl` (filesystem
+access to the deployment). An authenticated `GET /access-log` route is
+natural growth once there is a proven need to view it remotely.
+
 ## Deployment
 
 `deploy/dev-team-dispatch.service` is a hardened, singleton systemd unit
