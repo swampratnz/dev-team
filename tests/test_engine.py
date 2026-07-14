@@ -16,6 +16,8 @@ from dev_team.engine import (
     _review_from_dod,
 )
 from dev_team.execution import (
+    EXIT_NOT_FOUND,
+    EXIT_TIMEOUT,
     CommandResult,
     DryRunCommandRunner,
     FakeCommandRunner,
@@ -1489,6 +1491,143 @@ def test_security_scan_defaults_from_profile():
     run(engine.deliver(_request()))
     # the detected python profile's bandit scan ran through the runner
     assert any(c and c[0] == "bandit" for c in cmd.calls)
+
+
+def test_security_scanner_not_found_is_not_passed_off_as_findings():
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "bandit",
+        CommandResult(
+            ["bandit"], EXIT_NOT_FOUND, "", "[Errno 2] No such file or directory: 'bandit'"
+        ),
+    )
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(security_scan_command=("bandit", "-r", ".")),
+    )
+    outcome = run(engine.deliver(_request()))
+    sec_prompt = next(
+        c["prompt"]
+        for c in runner.calls
+        if "application security engineer" in (c["system_prompt"] or "")
+    )
+    assert "No such file or directory" not in sec_prompt
+    assert "(no scanner output available" in sec_prompt
+    assert outcome.security.scanner_failed is True
+    assert "No such file or directory" in outcome.security.scanner_error
+
+
+def test_security_scanner_timeout_is_not_passed_off_as_findings():
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "bandit", CommandResult(["bandit"], EXIT_TIMEOUT, "partial output", "command timed out")
+    )
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(security_scan_command=("bandit", "-r", ".")),
+    )
+    outcome = run(engine.deliver(_request()))
+    sec_prompt = next(
+        c["prompt"]
+        for c in runner.calls
+        if "application security engineer" in (c["system_prompt"] or "")
+    )
+    assert "partial output" not in sec_prompt
+    assert "(no scanner output available" in sec_prompt
+    assert outcome.security.scanner_failed is True
+    assert "command timed out" in outcome.security.scanner_error
+
+
+def test_security_scanner_clean_exit_is_unaffected():
+    cmd = GateCycleRunner()
+    cmd.add_rule("bandit", CommandResult(["bandit"], 0, "No issues identified.", ""))
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(security_scan_command=("bandit", "-r", ".")),
+    )
+    outcome = run(engine.deliver(_request()))
+    sec_prompt = next(
+        c["prompt"]
+        for c in runner.calls
+        if "application security engineer" in (c["system_prompt"] or "")
+    )
+    assert "No issues identified." in sec_prompt
+    assert outcome.security.scanner_failed is False
+    assert outcome.security.scanner_error is None
+
+
+def test_security_scan_command_none_never_invokes_runner():
+    cmd = GateCycleRunner()
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(security_scan_command=None),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert not any(c and c[0] == "bandit" for c in cmd.calls)
+    assert outcome.security.scanner_failed is False
+    assert outcome.security.scanner_error is None
+
+
+def test_security_scanner_failure_text_is_inert_never_reparsed():
+    # A stderr payload shaped like a shell-injection/path-traversal attempt
+    # must surface only as display text — never re-parsed or used to spawn
+    # another command.
+    malicious = "[Errno 2] No such file or directory: '; rm -rf / #'"
+    cmd = GateCycleRunner()
+    cmd.add_rule("bandit", CommandResult(["bandit"], EXIT_NOT_FOUND, "", malicious))
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(security_scan_command=("bandit", "-r", ".")),
+    )
+    outcome = run(engine.deliver(_request()))
+    # the scanner command ran exactly once; the malicious-looking text never
+    # triggered a second, distinct command invocation
+    bandit_calls = [c for c in cmd.calls if c and c[0] == "bandit"]
+    assert len(bandit_calls) == 1
+    assert outcome.security.scanner_error == malicious
+    from dev_team.report import render_delivery_summary
+
+    text = render_delivery_summary(outcome)
+    assert "[SCANNER DID NOT RUN]" in text
+
+
+def test_security_scan_command_invoked_with_unchanged_cwd_timeout():
+    class RecordingRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, command, *, cwd=None, timeout=None, env=None):
+            args = list(command)
+            self.calls.append({"args": args, "cwd": cwd, "timeout": timeout, "env": env})
+            if args and args[0] == "bandit":
+                return CommandResult(args, 0, "clean", "")
+            if args and args[0] in GateCycleRunner.VERIFY_PROGRAMS:
+                return CommandResult(args, 0, "", "")
+            return CommandResult(args, 0, "", "")
+
+    cmd = RecordingRunner()
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(
+            security_scan_command=("bandit", "-r", "."), gate_timeout_seconds=42.0
+        ),
+    )
+    run(engine.deliver(_request()))
+    scan_call = next(c for c in cmd.calls if c["args"] and c["args"][0] == "bandit")
+    assert scan_call["cwd"] == engine.workdir
+    assert scan_call["timeout"] == 42.0
 
 
 def test_vacuous_tests_are_rejected():

@@ -104,6 +104,9 @@ def delivery_to_dict(outcome: "DeliveryOutcome") -> Dict[str, Any]:
         "design_overview": outcome.design.overview,
         "tasks": [_task_to_dict(tr) for tr in outcome.task_results],
         "security_approved": outcome.security.approved if outcome.security else None,
+        "security_scanner_failed": (
+            outcome.security.scanner_failed if outcome.security else None
+        ),
         "production_ready": (
             outcome.reliability.production_ready if outcome.reliability else None
         ),
@@ -150,7 +153,8 @@ def render_delivery_summary(outcome: "DeliveryOutcome") -> str:
         lines.append("  (no tasks were produced)")
     if outcome.security is not None:
         state = "approved" if outcome.security.approved else "BLOCKED"
-        lines.append(f"Security: {state} — {outcome.security.summary}")
+        marker = " [SCANNER DID NOT RUN]" if outcome.security.scanner_failed else ""
+        lines.append(f"Security: {state} — {outcome.security.summary}{marker}")
     if outcome.reliability is not None:
         state = "ready" if outcome.reliability.production_ready else "NOT READY"
         lines.append(f"Reliability: {state}")

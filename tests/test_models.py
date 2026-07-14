@@ -99,3 +99,11 @@ def test_security_report_blocking_findings():
         ],
     )
     assert len(report.blocking_findings) == 2
+
+
+def test_security_report_scanner_failed_defaults_falsy():
+    from dev_team.models import SecurityReport
+
+    report = SecurityReport(approved=True, summary="ok")
+    assert report.scanner_failed is False
+    assert report.scanner_error is None

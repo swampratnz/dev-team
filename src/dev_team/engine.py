@@ -54,6 +54,8 @@ from .errors import DependencyCycleError, DevTeamError
 from .events import AgentEvent, Listener, emit
 from .failures import new_failures, parse_failed_tests
 from .execution import (
+    EXIT_NOT_FOUND,
+    EXIT_TIMEOUT,
     CommandRunner,
     DryRunCommandRunner,
     InMemoryWorkspace,
@@ -1725,6 +1727,8 @@ class DeliveryEngine:
             self._profile.security_scan_command if self._profile else None
         )
         scanner_output = None
+        scanner_failed = False
+        scanner_error = None
         if scan_command is not None:
             result = await asyncio.to_thread(
                 self.command_runner.run,
@@ -1732,7 +1736,14 @@ class DeliveryEngine:
                 cwd=self.workdir,
                 timeout=self.config.gate_timeout_seconds,
             )
-            scanner_output = result.output or None
+            if result.exit_code in (EXIT_NOT_FOUND, EXIT_TIMEOUT):
+                # The scanner never actually ran (binary missing / timed
+                # out) — its exception text must not reach the agent's
+                # <scanner-output> triage block looking like real findings.
+                scanner_failed = True
+                scanner_error = result.output or None
+            else:
+                scanner_output = result.output or None
         report = await self.security.review(
             pseudo_task,
             aggregate,
@@ -1740,6 +1751,8 @@ class DeliveryEngine:
             scanner_output=scanner_output,
             workspace_root=self.workdir,
         )
+        report.scanner_failed = scanner_failed
+        report.scanner_error = scanner_error
         self.blackboard.post_artifact("security", "FEATURE", report.summary)
         return report
 
