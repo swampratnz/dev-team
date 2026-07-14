@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 from .errors import DevTeamError
 from .execution import CommandRunner
@@ -253,6 +253,39 @@ class GitRepo:
         """
 
         self._git("reset", "--hard", ref)
+
+    def push(
+        self,
+        branch: str,
+        *,
+        remote: str = "origin",
+        set_upstream: bool = False,
+        force_with_lease: bool = False,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """Push ``branch`` to ``remote``.
+
+        Any credential rides in ``env`` (the per-command ``GIT_CONFIG_*``
+        ``http.extraheader`` the ``sources`` module builds), never in argv — so
+        the token stays out of process listings and ``.git/config``, matching
+        the clone path. ``force_with_lease`` (never a bare ``--force``) is the
+        safe form for re-pushing a rebased delivery branch. Raises
+        :class:`GitError` if the push is rejected.
+        """
+
+        args = ["push"]
+        if set_upstream:
+            args.append("--set-upstream")
+        if force_with_lease:
+            args.append("--force-with-lease")
+        args += [remote, branch]
+        result = self.runner.run(
+            ["git", *args], cwd=self.cwd, timeout=self.timeout, env=env
+        )
+        if not result.ok:
+            raise GitError(
+                f"git {' '.join(args)} failed ({result.exit_code}): {result.output}"
+            )
 
     def has_changes(self) -> bool:
         """Whether the working tree has uncommitted changes."""

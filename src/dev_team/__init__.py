@@ -141,6 +141,14 @@ from .models import (
 )
 from .policy import GuardedCommandRunner, PolicyVerdict, SideEffectPolicy
 from .profile import ProjectProfile, detect_project
+from .pullrequest import (
+    FakePullRequestPublisher,
+    GitHubPullRequestPublisher,
+    PullRequest,
+    PullRequestError,
+    PullRequestPublisher,
+    PullRequestRequest,
+)
 from .sandbox import ContainerCommandRunner, SandboxConfig, SandboxError
 from .scheduler import ScheduledResult, ScheduleStatus, schedule
 from .sdk import AgentResult, AgentRunner, ClaudeAgentRunner
@@ -268,6 +276,12 @@ __all__ = [
     "ContainerCommandRunner",
     "SandboxConfig",
     "SandboxError",
+    "PullRequest",
+    "PullRequestRequest",
+    "PullRequestPublisher",
+    "GitHubPullRequestPublisher",
+    "FakePullRequestPublisher",
+    "PullRequestError",
     # memory
     "Blackboard",
     "Artifact",

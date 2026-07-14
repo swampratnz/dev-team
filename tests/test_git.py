@@ -220,3 +220,37 @@ def test_commit_allow_empty():
     cmd = FakeCommandRunner()
     GitRepo(cmd).commit("msg", allow_empty=True)
     assert ["git", "commit", "--allow-empty", "-m", "msg"] in cmd.calls
+
+
+def test_push_sets_upstream_and_threads_env():
+    # The credential rides in env (the http.extraheader GIT_CONFIG_* the
+    # sources module builds), never in argv — so it stays out of process
+    # listings and .git/config. set_upstream adds --set-upstream.
+    cmd = FakeCommandRunner()
+    env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.extraheader"}
+    GitRepo(cmd).push("dev-team/feat", set_upstream=True, env=env)
+    assert cmd.calls[-1] == ["git", "push", "--set-upstream", "origin", "dev-team/feat"]
+    assert cmd.envs[-1] == env
+
+
+def test_push_force_with_lease_and_custom_remote():
+    # force_with_lease (never a bare --force) is the safe re-push form; a
+    # custom remote is honoured. No env is fine (public push).
+    cmd = FakeCommandRunner()
+    GitRepo(cmd).push("main", remote="upstream", force_with_lease=True)
+    assert cmd.calls[-1] == ["git", "push", "--force-with-lease", "upstream", "main"]
+    assert cmd.envs[-1] is None
+
+
+def test_push_defaults_to_plain_push_to_origin():
+    cmd = FakeCommandRunner()
+    GitRepo(cmd).push("dev-team/feat")
+    assert cmd.calls[-1] == ["git", "push", "origin", "dev-team/feat"]
+
+
+def test_push_raises_when_rejected():
+    cmd = FakeCommandRunner().add_rule(
+        "push", CommandResult(["git", "push"], 1, "", "! [rejected] (fetch first)")
+    )
+    with pytest.raises(GitError, match="git push"):
+        GitRepo(cmd).push("dev-team/feat")
