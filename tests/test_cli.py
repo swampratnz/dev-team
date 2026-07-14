@@ -1413,6 +1413,37 @@ def test_main_pr_tuning_requires_pull_request():
         assert exc.value.code == 2
 
 
+def test_main_chat_deliver_pull_request_threads_ref_and_token(
+    tmp_path, monkeypatch, capsys
+):
+    # Regression: an in-session /deliver must receive the clone's resolved
+    # ref/token so --pull-request works from chat too. They were dropped before,
+    # so publish saw ref=None/token="" and failed with a misleading
+    # "no token resolved" error even though the clone had just used one.
+    import io as _io
+
+    import dev_team.cli as cli_module
+    from helpers import engine_responses
+    from test_chat import FakeBackend
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(cli_module, "clone_or_update", _fake_clone_empty_repo)
+    seen = {}
+    monkeypatch.setattr(cli_module, "publish_pull_request", _fake_publish(seen))
+    monkeypatch.setattr("sys.stdin", _io.StringIO("/deliver\ny\n/quit\n"))
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(
+        ["--chat", "--repo", "acme/mono", "--pull-request",
+         "--verify-command", "python -c pass"],
+        runner=runner,
+        chat_backend=FakeBackend(),
+    )
+    assert code == 0
+    assert seen["slug"] == "acme/mono"
+    assert seen["token"] == "tok"
+
+
 # --- dashboard --------------------------------------------------------------------
 
 

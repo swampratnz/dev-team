@@ -636,8 +636,8 @@ def _validate_args(
         parser.error("--env-file: only valid with --repo")
     if args.remote_verify_trigger is not None and args.remote_verify_status is None:
         parser.error("--remote-verify-trigger requires --remote-verify-status")
-    if args.pull_request and not args.deliver:
-        parser.error("--pull-request: only valid with --deliver")
+    if args.pull_request and not (args.deliver or args.chat):
+        parser.error("--pull-request: only valid with --deliver or --chat")
     if args.pull_request and args.repo is None:
         parser.error(
             "--pull-request requires --repo (to know which GitHub repository "
@@ -997,6 +997,8 @@ async def _chat(
     backend: Optional[ChatBackend],
     *,
     budget: Budget,
+    repo_ref: Optional[RepoRef] = None,
+    github_token: Optional[str] = None,
 ) -> int:
     """Run the ``--chat`` session; returns the last run's exit code."""
 
@@ -1008,7 +1010,13 @@ async def _chat(
 
     async def run_feature(request: FeatureRequest, deliver: bool) -> int:
         if deliver:
-            return await _deliver(team, request, args, budget=budget)
+            # Thread the clone's resolved ref/token so an in-session /deliver can
+            # honour --pull-request too (the token was popped from the env at
+            # clone time and cannot be re-resolved) — mirroring the direct path.
+            return await _deliver(
+                team, request, args, budget=budget,
+                repo_ref=repo_ref, github_token=github_token,
+            )
         return await _simulate(team, request, args, budget=budget)
 
     session = ChatSession(
@@ -1364,7 +1372,12 @@ def _run(
     run_id = event_log.run if event_log is not None else None
 
     if args.chat:
-        return asyncio.run(_chat(team, args, chat_backend, budget=budget))
+        return asyncio.run(
+            _chat(
+                team, args, chat_backend,
+                budget=budget, repo_ref=repo_ref, github_token=github_token,
+            )
+        )
     if args.assess:
         return asyncio.run(_assess(team, args, run_id, budget=budget))
 
