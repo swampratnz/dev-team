@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Mapping, Optional
 
 from .errors import DevTeamError
 from .execution import CommandRunner
@@ -253,6 +253,52 @@ class GitRepo:
         """
 
         self._git("reset", "--hard", ref)
+
+    def push(
+        self,
+        branch: str,
+        *,
+        remote: str = "origin",
+        set_upstream: bool = False,
+        force_with_lease: bool = False,
+        env: Optional[Mapping[str, str]] = None,
+        scrub: Optional[Callable[[str], str]] = None,
+    ) -> None:
+        """Push ``branch`` to ``remote``.
+
+        Any credential rides in ``env`` (the per-command ``GIT_CONFIG_*``
+        ``http.extraheader`` the ``sources`` module builds), never in argv — so
+        the token stays out of process listings and ``.git/config``, matching
+        the clone path. ``force_with_lease`` (never a bare ``--force``) is the
+        safe form for re-pushing a rebased delivery branch.
+
+        ``scrub`` redacts the credential from git's own output before it is
+        embedded in the raised :class:`GitError`. This matters because a
+        verbose or ``GIT_TRACE`` run can echo the ``AUTHORIZATION: basic
+        <base64>`` header back in git's output, and that error text has real
+        downstream sinks (event log, transcript, an outcome report). Only the
+        argv-free ``result.output`` is scrubbed; ``args`` never carries the
+        credential. The caller that owns the token supplies the redactor
+        (e.g. ``lambda t: sources._scrub(t, token)``), keeping this generic
+        porcelain free of any GitHub/base64 specifics — the same split
+        ``sources`` uses between :func:`_auth_env` and :func:`_scrub`. Raises
+        :class:`GitError` if the push is rejected.
+        """
+
+        args = ["push"]
+        if set_upstream:
+            args.append("--set-upstream")
+        if force_with_lease:
+            args.append("--force-with-lease")
+        args += [remote, branch]
+        result = self.runner.run(
+            ["git", *args], cwd=self.cwd, timeout=self.timeout, env=env
+        )
+        if not result.ok:
+            output = scrub(result.output) if scrub else result.output
+            raise GitError(
+                f"git {' '.join(args)} failed ({result.exit_code}): {output}"
+            )
 
     def has_changes(self) -> bool:
         """Whether the working tree has uncommitted changes."""
