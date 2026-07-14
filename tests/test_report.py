@@ -134,6 +134,7 @@ def test_delivery_to_dict_minimal():
     data = delivery_to_dict(_outcome())
     assert data["success"] is False
     assert data["security_approved"] is None
+    assert data["security_scanner_failed"] is None
     assert data["production_ready"] is None
     assert data["committed"] is False
 
@@ -158,8 +159,21 @@ def test_delivery_to_dict_full():
     data = delivery_to_dict(outcome)
     assert data["success"] is True
     assert data["security_approved"] is True
+    assert data["security_scanner_failed"] is False
     assert data["production_ready"] is True
     assert data["workspace_files"] == ["src/x.py"]
+
+
+def test_delivery_to_dict_scanner_failed():
+    from dev_team.models import SecurityReport
+
+    outcome = _outcome(
+        security=SecurityReport(
+            approved=True, summary="ok", scanner_failed=True, scanner_error="not found"
+        ),
+    )
+    data = delivery_to_dict(outcome)
+    assert data["security_scanner_failed"] is True
 
 
 def test_render_delivery_summary_branches():
@@ -204,6 +218,25 @@ def test_render_delivery_summary_branches():
     assert "SUCCESS" in good
     assert "approved" in good
     assert "Committed: yes" in good
+    # today's rendering for a normal (non-scanner-failed) report is
+    # byte-identical — the new marker must never appear in the common case.
+    assert "Security: approved — ok" in good
+    assert "[SCANNER DID NOT RUN]" not in good
+
+
+def test_render_delivery_summary_marks_scanner_failure():
+    from dev_team.models import SecurityReport, Task, TaskResult, TaskStatus
+
+    task = Task(id="T1", title="t", description="", status=TaskStatus.DONE)
+    text = render_delivery_summary(
+        _outcome(
+            task_results=[TaskResult(task=task, attempts=1)],
+            security=SecurityReport(
+                approved=True, summary="ok", scanner_failed=True, scanner_error="not found"
+            ),
+        )
+    )
+    assert "Security: approved — ok [SCANNER DID NOT RUN]" in text
 
 
 def test_render_delivery_summary_halted():

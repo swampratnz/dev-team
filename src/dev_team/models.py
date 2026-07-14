@@ -192,6 +192,12 @@ class SecurityReport:
     approved: bool
     summary: str
     findings: List[SecurityFinding] = field(default_factory=list)
+    # Set only by the engine from a deterministic scan-command exit-code
+    # check — never by the LLM — when a configured scanner did not actually
+    # run (binary missing, timed out), so that gets surfaced as distinct
+    # from "scanner ran clean" rather than silently trusted.
+    scanner_failed: bool = False
+    scanner_error: Optional[str] = None
 
     @property
     def blocking_findings(self) -> List[SecurityFinding]:
