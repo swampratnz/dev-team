@@ -155,7 +155,8 @@ def _reject_embedded_credentials(ref: str) -> None:
 
     A ``https://user:pass@host/...`` (or bare ``https://token@host/...``) URL
     would put the secret straight into git's argv and ``.git/config``, where
-    neither the header-based auth design nor :func:`_scrub` can reach it — so
+    neither the header-based auth design nor :func:`scrub_credentials` can
+    reach it — so
     it must be rejected outright rather than silently propagated. A bare
     ``ssh://git@host`` username is left alone: that is a transport user, not a
     secret. Credentials belong in an env file, so point the user at
@@ -262,7 +263,7 @@ def _is_github_https(url: str) -> bool:
     return (parts.hostname or "") in _GITHUB_HOSTS
 
 
-def _auth_env(ref: RepoRef, token: Optional[str]) -> Dict[str, str]:
+def git_auth_env(ref: RepoRef, token: Optional[str]) -> Dict[str, str]:
     """Per-command git environment: never prompt; header-based auth.
 
     The basic-auth header rides in ``GIT_CONFIG_*`` variables scoped to this
@@ -270,6 +271,11 @@ def _auth_env(ref: RepoRef, token: Optional[str]) -> Dict[str, str]:
     header is attached only for GitHub HTTPS remotes: a token cannot help SSH
     or file URLs, and sending it to a non-GitHub HTTPS host would hand the
     credential to an arbitrary third party.
+
+    Public because the same env authenticates any git operation against the
+    remote, not just the clone — the delivery target reuses it to *push* the
+    delivered branch (paired with :func:`scrub_credentials`, exactly as
+    :func:`clone_or_update` pairs them here).
     """
 
     env = {"GIT_TERMINAL_PROMPT": "0"}
@@ -285,12 +291,16 @@ def _auth_env(ref: RepoRef, token: Optional[str]) -> Dict[str, str]:
     return env
 
 
-def _scrub(text: str, token: Optional[str]) -> str:
+def scrub_credentials(text: str, token: Optional[str]) -> str:
     """Redact the token *and* the basic-auth header value derived from it.
 
     A verbose/``GIT_TRACE`` line can echo the ``AUTHORIZATION: basic <base64>``
-    header rather than the raw token, so the exact base64 value :func:`_auth_env`
-    would compute is redacted alongside the token itself.
+    header rather than the raw token, so the exact base64 value
+    :func:`git_auth_env` would compute is redacted alongside the token itself.
+
+    Public for the same reason as :func:`git_auth_env`: any git call that
+    carries the header can leak it into its output, so every caller (the clone
+    here, the delivery target's push) redacts with this before raising.
     """
 
     if not token:
@@ -315,7 +325,7 @@ def clone_or_update(
     """
 
     destination = Path(dest)
-    env = _auth_env(ref, token)
+    env = git_auth_env(ref, token)
     if (destination / ".git").exists():
         remote = runner.run(
             ["git", "remote", "get-url", "origin"], cwd=dest, timeout=timeout
@@ -332,7 +342,7 @@ def clone_or_update(
             raise SourceError(
                 f"could not update the existing clone at {dest} "
                 f"(local changes or a diverged branch?): "
-                f"{_scrub(pulled.output, token)}"
+                f"{scrub_credentials(pulled.output, token)}"
             )
         return dest
     if destination.exists() and any(destination.iterdir()):
@@ -343,7 +353,7 @@ def clone_or_update(
     if not result.ok:
         raise SourceError(
             f"cloning {ref.slug} failed{_clone_hint(result.output)}: "
-            f"{_scrub(result.output, token)}"
+            f"{scrub_credentials(result.output, token)}"
         )
     return dest
 

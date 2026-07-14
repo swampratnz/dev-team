@@ -69,6 +69,7 @@ from .budget import Budget, BudgetExceededError, UsageMeter, UsageRecord
 from .changes import AppliedChange, ApplyResult, ChangeApplier
 from .config import TeamConfig
 from .context import RepoContext, build_repo_context
+from .delivery_target import DeliveryTargetError, publish_pull_request
 from .engine import DeliveryEngine, DeliveryOutcome, EngineConfig
 from .errors import (
     AgentResponseError,
@@ -157,9 +158,11 @@ from .sources import (
     SourceError,
     clone_or_update,
     default_env_file,
+    git_auth_env,
     load_env_file,
     parse_repo,
     resolve_github_token,
+    scrub_credentials,
 )
 from .team import DevTeam, build_workflow
 from .trace import Tracer, TraceSpan
@@ -282,6 +285,8 @@ __all__ = [
     "GitHubPullRequestPublisher",
     "FakePullRequestPublisher",
     "PullRequestError",
+    "publish_pull_request",
+    "DeliveryTargetError",
     # memory
     "Blackboard",
     "Artifact",
@@ -320,6 +325,8 @@ __all__ = [
     "default_env_file",
     "load_env_file",
     "resolve_github_token",
+    "git_auth_env",
+    "scrub_credentials",
     # verification
     "Gate",
     "GateContext",
