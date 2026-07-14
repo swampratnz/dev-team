@@ -302,20 +302,27 @@ class SessionAgentRunner:
     double in the suite — never has to know this parameter exists.
 
     Fail-secure behaviour (see :meth:`_reconnect`): a continuation call whose
-    transport drops, or whose requested model differs from the one the
-    session was connected with (``EngineConfig.escalation_model`` on the
-    final attempt — a ``ClaudeSDKClient``'s model is fixed at ``connect()``),
-    is never silently absorbed. The stale client is discarded and a fresh one
-    is connected, replaying the task's full prompt history so the attempt
-    still carries full context even though only this turn's compact prompt
-    was handed to :meth:`run`.
+    transport drops, whose connect or query wall-clock budget is exceeded, or
+    whose requested model differs from the one the session was connected
+    with (``EngineConfig.escalation_model`` on the final attempt — a
+    ``ClaudeSDKClient``'s model is fixed at ``connect()``), is never silently
+    absorbed. The stale client is discarded and a fresh one is connected,
+    replaying the task's full prompt history so the attempt still carries
+    full context even though only this turn's compact prompt was handed to
+    :meth:`run`.
 
     Attributes:
         permission_mode: Permission mode for every connected client (see
             :class:`ClaudeAgentRunner` — engineering needs edit permissions).
         max_turns: Optional cap on SDK turns per connected client.
-        timeout_seconds: Per-call wall-clock budget, matching
-            :class:`ClaudeAgentRunner`.
+        timeout_seconds: Wall-clock budget for each individual ``connect()``
+            or query/receive turn (see :meth:`_connect`/:meth:`_query`) —
+            bounded per call, not once for the whole of :meth:`run`, so a
+            timeout on a reused session is an ordinary fault :meth:`_run`
+            catches and routes through :meth:`_reconnect`/:meth:`_drop`
+            exactly like a dropped connection, rather than a cancellation
+            that would leave a half-consumed client sitting in
+            ``_sessions``.
         client_factory: Injection point for tests; defaults to the real
             ``ClaudeSDKClient``.
     """
@@ -339,16 +346,13 @@ class SessionAgentRunner:
         task_key: Optional[str] = None,
     ) -> AgentResult:
         try:
-            return await asyncio.wait_for(
-                self._run(
-                    prompt,
-                    system_prompt=system_prompt,
-                    allowed_tools=allowed_tools,
-                    model=model,
-                    cwd=cwd,
-                    task_key=task_key,
-                ),
-                timeout=self.timeout_seconds,
+            return await self._run(
+                prompt,
+                system_prompt=system_prompt,
+                allowed_tools=allowed_tools,
+                model=model,
+                cwd=cwd,
+                task_key=task_key,
             )
         except (ClaudeSDKError, OSError, UnicodeDecodeError, TimeoutError) as exc:
             return AgentResult(text=f"{type(exc).__name__}: {exc}", is_error=True)
@@ -406,6 +410,14 @@ class SessionAgentRunner:
         if session.model != model:
             # A connected client's model is fixed at connect() time; silently
             # continuing on the stale model would defeat escalation_model.
+            # NOTE: allowed_tools/system_prompt/cwd are just as fixed at
+            # connect() time but are deliberately NOT compared here — both
+            # call sites in engine.py pass the same values on every attempt
+            # for a given task_key, so a mismatch can't currently happen. If
+            # that ever changes (e.g. a narrower allowlist introduced between
+            # attempts), this check needs to grow to cover them too, or a
+            # narrowed-tools attempt would silently keep running with the
+            # wider, connect-time allowlist.
             return await self._reconnect(
                 task_key,
                 session,
@@ -490,10 +502,24 @@ class SessionAgentRunner:
         )
         factory = self.client_factory or _default_client_factory
         client = factory(options)
-        await client.connect()
+        # Bounded per-call, not by an outer wrap of the whole _run(): a
+        # timeout raised *here* is an ordinary TimeoutError our own
+        # try/except clauses catch, so a hung connect() routes through the
+        # same _reconnect/_drop fail-secure path as every other fault
+        # instead of surfacing as an uncatchable CancelledError further up.
+        await asyncio.wait_for(client.connect(), timeout=self.timeout_seconds)
         return client
 
     async def _query(self, client: Any, text: str) -> AgentResult:
+        # See _connect: timing out *this* coroutine (not the caller's) turns
+        # a hang into a plain TimeoutError the caller's except clauses can
+        # catch, so it self-heals via _reconnect/_drop instead of leaving a
+        # half-consumed client sitting in self._sessions for the next call.
+        return await asyncio.wait_for(
+            self._receive(client, text), timeout=self.timeout_seconds
+        )
+
+    async def _receive(self, client: Any, text: str) -> AgentResult:
         await client.query(text)
         texts: List[str] = []
         cost = 0.0

@@ -398,6 +398,54 @@ def test_session_runner_times_out_to_error_result():
     assert "TimeoutError" in result.text
 
 
+def test_session_runner_timeout_on_reused_session_reconnects_instead_of_hanging():
+    # A timeout on attempt 2+ (the session already exists and is being
+    # reused) must be caught INSIDE _run and routed through the same
+    # _reconnect/_drop fail-secure path as a dropped connection or a model
+    # mismatch — not surface as an uncatchable CancelledError that skips
+    # cleanup and leaves the hung client sitting in `_sessions` for the next
+    # call to reuse (and hang on again).
+    instances = []
+
+    class _Client:
+        def __init__(self, options):
+            self.options = options
+            self.connected = False
+            self.queries = []
+            instances.append(self)
+
+        async def connect(self):
+            self.connected = True
+
+        async def query(self, text):
+            self.queries.append(text)
+            if self is instances[0] and len(self.queries) == 2:
+                # the SECOND turn on the FIRST client hangs forever
+                await asyncio.sleep(30)
+
+        async def receive_response(self):
+            yield _SessionMessage(["recovered"])
+
+        async def disconnect(self):
+            self.connected = False
+
+    runner = SessionAgentRunner(client_factory=_Client, timeout_seconds=0.02)
+
+    first = run(runner.run("full context", task_key="T1"))
+    second = run(runner.run("just feedback", task_key="T1"))
+
+    assert first.text == "recovered"
+    assert second.is_error is False
+    assert second.text == "recovered"
+    # stale (hung) client discarded and disconnected, fresh one connected —
+    # not reused (which would just hang again on the next call).
+    assert len(instances) == 2
+    assert instances[0].connected is False
+    # the fresh session replayed the FULL history, not just this turn's
+    # compact prompt, since attempt 2's timeout meant it never got recorded.
+    assert instances[1].queries == ["full context\n\njust feedback"]
+
+
 def test_session_runner_connects_with_expected_options():
     client_cls = _session_client_factory(["x"])
     runner = SessionAgentRunner(client_factory=client_cls)
