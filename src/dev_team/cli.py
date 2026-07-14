@@ -312,6 +312,16 @@ def build_parser() -> argparse.ArgumentParser:
         "dependency list off the network.",
     )
     assessment.add_argument(
+        "--no-eol-scan",
+        action="store_true",
+        help="Skip the live endoflife.date EOL/support-status check of "
+        "detected runtime versions (with --assess). The scan is ON by "
+        "default; when it runs, each detected runtime's product and version "
+        "(parsed from package.json/.nvmrc/runtime.txt/.python-version/"
+        "global.json) is checked against endoflife.date. Pass this to keep "
+        "the runtime list off the network.",
+    )
+    assessment.add_argument(
         "--backlog",
         action="store_true",
         help="Convert assessment findings into stories in the persistent "
@@ -573,6 +583,7 @@ def _validate_args(
             ("--max-tree-entries", args.max_tree_entries is not None),
             ("--component-fanout", args.component_fanout),
             ("--no-osv-scan", args.no_osv_scan),
+            ("--no-eol-scan", args.no_eol_scan),
             ("--backlog", args.backlog),
             ("--no-conventions", args.no_conventions),
             ("--build-probe", args.build_probe),
@@ -775,6 +786,8 @@ async def _assess(
         config_kwargs["component_fanout"] = True
     if args.no_osv_scan:
         config_kwargs["osv_scan"] = False
+    if args.no_eol_scan:
+        config_kwargs["eol_scan"] = False
     if args.backlog:
         config_kwargs["update_backlog"] = True
     if args.no_conventions:

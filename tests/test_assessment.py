@@ -244,7 +244,8 @@ def test_assess_happy_path_produces_cited_report():
     assert "src/Api/packages.config" in report          # citations survive
     assert "Builds today: unlikely" in report
     assert "1. Pin build chain — *2 days*. global.json + CI" in report
-    assert "not a live vulnerability scan" in report
+    assert "not a live scan" in report
+    assert "EOL/support-status scan" not in report  # no runtime files detected
     # the report was written into the workspace at the default path
     assert ws.read_text("audit/assessment.md") == report
 
@@ -869,7 +870,83 @@ def test_assess_can_disable_osv_scan():
     )
     outcome = run(engine.assess())
     assert outcome.dependency_scan.queried is False
-    assert "model knowledge, not a live vulnerability scan" in outcome.report_markdown
+    assert "model knowledge, not a live scan" in outcome.report_markdown
+
+
+_NODE_WORKSPACE = {
+    "MyApp.sln": "Microsoft Visual Studio Solution File",
+    "src/Api/Api.csproj": "<Project><TargetFramework>net47</TargetFramework></Project>",
+    ".nvmrc": "18.17.0",
+    "README.md": "# MyApp",
+}
+
+
+def _eol_fetch(product):
+    assert product == "nodejs"
+    return [{"cycle": "18", "eol": "2000-01-01"}]
+
+
+def test_assess_integrates_eol_scan():
+    events = []
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(
+        runner,
+        workspace=InMemoryWorkspace(dict(_NODE_WORKSPACE)),
+        listener=events.append,
+        eol_fetch=_eol_fetch,
+    )
+    outcome = run(engine.assess())
+    assert outcome.success is True
+    assert outcome.eol_scan.queried is True
+    assert outcome.eol_scan.statuses[0].end_of_life is True
+    # no manifest pins any dependency, so the OSV half stays un-queried —
+    # this is the "EOL live, CVE model-knowledge" footer branch.
+    assert outcome.dependency_scan.queried is False
+    report = outcome.report_markdown
+    assert "END OF LIFE" in report
+    assert "endoflife.date" in report
+    assert (
+        "EOL/support-status findings include a live endoflife.date check" in report
+    )
+    stages = [e.stage for e in events]
+    assert "eol" in stages
+    data = outcome_to_dict(outcome)
+    assert data["eol_scan"]["statuses"][0]["end_of_life"] is True
+    assert data["eol_scan"]["statuses"][0]["runtime"]["product"] == "nodejs"
+
+
+def test_assess_can_disable_eol_scan():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    calls = []
+
+    def spy_fetch(product):
+        calls.append(product)
+        return []
+
+    engine = _engine(
+        runner,
+        workspace=InMemoryWorkspace(dict(_NODE_WORKSPACE)),
+        config=AssessConfig(eol_scan=False),
+        eol_fetch=spy_fetch,
+    )
+    outcome = run(engine.assess())
+    assert outcome.eol_scan.queried is False
+    assert outcome.eol_scan.error == "scan disabled"
+    assert calls == []
+    assert "model knowledge, not a live scan" in outcome.report_markdown
+
+
+def test_assess_report_footer_states_live_mode_for_both_scans():
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    ws = InMemoryWorkspace({**_DEAD_WORKSPACE, ".nvmrc": "18.17.0"})
+    engine = _engine(runner, workspace=ws, osv_fetch=_vuln_fetch, eol_fetch=_eol_fetch)
+    outcome = run(engine.assess())
+    report = outcome.report_markdown
+    assert outcome.dependency_scan.queried is True
+    assert outcome.eol_scan.queried is True
+    assert "OSV.dev vulnerability scan" in report
+    assert "endoflife.date" in report
+    assert "EOL/support-status check" in report
 
 
 # --- component fan-out -----------------------------------------------------------
