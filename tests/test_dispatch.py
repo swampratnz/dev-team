@@ -707,6 +707,377 @@ def test_archive_refuses_queued_and_running_jobs():
         disp.stop()
 
 
+# --- purge (permanent deletion) -------------------------------------------
+
+
+def _seed_terminal_job(disp, job_id, *, state="succeeded", archived=True):
+    """Insert a bare terminal registry record for ``job_id``, bypassing the
+    worker — mirrors the on-disk shape ``_mirror_meta``/``_set_archived``
+    themselves write, without actually running an assess job."""
+
+    spec = JobSpec(
+        mode="assess", repo="acme/mono", title="t", description="",
+        budget_usd=None, id=job_id,
+    )
+    disp._registry[job_id] = JobRecord(spec=spec, state=state)
+    disp._order.append(job_id)
+    disp._events[job_id] = threading.Event()
+    meta = {"repo": "acme/mono", "mode": "assess", "id": job_id}
+    if archived:
+        meta["archived"] = True
+        meta["archived_at"] = 1.0
+    disp._dashboard_workspace.write_text(f"audit/{job_id}/meta.json", json.dumps(meta))
+
+
+def test_purge_unknown_job_is_404():
+    disp = Dispatcher(token="x", dashboard_workspace=InMemoryWorkspace())
+    assert disp.purge_job("ghost") == (404, {"error": "unknown job"})
+
+
+def test_purge_queued_and_running_jobs_are_409():
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise,
+        dashboard_workspace=InMemoryWorkspace(),
+    )
+    disp.start()
+    try:
+        running_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+        queued_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/two"}))
+        assert disp.purge_job(running_id) == (409, {"error": "job is running"})
+        assert disp.purge_job(queued_id) == (409, {"error": "job is running"})
+    finally:
+        release.set()
+        disp.wait(running_id, 5)
+        disp.wait(queued_id, 5)
+        disp.stop()
+
+
+def test_purge_terminal_but_not_archived_is_409(tmp_path):
+    disp = Dispatcher(
+        token="x", dashboard_workspace=InMemoryWorkspace(), jobs_root=str(tmp_path))
+    _seed_terminal_job(disp, "assess-notarchived", archived=False)
+    assert disp.purge_job("assess-notarchived") == (
+        409, {"error": "job is not archived"})
+
+
+def test_purge_removes_workspace_audit_files_and_backlog_stories(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    jobs_root = tmp_path / "jobs"
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(jobs_root))
+    job_id = "assess-full"
+    _seed_terminal_job(disp, job_id, archived=True)
+
+    clone_dir = jobs_root / job_id
+    clone_dir.mkdir(parents=True)
+    (clone_dir / "marker.txt").write_text("clone contents")
+    dash.write_text(f"audit/{job_id}/assessment.md", "# report")
+    dash.write_text(f"audit/{job_id}/assessment.json", json.dumps({"success": True}))
+    dash.write_text(f"audit/{job_id}/verifications.jsonl", "{}\n")
+
+    store = BacklogStore(dash)
+    backlog = store.load()
+    backlog.add_story("finding A", source_job=job_id)
+    backlog.add_story("finding B", source_job=job_id)
+    other = backlog.add_story("unrelated", source_job="other-job")
+    store.save(backlog)
+
+    status, payload = disp.purge_job(job_id)
+    assert (status, payload) == (
+        200,
+        {
+            "id": job_id,
+            "purged": True,
+            "removed": {"workspace": True, "audit": True, "backlog_stories": 2},
+        },
+    )
+    assert not clone_dir.exists()
+    for name in ("assessment.md", "assessment.json", "meta.json", "verifications.jsonl"):
+        assert not dash.exists(f"audit/{job_id}/{name}")
+    survivors = store.load().stories
+    assert [s.id for s in survivors] == [other.id]
+    assert disp.get(job_id) is None
+
+
+def test_purge_missing_workspace_dir_reports_removed_false_without_raising(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-nodir"
+    _seed_terminal_job(disp, job_id, archived=True)  # no clone dir ever created
+
+    status, payload = disp.purge_job(job_id)
+    assert status == 200
+    assert payload["removed"]["workspace"] is False
+
+
+def test_purge_partial_audit_files_removed_without_raising(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-partial"
+    # only meta.json exists (via _seed_terminal_job); assessment.md/json and
+    # verifications.jsonl are already absent.
+    _seed_terminal_job(disp, job_id, archived=True)
+
+    status, payload = disp.purge_job(job_id)
+    assert status == 200
+    assert payload["removed"]["audit"] is True  # meta.json existed and was removed
+    assert not dash.exists(f"audit/{job_id}/meta.json")
+
+
+def test_purge_no_matching_backlog_stories_is_zero(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-nostories"
+    _seed_terminal_job(disp, job_id, archived=True)
+    store = BacklogStore(dash)
+    backlog = store.load()
+    backlog.add_story("unrelated", source_job="other-job")
+    store.save(backlog)
+
+    status, payload = disp.purge_job(job_id)
+    assert status == 200
+    assert payload["removed"]["backlog_stories"] == 0
+    assert len(store.load().stories) == 1  # the unrelated story survives
+
+
+def test_purge_is_not_idempotent_second_call_is_404(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-twice"
+    _seed_terminal_job(disp, job_id, archived=True)
+
+    assert disp.purge_job(job_id)[0] == 200
+    assert disp.purge_job(job_id) == (404, {"error": "unknown job"})
+
+
+class _SpyWorkspace:
+    """Wraps a real :class:`Workspace`, recording every ``delete`` call.
+
+    Exposes no raw filesystem primitives itself — the whole point is proving
+    a caller only ever removes files through :meth:`Workspace.delete`, never
+    a raw ``os``/``pathlib``/``shutil`` call against the wrapped root.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.deleted = []
+
+    def read_text(self, path):
+        return self.inner.read_text(path)
+
+    def write_text(self, path, content):
+        self.inner.write_text(path, content)
+
+    def exists(self, path):
+        return self.inner.exists(path)
+
+    def delete(self, path):
+        self.deleted.append(path)
+        self.inner.delete(path)
+
+    def list_files(self):
+        return self.inner.list_files()
+
+
+def test_purge_audit_deletion_never_touches_the_dashboard_root_directly(
+    tmp_path, monkeypatch
+):
+    # SECURITY: the audit/<id>/ mirror must be removed exclusively through
+    # Workspace.delete (the traversal/symlink-escape-checked abstraction
+    # every other route uses) -- never shutil.rmtree or a raw fs call
+    # against the dashboard workspace's own root.
+    real = LocalWorkspace(str(tmp_path / "dash"))
+    spy = _SpyWorkspace(real)
+    jobs_root = tmp_path / "jobs"
+    disp = Dispatcher(token="x", dashboard_workspace=spy, jobs_root=str(jobs_root))
+    job_id = "assess-spy"
+    _seed_terminal_job(disp, job_id, archived=True)  # writes meta.json via spy
+    real.write_text(f"audit/{job_id}/assessment.md", "# report")
+    real.write_text(f"audit/{job_id}/assessment.json", "{}")
+    real.write_text(f"audit/{job_id}/verifications.jsonl", "{}\n")
+    (jobs_root / job_id).mkdir(parents=True)
+
+    rmtree_calls = []
+    monkeypatch.setattr(
+        dispatch_mod.shutil, "rmtree",
+        lambda path, ignore_errors=False: rmtree_calls.append(str(path)),
+    )
+
+    status, _ = disp.purge_job(job_id)
+    assert status == 200
+    # rmtree is used exactly once, and only for the job's own clone dir --
+    # never anywhere under the dashboard workspace's root.
+    assert rmtree_calls == [str(jobs_root / job_id)]
+    assert set(spy.deleted) == {
+        f"audit/{job_id}/{name}" for name in
+        ("assessment.md", "assessment.json", "meta.json", "verifications.jsonl")
+    }
+
+
+def test_purge_refuses_a_symlink_escape_in_the_audit_mirror(tmp_path):
+    # SECURITY: a symlink planted at one of the four audit/<id>/ paths,
+    # pointing outside the dashboard workspace root, must be refused by
+    # Workspace's own _within_root check -- never silently followed.
+    dash_root = tmp_path / "dash"
+    dash = LocalWorkspace(str(dash_root))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-symlink"
+    _seed_terminal_job(disp, job_id, archived=True)
+
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("do not delete me")
+    audit_dir = dash_root / "audit" / job_id
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    (audit_dir / "assessment.json").symlink_to(outside)
+
+    status, payload = disp.purge_job(job_id)
+    assert status == 200  # the rest of the purge still completes
+    assert payload["purged"] is True
+    assert outside.exists()
+    assert outside.read_text() == "do not delete me"
+
+
+def test_purge_never_reenters_the_registry_lock(tmp_path, monkeypatch):
+    """SECURITY/CORRECTNESS: purge_job must never call _job_running -- which
+    itself acquires self._lock -- while already holding self._lock, or the
+    calling thread (and, because every mutation shares this lock, the whole
+    single-flight dispatcher) deadlocks forever. Patch _job_running to blow
+    up if invoked at all, and prove every branch (unknown / running /
+    not-archived / success) returns promptly from a background thread -- a
+    real deadlock would hang the join forever.
+    """
+
+    def _boom(self, job_id):
+        raise AssertionError("purge_job must never call _job_running")
+
+    monkeypatch.setattr(Dispatcher, "_job_running", _boom)
+
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise,
+        dashboard_workspace=InMemoryWorkspace(), jobs_root=str(tmp_path),
+    )
+    disp.start()
+    results = {}
+
+    def call(name, job_id):
+        results[name] = disp.purge_job(job_id)
+
+    try:
+        running_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+
+        t = threading.Thread(target=call, args=("unknown", "ghost"))
+        t.start()
+        t.join(timeout=5)
+        assert not t.is_alive(), "purge_job(unknown) hung -- possible deadlock"
+        assert results["unknown"] == (404, {"error": "unknown job"})
+
+        t = threading.Thread(target=call, args=("running", running_id))
+        t.start()
+        t.join(timeout=5)
+        assert not t.is_alive(), "purge_job(running) hung -- possible deadlock"
+        assert results["running"] == (409, {"error": "job is running"})
+    finally:
+        release.set()
+        disp.wait(running_id, 5)
+        disp.stop()
+
+    _seed_terminal_job(disp, "assess-na", archived=False)
+    t = threading.Thread(target=call, args=("not_archived", "assess-na"))
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "purge_job(not archived) hung -- possible deadlock"
+    assert results["not_archived"] == (409, {"error": "job is not archived"})
+
+    _seed_terminal_job(disp, "assess-ok", archived=True)
+    t = threading.Thread(target=call, args=("success", "assess-ok"))
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "purge_job(success) hung -- possible deadlock"
+    assert results["success"][0] == 200
+
+
+def test_purge_backlog_removal_shares_the_lock_with_concurrent_writes(tmp_path):
+    """A purge's backlog-story removal and a concurrent POST /backlog/story
+    (add_story_card) share self._backlog_lock, so they cannot interleave
+    into a corrupt backlog.json -- the same guarantee
+    test_backlog_write_lock_prevents_lost_updates already proves for
+    add_story_card + _merge_backlog.
+    """
+
+    dash = InMemoryWorkspace()
+
+    def slow_clock():
+        time.sleep(0.002)  # widen the load->save window the lock must cover
+        return time.time()
+
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, clock=slow_clock,
+        jobs_root=str(tmp_path),
+    )
+    job_id = "assess-lockrace"
+    _seed_terminal_job(disp, job_id, archived=True)
+    store = BacklogStore(dash)
+    backlog = store.load()
+    for _ in range(5):
+        backlog.add_story("to purge", source_job=job_id)
+    store.save(backlog)
+
+    per_thread = 10
+
+    def add_cards():
+        for index in range(per_thread):
+            assert disp.add_story_card({"title": f"new-{index}"})[0] == 201
+
+    results = {}
+
+    def purge():
+        results["purge"] = disp.purge_job(job_id)
+
+    threads = [
+        threading.Thread(target=add_cards),
+        threading.Thread(target=add_cards),
+        threading.Thread(target=purge),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert results["purge"][0] == 200
+    assert results["purge"][1]["removed"]["backlog_stories"] == 5
+
+    status, board = disp.board()
+    assert status == 200
+    ids = [s["id"] for s in board["stories"]]
+    assert len(set(ids)) == len(ids)  # no corruption / duplicate ids under the race
+    assert len(board["stories"]) == 2 * per_thread  # the 5 purged stories are gone
+
+
 # --- cancel (job lifecycle) ----------------------------------------------
 
 
@@ -1032,6 +1403,62 @@ def test_archive_http_route_running_job_is_409():
             409, {"error": "job is running"})
         release.set()
         server.dispatcher.wait(job["id"], 5)
+
+
+def test_purge_http_route_round_trips(tmp_path):
+    jobs_root = tmp_path / "jobs"
+
+    def materialise(spec, dest):
+        Path(dest).mkdir(parents=True, exist_ok=True)
+        return LocalWorkspace(dest)
+
+    with running(runner=_assess_runner(), materialise=materialise,
+                 dashboard_workspace=InMemoryWorkspace(),
+                 jobs_root=str(jobs_root)) as server:
+        _, job = _call(server, "/jobs", method="POST",
+                       body={"mode": "assess", "repo": "a/one"})
+        job_id = job["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        assert _call(server, f"/jobs/{job_id}/archive", method="POST") == (
+            200, {"id": job_id, "archived": True})
+
+        status, payload = _call(server, f"/jobs/{job_id}/purge", method="POST")
+        assert status == 200
+        assert payload["id"] == job_id
+        assert payload["purged"] is True
+        assert payload["removed"]["workspace"] is True
+        assert not (jobs_root / job_id).exists()
+        assert _call(server, f"/jobs/{job_id}") == (404, {"error": "unknown job"})
+        # not idempotent: a second purge answers 404, never 200 again
+        assert _call(server, f"/jobs/{job_id}/purge", method="POST") == (
+            404, {"error": "unknown job"})
+
+
+def test_purge_http_route_requires_auth():
+    # SECURITY: unauthenticated purge answers 401, matching every other
+    # authenticated dispatch route.
+    with running(materialise=_mem_materialise) as server:
+        assert _call(server, "/jobs/x/purge", method="POST", token=None) == (
+            401, {"error": "unauthorized"})
+
+
+def test_purge_http_route_traversal_id_is_404():
+    # SECURITY: a raw ".." segment splits the URL into more path components
+    # than the {id}/purge route shape expects, so the router itself rejects
+    # it (generic 404) before Dispatcher.purge_job ever runs.
+    with running(materialise=_mem_materialise,
+                 dashboard_workspace=InMemoryWorkspace()) as server:
+        status, payload = _call(
+            server, "/jobs/../../etc/passwd/purge", method="POST")
+        assert (status, payload) == (404, {"error": "not found"})
+        # A traversal-shaped id with no raw "/" (percent-encoded, so it
+        # survives as ONE path segment) reaches Dispatcher.purge_job, which
+        # is never a known registry id -> a clean 404, never reaching the
+        # delete step (no file outside jobs_root/<id> or audit/<id>/ is ever
+        # touched, since purge_job returns before any deletion).
+        status, payload = _call(
+            server, "/jobs/%2e%2e%2Fetc%2Fpasswd/purge", method="POST")
+        assert (status, payload) == (404, {"error": "unknown job"})
 
 
 def test_cancel_http_route_blocks_a_still_queued_job():
