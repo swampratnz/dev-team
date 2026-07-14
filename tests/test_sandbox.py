@@ -101,11 +101,12 @@ def test_no_cwd_to_mount_is_an_error():
         ContainerCommandRunner(_Spy()).run(["pytest"], cwd=None)
 
 
-def test_relative_cwd_is_made_absolute_for_the_mount():
+def test_relative_cwd_is_resolved_for_the_mount():
     spy = _Spy()
     ContainerCommandRunner(spy).run(["pytest"], cwd="build")
     argv = _argv(spy)
-    expected = f"{os.path.abspath('build')}:/workspace"
+    # realpath-resolved (absolute, symlink-free) mount source
+    expected = f"{os.path.realpath('build')}:/workspace"
     assert argv[argv.index("--volume") + 1] == expected
 
 
