@@ -2396,3 +2396,24 @@ def test_verify_finding_records_a_trace_span():
         )
     )
     assert [s.name for s in tracer.by_kind("agent")] == ["verifier"]
+
+
+def test_assess_sandbox_wraps_runner_boxing_probe_not_git(tmp_path):
+    # AssessConfig.sandbox boxes the build-probe's untrusted commands; the
+    # dead-code dormancy `git log` queries self-delegate to the host.
+    from dev_team.sandbox import ContainerCommandRunner, SandboxConfig
+
+    fake = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner(by_system_prompt={}),
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=fake,
+        config=AssessConfig(sandbox=SandboxConfig(image="sdk:1")),
+    )
+    assert isinstance(engine.command_runner, ContainerCommandRunner)
+    engine.command_runner.run(["dotnet", "test"], cwd=str(tmp_path))
+    assert fake.calls[-1][:2] == ["docker", "run"]
+    assert "sdk:1" in fake.calls[-1]
+
+    engine.command_runner.run(["git", "log"], cwd=str(tmp_path))
+    assert fake.calls[-1] == ["git", "log"]

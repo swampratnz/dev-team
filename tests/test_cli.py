@@ -1708,3 +1708,67 @@ def test_main_assess_journals_events_for_the_dashboard(tmp_path):
         for line in (repo / EVENTS_PATH).read_text().splitlines()
     ]
     assert any(r["run"].startswith("assess-") for r in records)
+
+
+def test_sandbox_config_from_flags():
+    from dev_team.cli import _sandbox_config
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--deliver", "--sandbox",
+            "--sandbox-image", "node:22",
+            "--sandbox-network", "bridge",
+            "--sandbox-engine", "podman",
+            "T", "D",
+        ]
+    )
+    sc = _sandbox_config(args)
+    assert (sc.engine, sc.image, sc.network) == ("podman", "node:22", "bridge")
+
+
+def test_sandbox_config_absent_and_defaults():
+    from dev_team.cli import _sandbox_config
+
+    parser = build_parser()
+    assert _sandbox_config(parser.parse_args(["--deliver", "T", "D"])) is None
+    sc = _sandbox_config(parser.parse_args(["--deliver", "--sandbox", "T", "D"]))
+    assert sc is not None
+    assert sc.network == "none"  # secure default preserved when not overridden
+
+
+def test_sandbox_wired_into_engine_config():
+    from dev_team.cli import _engine_config
+
+    parser = build_parser()
+    args = parser.parse_args(["--deliver", "--sandbox", "T", "D"])
+    assert _engine_config(args).sandbox is not None
+
+
+def test_main_sandbox_without_mode_exits_2(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["T", "D", "--sandbox"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--sandbox" in err
+
+
+def test_main_sandbox_tuning_without_sandbox_exits_2(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["T", "D", "--deliver", "--sandbox-image", "x"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--sandbox-image" in err
+
+
+def test_main_assess_with_sandbox_succeeds(tmp_path):
+    from test_assessment import assess_responses
+
+    repo = _dotnet_repo(tmp_path)
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(["--assess", "--workspace", str(repo), "--sandbox"], runner=runner)
+    assert code == 0
+    assert (repo / "audit" / "assessment.md").exists()

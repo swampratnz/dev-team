@@ -101,6 +101,7 @@ from .ordering import lint_plan
 from .persona import Roster
 from .policy import GuardedCommandRunner, SideEffectPolicy
 from .profile import detect_project
+from .sandbox import ContainerCommandRunner, SandboxConfig
 from .scheduler import ScheduledResult, schedule
 from .sdk import AgentRunner
 from .trace import Tracer
@@ -191,6 +192,12 @@ class EngineConfig:
     remote_verify_trigger: Optional[Sequence[str]] = None
     remote_verify_max_polls: int = 30
     remote_verify_interval_seconds: float = 60.0
+    #: When set (and the workspace is real), the commands the engine runs — the
+    #: gates, setup, and scans, i.e. the arbitrary-code-execution surface — are
+    #: boxed in a container per this config. git porcelain self-delegates to the
+    #: host inside the runner, so it still acts on the real repository. Off by
+    #: default; see ``dev_team.sandbox`` and ``docs/SANDBOX.md``.
+    sandbox: Optional[SandboxConfig] = None
 
     def __post_init__(self) -> None:
         if self.max_task_attempts < 1:
@@ -483,6 +490,12 @@ class DeliveryEngine:
                 if self.workdir is not None
                 else DryRunCommandRunner()
             )
+        if self.config.sandbox is not None and self.workdir is not None:
+            # Box the code the engine runs (gates/setup/scans) in a container;
+            # git self-delegates to the host inside ContainerCommandRunner, so
+            # porcelain still acts on the real repo. Only with a real workspace
+            # — an in-memory/dry-run has nothing on disk to run against or mount.
+            command_runner = ContainerCommandRunner(command_runner, self.config.sandbox)
         self.command_runner: CommandRunner = GuardedCommandRunner(
             command_runner,
             policy=policy or SideEffectPolicy(),

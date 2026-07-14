@@ -41,6 +41,7 @@ from .report import (
     render_summary,
     result_to_dict,
 )
+from .sandbox import SandboxConfig
 from .sdk import AgentRunner, ChatBackend, ClaudeAgentRunner, ClaudeChatBackend
 from .sources import (
     clone_or_update,
@@ -145,6 +146,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serving = parser.add_argument_group(
         "serving options", "Bind the dashboard/dispatch services."
+    )
+    sandbox = parser.add_argument_group(
+        "sandbox options",
+        "Run the commands the engine executes (gates, build probe) inside a "
+        "container (with --deliver/--assess). git stays on the host.",
     )
     interaction = parser.add_argument_group(
         "interaction & personas", "Collaboration and the agent cast."
@@ -371,7 +377,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Actually run the detected setup/verify commands so the "
         "buildability verdict rests on real exit codes (with --assess). "
         "This executes the repository's own build — arbitrary code — so "
-        "only use it on trusted repos or inside a sandbox.",
+        "only use it on trusted repos or inside a sandbox (see --sandbox).",
+    )
+    sandbox.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="Run the commands the engine executes (delivery gates, the "
+        "assessment build probe) inside a rootless container with no network, "
+        "dropped capabilities, and resource limits — real containment for the "
+        "arbitrary code those commands run. git stays on the host. Requires a "
+        "container engine (rootless docker/podman) at runtime.",
+    )
+    sandbox.add_argument(
+        "--sandbox-image",
+        default=None,
+        metavar="IMAGE",
+        help="Container image the sandbox runs in; must carry your toolchain "
+        "(default python:3.12-slim). Only with --sandbox.",
+    )
+    sandbox.add_argument(
+        "--sandbox-network",
+        default=None,
+        metavar="MODE",
+        help="Container --network for the sandbox (default 'none'); set e.g. "
+        "'bridge' when a setup command must fetch dependencies. Only with "
+        "--sandbox.",
+    )
+    sandbox.add_argument(
+        "--sandbox-engine",
+        default=None,
+        metavar="CLI",
+        help="Container CLI to invoke, docker or podman (default docker). "
+        "Only with --sandbox.",
     )
     misc.add_argument(
         "--workspace",
@@ -577,6 +614,17 @@ def _validate_args(
         parser.error("--env-file: only valid with --repo")
     if args.remote_verify_trigger is not None and args.remote_verify_status is None:
         parser.error("--remote-verify-trigger requires --remote-verify-status")
+    if args.sandbox and not (args.deliver or args.assess):
+        parser.error("--sandbox: only valid with --deliver or --assess")
+    sandbox_tuning = [
+        ("--sandbox-image", args.sandbox_image is not None),
+        ("--sandbox-network", args.sandbox_network is not None),
+        ("--sandbox-engine", args.sandbox_engine is not None),
+    ]
+    if not args.sandbox:
+        extra = [name for name, passed in sandbox_tuning if passed]
+        if extra:
+            parser.error(f"{', '.join(extra)}: only valid with --sandbox")
     if not args.assess:
         assess_only = [
             ("--exclude", args.exclude_globs is not None),
@@ -677,8 +725,28 @@ def _build_roster(args: argparse.Namespace) -> Optional[Roster]:
     return None
 
 
+def _sandbox_config(args: argparse.Namespace) -> Optional[SandboxConfig]:
+    """A :class:`SandboxConfig` from the ``--sandbox*`` flags, or ``None``.
+
+    Only the flags the user set override the (secure) defaults, so the sandbox
+    keeps ``network="none"`` etc. unless explicitly relaxed.
+    """
+
+    if not args.sandbox:
+        return None
+    overrides = {}
+    if args.sandbox_image is not None:
+        overrides["image"] = args.sandbox_image
+    if args.sandbox_network is not None:
+        overrides["network"] = args.sandbox_network
+    if args.sandbox_engine is not None:
+        overrides["engine"] = args.sandbox_engine
+    return SandboxConfig(**overrides)
+
+
 def _engine_config(args: argparse.Namespace) -> EngineConfig:
     return EngineConfig(
+        sandbox=_sandbox_config(args),
         model=args.model,
         max_task_attempts=args.max_attempts,
         max_concurrency=args.max_concurrency,
@@ -794,6 +862,9 @@ async def _assess(
         config_kwargs["save_conventions"] = False
     if args.build_probe:
         config_kwargs["build_probe"] = True
+    sandbox = _sandbox_config(args)
+    if sandbox is not None:
+        config_kwargs["sandbox"] = sandbox
     kwargs = {}
     recorder = _transcript_recorder(args, run)
     if recorder is not None:
