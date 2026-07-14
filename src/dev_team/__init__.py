@@ -141,6 +141,7 @@ from .models import (
 )
 from .policy import GuardedCommandRunner, PolicyVerdict, SideEffectPolicy
 from .profile import ProjectProfile, detect_project
+from .sandbox import ContainerCommandRunner, SandboxConfig, SandboxError
 from .scheduler import ScheduledResult, ScheduleStatus, schedule
 from .sdk import AgentResult, AgentRunner, ClaudeAgentRunner
 from .sources import (
@@ -264,6 +265,9 @@ __all__ = [
     "SideEffectPolicy",
     "GuardedCommandRunner",
     "PolicyVerdict",
+    "ContainerCommandRunner",
+    "SandboxConfig",
+    "SandboxError",
     # memory
     "Blackboard",
     "Artifact",
