@@ -1354,6 +1354,161 @@ def test_dashboard_html_purge_button_and_confirm_flow():
     assert 'e.target.closest("[data-purgejob]")' in DASHBOARD_HTML
 
 
+# --- the spend rollup proxy (GET /api/costs → dispatch GET /costs) -----------
+
+
+def test_costs_proxy_forwards_and_relays_verbatim(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch,
+        status=200,
+        body=b'{"total_usd": 12.5, "by_mode": {"assess": 12.5}, "jobs_counted": 3}',
+    )
+    status, headers, body = _request(proxy_server, "GET", "/api/costs", headers=AUTH)
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {
+        "total_usd": 12.5, "by_mode": {"assess": 12.5}, "jobs_counted": 3,
+    }
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/costs"
+    assert request.get_method() == "GET"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.data is None
+
+
+def test_costs_proxy_unconfigured_is_501(token_server, monkeypatch):
+    # token_server has no dispatch_url/dispatch_token wired
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(token_server, "GET", "/api/costs", headers=AUTH)
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "spend rollup not configured"}
+    assert seen == []
+
+
+def test_costs_proxy_url_without_token_stays_unconfigured(monkeypatch):
+    # A dispatch URL alone (no dispatch token) must not forward: still 501,
+    # matching the board-editing and job-lifecycle proxies' own behaviour.
+    seen = _capture_urlopen(monkeypatch)
+    srv = DashboardServer(
+        InMemoryWorkspace(), port=0, token=TOKEN, dispatch_url=DISPATCH_URL
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, body = _request(srv, "GET", "/api/costs", headers=AUTH)
+        assert status == 501
+        assert json.loads(body) == {"error": "spend rollup not configured"}
+        assert seen == []
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
+
+
+def test_costs_proxy_forwards_archived_flag_unchanged(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch, body=b'{"total_usd": 0, "by_mode": {}, "jobs_counted": 0}'
+    )
+    status, _, _ = _request(
+        proxy_server, "GET", "/api/costs?archived=1", headers=AUTH
+    )
+    assert status == 200
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/costs?archived=1"
+
+
+def test_costs_proxy_only_forwards_exact_archived_1(proxy_server, monkeypatch):
+    # Any other/absent archived value defaults to excluding archived jobs,
+    # matching GET /jobs's own exact-match contract.
+    seen = _capture_urlopen(
+        monkeypatch, body=b'{"total_usd": 0, "by_mode": {}, "jobs_counted": 0}'
+    )
+    for query in ("?archived=0", "?archived=true", ""):
+        status, _, _ = _request(proxy_server, "GET", "/api/costs" + query, headers=AUTH)
+        assert status == 200
+    assert [r.full_url for r in seen] == [f"{DISPATCH_URL}/costs"] * 3
+
+
+def test_costs_proxy_unreachable_dispatch_is_502(proxy_server, monkeypatch):
+    _capture_urlopen(monkeypatch, error=urllib.error.URLError("refused"))
+    status, _, body = _request(proxy_server, "GET", "/api/costs", headers=AUTH)
+    assert status == 502
+    assert json.loads(body) == {"error": "dispatch service unreachable"}
+    assert "refused" not in body  # no internals leak
+
+
+def test_costs_proxy_relays_a_dispatch_rejection_verbatim(proxy_server, monkeypatch):
+    # e.g. a stale dispatch token: the dispatch service's own 401, never
+    # swallowed or translated by the dashboard.
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/costs", 401, "Unauthorized", None,
+        io.BytesIO(b'{"error": "unauthorized"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(proxy_server, "GET", "/api/costs", headers=AUTH)
+    assert status == 401
+    assert json.loads(body) == {"error": "unauthorized"}
+
+
+def test_costs_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(proxy_server, "GET", "/api/costs")
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []  # nothing was ever forwarded
+
+
+def test_costs_proxy_never_echoes_the_dispatch_token(proxy_server, monkeypatch):
+    # SECURITY: the dispatch bearer token must never reach the browser, in
+    # the response body or in any header — checked on the handler's
+    # outgoing response, not just the (already-verbatim) proxied body.
+    _capture_urlopen(
+        monkeypatch,
+        body=b'{"total_usd": 1.0, "by_mode": {"deliver": 1.0}, "jobs_counted": 1}',
+    )
+    status, headers, body = _request(proxy_server, "GET", "/api/costs", headers=AUTH)
+    assert status == 200
+    assert DISPATCH_TOKEN not in body
+    assert DISPATCH_TOKEN not in str(headers)
+
+
+def test_costs_route_scope_is_exact_match_only(proxy_server, monkeypatch):
+    # SECURITY/scope: only exactly /api/costs is the spend route — a path
+    # that merely starts with it falls through to the ordinary 404, never
+    # forwarded to the dispatch service (no general dispatch passthrough).
+    seen = _capture_urlopen(monkeypatch)
+    for path in ("/api/costs/", "/api/costs/extra", "/api/costs2"):
+        status, _, _ = _request(proxy_server, "GET", path, headers=AUTH)
+        assert status == 404
+    assert seen == []
+
+
+def test_dashboard_html_spend_panel():
+    # The Spend panel is fetched once on load plus on manual refresh only —
+    # never inside the setInterval-driven refresh() poll (folding a proxied
+    # dispatch hop into the 2.5s poll would multiply dispatch-service load
+    # by open-tabs x poll-cadence for a number that only changes on job
+    # completion).
+    assert 'id="spend-refresh"' in DASHBOARD_HTML
+    assert '<div class="panel" id="spend">' in DASHBOARD_HTML
+    assert 'fetch("/api/costs")' in DASHBOARD_HTML
+    assert "spend rollup not configured" in DASHBOARD_HTML
+    assert '$("spend-refresh").addEventListener("click", loadSpend)' in DASHBOARD_HTML
+    assert "data.total_usd" in DASHBOARD_HTML
+    assert "data.by_mode" in DASHBOARD_HTML
+
+    refresh_start = DASHBOARD_HTML.index("async function refresh()")
+    refresh_end = DASHBOARD_HTML.index("refresh();", refresh_start)
+    assert "/api/costs" not in DASHBOARD_HTML[refresh_start:refresh_end]
+    # loadSpend's only two call sites are the manual-refresh click listener
+    # and the one-time call alongside refresh() at page load — never inside
+    # refresh() itself, and never wired to setInterval.
+    assert 'addEventListener("click", loadSpend)' in DASHBOARD_HTML
+    assert "setInterval(loadSpend" not in DASHBOARD_HTML
+    assert "\nloadSpend();" in DASHBOARD_HTML
+
+
 # --- /api/state?archived=1 ----------------------------------------------------
 
 

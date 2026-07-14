@@ -132,6 +132,18 @@ sections below are reconstructed from the repository history.
   Respects the same `include_archived` exclusion as the rest of the page;
   a zero-verification workspace renders a muted empty state, not an empty
   table.
+- **Spend panel** (`docs/DASHBOARD.md`): a new `GET /api/costs` route
+  proxies the dispatch service's `GET /costs` spend rollup — unlike
+  calibration, `deliver` job cost is never mirrored to disk, so this has
+  to be a proxied read of the dispatch registry, not an in-process disk
+  computation. Renders total spend plus a per-mode breakdown next to
+  Memory & conventions, fetched once on page load and on manual refresh
+  only — deliberately kept out of the existing 2.5s `/api/state` poll, so
+  it doesn't multiply dispatch-service load per open dashboard tab.
+  Without `--dispatch-url`/`DEV_TEAM_DISPATCH_TOKEN` configured it answers
+  `501` and the panel shows a muted "not configured" state. Scope is
+  strictly `/api/costs` (exact match, no path parameter) — the same
+  narrow-proxy discipline as the existing backlog/job-lifecycle proxies.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /

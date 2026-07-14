@@ -416,9 +416,10 @@ def _make_handler(
     ``/backlog`` mutation API (the board's write path), and
     ``/api/jobs/{id}/archive``, ``/api/jobs/{id}/unarchive``, or
     ``/api/jobs/{id}/purge`` are forwarded to the matching
-    ``/jobs/{id}/...`` lifecycle route; with either unset both stay
-    unavailable and those writes answer ``501``. The dispatch token is only
-    ever sent to ``dispatch_url`` — never logged or reflected.
+    ``/jobs/{id}/...`` lifecycle route; ``GET /api/costs`` is forwarded to
+    the dispatch service's ``GET /costs`` spend rollup; with either unset
+    all three stay unavailable and answer ``501``. The dispatch token is
+    only ever sent to ``dispatch_url`` — never logged or reflected.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -644,6 +645,8 @@ def _make_handler(
                 self._transcripts(parts.query)
             elif parts.path == "/api/transcript":
                 self._transcript(parts.query)
+            elif parts.path == "/api/costs":
+                self._costs(parts.query)
             else:
                 self._send(404, "text/plain", "not found")
 
@@ -668,6 +671,25 @@ def _make_handler(
                 "history": agent_history(workspace, role),
             }
             self._send(200, "application/json", json.dumps(payload))
+
+        # -- spend rollup: a narrow read-only proxy, same shape as the write
+        # proxies above but GET-only and taking no body. Scope is exactly
+        # this one path (see do_GET's exact-match dispatch above) — never a
+        # general dispatch passthrough.
+
+        def _costs(self, query: str) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "spend rollup not configured"}),
+                )
+                return
+            # ?archived=1 includes archived jobs' spend too — same exact-match
+            # contract /api/state and the dispatch service's GET /jobs use.
+            include_archived = parse_qs(query).get("archived", ["0"])[0] == "1"
+            suffix = "/costs?archived=1" if include_archived else "/costs"
+            self._proxy("GET", suffix, None)
 
         # -- transcripts: a SENSITIVE surface -------------------------------
         # These two routes serve the raw system-prompt/prompt/response of each
@@ -892,9 +914,10 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
   background: var(--inset); color: var(--ink); border: 1px solid var(--line);
   border-radius: 8px; padding: 4px 8px; font: inherit; font-size: 12px; max-width: 100%;
 }
-.filters .ghost { background: none; border: none; color: var(--accent);
+.filters .ghost, .section-head .ghost { background: none; border: none; color: var(--accent);
                   font-size: 12px; cursor: pointer; padding: 4px 6px; border-radius: 6px; }
-.filters .ghost:hover { background: var(--accent-soft); }
+.filters .ghost:hover, .section-head .ghost:hover { background: var(--accent-soft); }
+.spend-total { font-size: 18px; font-weight: 600; }
 
 .feed { list-style: none; max-height: 520px; overflow-y: auto; }
 .feed li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px;
@@ -1145,6 +1168,11 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
   <div>
     <h2>Memory &amp; conventions</h2>
     <div class="panel" id="memory"><span class="muted">no cross-run memory yet</span></div>
+    <div class="section-head">
+      <h2>Spend</h2>
+      <button id="spend-refresh" class="ghost">refresh</button>
+    </div>
+    <div class="panel" id="spend"><span class="muted">loading&hellip;</span></div>
     <h2>Reports</h2>
     <div class="panel" id="reports"><span class="muted">no assessment reports</span></div>
   </div>
@@ -1556,6 +1584,42 @@ function calibrationPanel(cal) {
     + calibrationRow("overall", cal.overall);
   return `<table class="cal-table"><thead><tr><th>phase</th><th>confirmed</th><th>refuted</th>`
     + `<th>needs context</th><th>total</th><th>confirm rate</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// The Spend panel: total + by-mode breakdown from GET /api/costs. Fetched
+// once on load plus on manual refresh only — deliberately NOT part of the
+// setInterval(refresh, 2500) poll (see loadSpend below), since the dispatch
+// hop it proxies is worth paying for on operator page-loads, not every tick
+// of every open dashboard tab. SECURITY: mode names come from the dispatch
+// service (an operator-controlled but still external process) — esc()
+// before innerHTML, same discipline as every other panel.
+function spendRow(mode, usd) {
+  return `<tr><td>${esc(mode)}</td><td>$${esc(usd.toFixed(2))}</td></tr>`;
+}
+
+function spendPanel(data) {
+  const modes = Object.keys(data.by_mode || {}).sort();
+  const jobs = data.jobs_counted;
+  const total = `<div class="spend-total">$${esc(Number(data.total_usd).toFixed(2))}`
+    + ` <span class="muted">across ${esc(jobs)} job${jobs === 1 ? "" : "s"}</span></div>`;
+  if (!modes.length) return total;
+  const rows = modes.map(m => spendRow(m, data.by_mode[m])).join("");
+  return total + `<table class="cal-table"><thead><tr><th>mode</th><th>spend</th></tr></thead>`
+    + `<tbody>${rows}</tbody></table>`;
+}
+
+async function loadSpend() {
+  try {
+    const res = await fetch("/api/costs");
+    if (res.status === 501) {
+      put($("spend"), '<span class="muted">spend rollup not configured</span>');
+      return;
+    }
+    if (!res.ok) throw new Error(String(res.status));
+    put($("spend"), spendPanel(await res.json()));
+  } catch (err) {
+    put($("spend"), '<span class="muted">failed to load spend</span>');
+  }
 }
 
 function memory(s) {
@@ -2075,6 +2139,7 @@ $("agent-close").addEventListener("click", closeAgent);
 $("agent-overlay").addEventListener("click", e => { if (e.target === $("agent-overlay")) closeAgent(); });
 $("story-close").addEventListener("click", closeStory);
 $("story-overlay").addEventListener("click", e => { if (e.target === $("story-overlay")) closeStory(); });
+$("spend-refresh").addEventListener("click", loadSpend);
 document.addEventListener("keydown", e => { if (e.key === "Escape") { closeModal(); closeAgent(); closeStory(); } });
 
 // ---- poll loop ----
@@ -2111,6 +2176,7 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 2500);
+loadSpend();
 </script>
 </body>
 </html>

@@ -27,6 +27,7 @@ workspace on every request.
 | **Memory** — run count, recent retrospectives, ADR titles | `.dev_team/memory.json` |
 | **House conventions** — the captured style summary | `.dev_team/conventions.json` |
 | **Verdict calibration** — per-phase and overall confirmed/refuted/needs-context counts and confirm rate | `audit/<id>/verifications.jsonl` (same aggregate as `GET /calibration`) |
+| **Spend** — total spend and a per-mode breakdown, fetched on demand | the dispatch service's `GET /costs` (proxied, see *Spend* below) |
 | **Reports** — every `audit/*.md`, viewable in place | the workspace tree |
 
 Runs, Reports, and the Kanban board all exclude **archived** jobs by
@@ -133,6 +134,27 @@ same archived-job exclusion and "show archived" toggle as the rest of the
 page, and renders a muted empty state until the first verification is
 recorded.
 
+### Spend
+
+The **Spend** panel (next to Memory & conventions) shows the dispatch
+service's total spend and a per-mode breakdown — the same rollup
+`GET /costs` computes (see [`docs/DISPATCH.md`](DISPATCH.md)). Unlike
+calibration, this is **proxied to the dispatch service, not computed
+in-process**: `deliver` job cost is never mirrored to disk (only `assess`
+jobs get a mirrored `meta.json`), so an in-process disk walk would silently
+under-report total spend by omitting every `deliver` job. The dashboard
+therefore forwards `GET /api/costs` to the running dispatch service's
+`GET /costs`, the same proxy shape the archive/unarchive/purge actions
+already use (see *The board write model* below).
+
+The panel is fetched **once on page load plus a manual refresh button** —
+deliberately **not** part of the 2.5s `/api/state` poll every open
+dashboard tab runs, since folding a proxied network hop into that poll
+would multiply dispatch-service load by (open tabs) every 2.5s for a
+number that only changes when a job finishes. Without a dispatch URL/token
+configured, `GET /api/costs` answers `501` and the panel renders a muted
+"not configured" state, never a raw error.
+
 ## The event journal
 
 Runs journal automatically — every `--deliver` or `--assess` invocation
@@ -199,6 +221,13 @@ same shape:
 browser ──(dashboard token)──▶ dashboard /api/jobs/{id}/archive|unarchive|purge ──(dispatch token)──▶ dispatch /jobs/{id}/archive|unarchive|purge
 ```
 
+The Spend panel's `GET /api/costs` (above) is a third, read-only proxy of
+the same shape:
+
+```
+browser ──(dashboard token)──▶ dashboard GET /api/costs ──(dispatch token)──▶ dispatch GET /costs
+```
+
 - **The proxy** (`--dashboard` with `--dispatch-url`, default
   `http://127.0.0.1:8738`): authorised `POST`/`PATCH`/`DELETE` requests
   under `/api/backlog/` are forwarded — same method, same JSON body — to
@@ -217,6 +246,12 @@ browser ──(dashboard token)──▶ dashboard /api/jobs/{id}/archive|unarch
   actions forwarded (never a general `/api/jobs/*` passthrough), and
   without a token they answer `501 {"error": "job actions not
   configured"}`.
+- Same again for `GET /api/costs`: forwarded verbatim to `<dispatch-url>
+  /costs` (`?archived=1` passed through unchanged, any other/absent value
+  excludes archived jobs, matching `GET /jobs`), and without a token it
+  answers `501 {"error": "spend rollup not configured"}`. Scope is
+  **exactly `/api/costs`** — no path parameter, no other dispatch route
+  reachable through it.
 - **Auth is layered**: the browser authenticates to the dashboard
   (dashboard token / cookie, checked first); the dashboard process — not
   the browser — holds the dispatch bearer token. Both comparisons are
@@ -264,3 +299,6 @@ the bearer header when a token is set):
 - `POST /api/jobs/{id}/archive` / `POST /api/jobs/{id}/unarchive` /
   `POST /api/jobs/{id}/purge` — the archive/unarchive/purge proxy described
   above (same auth and `501` gating).
+- `GET /api/costs` — the spend rollup proxy described above (`?archived=1`
+  passed through unchanged; same auth and `501` gating; requires dashboard
+  auth).
