@@ -29,8 +29,19 @@ ReadWritePaths=/opt/dev-team
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectClock=yes
 RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RemoveIPC=yes
 LockPersonality=yes
+SystemCallArchitectures=native
+# A job may use the in-process container sandbox (--sandbox, rootless
+# podman/docker), which needs user namespaces and clone/mount syscalls, so the
+# namespace/capability/syscall filters are intentionally omitted. If this host
+# never uses --sandbox, run the whole process in an outer container/VM instead
+# (see DEPLOYMENT.md 5d) — that is what contains the engineer's own tool loop.
 
 [Install]
 WantedBy=multi-user.target

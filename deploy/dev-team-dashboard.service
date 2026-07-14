@@ -56,8 +56,21 @@ ProtectHome=yes
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectClock=yes
 RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
 LockPersonality=yes
+# The read-only viewer needs no privileges and spawns no container engine, so
+# it can be locked down harder than the dispatch/@ units (which may run the
+# in-process --sandbox and must keep namespaces/syscalls for podman/docker).
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target
