@@ -116,6 +116,25 @@ def test_diff_returns_patch():
     cmd = FakeCommandRunner()
     cmd.add_rule("diff HEAD", CommandResult(["git"], 0, "the-patch", ""))
     assert GitRepo(cmd).diff() == "the-patch"
+    # with no untracked files, no intent-to-add dance happens
+    assert not any(c[:3] == ["git", "add", "-N"] for c in cmd.calls)
+
+
+def test_diff_includes_untracked_via_intent_to_add_and_restores_index():
+    # ``git diff HEAD`` alone omits untracked files; diff() marks them
+    # intent-to-add so they appear, then un-adds them to leave the index as
+    # it was. The blank line in the ls-files output must be ignored.
+    cmd = FakeCommandRunner()
+    cmd.add_rule(
+        "ls-files --others --exclude-standard",
+        CommandResult(["git"], 0, "new.py\n\nsub/added.py\n", ""),
+    )
+    cmd.add_rule("diff HEAD", CommandResult(["git"], 0, "the-patch", ""))
+    assert GitRepo(cmd).diff() == "the-patch"
+    # untracked files were marked intent-to-add so they show up in the diff...
+    assert ["git", "add", "-N", "--", "new.py", "sub/added.py"] in cmd.calls
+    # ...then un-added so the index round-trips to exactly its prior state
+    assert ["git", "reset", "--", "new.py", "sub/added.py"] in cmd.calls
 
 
 def test_discard_changes_resets_and_cleans():
@@ -169,6 +188,32 @@ def test_stash_push_reports_failure():
     cmd = FakeCommandRunner()
     cmd.add_rule("stash push", CommandResult(["git"], 1, "", "nothing to stash"))
     assert GitRepo(cmd).stash_push(["a.py"]) is False
+
+
+def test_stash_push_reports_no_entry_on_exit_zero_with_nothing_to_save():
+    # git exits 0 with "No local changes to save" when the pathspec matched
+    # nothing to shelve — no entry was created, so a pop would restore an
+    # unrelated older stash. The push must report failure despite exit 0.
+    cmd = FakeCommandRunner()
+    cmd.add_rule(
+        "stash push", CommandResult(["git"], 0, "No local changes to save", "")
+    )
+    assert GitRepo(cmd).stash_push(["a.py"]) is False
+
+
+def test_stash_pop_reports_success_and_conflict():
+    ok = FakeCommandRunner()  # default exit 0
+    assert GitRepo(ok).stash_pop() is True
+    conflicting = FakeCommandRunner().add_rule(
+        "stash pop", CommandResult(["git"], 1, "", "CONFLICT (content): merge conflict")
+    )
+    assert GitRepo(conflicting).stash_pop() is False
+
+
+def test_reset_hard_moves_tip_to_ref():
+    cmd = FakeCommandRunner()
+    GitRepo(cmd).reset_hard("abc123")
+    assert ["git", "reset", "--hard", "abc123"] in cmd.calls
 
 
 def test_commit_allow_empty():

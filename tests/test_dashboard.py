@@ -233,7 +233,7 @@ def test_dashboard_page_story_modal_desk_check():
     so the load-bearing properties are pinned against the page source: rows
     are keyboard-operable buttons, every story field flows through esc()
     before innerHTML (a <script> in a description must render inert), the
-    dev_team_verify one-liner appears only when BOTH provenance ids exist,
+    verify curl one-liner appears only when BOTH provenance ids exist,
     and deterministic stories get the muted non-verifiable note.
     """
 
@@ -247,9 +247,19 @@ def test_dashboard_page_story_modal_desk_check():
     assert "${esc(st.source_job)}" in DASHBOARD_HTML
     # the title bypasses innerHTML entirely (textContent never parses HTML)
     assert '$("story-title").textContent = st.id' in DASHBOARD_HTML
-    # the re-verify hook requires BOTH ids and is escaped end to end
+    # the re-verify hook requires BOTH ids and is escaped end to end; the
+    # command is the REAL dispatch mode:"verify" submit (POST /jobs, see
+    # docs/DISPATCH.md), built from the two repo-derived provenance ids
     assert "if (st.finding_id && st.source_job)" in DASHBOARD_HTML
-    assert '"dev_team_verify " + st.source_job + " " + st.finding_id' in DASHBOARD_HTML
+    assert (
+        'JSON.stringify({ mode: "verify", source_job: st.source_job, '
+        "finding_id: st.finding_id })"
+    ) in DASHBOARD_HTML
+    assert (
+        "curl -sX POST http://127.0.0.1:8738/jobs "
+        '-H "Authorization: Bearer $DEV_TEAM_DISPATCH_TOKEN" '
+        "-H \"Content-Type: application/json\" -d '${body}'"
+    ) in DASHBOARD_HTML
     assert "<code>${esc(cmd)}</code>" in DASHBOARD_HTML
     assert 'data-copy="${esc(cmd)}"' in DASHBOARD_HTML
     # deterministic stories: the muted, non-verifiable note

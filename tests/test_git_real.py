@@ -135,6 +135,35 @@ def test_diff_reports_staged_and_unstaged_edits(repo, tmp_path):
     assert "+after" in diff
 
 
+def test_diff_includes_untracked_file_and_leaves_index_unchanged(repo, tmp_path):
+    repo.ensure_repo()
+    _commit_file(repo, tmp_path, "a.txt", "committed\n")
+    # a brand-new file git is not yet tracking
+    _write(tmp_path, "brand_new.txt", "hello new file\n")
+    diff = repo.diff()
+    # the untracked file (and its content) appears in the reviewer's diff...
+    assert "brand_new.txt" in diff
+    assert "+hello new file" in diff
+    # ...but the intent-to-add was undone: nothing is staged and the file is
+    # still untracked, so the index round-tripped to exactly its prior state.
+    assert repo._git("diff", "--cached", "--name-only").stdout.strip() == ""
+    assert "?? brand_new.txt" in repo._git("status", "--porcelain").stdout
+
+
+def test_reset_hard_restores_tip_to_captured_sha(repo, tmp_path):
+    repo.ensure_repo()
+    _commit_file(repo, tmp_path, "a.txt", "one\n")
+    head = repo.rev_parse("HEAD")
+    _commit_file(repo, tmp_path, "b.txt", "two\n", message="second")
+    assert repo.rev_parse("HEAD") != head
+    # reset_hard moves the tip back to the captured sha, dropping the later
+    # commit and its file entirely (the undo for a stray reset_soft).
+    repo.reset_hard(head)
+    assert repo.rev_parse("HEAD") == head
+    assert not (tmp_path / "b.txt").exists()
+    assert repo.has_changes() is False
+
+
 def test_discard_changes_resets_and_cleans(repo, tmp_path):
     repo.ensure_repo()
     _commit_file(repo, tmp_path, "a.txt", "keep\n")

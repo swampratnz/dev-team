@@ -27,6 +27,40 @@ def test_min_coverage_default_is_pragmatic():
     assert parser.parse_args(["Title", "Desc"]).min_coverage == 80.0
 
 
+def test_build_parser_groups_flags_for_help():
+    # U4: flags are organised into argument groups for --help readability;
+    # grouping is cosmetic and must not change parsing.
+    parser = build_parser()
+    titles = [g.title for g in parser._action_groups]
+    for expected in (
+        "modes",
+        "delivery options",
+        "assessment options",
+        "serving options",
+    ):
+        assert expected in titles
+
+
+def test_workspace_help_names_deliver_assess_dashboard():
+    # U4: --workspace is the target dir for --deliver, --assess and --dashboard,
+    # not just --deliver as the old help implied.
+    parser = build_parser()
+    workspace = next(a for a in parser._actions if a.dest == "workspace")
+    assert "--deliver" in workspace.help
+    assert "--assess" in workspace.help
+    assert "--dashboard" in workspace.help
+
+
+def test_build_parser_epilog_documents_exit_codes():
+    # U13.2: exit-code semantics are surfaced in --help, not only the README.
+    epilog = build_parser().epilog
+    assert "exit codes" in epilog
+    assert "success" in epilog
+    assert "invalid input" in epilog
+    assert "130" in epilog
+    assert "interrupted" in epilog
+
+
 def test_version_flag_prints_version(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["--version"])
@@ -156,6 +190,42 @@ def test_main_simulation_accepts_budget_and_reports_cost(monkeypatch, capsys):
     assert code == 1  # no tasks succeeded, but the run was accepted (not exit 2)
     assert captured["budget"].limit_usd == 5.0
     assert "Cost:    $0.1234" in out
+
+
+def test_main_simulation_prints_paid_agent_notice(capsys):
+    # U5: the default (simulation) mode drives the same paid agents, so it says
+    # so once up front on stderr (stdout stays a clean result document).
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(["Login", "Add login"], runner=runner)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "paid agents" in captured.err
+    assert captured.err.count("paid agents") == 1  # once, not per event
+    assert "paid agents" not in captured.out
+
+
+def test_main_simulation_notice_suppressed_by_quiet(capsys):
+    # U5: --quiet silences the upfront notice.
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(["Login", "Add login", "--quiet"], runner=runner)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "paid agents" not in captured.err
+
+
+def test_main_keyboard_interrupt_returns_130(capsys):
+    # U8: Ctrl-C during a run exits 130 with a clean line, no asyncio traceback.
+    class _InterruptingRunner:
+        async def run(self, prompt, *, system_prompt=None, allowed_tools=None,
+                      model=None, cwd=None):
+            raise KeyboardInterrupt
+
+    code = main(["Login", "Add login"], runner=_InterruptingRunner())
+    captured = capsys.readouterr()
+    assert code == 130
+    assert "interrupted" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
 
 
 def test_main_min_coverage_rejected_with_deliver(capsys):
@@ -473,7 +543,7 @@ def test_main_chat_runs_simulation_from_conversation(monkeypatch, capsys):
 
     from test_chat import FakeBackend
 
-    monkeypatch.setattr("sys.stdin", _io.StringIO("I want login\n/run\n/quit\n"))
+    monkeypatch.setattr("sys.stdin", _io.StringIO("I want login\n/run\ny\n/quit\n"))
     backend = FakeBackend(["what kind of login?"])
     runner = ScriptedRunner(happy_responses(1))
     code = main(["--chat"], runner=runner, chat_backend=backend)
@@ -491,7 +561,7 @@ def test_main_chat_deliver_from_conversation(monkeypatch, tmp_path, capsys):
     from helpers import engine_responses
     from test_chat import FakeBackend
 
-    monkeypatch.setattr("sys.stdin", _io.StringIO("/deliver\n/quit\n"))
+    monkeypatch.setattr("sys.stdin", _io.StringIO("/deliver\ny\n/quit\n"))
     backend = FakeBackend()
     runner = ScriptedRunner(by_system_prompt=engine_responses())
     code = main(
@@ -613,6 +683,27 @@ def test_main_assess_interactive_scope_prompt(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert code == 0
     assert "Adjust the audit scope" in captured.err
+
+
+def test_main_assess_missing_workspace_exits_2(tmp_path, capsys):
+    # U2: --assess audits an existing repo; a mistyped --workspace must fail
+    # loudly rather than silently audit an empty dir LocalWorkspace mkdirs.
+    missing = tmp_path / "nope"
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--assess", "--workspace", str(missing)], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "--assess" in capsys.readouterr().err
+    assert not missing.exists()  # the typo did not create it
+
+
+def test_main_assess_empty_workspace_exits_2(tmp_path, capsys):
+    # U2: an existing but empty --workspace is also a likely typo, not a repo.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--assess", "--workspace", str(empty)], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "--assess" in capsys.readouterr().err
 
 
 def test_main_assess_rejects_chat_and_deliver(capsys):

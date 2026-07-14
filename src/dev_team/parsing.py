@@ -6,6 +6,7 @@ missing keys fall back to sensible defaults and unexpected types are coerced.
 
 from __future__ import annotations
 
+import re
 from typing import Any, List, Type, TypeVar
 
 from .models import (
@@ -130,6 +131,28 @@ def as_obj_list(data: dict, key: str) -> List[dict]:
     return [item for item in value if isinstance(item, dict)]
 
 
+# Task ids flow into filesystem paths (worktree directories) and git branch
+# names, so a raw model-authored id can contain path separators, ``..``, or
+# spaces that break worktree/branch creation or escape the workspace. This
+# matches any run of characters outside the safe slug alphabet.
+_UNSAFE_ID_RUN = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _slugify_task_id(raw: str, index: int) -> str:
+    """Sanitise a model-authored task id into a path/branch-safe slug.
+
+    Keeps only ``[A-Za-z0-9_-]``, collapses every other run of characters into
+    a single ``-``, and trims leading/trailing separators; an id that reduces
+    to nothing falls back to the stable positional ``T{index + 1}``.
+
+    Case is preserved on purpose — ids like ``T1`` must round-trip unchanged so
+    dependency references, checkpoints, and test comparisons keep matching.
+    """
+
+    slug = _UNSAFE_ID_RUN.sub("-", raw).strip("-")
+    return slug or f"T{index + 1}"
+
+
 def task_from_dict(data: dict, index: int) -> Task:
     """Build a :class:`Task` from a JSON dict.
 
@@ -137,7 +160,7 @@ def task_from_dict(data: dict, index: int) -> Task:
     """
 
     data = as_dict(data)
-    task_id = as_str(data, "id") or f"T{index + 1}"
+    task_id = _slugify_task_id(as_str(data, "id"), index)
     return Task(
         id=task_id,
         title=as_str(data, "title") or task_id,

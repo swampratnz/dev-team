@@ -110,9 +110,12 @@ came from:
 
 - A story bred from an **LLM finding** carries its source job and finding
   id (`recommendation.plan[0]`, `risk.secrets[1]`, …) and shows a copyable
-  **`dev_team_verify <source_job> <finding_id>`** one-liner: it re-checks
-  that single claim with a fresh, skeptical agent against a clean clone,
-  fully independent of the auditor that wrote it.
+  one-liner that submits the dispatch service's `mode:"verify"` job — a
+  `curl -sX POST /jobs` with the `{"mode":"verify","source_job":…,
+  "finding_id":…}` body documented in [`docs/DISPATCH.md`](DISPATCH.md)
+  (the repo to re-clone comes from the source job's `meta.json`, so no repo
+  is sent). It re-checks that single claim with a fresh, skeptical agent
+  against a clean clone, fully independent of the auditor that wrote it.
 - A **deterministic** story (dependency scan, dead-code probe) is exact
   program output, not a model claim — the modal says so and suggests
   re-running the assessment to refresh it.

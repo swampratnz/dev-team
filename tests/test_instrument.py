@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from helpers import run
 
-from dev_team.budget import Budget
+from dev_team.budget import Budget, BudgetExceededError
 from dev_team.execution import InMemoryWorkspace
 from dev_team.instrument import InstrumentedRunner
 from dev_team.sdk import AgentResult
@@ -125,6 +125,29 @@ def test_does_not_record_on_raising_call():
         raise AssertionError("expected RuntimeError")
     # no result to record, so nothing was written
     assert list_transcripts(ws, "deliver-1", "engineer") == []
+
+
+def test_transcript_written_before_budget_enforcement():
+    # The call whose cost tips the budget over its ceiling has still been paid
+    # for; its transcript must be written BEFORE budget.record raises, or the
+    # paid I/O is lost to the exception and never audited.
+    inner = ScriptedRunner([AgentResult(text="pricey", cost_usd=2.0, num_turns=1)])
+    ws = InMemoryWorkspace()
+    recorder = TranscriptRecorder(ws, run="deliver-1")
+    budget = Budget(limit_usd=1.0)
+    runner = InstrumentedRunner(
+        inner, "engineer", budget=budget, transcript_recorder=recorder
+    )
+    try:
+        run(runner.run("do it", system_prompt="be an engineer"))
+    except BudgetExceededError:
+        pass
+    else:  # pragma: no cover - the raise is the point
+        raise AssertionError("expected BudgetExceededError")
+    # the paid call's transcript survived the budget death
+    record = read_transcript(ws, "deliver-1", "engineer", 1)
+    assert record["response"] == "pricey"
+    assert record["cost_usd"] == 2.0
 
 
 def test_transcript_write_failure_never_breaks_the_run():

@@ -136,7 +136,10 @@ def render_delivery_summary(outcome: "DeliveryOutcome") -> str:
         lines.append(f"Halted:  {outcome.halted_reason}")
         if outcome.baseline is not None:
             for gate in outcome.baseline.failed_gates:
-                lines.append(f"  baseline gate failed — {gate.name}: {gate.detail[:200]}")
+                detail = gate.detail[:200]
+                if len(gate.detail) > 200:
+                    detail += " (full detail in .dev_team/events.jsonl)"
+                lines.append(f"  baseline gate failed — {gate.name}: {detail}")
         return "\n".join(lines)
     if outcome.branch:
         lines.append(f"Branch:  {outcome.branch}")

@@ -1,0 +1,63 @@
+# Singleton, long-lived unit for the standing dev-team web dashboard.
+#
+#   sudo cp deploy/dev-team-dashboard.service /etc/systemd/system/
+#   sudo systemctl enable --now dev-team-dashboard.service
+#
+# The dashboard is a READ-ONLY viewer over a single workspace
+# (/opt/dev-team/workspace below): it renders the event journal, backlog,
+# cross-run memory, house conventions, and assessment reports that runs write
+# there. Point it at the same workspace the dispatch service mirrors jobs into
+# (its --dashboard-workspace, see deploy/dev-team-dispatch.service) and every
+# dispatched run shows up here live. See docs/DASHBOARD.md.
+#
+# Reads /etc/dev-team/dashboard.env, which must define:
+#   - DEV_TEAM_DASHBOARD_TOKEN  the token every dashboard route requires
+#                               (browser login cookie or `Authorization:
+#                               Bearer <token>`) — a credential; keep it out of
+#                               version control and rotate by editing the env
+#                               file and restarting the unit. Set it even on
+#                               the loopback bind below: a standing service on
+#                               a shared host is reachable by anyone with
+#                               local/SSH access, and the dashboard exposes the
+#                               assessment reports (and, if transcripts are
+#                               enabled, raw repo content). The tokenless "open"
+#                               mode is for localhost development only.
+#
+# This unit holds NO Claude credentials on purpose: the dashboard runs no
+# agents, so its env file is kept separate from the dispatch service's
+# (least privilege — the read-only viewer never sees the subscription/API
+# token). To make the Kanban board editable, add
+# `--dispatch-url http://127.0.0.1:8738` to ExecStart and
+# DEV_TEAM_DISPATCH_TOKEN to dashboard.env; edits then proxy to the dispatch
+# service, which owns every backlog write (see docs/DASHBOARD.md).
+[Unit]
+Description=dev-team web dashboard (read-only workspace viewer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=devteam
+Group=devteam
+WorkingDirectory=/opt/dev-team
+EnvironmentFile=/etc/dev-team/dashboard.env
+ExecStart=/opt/dev-team/.venv/bin/dev-team --dashboard --workspace /opt/dev-team/workspace --host 127.0.0.1
+Restart=on-failure
+RestartSec=5
+
+# Hardening (mirrors deploy/dev-team-dispatch.service). Deliberately no
+# ReadWritePaths: the dashboard only READS the workspace — every backlog write
+# flows through the dispatch service — so ProtectSystem=strict correctly leaves
+# it with no writable path outside its private /tmp.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1843,7 +1843,13 @@ function openStory(id) {
     `<pre class="tx-pre">${st.description ? esc(st.description) : "(no description)"}</pre>`,
   ];
   if (st.finding_id && st.source_job) {
-    const cmd = "dev_team_verify " + st.source_job + " " + st.finding_id;
+    // Real re-check: the dispatch service's mode:"verify" submit (POST /jobs,
+    // see docs/DISPATCH.md) — source_job + finding_id only; the repo to
+    // re-clone comes from the source job's meta.json. JSON.stringify keeps the
+    // two repo-derived ids correctly quoted inside the body, and esc() escapes
+    // the whole line for both the <code> preview and the data-copy attribute.
+    const body = JSON.stringify({ mode: "verify", source_job: st.source_job, finding_id: st.finding_id });
+    const cmd = `curl -sX POST http://127.0.0.1:8738/jobs -H "Authorization: Bearer $DEV_TEAM_DISPATCH_TOKEN" -H "Content-Type: application/json" -d '${body}'`;
     bits.push(`<div class="verify"><div class="tx-label">Re-verify this finding</div>
       <div class="cmd"><code>${esc(cmd)}</code><button data-copy="${esc(cmd)}">copy</button></div>
       <div class="note">Re-checks this claim (finding <code>${esc(st.finding_id)}</code>) with a fresh, skeptical agent against a clean clone \\u2014 independent of the auditor that wrote it.</div></div>`);

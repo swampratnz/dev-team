@@ -250,10 +250,27 @@ def test_render_delivery_summary_halted():
     assert "Halted:" in text
     assert "3 legacy failures" in text
     assert "Tasks:" not in text  # nothing ran; report stops at the halt
+    # short detail is shown verbatim — no truncation pointer
+    assert "(full detail in .dev_team/events.jsonl)" not in text
 
     data = delivery_to_dict(halted)
     assert data["halted_reason"].startswith("baseline")
     assert data["baseline_green"] is False
+
+
+def test_render_delivery_summary_halted_long_detail_points_to_journal():
+    # U13.3: detail over 200 chars is truncated and points at the full journal.
+    from dev_team.verification import DoDReport, GateResult
+
+    long_detail = "x" * 250
+    halted = _outcome(
+        halted_reason="baseline quality gates are already failing",
+        baseline=DoDReport([GateResult("tests", False, long_detail)]),
+    )
+    text = render_delivery_summary(halted)
+    assert "x" * 200 in text
+    assert "x" * 201 not in text  # truncated at 200 chars
+    assert "(full detail in .dev_team/events.jsonl)" in text
 
 
 def test_render_delivery_summary_shows_branch():

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+
 import pytest
 from helpers import GateCycleRunner, engine_responses, qa_suite_dict, run
 
 from dev_team.backlog import BacklogStore, ItemStatus
-from dev_team.budget import Budget
+from dev_team.budget import Budget, BudgetExceededError
 from dev_team.engine import (
     DeliveryEngine,
     DeliveryOutcome,
@@ -27,7 +30,15 @@ from dev_team.execution import (
 )
 from dev_team.git import GitRepo
 from dev_team.memory import CheckpointStore
-from dev_team.models import Design, FeatureRequest, Implementation, TaskStatus
+from dev_team.models import (
+    Design,
+    FeatureRequest,
+    Implementation,
+    SecurityReport,
+    Task,
+    TaskResult,
+    TaskStatus,
+)
 from dev_team.sdk import AgentResult
 from dev_team.testing import ScriptedRunner, json_response
 from dev_team.trace import Tracer
@@ -335,6 +346,31 @@ def test_deliver_commit_failure_is_contained():
     assert outcome.tasks_complete is True  # the run itself is not sunk
 
 
+def test_commit_failure_restores_banked_wip_commits():
+    # In the baseline branch _commit_if_approved soft-resets the tip back to
+    # the baseline and then commits; if that commit fails, the WIP commits are
+    # left only in the reflog. The fix hard-resets the tip back to the pre-reset
+    # HEAD so the banked commits (and a resumable state) return.
+    cmd = FakeCommandRunner()
+    cmd.add_rule("rev-parse --verify --quiet HEAD", CommandResult(["git"], 0, "TIP", ""))
+    cmd.add_rule("commit", CommandResult(["git"], 1, "", "hook rejected the commit"))
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, git=GitRepo(cmd))
+    engine._baseline_sha = "BASE"  # a baseline exists, so WIP commits are banked
+
+    task = Task(id="T1", title="t", description="")
+    task.status = TaskStatus.DONE
+    results = [TaskResult(task=task, attempts=1)]
+    committed = engine._commit_if_approved(
+        _request(), results, SecurityReport(approved=True, summary="ok")
+    )
+
+    assert committed is False
+    # the soft reset to BASE was undone by a hard reset back to the captured tip
+    assert ["git", "reset", "--soft", "BASE"] in cmd.calls
+    assert ["git", "reset", "--hard", "TIP"] in cmd.calls
+
+
 def test_deliver_no_commit_without_git_or_root():
     # In-memory workspace, no injected GitRepo: there is nowhere to commit.
     runner = ScriptedRunner(by_system_prompt=engine_responses())
@@ -408,6 +444,49 @@ def test_deliver_budget_death_mid_integration_rolls_back():
     assert outcome.budget_exhausted is True
     # the applied-but-unverified implementation was rolled back
     assert "a.py" not in ws.list_files()
+
+
+def test_deliver_agentic_engineer_raise_discards_dirty_tree(tmp_path, monkeypatch):
+    # The agentic mirror of the budget-death rollback above: the engineer
+    # edits the shared workdir directly and then the paid call dies. The
+    # implement_in_place call sits outside _integrate's rollback scope, so
+    # without its own guard the half-written file survives on disk and the
+    # next task's _commit_wip would bank it as if it were gated work.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    ws = LocalWorkspace(str(tmp_path))
+
+    class RaisingEngineerRunner(ScriptedRunner):
+        async def run(self, prompt, *, system_prompt=None, **kwargs):
+            if system_prompt and "senior software engineer" in system_prompt:
+                # a real edit to the shared workdir, then the call blows the budget
+                (tmp_path / "leaked.py").write_text("leaked = 1\n")
+                raise BudgetExceededError(999.0, 1.0)
+            return await super().run(prompt, system_prompt=system_prompt, **kwargs)
+
+    runner = RaisingEngineerRunner(by_system_prompt=engine_responses())
+    cmd = SubprocessCommandRunner(cwd=str(tmp_path))
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(max_task_attempts=1),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.budget_exhausted is True
+    # the engineer's half-written file was discarded by the rollback (real git
+    # reset --hard + clean), so it never survives to pollute a later commit
+    assert not (tmp_path / "leaked.py").exists()
+    assert "leaked.py" not in outcome.workspace_files
+    # the working tree is clean: a subsequent task's _commit_wip has nothing of
+    # the failed task's to bank, and it never reached any commit
+    assert engine.git.has_changes() is False
+    log = cmd.run(
+        ["git", "log", "--all", "--pretty=format:%s%n", "--name-only"],
+        cwd=str(tmp_path),
+    )
+    assert "leaked.py" not in log.stdout
 
 
 # --- checkpoint / resume --------------------------------------------------
@@ -873,6 +952,32 @@ def test_deliver_skips_baseline_check_on_empty_workspace():
     outcome = run(engine.deliver(_request()))
     assert outcome.baseline is None
     assert outcome.success is True
+
+
+def test_baseline_gate_evaluation_runs_off_the_event_loop(monkeypatch):
+    # A remote-CI baseline gate polls with blocking time.sleep for up to its
+    # whole timeout; the baseline check must dispatch it via asyncio.to_thread
+    # so it never starves the event loop. A red baseline halts before any task,
+    # isolating the baseline evaluation as the only gate run.
+    ws = InMemoryWorkspace({"src/app.py": "x = 1"})
+    cmd = FakeCommandRunner()
+    cmd.add_rule("pytest", CommandResult(["pytest"], 1, "", "legacy test broken"))
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws, command_runner=cmd)
+
+    dispatched = []
+    real_to_thread = asyncio.to_thread
+
+    async def spy(func, *args, **kwargs):
+        dispatched.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr("dev_team.engine.asyncio.to_thread", spy)
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.halted_reason is not None  # red baseline halts before tasks
+    # the baseline evaluation was handed to a worker thread, not run inline
+    assert engine.definition_of_done.evaluate in dispatched
 
 
 def test_deliver_halts_on_dirty_tree(tmp_path):
@@ -1723,6 +1828,42 @@ def test_fail_to_pass_skips_when_stash_fails(tmp_path):
     # stash failed -> check skipped rather than falsely rejecting
     assert outcome.success is True
     assert not any(c[:2] == ["git", "stash"] and c[2] == "pop" for c in cmd.calls)
+
+
+def test_fail_to_pass_conflicting_stash_pop_rejects_as_gate_failure(tmp_path):
+    # The implementation is shelved for the fail-to-pass check, but the pop
+    # back conflicts. The change is no longer intact on disk, so the attempt
+    # must be rejected as a gate failure — never accepted/marked DONE with the
+    # implementation silently lost to the stash.
+    ws = LocalWorkspace(str(tmp_path))
+
+    class AgenticRunner(ScriptedRunner):
+        async def run(self, prompt, *, system_prompt=None, **kwargs):
+            if system_prompt and "senior software engineer" in system_prompt:
+                (tmp_path / "src").mkdir(exist_ok=True)
+                (tmp_path / "src" / "x.py").write_text("x = 1\n")
+            return await super().run(prompt, system_prompt=system_prompt, **kwargs)
+
+    mapping = engine_responses()
+    mapping["senior software engineer"] = json_response(
+        {"summary": "impl", "files": [{"path": "src/x.py", "change_type": "create", "summary": "s"}]}
+    )
+    runner = AgenticRunner(by_system_prompt=mapping)
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "stash pop",
+        CommandResult(["git"], 1, "", "CONFLICT (content): merge conflict in src/x.py"),
+    )
+    engine = _engine(
+        runner, workspace=ws, command_runner=cmd, config=EngineConfig(max_task_attempts=1)
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is False
+    assert outcome.task_results[0].task.status is TaskStatus.FAILED
+    # surfaced as a gate failure, not a vacuous-test rejection
+    assert outcome.blackboard.get("scorecard")["gate_failures"] >= 1
+    assert "could not be restored" in outcome.task_results[0].test_report.summary
 
 
 def test_devops_artifacts_are_written_and_committed():

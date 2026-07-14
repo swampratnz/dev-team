@@ -78,9 +78,33 @@ class GitRepo:
                 self._git("config", key, value)
 
     def diff(self) -> str:
-        """Return the combined staged and unstaged diff against HEAD."""
+        """Return the combined staged and unstaged diff against HEAD.
 
-        return self._git("diff", "HEAD", check=False).stdout
+        ``git diff HEAD`` on its own omits untracked (newly created) files, so
+        the agentic reviewer's diff would silently miss whole files the
+        engineer just wrote. Brand-new files are therefore marked
+        intent-to-add (``git add -N``) so they appear in the diff as additions,
+        then un-added (``git reset``) so the index is left exactly as it was
+        found — the intent-to-add is a transient device for capturing the diff,
+        never a staged change.
+        """
+
+        untracked = [
+            line.strip()
+            for line in self._git(
+                "ls-files", "--others", "--exclude-standard", check=False
+            ).stdout.splitlines()
+            if line.strip()
+        ]
+        if untracked:
+            self._git("add", "-N", "--", *untracked, check=False)
+        try:
+            return self._git("diff", "HEAD", check=False).stdout
+        finally:
+            # Undo the intent-to-add so the index round-trips to its prior
+            # state, whatever the diff did.
+            if untracked:
+                self._git("reset", "--", *untracked, check=False)
 
     def diff_names(self, ref: str) -> List[str]:
         """Return the tracked paths that differ between ``ref`` and the tree."""
@@ -182,16 +206,32 @@ class GitRepo:
     def stash_push(self, paths: List[str]) -> bool:
         """Temporarily shelve changes to ``paths`` (untracked included).
 
-        Returns whether anything was actually stashed; callers must only
-        ``stash_pop`` when it was.
+        Returns whether an entry was *actually created*; callers must only
+        ``stash_pop`` when it was. Exit code alone is not enough: when nothing
+        matches the pathspec ``git stash push`` still exits 0 while printing
+        "No local changes to save" and creating no entry — popping then would
+        restore an *unrelated* older stash over the working tree. That case is
+        detected here and reported as a failed push.
         """
 
-        return self._git("stash", "push", "-u", "--", *paths, check=False).ok
+        result = self._git("stash", "push", "-u", "--", *paths, check=False)
+        if not result.ok:
+            return False
+        if "No local changes to save" in result.output:
+            return False
+        return True
 
-    def stash_pop(self) -> None:
-        """Restore the most recently stashed changes (best effort)."""
+    def stash_pop(self) -> bool:
+        """Restore the most recently stashed changes.
 
-        self._git("stash", "pop", check=False)
+        Returns whether the pop applied cleanly. A conflicting or otherwise
+        failed pop returns ``False`` (git leaves the entry on the stack and may
+        write conflict markers into the tree) so the caller can react — a
+        silently dropped pop would lose the shelved change while the tree looks
+        superficially fine.
+        """
+
+        return self._git("stash", "pop", check=False).ok
 
     def merge_squash(self, branch: str) -> None:
         """Stage ``branch``'s changes onto the current branch without committing."""
@@ -202,6 +242,17 @@ class GitRepo:
         """Move the branch tip to ``ref`` keeping all changes staged."""
 
         self._git("reset", "--soft", ref)
+
+    def reset_hard(self, ref: str) -> None:
+        """Move the branch tip to ``ref``, discarding index and working-tree
+        changes.
+
+        Unlike :meth:`discard_changes` (which resets to the current ``HEAD``),
+        this moves the tip to an explicit commit — the operation that undoes a
+        prior ``reset_soft`` by restoring the branch to a captured sha.
+        """
+
+        self._git("reset", "--hard", ref)
 
     def has_changes(self) -> bool:
         """Whether the working tree has uncommitted changes."""

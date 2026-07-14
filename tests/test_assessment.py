@@ -249,6 +249,22 @@ def test_assess_happy_path_produces_cited_report():
     assert ws.read_text("audit/assessment.md") == report
 
 
+def test_assess_empty_workspace_refuses_before_any_paid_call():
+    """A mistyped/empty workspace must fail fast, before spending on agents."""
+
+    import pytest
+
+    from dev_team.errors import DevTeamError
+
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(runner, workspace=InMemoryWorkspace())
+    with pytest.raises(DevTeamError) as excinfo:
+        run(engine.assess())
+    assert "Nothing to assess" in str(excinfo.value)
+    # the guard fires before the first agent phase: no model call was made
+    assert runner.calls == []
+
+
 def test_assess_report_path_none_skips_writing():
     runner = ScriptedRunner(by_system_prompt=assess_responses())
     ws = _workspace()
@@ -627,6 +643,119 @@ def test_cited_handles_items_without_fields():
     lines = []
     _cited(lines, [{"evidence": "a.cs"}, {}], "claim")
     assert lines == ["- (unspecified) (evidence: a.cs)", "- (unspecified)"]
+
+
+def test_render_report_finding_bullets_carry_reverifiable_ids():
+    """Every _FINDING_LISTS-backed bullet is suffixed with the exact positional
+    id list_findings mints, and every rendered id round-trips through
+    find_finding. Non-finding lists stay untagged."""
+
+    import re
+
+    from dev_team.assessment import find_finding
+
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    outcome = run(_engine(runner).assess())
+    report = outcome.report_markdown
+
+    # Each finding-backed list is tagged with its list_findings id.
+    for finding_id in (
+        "inventory.findings[0]",
+        "buildability.blockers[0]",
+        "risk.dependencies[0]",
+        "risk.secrets[0]",
+        "risk.data_layer[0]",
+        "risk.external_services[0]",
+        "coverage.tests[0]",
+        "coverage.documentation[0]",
+        "conventions.conventions[0]",
+        "recommendation.plan[0]",     # rendered as a numbered list, not _cited
+    ):
+        assert f"[{finding_id}]" in report
+
+    # Lists that are NOT re-verifiable must carry no id (find_finding would
+    # never resolve one), and the citation itself stays intact.
+    assert "[buildability.runtime_requirements" not in report
+    assert "(evidence: src/Api/packages.config)" in report
+
+    # Round-trip: pull every rendered finding id back out and resolve it.
+    data = outcome_to_dict(outcome)
+    rendered_ids = re.findall(
+        r"\[((?:[a-z_]+\.[a-z_]+\[\d+\])(?:\.findings\[\d+\])?)\]", report
+    )
+    assert "risk.secrets[0]" in rendered_ids
+    for finding_id in rendered_ids:
+        assert find_finding(data, finding_id) is not None, finding_id
+    assert find_finding(data, "risk.secrets[0]")["claim"] == (
+        "connection string committed"
+    )
+    assert find_finding(data, "recommendation.plan[0]")["claim"] == "Pin build chain"
+
+
+def test_render_report_ids_gate_on_phase_ok_and_claim_presence():
+    """Ids are only minted where find_finding can resolve them: an ok phase
+    with claim-bearing items. Failed phases, and claim-less items in an ok
+    list, render their bullets untagged."""
+
+    from dev_team.assessment import find_finding
+
+    phases = {
+        # Failed phase with data: the bullet still renders, but no id (the
+        # enumerator skips failed phases, so an id could not be resolved).
+        "risk": PhaseResult(
+            phase="risk",
+            role="security-engineer",
+            error="budget exhausted",
+            data={"secrets": [{"claim": "leaked key", "evidence": "x"}]},
+        ),
+        # Ok plan mixing a real step with a claim-less one.
+        "recommendation": PhaseResult(
+            phase="recommendation",
+            role="product-manager",
+            data={
+                "classification": "archive",
+                "plan": [
+                    {"step": "Do the thing", "effort": "1 day", "detail": "d"},
+                    {"effort": "1 week", "detail": "no step text"},  # no claim
+                ],
+            },
+        ),
+        # Ok component deep-dive: nested finding ids, claim-less sibling skipped.
+        "components": PhaseResult(
+            phase="components",
+            role="architect",
+            data={
+                "summary": "deep dive",
+                "components": [
+                    {
+                        "name": "Api",
+                        "path": "src/Api",
+                        "findings": [
+                            {"claim": "God object", "evidence": "Pay.cs"},
+                            {"note": "no claim text"},  # claim-less -> no id
+                        ],
+                    }
+                ],
+            },
+        ),
+    }
+    report = render_report(_bare_outcome(phases=phases))
+
+    # Failed phase: bullet present, id absent.
+    assert "leaked key" in report
+    assert "[risk.secrets[0]]" not in report
+    # Ok plan: claim step tagged, claim-less step not.
+    assert "1. Do the thing — *1 day*. d [recommendation.plan[0]]" in report
+    assert "[recommendation.plan[1]]" not in report
+    # Component deep-dive: nested id scheme, claim-less sibling untagged.
+    assert "[components.components[0].findings[0]]" in report
+    assert "[components.components[0].findings[1]]" not in report
+
+    # The one minted id round-trips through the serialised form.
+    data = outcome_to_dict(_bare_outcome(phases=phases))
+    assert find_finding(data, "components.components[0].findings[0]")["claim"] == (
+        "God object"
+    )
 
 
 # --- excludes, components, dead code, dependency scan ---------------------------
@@ -1033,7 +1162,8 @@ def test_dict_to_backlog_threads_finding_provenance():
         == "risk.secrets[0]"
     )
     # Every threaded id resolves against the finding enumerator — the two
-    # schemes cannot drift, so `--verify` / dev_team_verify can re-check it.
+    # schemes cannot drift, so `--verify --finding <id>` (or a dispatch
+    # mode:"verify" job) can re-check it.
     known = {f["id"] for f in list_findings(data)}
     assert {s.finding_id for s in stories if s.finding_id is not None} <= known
     assert all(s.source_job == "assess-1" for s in stories)

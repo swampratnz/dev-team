@@ -102,6 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dev-team",
         description="Run a multi-agent software development team on a feature.",
+        epilog=(
+            "exit codes:\n"
+            "  0    success\n"
+            "  1    completed with failed tasks\n"
+            "  2    invalid input or usage error\n"
+            "  130  interrupted (Ctrl-C)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--version",
@@ -120,7 +128,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Detailed description of what the feature should do (omit with --chat).",
     )
-    parser.add_argument(
+
+    # Argument groups organise --help only; they do not change parsing, so the
+    # add order below (and every flag's dest/default) is unchanged.
+    modes = parser.add_argument_group(
+        "modes",
+        "What dev-team does. With no mode flag it runs the paid simulation on "
+        "the title/description; the flags here select other modes.",
+    )
+    delivery = parser.add_argument_group(
+        "delivery options", "Tune real delivery (with --deliver)."
+    )
+    assessment = parser.add_argument_group(
+        "assessment options",
+        "Tune an audit and its follow-ups (with --assess/--verify).",
+    )
+    serving = parser.add_argument_group(
+        "serving options", "Bind the dashboard/dispatch services."
+    )
+    interaction = parser.add_argument_group(
+        "interaction & personas", "Collaboration and the agent cast."
+    )
+    misc = parser.add_argument_group("general options")
+
+    misc.add_argument(
         "-c",
         "--constraint",
         action="append",
@@ -129,14 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TEXT",
         help="A constraint the solution must satisfy (repeatable).",
     )
-    parser.add_argument("--model", default=None, help="Model id for the agents.")
-    parser.add_argument(
+    misc.add_argument("--model", default=None, help="Model id for the agents.")
+    misc.add_argument(
         "--max-attempts",
         type=int,
         default=2,
         help="Maximum attempts per task before it is marked failed.",
     )
-    parser.add_argument(
+    misc.add_argument(
         "--min-coverage",
         type=float,
         default=80.0,
@@ -145,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
         "to mark first runs INCOMPLETE). Ignored by --deliver, which gates on "
         "its definition-of-done instead — passing both is an error.",
     )
-    parser.add_argument(
+    interaction.add_argument(
         "-i",
         "--interactive",
         action="store_true",
@@ -153,13 +184,13 @@ def build_parser() -> argparse.ArgumentParser:
         "starts, decide what happens when a task fails, and approve the "
         "feature commit and risky commands on this terminal.",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--chat",
         action="store_true",
         help="Start a conversation with the product manager to shape the "
         "feature first; /run or /deliver hands the agreed brief to the team.",
     )
-    parser.add_argument(
+    interaction.add_argument(
         "--roster",
         default=None,
         metavar="FILE",
@@ -167,12 +198,12 @@ def build_parser() -> argparse.ArgumentParser:
         '{"engineer": {"name": "Ada", "style": "..."}}. '
         "Entries overlay the default cast.",
     )
-    parser.add_argument(
+    interaction.add_argument(
         "--no-personas",
         action="store_true",
         help="Disable agent personas; agents present as bare roles.",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--deliver",
         action="store_true",
         help="Run the real delivery engine (writes files, runs gates, commits) "
@@ -180,14 +211,14 @@ def build_parser() -> argparse.ArgumentParser:
         "runs the same real, paid agents, it just makes no filesystem or git "
         "changes.",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--assess",
         action="store_true",
         help="Audit the --workspace repository read-only (inventory, "
         "buildability, risk, tests/docs, recommendation) and write a cited "
         "markdown report. Optional description argument scopes the audit.",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--dashboard",
         action="store_true",
         help="Serve a local web dashboard over the --workspace: each "
@@ -195,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
         "and assessment reports. Read-only; runs happily alongside "
         "--deliver/--assess runs on the same workspace.",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--dispatch",
         action="store_true",
         help="Serve an authenticated HTTP dispatch service: an external "
@@ -204,13 +235,13 @@ def build_parser() -> argparse.ArgumentParser:
         "The bearer token is read from the DEV_TEAM_DISPATCH_TOKEN "
         "environment variable; bind to a trusted (e.g. tailnet) address.",
     )
-    parser.add_argument(
+    serving.add_argument(
         "--port",
         type=int,
         default=None,
         help="Port for --dashboard (default 8737) or --dispatch (default 8738).",
     )
-    parser.add_argument(
+    serving.add_argument(
         "--host",
         default=None,
         metavar="ADDR",
@@ -221,7 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
         "authenticates but runs agent code — only widen this on a trusted "
         "network.",
     )
-    parser.add_argument(
+    serving.add_argument(
         "--dashboard-workspace",
         default=None,
         metavar="DIR",
@@ -231,7 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
         "report under audit/<job-id>/, so dispatched runs are visible on the "
         "dashboard. Each job still runs in its own isolated workspace.",
     )
-    parser.add_argument(
+    serving.add_argument(
         "--dispatch-url",
         default=None,
         metavar="URL",
@@ -241,14 +272,14 @@ def build_parser() -> argparse.ArgumentParser:
         "DEV_TEAM_DISPATCH_TOKEN environment variable; without that token "
         "the board stays read-only (writes answer 501).",
     )
-    parser.add_argument(
+    assessment.add_argument(
         "--report",
         default=None,
         metavar="FILE",
         help="Workspace-relative path for the assessment report "
         "(with --assess; default: audit/assessment.md).",
     )
-    parser.add_argument(
+    assessment.add_argument(
         "--exclude",
         action="append",
         default=None,
@@ -257,7 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exclude paths matching this glob from the assessment "
         "(repeatable; replaces the built-in vendored/build-output defaults).",
     )
-    parser.add_argument(
+    assessment.add_argument(
         "--max-tree-entries",
         type=int,
         default=None,
@@ -265,13 +296,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many file-tree entries the assessment evidence may list "
         "(with --assess; default 400).",
     )
-    parser.add_argument(
+    assessment.add_argument(
         "--component-fanout",
         action="store_true",
         help="Deep-dive each detected sub-project with its own parallel "
         "audit (with --assess).",
     )
-    parser.add_argument(
+    assessment.add_argument(
         "--no-osv-scan",
         action="store_true",
         help="Skip the live OSV.dev vulnerability scan of pinned "
@@ -280,14 +311,14 @@ def build_parser() -> argparse.ArgumentParser:
         "api.osv.dev to look up known vulnerabilities. Pass this to keep the "
         "dependency list off the network.",
     )
-    parser.add_argument(
+    assessment.add_argument(
         "--backlog",
         action="store_true",
         help="Convert assessment findings into stories in the persistent "
         "backlog (.dev_team/backlog.json) so delivery runs can work them "
         "off (with --assess).",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--make-backlog",
         default=None,
         metavar="DIR",
@@ -298,7 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
         "and it costs $0 — assess once, generate the backlog any time "
         "later. Standalone: not combined with other modes.",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--verify",
         default=None,
         metavar="DIR",
@@ -310,7 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
         "and Claude credentials (an agent runs). Standalone: not combined "
         "with other modes.",
     )
-    parser.add_argument(
+    assessment.add_argument(
         "--finding",
         default=None,
         metavar="ID",
@@ -318,13 +349,13 @@ def build_parser() -> argparse.ArgumentParser:
         "persisted assessment (e.g. 'risk.secrets[0]') or a case-insensitive "
         "substring of its claim text (first match wins).",
     )
-    parser.add_argument(
+    assessment.add_argument(
         "--no-conventions",
         action="store_true",
         help="Do not persist the captured house-conventions profile "
         "(with --assess).",
     )
-    parser.add_argument(
+    assessment.add_argument(
         "--build-probe",
         action="store_true",
         help="Actually run the detected setup/verify commands so the "
@@ -332,13 +363,15 @@ def build_parser() -> argparse.ArgumentParser:
         "This executes the repository's own build — arbitrary code — so "
         "only use it on trusted repos or inside a sandbox.",
     )
-    parser.add_argument(
+    misc.add_argument(
         "--workspace",
         default="./build",
         metavar="DIR",
-        help="Directory the delivery engine works in (with --deliver).",
+        help="Working/target directory for --deliver (the delivery engine's "
+        "build dir, created if missing), --assess (the repository to audit), "
+        "and --dashboard (the workspace to serve). Default ./build.",
     )
-    parser.add_argument(
+    misc.add_argument(
         "--repo",
         default=None,
         metavar="OWNER/NAME",
@@ -349,7 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
         "/etc/dev-team/dev-team.env (override with --env-file). An existing "
         "clone is fast-forwarded instead of re-cloned.",
     )
-    parser.add_argument(
+    misc.add_argument(
         "--env-file",
         default=None,
         metavar="FILE",
@@ -359,21 +392,21 @@ def build_parser() -> argparse.ArgumentParser:
         "The token stays out of the process environment, so commands the "
         "agents run never see it.",
     )
-    parser.add_argument(
+    delivery.add_argument(
         "--verify-command",
         default=None,
         metavar="CMD",
         help="Quality-gate command run in the workspace (with --deliver). "
         "Defaults to auto-detection from the workspace's manifests.",
     )
-    parser.add_argument(
+    delivery.add_argument(
         "--setup-command",
         default=None,
         metavar="CMD",
         help="Command run once in the workspace before delivery starts, "
         "e.g. 'npm install' (with --deliver).",
     )
-    parser.add_argument(
+    delivery.add_argument(
         "--remote-verify-status",
         default=None,
         metavar="CMD",
@@ -381,32 +414,32 @@ def build_parser() -> argparse.ArgumentParser:
         "is polled until it exits zero, e.g. a pipeline status check "
         "(with --deliver). For stacks that cannot build locally.",
     )
-    parser.add_argument(
+    delivery.add_argument(
         "--remote-verify-trigger",
         default=None,
         metavar="CMD",
         help="Command that kicks off the remote CI run before polling "
         "--remote-verify-status (with --deliver).",
     )
-    parser.add_argument(
+    delivery.add_argument(
         "--branch",
         default=None,
         metavar="NAME",
         help="Branch the delivery works on (default: dev-team/<feature-slug>).",
     )
-    parser.add_argument(
+    delivery.add_argument(
         "--allow-dirty-baseline",
         action="store_true",
         help="Proceed over uncommitted changes by sweeping them into a "
         "baseline commit on the delivery branch (with --deliver).",
     )
-    parser.add_argument(
+    delivery.add_argument(
         "--proceed-on-red-baseline",
         action="store_true",
         help="Start even when the workspace's quality gates already fail "
         "(with --deliver). By default a red baseline halts the run.",
     )
-    parser.add_argument(
+    misc.add_argument(
         "--budget-usd",
         type=float,
         default=None,
@@ -414,36 +447,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cost ceiling for the run; the run stops gracefully when reached "
         "(with --deliver).",
     )
-    parser.add_argument(
+    delivery.add_argument(
         "--max-concurrency",
         type=int,
         default=4,
         help="How many independent tasks may be implemented at once (with --deliver).",
     )
-    parser.add_argument(
+    delivery.add_argument(
         "--no-commit",
         action="store_true",
         help="Do not git-commit the delivered work (with --deliver).",
     )
-    parser.add_argument(
+    misc.add_argument(
         "--json",
         action="store_true",
         help="Emit the result as JSON instead of a text summary.",
     )
-    parser.add_argument(
+    misc.add_argument(
         "-v",
         "--verbose",
         action="store_true",
         help="Print the full progress event stream as the team works.",
     )
-    parser.add_argument(
+    misc.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress the default one-line-per-event progress shown on "
         "--deliver/--assess. No effect with -v/--verbose (which prints the "
         "full event stream).",
     )
-    parser.add_argument(
+    misc.add_argument(
         "--record-transcripts",
         action="store_true",
         help="Capture each agent call's raw system prompt, prompt, response "
@@ -576,6 +609,17 @@ def _validate_args(
     if args.make_backlog is not None and not os.path.isdir(args.make_backlog):
         parser.error(f"--make-backlog: no such directory: {args.make_backlog}")
     _reject_deliver_only_flags(parser, args)
+    # --assess audits an existing repository read-only; a missing or empty
+    # --workspace is a typo (LocalWorkspace would mkdir it and then silently
+    # audit an empty tree). --repo is exempt — its clone lands here later.
+    if args.assess and args.repo is None and (
+        not os.path.isdir(args.workspace) or not os.listdir(args.workspace)
+    ):
+        parser.error(
+            f"--assess audits an existing repository, but {args.workspace} "
+            "does not exist or is empty; pass an existing --workspace (or "
+            "--repo to clone one)"
+        )
 
 
 def _reject_deliver_only_flags(
@@ -765,6 +809,15 @@ async def _simulate(
     ``--budget-usd`` ceiling additionally stops the run gracefully at the line.
     """
 
+    # The default mode looks free but drives the same paid agents, so say so
+    # once up front (stderr, out of the result document). --quiet silences it;
+    # a single line means -v never double-prints it.
+    if not args.quiet:
+        print(
+            "note: simulation runs real, paid agents (no files or git are "
+            "changed); pass --budget-usd to cap spend.",
+            file=sys.stderr,
+        )
     result = await team.develop(request, budget=budget)
     if args.json:
         print(json.dumps(result_to_dict(result), indent=2))
@@ -1170,6 +1223,13 @@ def main(
 
     try:
         return _run(argv, runner, chat_backend)
+    except KeyboardInterrupt:
+        # A Ctrl-C during a paid run should not dump a raw asyncio traceback.
+        print(
+            "interrupted; any completed work is checkpointed and can be resumed",
+            file=sys.stderr,
+        )
+        return 130
     except (DevTeamError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

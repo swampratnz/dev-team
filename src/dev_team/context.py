@@ -39,6 +39,30 @@ def path_excluded(path: str, exclude_globs: Sequence[str]) -> bool:
     return any(fnmatch.fnmatch(path, pattern) for pattern in exclude_globs)
 
 
+#: Structural fence tokens whose literal appearance inside untrusted manifest
+#: text could try to break out of the block it is interpolated into.
+_FENCE_TOKENS = ("</manifest-content>", "</repo-context>")
+
+
+def _defuse(text: str) -> str:
+    """Neutralise structural fence tokens in untrusted manifest/README text.
+
+    The manifest head is interpolated raw between ``<manifest-content>`` … tags
+    that later nest inside assessment's ``<repo-context>`` block. A hostile file
+    whose body contains a literal ``</manifest-content>`` or ``</repo-context>``
+    could otherwise try to close the block early and smuggle instructions after
+    it. Insert a zero-width space into each closing token so it reads
+    identically to a human but no longer matches the structural tag. Only the
+    untrusted head is defused; the renderer's own emitted tags are untouched.
+    """
+
+    for token in _FENCE_TOKENS:
+        # Zero-width space (U+200B) between "<" and "/": invisible to a human,
+        # but the token no longer matches the structural closing tag.
+        text = text.replace(token, "<\u200b" + token[1:])
+    return text
+
+
 @dataclass
 class RepoContext:
     """What the workspace holds, in prompt-ready form."""
@@ -105,7 +129,9 @@ def build_repo_context(
             head = content[:manifest_head_chars]
             if len(head) < len(content):
                 head += "\n... (truncated)"
-            heads[name] = head
+            # The head is untrusted repo content; neutralise any structural
+            # fence tokens before it is interpolated into the prompt block.
+            heads[name] = _defuse(head)
     test_locations = set()
     for path in files:
         root = path.split("/")[0]
