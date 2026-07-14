@@ -608,6 +608,129 @@ def test_calibration_only_counts_files_that_contributed_a_parseable_line():
     assert payload["overall"]["total"] == 1
 
 
+# --- costs rollup ---------------------------------------------------------
+
+
+def _insert_job(disp, job_id, mode, state, cost_usd):
+    """Register a job directly in the registry, bypassing submit/run_job —
+    lets one test exercise every state/cost combination with no real clone
+    or agent run."""
+
+    spec = JobSpec(
+        mode=mode, repo="acme/mono", title="T", description="D",
+        budget_usd=None, id=job_id,
+    )
+    disp._registry[job_id] = JobRecord(spec=spec, state=state, cost_usd=cost_usd)
+    disp._order.append(job_id)
+
+
+def test_costs_on_empty_registry_is_zeroed():
+    disp = Dispatcher(token="x")
+    assert disp.costs() == (
+        200, {"total_usd": 0.0, "by_mode": {}, "jobs_counted": 0})
+
+
+def test_costs_counts_one_succeeded_job_without_a_dashboard_workspace():
+    # AC2 + AC8: no --dashboard-workspace configured, and never a 409 —
+    # archived-exclusion just no-ops via _is_archived's False-when-no-
+    # workspace short circuit.
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "assess-1", "assess", "succeeded", 2.5)
+    assert disp.costs() == (
+        200, {"total_usd": 2.5, "by_mode": {"assess": 2.5}, "jobs_counted": 1})
+
+
+def test_costs_sums_across_all_three_modes():
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "assess-1", "assess", "succeeded", 1.0)
+    _insert_job(disp, "deliver-1", "deliver", "succeeded", 2.0)
+    _insert_job(disp, "verify-1", "verify", "succeeded", 0.5)
+    status, payload = disp.costs()
+    assert status == 200
+    assert payload["total_usd"] == 3.5
+    assert payload["by_mode"] == {"assess": 1.0, "deliver": 2.0, "verify": 0.5}
+    assert payload["jobs_counted"] == 3
+
+
+def test_costs_counts_a_failed_job_at_zero_cost():
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "assess-1", "assess", "failed", 0.0)
+    assert disp.costs() == (
+        200, {"total_usd": 0.0, "by_mode": {"assess": 0.0}, "jobs_counted": 1})
+
+
+def test_costs_excludes_queued_and_running_jobs():
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "assess-1", "assess", "queued", None)
+    _insert_job(disp, "assess-2", "assess", "running", None)
+    assert disp.costs() == (
+        200, {"total_usd": 0.0, "by_mode": {}, "jobs_counted": 0})
+
+
+def test_costs_excludes_a_cancelled_job():
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "assess-1", "assess", "cancelled", None)
+    assert disp.costs() == (
+        200, {"total_usd": 0.0, "by_mode": {}, "jobs_counted": 0})
+
+
+def test_costs_excludes_archived_job_and_reappears_after_unarchive():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-1/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-1"}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    _insert_job(disp, "assess-1", "assess", "succeeded", 5.0)
+
+    assert disp.costs() == (
+        200, {"total_usd": 5.0, "by_mode": {"assess": 5.0}, "jobs_counted": 1})
+
+    disp.archive_job("assess-1")
+    assert disp.costs() == (
+        200, {"total_usd": 0.0, "by_mode": {}, "jobs_counted": 0})
+    assert disp.costs(include_archived=True) == (
+        200, {"total_usd": 5.0, "by_mode": {"assess": 5.0}, "jobs_counted": 1})
+
+    disp.unarchive_job("assess-1")
+    assert disp.costs() == (
+        200, {"total_usd": 5.0, "by_mode": {"assess": 5.0}, "jobs_counted": 1})
+
+
+def test_costs_http_route_end_to_end():
+    with running(materialise=_mem_materialise) as server:
+        assert _call(server, "/costs", token=None) == (
+            401, {"error": "unauthorized"})
+        status, payload = _call(server, "/costs")
+        assert status == 200
+        assert payload == {"total_usd": 0.0, "by_mode": {}, "jobs_counted": 0}
+
+
+def test_costs_http_route_archived_query_param():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-1/meta.json",
+        json.dumps(
+            {"repo": "acme/mono", "mode": "assess", "id": "assess-1",
+             "archived": True}
+        ),
+    )
+    with running(materialise=_mem_materialise, dashboard_workspace=dash) as server:
+        _insert_job(server.dispatcher, "assess-1", "assess", "succeeded", 4.0)
+
+        status, payload = _call(server, "/costs")
+        assert status == 200
+        assert payload["jobs_counted"] == 0
+
+        status, payload = _call(server, "/costs?archived=true")
+        assert status == 200
+        assert payload["jobs_counted"] == 0  # only the literal "1" reveals archived
+
+        status, payload = _call(server, "/costs?archived=1")
+        assert status == 200
+        assert payload == {"total_usd": 4.0, "by_mode": {"assess": 4.0}, "jobs_counted": 1}
+
+
 # --- archive / unarchive (job lifecycle) --------------------------------------
 
 

@@ -859,6 +859,44 @@ class Dispatcher:
                 jobs_counted += 1
         return 200, {**calibration_summary(entries), "jobs_counted": jobs_counted}
 
+    def costs(self, *, include_archived: bool = False) -> Tuple[int, Dict[str, Any]]:
+        """The ``GET /costs`` core: total spend rollup across every job.
+
+        Source of truth is the in-memory registry, not disk: unlike
+        verdicts, ``deliver`` job cost is never mirrored to disk, so a
+        disk walk would silently under-report. Snapshots the registry
+        under ``self._lock`` exactly like :meth:`recent`, then filters and
+        sums outside it — archived-exclusion does a disk read via
+        :meth:`_is_archived`, which must never run while the lock is held.
+
+        Only ``succeeded``/``failed`` jobs have a non-``None`` ``cost_usd``
+        (``queued``/``running`` never set it; ``cancel_job`` never touches
+        it), matching :meth:`result`'s "finished" framing — those are the
+        only ones counted. No dashboard-workspace guard is needed:
+        :meth:`_is_archived` returns ``False`` (never raises) when
+        ``self._dashboard_workspace is None``, so archived-exclusion is
+        simply a no-op until one is configured.
+        """
+
+        with self._lock:
+            records = list(self._registry.values())
+        total_usd = 0.0
+        by_mode: Dict[str, float] = {}
+        jobs_counted = 0
+        for record in records:
+            if record.cost_usd is None:
+                continue
+            if not include_archived and self._is_archived(record.spec.id):
+                continue
+            total_usd += record.cost_usd
+            by_mode[record.spec.mode] = by_mode.get(record.spec.mode, 0.0) + record.cost_usd
+            jobs_counted += 1
+        return 200, {
+            "total_usd": total_usd,
+            "by_mode": by_mode,
+            "jobs_counted": jobs_counted,
+        }
+
     def _merge_backlog(
         self,
         data: Dict[str, Any],
@@ -1268,6 +1306,15 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             if path == "/calibration":
                 status, payload = dispatcher.calibration()
+                self._json(status, payload)
+                return
+            if path == "/costs":
+                # ?archived=1 reveals archived jobs too — same exact-match
+                # contract as /jobs.
+                include_archived = (
+                    parse_qs(split.query).get("archived", ["0"])[0] == "1"
+                )
+                status, payload = dispatcher.costs(include_archived=include_archived)
                 self._json(status, payload)
                 return
             parts = path.strip("/").split("/")

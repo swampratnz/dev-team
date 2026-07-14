@@ -82,6 +82,14 @@ sections below are reconstructed from the repository history.
   new auth surface, no new store — reuses the existing bearer gate and the
   in-memory registry's lock, shared with the worker's `queued → running`
   flip so the two transitions are mutually exclusive.
+- **Spend rollup** (`docs/DISPATCH.md`): `GET /costs`, a pure, $0,
+  in-memory aggregate summing `cost_usd` across every `succeeded`/`failed`
+  job into `total_usd`, `by_mode`, and `jobs_counted`. Unlike
+  `GET /calibration`, this rolls up the in-memory registry rather than
+  disk — `deliver` job cost is never mirrored to disk, so a disk walk
+  would silently under-report. Respects the same archived-exclusion
+  (`?archived=1`) as `GET /jobs`, and needs no dashboard workspace to
+  answer (archived-exclusion simply no-ops without one).
 
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the

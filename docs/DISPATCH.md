@@ -262,7 +262,8 @@ errors as archive (never the running-job 409).
 
 ### Effect elsewhere
 
-- `GET /jobs` and `GET /calibration` exclude an archived job (see above).
+- `GET /jobs`, `GET /calibration`, and `GET /costs` exclude an archived job
+  (see above).
 - The dashboard's activity feed, Reports panel, and Kanban board (stories
   carrying that job's `source_job`) exclude it too, with a "show archived"
   toggle to reveal it again — see [`docs/DASHBOARD.md`](DASHBOARD.md).
@@ -369,6 +370,28 @@ tolerant parse as `GET /jobs/{id}/verifications`. `jobs_counted` is the
 number of `verifications.jsonl` files that contributed at least one
 parseable line. `409 {"error":"calibration needs a dashboard workspace"}`
 when the service was started without `--dashboard-workspace`.
+
+### `GET /costs` (auth) — total spend rollup, across every job
+
+A pure, $0, in-memory aggregate over every job's `cost_usd` — the registry,
+not disk, is the source of truth here: unlike verdicts, `deliver` job cost is
+never mirrored to disk, so a disk walk (as `/calibration` does) would
+silently under-report. Only `succeeded` and `failed` jobs have a non-`null`
+`cost_usd` (`queued`/`running` never set it; a cancelled job never touches
+it) — those are the only ones counted:
+
+```json
+{"total_usd":12.34,"by_mode":{"assess":8.0,"deliver":3.34,"verify":1.0},
+ "jobs_counted":15}
+```
+
+`by_mode` includes only modes with at least one counted job (an empty
+registry gives `{"total_usd":0.0,"by_mode":{},"jobs_counted":0}`). Archived
+jobs (see *Archive / unarchive* above) are excluded by default; `?archived=1`
+includes them, matching `GET /jobs`'s toggle. Unlike `/calibration`, `/costs`
+needs **no** dashboard-workspace guard — it works standalone off the
+registry, and archived-exclusion simply no-ops (never excludes anything)
+until `--dashboard-workspace` is configured.
 
 ## Deployment
 
