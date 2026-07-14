@@ -37,6 +37,7 @@ import asyncio
 import hmac
 import json
 import queue
+import shutil
 import threading
 import time
 from dataclasses import dataclass
@@ -112,6 +113,11 @@ _MODES = ("assess", "deliver", "verify")
 
 #: Terminal job states.
 _TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
+
+#: The exact ``audit/<id>/`` files a purge removes, each through
+#: :meth:`Workspace.delete` (never a raw filesystem call against the
+#: dashboard workspace — see :meth:`Dispatcher.purge_job`).
+_AUDIT_FILES = ("assessment.md", "assessment.json", "meta.json", "verifications.jsonl")
 
 # A sentinel the worker loop treats as "stop draining and exit".
 _SHUTDOWN = object()
@@ -774,6 +780,97 @@ class Dispatcher:
 
         return self._set_archived(job_id, False)
 
+    # -- purge (permanent deletion) -------------------------------------------
+
+    def _purge_backlog_stories(self, job_id: str) -> int:
+        """Remove every backlog story bred from ``job_id``, edges included.
+
+        Shares ``self._backlog_lock`` with :meth:`delete_story` /
+        :meth:`_mutate_backlog` (the ``DELETE /backlog/story/{id}`` core) so a
+        concurrent board write can never interleave into a corrupt
+        ``backlog.json``. A no-op (no save) when nothing matches, exactly
+        like :meth:`make_backlog` on an empty merge.
+        """
+
+        store = BacklogStore(self._dashboard_workspace)
+        with self._backlog_lock:
+            backlog = store.load()
+            removed_ids = {s.id for s in backlog.stories if s.source_job == job_id}
+            if not removed_ids:
+                return 0
+            backlog.stories = [s for s in backlog.stories if s.id not in removed_ids]
+            for survivor in backlog.stories:
+                survivor.depends_on = [
+                    dep for dep in survivor.depends_on if dep not in removed_ids
+                ]
+            store.save(backlog)
+        return len(removed_ids)
+
+    def purge_job(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /jobs/{id}/purge`` core: permanent, archive-gated deletion.
+
+        Removes exactly three things: the workspace clone
+        (``jobs_root/<id>``, ``shutil.rmtree`` — it already sits outside the
+        :class:`Workspace` abstraction, the same raw ``Path`` join
+        :meth:`run_job` itself uses), the ``audit/<id>/`` mirror (each of
+        :data:`_AUDIT_FILES` through ``self._dashboard_workspace.delete`` —
+        **never** a raw filesystem call against the dashboard workspace, so
+        the existing traversal/symlink-escape guard on that abstraction
+        (``_within_root``) still applies), and any backlog stories bred from
+        this job (:meth:`_purge_backlog_stories`).
+
+        The terminal-state check happens directly against ``record.state``
+        inside a single ``self._lock`` block — never via :meth:`_job_running`,
+        which itself acquires ``self._lock`` and would deadlock the caller
+        (and, because every other mutation shares this lock, the whole
+        single-flight dispatcher). The registry entry is deleted in that same
+        block, so a purged job is gone for good: a second call finds no
+        record and answers 404, never an idempotent 200.
+        """
+
+        with self._lock:
+            record = self._registry.get(job_id)
+            if record is None:
+                return 404, {"error": "unknown job"}
+            if record.state not in _TERMINAL:
+                return 409, {"error": "job is running"}
+            if not self._is_archived(job_id):
+                return 409, {"error": "job is not archived"}
+            del self._registry[job_id]
+            self._order.remove(job_id)
+            self._events.pop(job_id, None)
+
+        workspace_dir = Path(self._jobs_root) / job_id
+        removed_workspace = workspace_dir.exists()
+        shutil.rmtree(workspace_dir, ignore_errors=True)
+
+        removed_audit = False
+        for name in _AUDIT_FILES:
+            path = f"audit/{job_id}/{name}"
+            try:
+                if self._dashboard_workspace.exists(path):
+                    removed_audit = True
+                    self._dashboard_workspace.delete(path)
+            except WorkspaceError:
+                # A symlink planted at this path resolves outside the
+                # dashboard workspace root — refused by the workspace's own
+                # escape check, not silently followed. Leave it in place
+                # rather than raising out of a purge that already succeeded
+                # for the rest of the job's state.
+                continue
+
+        removed_stories = self._purge_backlog_stories(job_id)
+
+        return 200, {
+            "id": job_id,
+            "purged": True,
+            "removed": {
+                "workspace": removed_workspace,
+                "audit": removed_audit,
+                "backlog_stories": removed_stories,
+            },
+        }
+
     def list_job_findings(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
         """The ``GET /jobs/{id}/findings`` core: the re-checkable claims.
 
@@ -1366,6 +1463,12 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                     status, payload = dispatcher.archive_job(parts[1])
                 else:
                     status, payload = dispatcher.unarchive_job(parts[1])
+                self._json(status, payload)
+                return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "purge":
+                # Same shape as .../archive above: a pure disk transform,
+                # synchronous, no queue slot.
+                status, payload = dispatcher.purge_job(parts[1])
                 self._json(status, payload)
                 return
             if parts[0] == "backlog":

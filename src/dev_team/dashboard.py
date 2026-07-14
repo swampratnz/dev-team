@@ -351,8 +351,11 @@ _BACKLOG_PROXY_PREFIX = "/api/backlog/"
 #: browser submit jobs with the dispatch token).
 _JOBS_PROXY_PREFIX = "/api/jobs/"
 
-#: The only two actions the jobs proxy will forward.
-_JOBS_PROXY_ACTIONS = frozenset({"archive", "unarchive"})
+#: The only actions the jobs proxy will forward. ``purge`` is archive-gated
+#: server-side (the dispatch service's own ``purge_job`` refuses a
+#: non-archived job with 409) — the proxy's job here is only to keep the
+#: forwarding surface narrow, not to re-enforce that gate.
+_JOBS_PROXY_ACTIONS = frozenset({"archive", "unarchive", "purge"})
 
 #: How long a proxied board write may take end to end. The dispatch cores are
 #: pure disk transforms, so anything slower means the service is wedged.
@@ -411,10 +414,11 @@ def _make_handler(
     With BOTH ``dispatch_url`` and ``dispatch_token`` set, authorised writes
     under ``/api/backlog/`` are forwarded to the dispatch service's
     ``/backlog`` mutation API (the board's write path), and
-    ``/api/jobs/{id}/archive`` or ``/api/jobs/{id}/unarchive`` are forwarded
-    to the matching ``/jobs/{id}/...`` lifecycle route; with either unset
-    both stay unavailable and those writes answer ``501``. The dispatch
-    token is only ever sent to ``dispatch_url`` — never logged or reflected.
+    ``/api/jobs/{id}/archive``, ``/api/jobs/{id}/unarchive``, or
+    ``/api/jobs/{id}/purge`` are forwarded to the matching
+    ``/jobs/{id}/...`` lifecycle route; with either unset both stay
+    unavailable and those writes answer ``501``. The dispatch token is only
+    ever sent to ``dispatch_url`` — never logged or reflected.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -593,9 +597,9 @@ def _make_handler(
             self._proxy(method, f"/backlog/{rest}", body)
 
         # -- job lifecycle actions: a second, equally narrow proxy ----------
-        # archive/unarchive are POST-only and take no body; scope is exactly
-        # /api/jobs/{id}/archive|unarchive, never a general /jobs passthrough
-        # (see _JOBS_PROXY_PREFIX).
+        # archive/unarchive/purge are POST-only and take no body; scope is
+        # exactly /api/jobs/{id}/archive|unarchive|purge, never a general
+        # /jobs passthrough (see _JOBS_PROXY_PREFIX).
 
         def _proxy_jobs(self, path: str) -> None:
             if not (dispatch_url and dispatch_token):
@@ -982,6 +986,10 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
            color: var(--ink-2); font-size: 11px; padding: 2px 8px; cursor: pointer;
            margin-left: 6px; }
 .archbtn:hover { color: var(--ink); border-color: var(--ink-3); }
+.purgebtn { background: none; border: 1px solid var(--critical); border-radius: 6px;
+            color: var(--critical); font-size: 11px; padding: 2px 8px; cursor: pointer;
+            margin-left: 6px; }
+.purgebtn:hover { background: var(--critical); color: var(--bg); }
 .story-form input, .story-form textarea {
   width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--inset); color: var(--ink); font: inherit; font-size: 13px;
@@ -1412,6 +1420,16 @@ function archiveButton(id, archived) {
   return `<button class="archbtn" data-archjob="${esc(id)}" data-arch-action="${action}" title="${action} this job">${action}</button>`;
 }
 
+// A "delete permanently" button, forwarded through the same /api/jobs/{id}/...
+// proxy to /jobs/{id}/purge. Renders only for an already-archived job — the
+// server's own purge_job enforces the same archive-first gate (409 otherwise),
+// so this is a UX nicety, not the security boundary. Two-step confirm wired
+// alongside deleteStory's identical armed-button pattern below.
+function purgeButton(id, archived) {
+  if (!archived) return "";
+  return `<button class="purgebtn" data-purgejob="${esc(id)}" title="permanently delete this job">delete permanently</button>`;
+}
+
 function runsPanel(s) {
   if (!s.runs.length) { put($("runs"), '<div class="panel muted">no runs recorded</div>'); return; }
   const archivedSet = new Set(s.archived_jobs || []);
@@ -1427,7 +1445,7 @@ function runsPanel(s) {
     ].filter(Boolean).join("");
     return `<div class="run${filters.run === r.id ? " selected" : ""}" data-run="${esc(r.id)}" role="button" tabindex="0" title="filter the activity feed to ${esc(r.id)}">
       <div class="top"><code>${esc(r.id)}</code>${runChip(r.last_stage)}${isArchived ? chip("archived", "archived") : ""}</div>
-      <div class="meta">${meta}${archiveButton(r.id, isArchived)}</div>
+      <div class="meta">${meta}${archiveButton(r.id, isArchived)}${purgeButton(r.id, isArchived)}</div>
       ${r.last_message ? `<div class="msg" title="${esc(r.last_message)}">${esc(r.last_message)}</div>` : ""}
     </div>`;
   }).join(""));
@@ -1944,15 +1962,31 @@ async function archiveJob(id, action) {
   } catch (err) { showBoardError(action + " failed: " + err.message); }
 }
 
+// ---- job purge (permanent delete, forwarded via the same jobs proxy) ----
+async function purgeJob(id) {
+  try {
+    const res = await fetch("/api/jobs/" + encodeURIComponent(id) + "/purge", { method: "POST" });
+    if (!res.ok) throw new Error(String(res.status));
+    await refresh();
+  } catch (err) { showBoardError("purge failed: " + err.message); }
+}
+
 // ---- wiring ----
 $("runs").addEventListener("click", e => {
+  const purge = e.target.closest("[data-purgejob]");
+  if (purge) {
+    // two-step confirm: the first click arms the button, the second purges
+    if (purge.dataset.armed) purgeJob(purge.dataset.purgejob);
+    else { purge.dataset.armed = "1"; purge.textContent = "confirm delete permanently?"; }
+    return;
+  }
   const arch = e.target.closest("[data-archjob]");
   if (arch) { archiveJob(arch.dataset.archjob, arch.dataset.archAction); return; }
   const card = e.target.closest("[data-run]");
   if (card) toggleRun(card.dataset.run);
 });
 $("runs").addEventListener("keydown", e => {
-  if (e.target.closest("[data-archjob]")) return; // a real <button>: handles its own Enter/Space
+  if (e.target.closest("[data-archjob]") || e.target.closest("[data-purgejob]")) return; // real <button>s: handle their own Enter/Space
   const card = e.target.closest("[data-run]");
   if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleRun(card.dataset.run); }
 });

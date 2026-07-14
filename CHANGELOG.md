@@ -82,6 +82,23 @@ sections below are reconstructed from the repository history.
   new auth surface, no new store — reuses the existing bearer gate and the
   in-memory registry's lock, shared with the worker's `queued → running`
   flip so the two transitions are mutually exclusive.
+- **`POST /jobs/{id}/purge`** (`docs/DISPATCH.md`): permanent, **archive-
+  gated** deletion — the follow-up #35 deferred as its own proposal.
+  Requires the job to already be `archived` (`409` otherwise), turning
+  irreversible deletion into an explicit two-step action. Removes exactly
+  three things: the job's workspace clone (`jobs_root/{id}`), the
+  `audit/{id}/` mirror (`assessment.md`/`assessment.json`/`meta.json`/
+  `verifications.jsonl`, each removed through the traversal/symlink-escape-
+  checked `Workspace.delete()` — never a raw filesystem call), and backlog
+  stories bred from that job (same write lock `DELETE /backlog/story/{id}`
+  uses). `events.jsonl`/transcripts are out of scope for v1. Not idempotent:
+  a second purge on the same id is `404`, never a redundant `200`. The
+  terminal-state check reads `record.state` directly within a single locked
+  block rather than reusing `archive_job`'s internal helper (which itself
+  acquires the same lock and would deadlock the single-flight dispatcher).
+  The dashboard gained a "delete permanently" button on each archived run
+  row, behind the same two-step confirm the backlog's story-delete already
+  uses (`docs/DASHBOARD.md`).
 - **Spend rollup** (`docs/DISPATCH.md`): `GET /costs`, a pure, $0,
   in-memory aggregate summing `cost_usd` across every `succeeded`/`failed`
   job into `total_usd`, `by_mode`, and `jobs_counted`. Unlike

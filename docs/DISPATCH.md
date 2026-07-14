@@ -232,9 +232,7 @@ Test/demo runs and superseded re-assessments accumulate with no lifecycle —
 worse, a stale or fabricated verification pollutes the `GET /calibration`
 rollup. Archiving hides a job (and its stories/verdicts) from every listing
 without deleting anything: the data stays on disk and is fully restorable.
-**This is metadata-only** — permanent deletion (`DELETE /jobs/{id}`, backlog
-epic/story removal, transcript surgery) is explicitly out of scope; the
-pre-existing manual `rm -r` path is unchanged for that.
+**This is metadata-only** — for permanent deletion see *Purge* below.
 
 ### `POST /jobs/{id}/archive` (auth, no body)
 
@@ -273,6 +271,71 @@ errors as archive (never the running-job 409).
   refused above, so the worker and an archive/unarchive call never race.
   What remains is concurrent archive/unarchive calls against the same job,
   which the dispatcher serialises with a dedicated lock.
+
+## Purge (permanent deletion)
+
+Archiving hides; it never reclaims disk. A long-running deployment
+accumulates a workspace clone per job forever (see *Deployment* below), and
+the only way to reclaim that space was, until now, shell access and a manual
+`rm -r`. `POST /jobs/{id}/purge` is the operator-facing, narrow, **archive-
+gated** alternative: permanent deletion made an explicit two-step action
+(archive, confirm, then purge) rather than a single-click irreversible one.
+
+v1 removes exactly three things, each independently testable:
+
+- the job's workspace clone (`jobs_root/{id}`) — `shutil.rmtree`, since this
+  directory already sits outside the `Workspace` abstraction (the same raw
+  path join the worker itself uses to materialise it);
+- the `audit/{id}/` mirror in the dashboard workspace (`assessment.md`,
+  `assessment.json`, `meta.json`, `verifications.jsonl`) — each removed
+  through `Workspace.delete()`, **never** a raw filesystem call, so the
+  existing traversal/symlink-escape guard on that abstraction still applies;
+- backlog stories whose `source_job` is this job, removed under the same
+  write lock `DELETE /backlog/story/{id}` already uses, dependency edges
+  stripped the same way.
+
+`events.jsonl` and transcripts are **out of scope for v1** — hand-filtering
+an append-only, size-bounded journal is a separable, harder-to-test surface.
+
+### `POST /jobs/{id}/purge` (auth, no body)
+
+→ `200 {"id":"assess-…","purged":true,"removed":{"workspace":true,"audit":true,"backlog_stories":2}}`.
+Each `removed.*` field reflects what was actually found and deleted — `false`/`0`
+if that piece was already gone (a job purged after someone already ran a
+manual `rm -r` on its clone, say), never an error. Errors:
+
+- `404 {"error":"unknown job"}` — no such job (unknown id, or already
+  purged: purge is **not idempotent**, unlike unarchive — a second call on
+  the same id is a 404, never a redundant 200).
+- `409 {"error":"job is running"}` — the job is `queued` or `running`;
+  checked directly against the in-memory record within one locked block
+  (never by re-entering the archive check's own lock — see *Concurrency*
+  below).
+- `409 {"error":"job is not archived"}` — the job is terminal but was never
+  archived. Archive it first.
+- `401` — as everywhere.
+
+### Concurrency and deadlock safety
+
+`purge_job` acquires the dispatcher's registry lock exactly once, checking
+`record.state` directly rather than calling the same internal helper
+`archive_job` uses to make that check (which itself acquires the same lock —
+calling it from inside an already-held lock would hang the calling thread
+forever, and because every other mutation in this service shares that lock,
+freeze the entire single-flight dispatcher). The registry entry is deleted
+inside that same locked block, so a second purge call always sees "unknown
+job", never a redundant success. The backlog-story removal is a separate,
+independent lock — the same one `DELETE /backlog/story/{id}` uses — so a
+purge and a concurrent board write can never interleave into a corrupt
+`backlog.json`.
+
+### Natural growth (not in v1)
+
+- Fold `events.jsonl`/transcript surgery into the purge once this pattern is
+  proven.
+- A scheduled/TTL auto-purge policy over already-archived jobs past N days.
+- Bulk purge (`?archived_before=`) once the single-job primitive has real
+  usage to generalise from.
 
 ## Finding re-verification (mode `verify` + two read routes)
 
