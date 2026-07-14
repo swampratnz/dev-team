@@ -1885,6 +1885,70 @@ def test_list_findings_from_a_real_assessment_run():
     assert "buildability.blockers[0]" in by_id
 
 
+def test_list_findings_flags_citation_broken_when_evidence_matches():
+    from dev_team.assessment import list_findings
+
+    data = _verifiable_assessment()
+    data["broken_citations"] = {"risk": ["Web.config", "does/not/exist.py"]}
+    by_id = {f["id"]: f for f in list_findings(data)}
+    assert by_id["risk.secrets[0]"]["citation_broken"] is True
+    # a sibling finding in the same phase with a real (non-broken) citation
+    assert by_id["risk.dependencies[0]"]["citation_broken"] is False
+
+
+def test_list_findings_citation_broken_false_without_broken_citations_key():
+    from dev_team.assessment import list_findings
+
+    data = _verifiable_assessment()
+    assert "broken_citations" not in data  # assessments persisted before #42
+    assert all(f["citation_broken"] is False for f in list_findings(data))
+
+
+def test_list_findings_citation_broken_false_for_phase_with_no_entry():
+    from dev_team.assessment import list_findings
+
+    data = _verifiable_assessment()
+    data["broken_citations"] = {"coverage": ["tests/some/broken/path.py"]}
+    by_id = {f["id"]: f for f in list_findings(data)}
+    assert by_id["risk.secrets[0]"]["citation_broken"] is False
+
+
+def test_list_findings_citation_broken_fails_secure_on_malformed_value():
+    from dev_team.assessment import list_findings
+
+    # a non-list value for the phase degrades to no broken citations
+    data = _verifiable_assessment()
+    data["broken_citations"] = {"risk": "Web.config"}
+    by_id = {f["id"]: f for f in list_findings(data)}
+    assert by_id["risk.secrets[0]"]["citation_broken"] is False
+
+    # a non-dict broken_citations value entirely degrades the same way
+    data = _verifiable_assessment()
+    data["broken_citations"] = ["risk"]
+    by_id = {f["id"]: f for f in list_findings(data)}
+    assert by_id["risk.secrets[0]"]["citation_broken"] is False
+
+
+def test_list_findings_empty_evidence_never_matches_citation_broken():
+    from dev_team.assessment import list_findings
+
+    data = _verifiable_assessment()
+    # risk.external_services[0]'s evidence is non-string -> degrades to ""
+    data["broken_citations"] = {"risk": [""]}
+    by_id = {f["id"]: f for f in list_findings(data)}
+    assert by_id["risk.external_services[0]"]["evidence"] == ""
+    assert by_id["risk.external_services[0]"]["citation_broken"] is False
+
+
+def test_find_finding_carries_citation_broken():
+    from dev_team.assessment import find_finding
+
+    data = _verifiable_assessment()
+    data["broken_citations"] = {"risk": ["Web.config"]}
+    finding = find_finding(data, "risk.secrets[0]")
+    assert finding["citation_broken"] is True
+
+
 def test_find_finding_by_exact_id_then_claim_substring():
     from dev_team.assessment import find_finding
 
