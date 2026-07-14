@@ -1291,6 +1291,159 @@ def test_main_repo_finds_user_level_env_file_without_flags(
     assert f"env file: {config}" in capsys.readouterr().err
 
 
+# --- --pull-request ---------------------------------------------------------------
+
+
+def _fake_publish(seen, *, result=None, raises=None):
+    """A stand-in for cli.publish_pull_request that records its kwargs."""
+
+    from dev_team.pullrequest import PullRequest
+
+    def publish(outcome, *, ref, token, git, publisher, base, draft):
+        seen.update(
+            slug=ref.slug, token=token, base=base, draft=draft,
+            committed=outcome.committed, branch=outcome.branch,
+        )
+        if raises is not None:
+            raise raises
+        return result or PullRequest(3, "https://github.com/acme/mono/pull/3")
+
+    return publish
+
+
+def _fake_clone_empty_repo(ref, dest, *, runner, token=None, timeout=None):
+    """A clone stand-in that yields a clean workspace (the engine inits git).
+
+    Unlike a fake that writes untracked files into a non-git dir (which trips
+    the dirty-baseline guard), an empty dir lets the engine ``git init`` a clean
+    baseline — matching what a real clone hands the delivery.
+    """
+
+    from pathlib import Path
+
+    Path(dest).mkdir(parents=True, exist_ok=True)
+    return dest
+
+
+def _pr_deliver(tmp_path, monkeypatch, seen, *extra, publish=None):
+    """Drive `--deliver --repo --pull-request` with clone + publish faked."""
+
+    import dev_team.cli as cli_module
+    from helpers import engine_responses
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(cli_module, "clone_or_update", _fake_clone_empty_repo)
+    monkeypatch.setattr(
+        cli_module, "publish_pull_request", publish or _fake_publish(seen)
+    )
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    return main(
+        ["Health", "Add /health", "--deliver", "--repo", "acme/mono",
+         "--pull-request", "--verify-command", "python -c pass", *extra],
+        runner=runner,
+    )
+
+
+def test_main_deliver_pull_request_opens_pr(tmp_path, monkeypatch, capsys):
+    seen = {}
+    code = _pr_deliver(tmp_path, monkeypatch, seen)
+    out = capsys.readouterr()
+    assert code == 0
+    # The CLI threaded the resolved ref + token (never re-resolved) into the
+    # publish, with the default base and non-draft.
+    assert seen["slug"] == "acme/mono"
+    assert seen["token"] == "tok"
+    assert seen["base"] == "main" and seen["draft"] is False
+    # The URL is surfaced both as stderr progress and in the stdout summary.
+    assert "opened pull request: https://github.com/acme/mono/pull/3" in out.err
+    assert "Pull request: https://github.com/acme/mono/pull/3" in out.out
+
+
+def test_main_deliver_pull_request_honours_base_and_draft(tmp_path, monkeypatch, capsys):
+    seen = {}
+    code = _pr_deliver(
+        tmp_path, monkeypatch, seen, "--pr-base", "develop", "--pr-draft"
+    )
+    assert code == 0
+    assert seen["base"] == "develop" and seen["draft"] is True
+
+
+def test_main_deliver_pull_request_failure_sets_exit_code(tmp_path, monkeypatch, capsys):
+    from dev_team.delivery_target import DeliveryTargetError
+
+    seen = {}
+    publish = _fake_publish(seen, raises=DeliveryTargetError("nothing to publish: no commit"))
+    code = _pr_deliver(tmp_path, monkeypatch, seen, publish=publish)
+    err = capsys.readouterr().err
+    # The delivery itself succeeded, but the requested PR did not open, so the
+    # exit code is non-zero and the reason is a clean line (no traceback).
+    assert code == 1
+    assert "pull request not opened: nothing to publish" in err
+
+
+def test_main_pull_request_requires_deliver():
+    with pytest.raises(SystemExit) as exc:
+        main(["T", "D", "--pull-request"], runner=ScriptedRunner([]))
+    assert exc.value.code == 2
+
+
+def test_main_pull_request_requires_repo():
+    with pytest.raises(SystemExit) as exc:
+        main(["T", "D", "--deliver", "--pull-request"], runner=ScriptedRunner([]))
+    assert exc.value.code == 2
+
+
+def test_main_pull_request_incompatible_with_no_commit():
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["T", "D", "--deliver", "--repo", "acme/mono", "--pull-request", "--no-commit"],
+            runner=ScriptedRunner([]),
+        )
+    assert exc.value.code == 2
+
+
+def test_main_pr_tuning_requires_pull_request():
+    for extra in (["--pr-base", "develop"], ["--pr-draft"]):
+        with pytest.raises(SystemExit) as exc:
+            main(
+                ["T", "D", "--deliver", "--repo", "acme/mono", *extra],
+                runner=ScriptedRunner([]),
+            )
+        assert exc.value.code == 2
+
+
+def test_main_chat_deliver_pull_request_threads_ref_and_token(
+    tmp_path, monkeypatch, capsys
+):
+    # Regression: an in-session /deliver must receive the clone's resolved
+    # ref/token so --pull-request works from chat too. They were dropped before,
+    # so publish saw ref=None/token="" and failed with a misleading
+    # "no token resolved" error even though the clone had just used one.
+    import io as _io
+
+    import dev_team.cli as cli_module
+    from helpers import engine_responses
+    from test_chat import FakeBackend
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(cli_module, "clone_or_update", _fake_clone_empty_repo)
+    seen = {}
+    monkeypatch.setattr(cli_module, "publish_pull_request", _fake_publish(seen))
+    monkeypatch.setattr("sys.stdin", _io.StringIO("/deliver\ny\n/quit\n"))
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(
+        ["--chat", "--repo", "acme/mono", "--pull-request",
+         "--verify-command", "python -c pass"],
+        runner=runner,
+        chat_backend=FakeBackend(),
+    )
+    assert code == 0
+    assert seen["slug"] == "acme/mono"
+    assert seen["token"] == "tok"
+
+
 # --- dashboard --------------------------------------------------------------------
 
 

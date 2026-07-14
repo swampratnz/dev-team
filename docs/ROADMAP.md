@@ -59,6 +59,21 @@ CI, not a local commit.
 opens a PR (with the outcome report as the body), watches required checks,
 and feeds CI failures back into the task loop as gate feedback.
 
+**Shipped (push + open):** the primitives — `GitRepo.push` (credential only in
+the per-command `http.extraheader` env, `--force-with-lease` only) and a
+`PullRequestPublisher` (GitHub REST, injectable transport, token-scrubbed
+errors) — plus `delivery_target.publish_pull_request`, which pushes the
+committed branch and opens the PR with `render_delivery_summary` as the body.
+Token hygiene (`sources.git_auth_env` + `scrub_credentials`) is baked into the
+push, never opt-in. Wired to the CLI as `--deliver --repo … --pull-request`
+(with `--pr-base` / `--pr-draft`); the resolved token and repo ref are threaded
+from the clone rather than re-resolved, and the PR URL is surfaced in the run
+summary and JSON (`DeliveryOutcome.pull_request_url`).
+
+**Remaining:** watching the PR's required checks after opening it, and feeding
+CI failures back into the delivery task loop as gate feedback (closing the loop
+rather than stopping at "PR opened").
+
 ## 3. Dynamic re-planning
 
 **Why:** interactive runs now escalate a failed task to the *human* (skip, or

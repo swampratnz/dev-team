@@ -10,7 +10,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import List, Mapping, Optional
+from typing import List, Mapping, Optional, Tuple
 
 from . import __version__
 from .assessment import (
@@ -26,15 +26,18 @@ from .budget import Budget
 from .chat import ChatSession, chat_system_prompt
 from .config import TeamConfig
 from .dashboard import DashboardServer
+from .delivery_target import DeliveryTargetError, publish_pull_request
 from .dispatch import DispatchServer
 from .engine import EngineConfig
 from .errors import DevTeamError
 from .eventlog import EventLog, compose
 from .events import AgentEvent, Listener
 from .execution import DEFAULT_EXCLUDED_DIRS, LocalWorkspace, SubprocessCommandRunner
+from .git import GitError, GitRepo
 from .interaction import ChannelApprovalGate, ConsoleChannel
 from .models import FeatureRequest
 from .persona import Roster
+from .pullrequest import GitHubPullRequestPublisher, PullRequestError
 from .report import (
     delivery_to_dict,
     render_delivery_summary,
@@ -44,6 +47,7 @@ from .report import (
 from .sandbox import SandboxConfig
 from .sdk import AgentRunner, ChatBackend, ClaudeAgentRunner, ClaudeChatBackend
 from .sources import (
+    RepoRef,
     clone_or_update,
     default_env_file,
     parse_repo,
@@ -505,6 +509,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not git-commit the delivered work (with --deliver).",
     )
+    delivery.add_argument(
+        "--pull-request",
+        action="store_true",
+        help="After a committed delivery, push the branch and open a GitHub "
+        "pull request whose body is the run summary (requires --repo; "
+        "with --deliver).",
+    )
+    delivery.add_argument(
+        "--pr-base",
+        default=None,
+        metavar="BRANCH",
+        help="Base branch for the --pull-request (default: main).",
+    )
+    delivery.add_argument(
+        "--pr-draft",
+        action="store_true",
+        help="Open the --pull-request as a draft.",
+    )
     misc.add_argument(
         "--json",
         action="store_true",
@@ -614,6 +636,26 @@ def _validate_args(
         parser.error("--env-file: only valid with --repo")
     if args.remote_verify_trigger is not None and args.remote_verify_status is None:
         parser.error("--remote-verify-trigger requires --remote-verify-status")
+    if args.pull_request and not (args.deliver or args.chat):
+        parser.error("--pull-request: only valid with --deliver or --chat")
+    if args.pull_request and args.repo is None:
+        parser.error(
+            "--pull-request requires --repo (to know which GitHub repository "
+            "to open the pull request on)"
+        )
+    if args.pull_request and args.no_commit:
+        parser.error(
+            "--pull-request needs a commit to publish; it is incompatible "
+            "with --no-commit"
+        )
+    pr_tuning = [
+        ("--pr-base", args.pr_base is not None),
+        ("--pr-draft", args.pr_draft),
+    ]
+    if not args.pull_request:
+        extra = [name for name, passed in pr_tuning if passed]
+        if extra:
+            parser.error(f"{', '.join(extra)}: only valid with --pull-request")
     if args.sandbox and not (args.deliver or args.assess):
         parser.error("--sandbox: only valid with --deliver or --assess")
     sandbox_tuning = [
@@ -812,6 +854,8 @@ async def _deliver(
     run: Optional[str] = None,
     *,
     budget: Budget,
+    repo_ref: Optional[RepoRef] = None,
+    github_token: Optional[str] = None,
 ) -> int:
     """Run real delivery and print the result; returns the exit code."""
 
@@ -830,11 +874,48 @@ async def _deliver(
         config=_engine_config(args),
         **kwargs,
     )
+    # --pull-request is the human's opt-in to publish; a failure to open the PR
+    # is reflected in the exit code but never masks the delivery result itself.
+    pr_ok = True
+    if args.pull_request:
+        pr_ok = _open_pull_request(outcome, args, repo_ref, github_token)
     if args.json:
         print(json.dumps(delivery_to_dict(outcome), indent=2))
     else:
         print(render_delivery_summary(outcome))
-    return 0 if outcome.success else 1
+    return 0 if outcome.success and pr_ok else 1
+
+
+def _open_pull_request(
+    outcome, args, ref: Optional[RepoRef], token: Optional[str]
+) -> bool:
+    """Push the delivered branch and open its pull request; return success.
+
+    Reached only under ``--pull-request``, which validation has already tied to
+    ``--repo`` (so ``ref`` is set) and a commit. The push and API call go
+    through the tested delivery target, so token hygiene (auth via the
+    ``http.extraheader`` env, scrubbed errors) is guaranteed. Any failure — an
+    uncommitted delivery, a rejected push, a GitHub error — prints a clean
+    reason to stderr rather than a traceback, and is surfaced in the exit code.
+    """
+
+    git = GitRepo(SubprocessCommandRunner(cwd=args.workspace), cwd=args.workspace)
+    try:
+        pull_request = publish_pull_request(
+            outcome,
+            ref=ref,
+            token=token or "",
+            git=git,
+            publisher=GitHubPullRequestPublisher(token=token or ""),
+            base=args.pr_base or "main",
+            draft=args.pr_draft,
+        )
+    except (DeliveryTargetError, GitError, PullRequestError) as exc:
+        print(f"pull request not opened: {exc}", file=sys.stderr)
+        return False
+    outcome.pull_request_url = pull_request.url
+    print(f"opened pull request: {pull_request.url}", file=sys.stderr)
+    return True
 
 
 async def _assess(
@@ -916,6 +997,8 @@ async def _chat(
     backend: Optional[ChatBackend],
     *,
     budget: Budget,
+    repo_ref: Optional[RepoRef] = None,
+    github_token: Optional[str] = None,
 ) -> int:
     """Run the ``--chat`` session; returns the last run's exit code."""
 
@@ -927,7 +1010,13 @@ async def _chat(
 
     async def run_feature(request: FeatureRequest, deliver: bool) -> int:
         if deliver:
-            return await _deliver(team, request, args, budget=budget)
+            # Thread the clone's resolved ref/token so an in-session /deliver can
+            # honour --pull-request too (the token was popped from the env at
+            # clone time and cannot be re-resolved) — mirroring the direct path.
+            return await _deliver(
+                team, request, args, budget=budget,
+                repo_ref=repo_ref, github_token=github_token,
+            )
         return await _simulate(team, request, args, budget=budget)
 
     session = ChatSession(
@@ -938,7 +1027,7 @@ async def _chat(
     return await session.run()
 
 
-def _materialise_repo(args, default_workspace: str) -> None:
+def _materialise_repo(args, default_workspace: str) -> Tuple[RepoRef, Optional[str]]:
     """Clone (or update) ``--repo`` and point ``--workspace`` at the result.
 
     The token is resolved from ``--env-file`` or, without one, the default
@@ -948,6 +1037,10 @@ def _materialise_repo(args, default_workspace: str) -> None:
     engines' subprocesses must never inherit it. An explicit ``--workspace``
     is the clone destination; otherwise each repository gets its own
     directory under the default workspace root.
+
+    Returns the resolved ``(ref, token)`` so a later ``--pull-request`` can push
+    and open the PR without re-resolving — ``resolve_github_token`` *pops* the
+    token out of the process env, so a second call would come back empty.
     """
 
     ref = parse_repo(args.repo)
@@ -960,6 +1053,7 @@ def _materialise_repo(args, default_workspace: str) -> None:
     clone_or_update(
         ref, args.workspace, runner=SubprocessCommandRunner(), token=token
     )
+    return ref, token
 
 
 #: The dashboard lists ``.dev_team/transcripts/`` to surface transcripts, so
@@ -1225,8 +1319,10 @@ def _run(
             _verify_one(args, runner or ClaudeAgentRunner(default_model=args.model))
         )
 
+    repo_ref: Optional[RepoRef] = None
+    github_token: Optional[str] = None
     if args.repo is not None:
-        _materialise_repo(args, parser.get_default("workspace"))
+        repo_ref, github_token = _materialise_repo(args, parser.get_default("workspace"))
 
     config = TeamConfig(
         model=args.model,
@@ -1276,7 +1372,12 @@ def _run(
     run_id = event_log.run if event_log is not None else None
 
     if args.chat:
-        return asyncio.run(_chat(team, args, chat_backend, budget=budget))
+        return asyncio.run(
+            _chat(
+                team, args, chat_backend,
+                budget=budget, repo_ref=repo_ref, github_token=github_token,
+            )
+        )
     if args.assess:
         return asyncio.run(_assess(team, args, run_id, budget=budget))
 
@@ -1286,7 +1387,12 @@ def _run(
         constraints=list(args.constraints),
     )
     if args.deliver:
-        return asyncio.run(_deliver(team, request, args, run_id, budget=budget))
+        return asyncio.run(
+            _deliver(
+                team, request, args, run_id,
+                budget=budget, repo_ref=repo_ref, github_token=github_token,
+            )
+        )
     return asyncio.run(_simulate(team, request, args, budget=budget))
 
 
