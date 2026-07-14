@@ -279,10 +279,11 @@ class GitRepo:
         downstream sinks (event log, transcript, an outcome report). Only the
         argv-free ``result.output`` is scrubbed; ``args`` never carries the
         credential. The caller that owns the token supplies the redactor
-        (e.g. ``lambda t: sources._scrub(t, token)``), keeping this generic
-        porcelain free of any GitHub/base64 specifics — the same split
-        ``sources`` uses between :func:`_auth_env` and :func:`_scrub`. Raises
-        :class:`GitError` if the push is rejected.
+        (e.g. ``lambda t: sources.scrub_credentials(t, token)``), keeping this
+        generic porcelain free of any GitHub/base64 specifics — the same split
+        ``sources`` uses between :func:`~dev_team.sources.git_auth_env` and
+        :func:`~dev_team.sources.scrub_credentials`. Raises :class:`GitError`
+        if the push is rejected.
         """
 
         args = ["push"]
