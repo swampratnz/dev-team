@@ -34,15 +34,17 @@ container (no credentials, no network by default, workspace bind-mounted),
 so the isolation boundary matches the trust boundary; the same container
 hosts the engineer's tool loop.
 
-**Status:** the primitive has landed — `ContainerCommandRunner` +
-`SandboxConfig` (`dev_team.sandbox`, see [`docs/SANDBOX.md`](SANDBOX.md)): it
-wraps any `CommandRunner`, boxes every non-`git` command in a `docker`/`podman`
-run with no network, dropped capabilities, no-new-privileges and resource
-limits, and mounts only the workspace, while git porcelain stays on the host.
-Remaining phases: **(b)** wire it into the delivery gates / build probe and a
-`--sandbox` CLI opt-in (a gate/probe runner distinct from the host git runner);
-**(c)** deployment wiring so the engineer's own SDK tool loop runs inside the
-box too (process-level, since that loop bypasses the `CommandRunner`).
+**Status:** phases (a) and (b) have landed (`dev_team.sandbox`, see
+[`docs/SANDBOX.md`](SANDBOX.md)). **(a)** the primitive — `ContainerCommandRunner`
++ `SandboxConfig` — boxes every non-`git` command in a `docker`/`podman` run with
+no network, dropped capabilities, no-new-privileges and resource limits, mounts
+only the workspace, and forwards env via a `0600` `--env-file` (never argv), while
+git porcelain self-delegates to the host. **(b)** wiring — `EngineConfig.sandbox`
+/ `AssessConfig.sandbox` and the `--sandbox` CLI opt-in box the delivery gates and
+the assessment build probe (no gate/git runner split needed, since git
+self-delegates). Remaining: **(c)** deployment wiring so the engineer's own SDK
+tool loop runs inside the box too (process-level, since that loop bypasses the
+`CommandRunner`).
 
 ## 2. PR / CI integration
 

@@ -46,8 +46,8 @@ inner runner's timeout handling and secret-env scrubbing.
 
 | Surface | Contained by this? |
 |---|---|
-| Gate commands (the verify command / agent-authored tests) | ✅ when wired in |
-| Build probe / setup / dependency-scan commands | ✅ when wired in |
+| Gate commands (the verify command / agent-authored tests) | ✅ via `--sandbox` |
+| Build probe / setup / dependency-scan commands | ✅ via `--sandbox` |
 | git porcelain (commit, branch, worktree, `git log`) | ❌ by design — host |
 | The agentic engineer's own SDK tool loop (Bash/Edit via the Claude CLI) | ❌ — see below |
 
@@ -76,6 +76,24 @@ runner = ContainerCommandRunner(
 result = runner.run(["pytest", "-q"], cwd="/path/to/workspace")
 ```
 
+### From the CLI
+
+`--sandbox` boxes the commands a `--deliver` or `--assess` run executes (the
+delivery gates, the assessment build probe); git stays on the host.
+
+```bash
+# gate the delivery in a container (rootless docker/podman required at runtime)
+dev-team "Health endpoint" "Add /health returning 200" --deliver --workspace ./build \
+    --sandbox --sandbox-image python:3.12-slim
+
+# a build probe that must restore dependencies needs a network:
+dev-team --assess --workspace /path/to/repo --build-probe \
+    --sandbox --sandbox-network bridge --sandbox-engine podman
+```
+
+`--sandbox-image` / `--sandbox-network` / `--sandbox-engine` override the
+matching `SandboxConfig` field; everything else keeps its secure default.
+
 Notes and gotchas:
 
 - **Rootless is the model.** `user` is unset by default; a rootless engine
@@ -95,9 +113,14 @@ Notes and gotchas:
 
 ## Status
 
-This PR ships the primitive and its tests. Still to come (see ROADMAP item 1):
-
-- **(b)** wire it into the delivery gates and the assessment `--build-probe`
-  behind a `--sandbox` opt-in — as a gate/probe runner kept distinct from the
-  host git runner;
-- **(c)** deployment wiring so the engineer's SDK tool loop runs in the box too.
+- **(a) primitive** — shipped: `ContainerCommandRunner` + `SandboxConfig`.
+- **(b) wiring** — shipped: `EngineConfig.sandbox` / `AssessConfig.sandbox` and
+  the `--sandbox` CLI opt-in box the delivery gates and the assessment build
+  probe. Because git self-delegates to the host inside the runner, no separate
+  gate/git runner split was needed. Two guardrails from review are in place:
+  the program name reaching the runner is engine/profile-controlled (never
+  repo-derived, so a repo script named `git` cannot slip onto the host), and the
+  mount source is `realpath`-resolved.
+- **(c) process-level** — still to come: run the agentic engineer's own SDK tool
+  loop inside the box (it bypasses the `CommandRunner`, so this is a deployment
+  concern — run the whole dev-team process in a container).

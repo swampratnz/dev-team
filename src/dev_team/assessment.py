@@ -71,6 +71,7 @@ from .interaction import (
 )
 from .persona import Roster
 from .profile import ProjectProfile, detect_project
+from .sandbox import ContainerCommandRunner, SandboxConfig
 from .sdk import AgentRunner
 from .trace import Tracer
 from .transcripts import TranscriptRecorder
@@ -497,6 +498,11 @@ class AssessConfig:
     dormancy_days: int = 365
     build_probe: bool = False
     build_probe_timeout: float = 600.0
+    #: When set (and a build probe runs against a real workspace), the probe's
+    #: untrusted setup/verify commands are boxed in a container per this config.
+    #: The read-only git dormancy queries self-delegate to the host. Off by
+    #: default; see ``dev_team.sandbox`` and ``docs/SANDBOX.md``.
+    sandbox: Optional[SandboxConfig] = None
 
 
 @dataclass
@@ -709,6 +715,13 @@ class AssessmentEngine:
         self.command_runner = command_runner or (
             SubprocessCommandRunner() if self.workdir is not None else None
         )
+        if self.config.sandbox is not None and self.command_runner is not None:
+            # Box the build probe's untrusted setup/verify commands; the
+            # dead-code dormancy `git log` queries self-delegate to the host
+            # inside ContainerCommandRunner, so they still read the real repo.
+            self.command_runner = ContainerCommandRunner(
+                self.command_runner, self.config.sandbox
+            )
         self._osv_fetch = osv_fetch
 
         def make(cls):

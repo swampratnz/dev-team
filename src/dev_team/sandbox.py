@@ -175,7 +175,10 @@ class ContainerCommandRunner:
                 "cannot sandbox a command without a workspace directory to mount"
             )
         cfg = self.config
-        host_dir = os.path.abspath(cwd)
+        # realpath (not just abspath): resolve any symlink in the workspace path
+        # before it becomes a bind-mount source, so a symlinked cwd can't point
+        # the mount somewhere unintended once a repo-derived path can reach here.
+        host_dir = os.path.realpath(cwd)
         mount = cfg.workspace_mount
         run: List[str] = [cfg.engine, "run", "--rm"]
         run += ["--network", cfg.network]

@@ -2263,3 +2263,26 @@ def test_delivery_without_conventions_leaves_prompts_clean():
     assert outcome.success is True
     assert engine._conventions is None
     assert not any("House conventions" in c["prompt"] for c in runner.calls)
+
+
+def test_sandbox_boxes_gates_but_delegates_git_to_host(tmp_path):
+    # With EngineConfig.sandbox set on a real workspace, the commands the engine
+    # runs (gates/setup/scans) are containerised — except git, which
+    # self-delegates to the host so porcelain still acts on the real repo.
+    from dev_team.sandbox import SandboxConfig
+
+    fake = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner(by_system_prompt={}),
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=fake,
+        config=EngineConfig(sandbox=SandboxConfig(image="toolchain:1")),
+    )
+    engine.command_runner.run(["pytest", "-q"], cwd=str(tmp_path))
+    gate = fake.calls[-1]
+    assert gate[:2] == ["docker", "run"]
+    assert "toolchain:1" in gate
+    assert gate[-2:] == ["pytest", "-q"]
+
+    engine.command_runner.run(["git", "status"], cwd=str(tmp_path))
+    assert fake.calls[-1] == ["git", "status"]
