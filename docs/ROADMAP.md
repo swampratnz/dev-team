@@ -23,7 +23,7 @@ assessment with cited, phased audit reports (see `docs/ASSESSMENT.md`) — and
 items below are the known, deliberately deferred capabilities, roughly in
 priority order.
 
-## 1. Container-level sandboxing *(in progress)*
+## 1. Container-level sandboxing *(done)*
 
 **Why:** running agent-authored tests is arbitrary code execution.
 `SideEffectPolicy` is defence-in-depth, not containment — and the agentic
@@ -42,9 +42,13 @@ only the workspace, and forwards env via a `0600` `--env-file` (never argv), whi
 git porcelain self-delegates to the host. **(b)** wiring — `EngineConfig.sandbox`
 / `AssessConfig.sandbox` and the `--sandbox` CLI opt-in box the delivery gates and
 the assessment build probe (no gate/git runner split needed, since git
-self-delegates). Remaining: **(c)** deployment wiring so the engineer's own SDK
-tool loop runs inside the box too (process-level, since that loop bypasses the
-`CommandRunner`).
+self-delegates). **(c)** process-level — shipped as deployment guidance: the
+engineer's own SDK tool loop bypasses the `CommandRunner`, so it is contained by
+running the whole process in a container/VM ([`DEPLOYMENT.md` §5d](../DEPLOYMENT.md)
+has a hardened recipe and the layered model), with matching hardening on the
+standing systemd units. The remaining open edge is a per-job isolation boundary
+(review S4) — one dispatched job's container can still see another's workspace on
+a shared host; a per-job rootless container/namespace is the follow-up.
 
 ## 2. PR / CI integration
 

@@ -48,8 +48,23 @@ ReadWritePaths=/opt/dev-team
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectClock=yes
 RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RemoveIPC=yes
 LockPersonality=yes
+SystemCallArchitectures=native
+# Stronger still — but this unit RUNS jobs, which may use the in-process
+# container sandbox (--sandbox, rootless podman/docker); those engines need
+# user namespaces and clone/mount syscalls. Do NOT enable the following here
+# unless this host never uses --sandbox (and then also run the whole process in
+# an outer container/VM — see DEPLOYMENT.md 5d):
+#   CapabilityBoundingSet=
+#   RestrictNamespaces=yes
+#   SystemCallFilter=@system-service
+#   RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

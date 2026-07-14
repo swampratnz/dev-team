@@ -49,14 +49,15 @@ inner runner's timeout handling and secret-env scrubbing.
 | Gate commands (the verify command / agent-authored tests) | ✅ via `--sandbox` |
 | Build probe / setup / dependency-scan commands | ✅ via `--sandbox` |
 | git porcelain (commit, branch, worktree, `git log`) | ❌ by design — host |
-| The agentic engineer's own SDK tool loop (Bash/Edit via the Claude CLI) | ❌ — see below |
+| The agentic engineer's own SDK tool loop (Bash/Edit via the Claude CLI) | ✅ when the whole process runs in a container/VM — see below |
 
 The engineer's tool loop runs via the Claude CLI **on the host**, outside any
 `CommandRunner`, so this primitive cannot box it. Containing *that* means running
-the whole dev-team process inside a container/VM (a deployment concern, phase
-(c)). Until then, for unattended or untrusted runs, put the whole process in a
-sandboxed container with no credentials and restricted network — exactly as the
-README's *Safety* section already advises.
+the whole dev-team process inside a container/VM — the phase (c) deployment
+model, documented with a hardened recipe in
+[`DEPLOYMENT.md` §5d](../DEPLOYMENT.md#5d-sandboxing-the-whole-process-unattended--untrusted-runs).
+`--sandbox` is the per-command belt; the outer process container is the
+suspenders that also covers the engineer's tool loop and everything else.
 
 ## Configuration
 
@@ -121,6 +122,11 @@ Notes and gotchas:
   the program name reaching the runner is engine/profile-controlled (never
   repo-derived, so a repo script named `git` cannot slip onto the host), and the
   mount source is `realpath`-resolved.
-- **(c) process-level** — still to come: run the agentic engineer's own SDK tool
-  loop inside the box (it bypasses the `CommandRunner`, so this is a deployment
-  concern — run the whole dev-team process in a container).
+- **(c) process-level** — shipped as deployment guidance: run the whole
+  dev-team process in a container/VM to contain the engineer's own SDK tool loop
+  (which bypasses the `CommandRunner`). A hardened `docker run` recipe and the
+  layered model live in
+  [`DEPLOYMENT.md` §5d](../DEPLOYMENT.md#5d-sandboxing-the-whole-process-unattended--untrusted-runs);
+  the standing systemd units carry matching hardening (the read-only dashboard
+  unit fully locked down; the job-running units kept namespace/syscall-open so
+  the in-process sandbox's container engine still works).

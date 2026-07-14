@@ -268,6 +268,59 @@ and `DEV_TEAM_DISPATCH_TOKEN=...` to `dashboard.env`; edits then proxy to the
 dispatch service, which owns every backlog write (see
 [`docs/DASHBOARD.md`](docs/DASHBOARD.md)).
 
+## 5d. Sandboxing the whole process (unattended / untrusted runs)
+
+dev-team executes code from the repositories it works on — and that happens on
+**two** surfaces:
+
+1. The commands the engine itself runs (delivery gates, the assessment build
+   probe). `--sandbox` boxes these per-command in a container (rootless, no
+   network, dropped caps, resource limits — see
+   [`docs/SANDBOX.md`](docs/SANDBOX.md)). Prefer it whenever a runtime container
+   engine is available.
+2. The **agentic engineer's own tool loop** — its `Bash`/`Edit` tools run via
+   the Claude CLI *on the host*, outside any `CommandRunner`, so `--sandbox`
+   cannot reach them. Containing that surface means running the **whole
+   dev-team process** in a box.
+
+So for unattended runs, or any run over a repository you don't fully trust, run
+the process itself inside a container (or a disposable VM) with no ambient
+credentials, tight resource limits, and egress restricted to only what it
+needs. The included image already runs as the unprivileged `devteam` user; add
+the runtime hardening:
+
+```bash
+docker run --rm \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --pids-limit 1024 \
+    --memory 4g --cpus 2 \
+    --read-only --tmpfs /tmp --tmpfs /home/devteam \
+    -e CLAUDE_CODE_OAUTH_TOKEN \
+    -v "$PWD/build:/build" \
+    dev-team:latest "Health endpoint" "Add a /health endpoint" \
+    --deliver --workspace /build --budget-usd 5.0 --json
+```
+
+- **Network.** The process needs outbound HTTPS to the Anthropic API (and to
+  GitHub when you use `--repo`); it does **not** need inbound or any other
+  egress. Don't use `--network none` here — it would break the agents. Instead
+  restrict egress to those hosts with a firewall/proxy or a locked-down Docker
+  network. (The per-command `--sandbox` container *does* default to no network,
+  because gate/test code shouldn't phone home.)
+- **Credentials.** Pass only the one credential the run needs (a subscription
+  token or API key, and a fine-grained read-only `GITHUB_TOKEN` for private
+  `--repo`). Nothing else should be on disk or in the environment — a run over
+  an untrusted repo is untrusted-code execution with your Claude account
+  attached.
+- **Disposability.** Treat the workspace and the container as single-use; the
+  `--rm` above discards the container, and a fresh `build/` per run keeps one
+  job's artifacts out of the next.
+
+This outer box is the belt; `--sandbox` is the suspenders. Together they contain
+both code-execution surfaces; on a host with no container engine at all, the
+disposable-VM form of the outer box is the minimum for untrusted repositories.
+
 ## 6. Security notes
 
 - The unit runs as the unprivileged `devteam` user with a hardened sandbox
@@ -288,6 +341,12 @@ dispatch service, which owns every backlog write (see
 - The agents run the Claude CLI in `acceptEdits` mode by default, with tools
   granted per call via `allowed_tools`. `bypassPermissions` is opt-in via
   `TeamConfig`; only enable it inside a sandboxed container/VM.
-- Delivery runs (`--deliver`) execute the code the agents write (that is what
-  running the quality gates means). Treat the workspace host as untrusted-code
-  execution: no ambient credentials, restricted network, disposable machine.
+- Delivery runs (`--deliver`) and the assessment build probe (`--build-probe`)
+  execute the code the agents write or the repo ships (that is what running the
+  quality gates / probe means), and the agentic engineer's own `Bash` tool runs
+  arbitrary commands too. Contain **both** surfaces: `--sandbox` boxes the
+  gate/probe commands per-command (see [`docs/SANDBOX.md`](docs/SANDBOX.md)), and
+  running the whole process in a container/VM boxes the engineer's tool loop and
+  everything else — see [5d](#5d-sandboxing-the-whole-process-unattended--untrusted-runs).
+  Treat the host as untrusted-code execution: no ambient credentials, egress
+  restricted to the API/GitHub, disposable machine.
