@@ -139,15 +139,40 @@ Respond with JSON of the form:
         conventions: Optional[str] = None,
         model: Optional[str] = None,
         tools: Optional[Sequence[str]] = None,
+        task_key: Optional[str] = None,
+        continuation: bool = False,
     ) -> Implementation:
         """Implement ``task`` directly in ``cwd`` using real tools.
 
         The engineer reads the existing code, makes the changes, writes tests,
         and runs them itself; the returned JSON lists what changed (paths and
         summaries — the workspace itself is the source of truth for content).
+
+        ``task_key``/``continuation`` are session-continuity plumbing (see
+        ``EngineConfig.session_continuity``): when the caller has an active,
+        already-connected session for this task (``continuation=True``), the
+        prompt is just the review feedback — the connected session from
+        attempt 1 already holds the task/conventions/tool-loop context, so
+        resending it would waste the exact cost continuity exists to avoid.
+        ``task_key`` is passed through regardless so a session-holding runner
+        can key its session even on the first (full-context) attempt.
         """
 
-        prompt = f"""\
+        if continuation:
+            prompt = f"""\
+{_feedback_section(feedback)}
+
+Address this feedback directly in the current working directory using your \
+tools, then respond with JSON of the same form as before:
+{{
+  "summary": "what you built",
+  "files": [
+    {{"path": "src/x.py", "change_type": "create", "summary": "..."}}
+  ],
+  "notes": "anything reviewers should know"
+}}"""
+        else:
+            prompt = f"""\
 Implement the following task in the current working directory. Use your tools:
 read the existing code before changing it, create or edit files directly,
 write automated tests for the acceptance criteria, and run the test suite to
@@ -169,6 +194,10 @@ the files on disk are the deliverable):
   "notes": "anything reviewers should know"
 }}"""
         data = await self.ask_json(
-            prompt, allowed_tools=tools if tools is not None else TOOLS, cwd=cwd, model=model
+            prompt,
+            allowed_tools=tools if tools is not None else TOOLS,
+            cwd=cwd,
+            model=model,
+            task_key=task_key,
         )
         return parsing.implementation_from_dict(data, task.id)

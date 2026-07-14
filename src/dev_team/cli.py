@@ -505,6 +505,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many independent tasks may be implemented at once (with --deliver).",
     )
     delivery.add_argument(
+        "--session-continuity",
+        action="store_true",
+        help="Keep one persistent SDK session per task across the agentic "
+        "engineer's retry attempts, instead of a fresh session every attempt "
+        "(with --deliver): attempt 2+ sends just the reviewer's feedback as "
+        "a follow-up turn instead of re-sending the whole task/conventions "
+        "prompt. Opt-in; off by default.",
+    )
+    delivery.add_argument(
         "--no-commit",
         action="store_true",
         help="Do not git-commit the delivered work (with --deliver).",
@@ -747,6 +756,7 @@ def _reject_deliver_only_flags(
         ("--no-commit", args.no_commit),
         ("--remote-verify-status", args.remote_verify_status is not None),
         ("--remote-verify-trigger", args.remote_verify_trigger is not None),
+        ("--session-continuity", args.session_continuity),
     ]
     if not (args.assess or args.dashboard):
         checks += [
@@ -812,6 +822,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
             if args.remote_verify_trigger
             else None
         ),
+        session_continuity=args.session_continuity,
     )
 
 

@@ -1898,6 +1898,32 @@ def test_sandbox_wired_into_engine_config():
     assert _engine_config(args).sandbox is not None
 
 
+def test_session_continuity_flag_defaults_off():
+    parser = build_parser()
+    args = parser.parse_args(["--deliver", "T", "D"])
+    assert args.session_continuity is False
+
+
+def test_session_continuity_wired_into_engine_config():
+    from dev_team.cli import _engine_config
+
+    parser = build_parser()
+    off = parser.parse_args(["--deliver", "T", "D"])
+    assert _engine_config(off).session_continuity is False
+
+    on = parser.parse_args(["--deliver", "--session-continuity", "T", "D"])
+    assert _engine_config(on).session_continuity is True
+
+
+def test_session_continuity_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--session-continuity"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--session-continuity" in err
+    assert "--deliver" in err
+
+
 def test_main_sandbox_without_mode_exits_2(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["T", "D", "--sandbox"], runner=ScriptedRunner([]))

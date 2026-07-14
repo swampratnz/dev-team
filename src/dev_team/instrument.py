@@ -46,6 +46,7 @@ class InstrumentedRunner:
         allowed_tools: Optional[Sequence[str]] = None,
         model: Optional[str] = None,
         cwd: Optional[str] = None,
+        task_key: Optional[str] = None,
     ) -> AgentResult:
         if self.budget is not None:
             # Pre-flight: refuse to spend anything once the ceiling is hit.
@@ -53,6 +54,11 @@ class InstrumentedRunner:
         span = None
         if self.tracer is not None:
             span = self.tracer.start("agent", self.role)
+        # task_key is a SessionAgentRunner extension beyond the AgentRunner
+        # protocol's formal signature (see its docstring); every other inner
+        # runner — ClaudeAgentRunner, every test double — has no such
+        # parameter, so it is only forwarded when a caller actually set one.
+        extra = {"task_key": task_key} if task_key is not None else {}
         try:
             result = await self.inner.run(
                 prompt,
@@ -60,6 +66,7 @@ class InstrumentedRunner:
                 allowed_tools=allowed_tools,
                 model=model,
                 cwd=cwd,
+                **extra,
             )
         except BaseException:
             # A raising call must not leave its trace span open forever. Its

@@ -99,16 +99,27 @@ class BaseAgent:
         allowed_tools: Optional[Sequence[str]] = None,
         cwd: Optional[str] = None,
         model: Optional[str] = None,
+        task_key: Optional[str] = None,
     ) -> AgentResult:
-        """Send ``prompt`` to the model and return the raw result."""
+        """Send ``prompt`` to the model and return the raw result.
+
+        ``task_key`` is a :class:`~dev_team.sdk.SessionAgentRunner` extension
+        beyond the plain :class:`~dev_team.sdk.AgentRunner` protocol, so it is
+        only forwarded when a caller actually sets one — a raw runner (as
+        many tests construct directly, without the
+        :class:`~dev_team.instrument.InstrumentedRunner` wrapping the engine
+        adds) has no such parameter.
+        """
 
         self._emit("working")
+        extra = {"task_key": task_key} if task_key is not None else {}
         result = await self.runner.run(
             prompt,
             system_prompt=self.effective_system_prompt,
             allowed_tools=allowed_tools,
             model=model or self.model,
             cwd=cwd,
+            **extra,
         )
         self._emit("completed", detail=f"{result.num_turns} turn(s)")
         return result
@@ -120,6 +131,7 @@ class BaseAgent:
         allowed_tools: Optional[Sequence[str]] = None,
         cwd: Optional[str] = None,
         model: Optional[str] = None,
+        task_key: Optional[str] = None,
     ) -> Any:
         """Send ``prompt`` and parse the response as a JSON object.
 
@@ -136,7 +148,11 @@ class BaseAgent:
         last_text = ""
         for attempt in range(self.json_retries + 1):
             result = await self.ask(
-                attempt_prompt, allowed_tools=allowed_tools, cwd=cwd, model=model
+                attempt_prompt,
+                allowed_tools=allowed_tools,
+                cwd=cwd,
+                model=model,
+                task_key=task_key,
             )
             last_text = result.text
             reason = None

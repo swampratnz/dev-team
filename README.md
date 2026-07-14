@@ -298,7 +298,10 @@ FeatureRequest
 A task is retried up to `max_task_attempts` times whenever review or the gates
 reject it; the failed attempt is rolled back and the engineer receives the
 feedback (including real gate output) on the next attempt — optionally on a
-stronger `escalation_model` for the final try. If it never passes, the task is
+stronger `escalation_model` for the final try. Opt-in `--session-continuity`
+keeps one persistent SDK session per task across those retries instead of a
+fresh one each time, so attempt 2+ sends just the feedback as a follow-up turn
+rather than re-exploring the repo from zero. If it never passes, the task is
 marked `FAILED`, dependants cascade-skip, and the run reports incomplete. A
 blown budget or crash leaves a checkpoint (and the accepted work banked as WIP
 commits); re-running the same feature reuses the checkpointed plan, skips the

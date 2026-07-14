@@ -5,6 +5,20 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Delivery engine
+- **Opt-in session continuity across the engineer's retry attempts**
+  (`--session-continuity`, `EngineConfig.session_continuity`, ROADMAP #5):
+  `SessionAgentRunner` (`sdk.py`) holds one persistent `ClaudeSDKClient` per
+  task, mirroring the `--chat` transport (`ClaudeChatBackend`). Wired to the
+  engineer's runner only, and only when enabled — off by default, with
+  behaviour then provably unchanged. Attempt 2+ on the same task sends just
+  the review feedback as a follow-up turn instead of re-sending the whole
+  task/conventions prompt, cutting the re-exploration cost every retry pays
+  today. Fail-secure: a dropped connection or a model change
+  (`escalation_model` on the final attempt) discards the stale session and
+  reconnects fresh, replaying the task's full prompt history rather than
+  silently continuing on stale state.
+
 ### Self-improvement pipeline
 - **A supervised multi-loop development pipeline now extends this repo
   itself** (`docs/PIPELINE.md`), ported from the community-agent repo's

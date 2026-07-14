@@ -103,7 +103,7 @@ from .policy import GuardedCommandRunner, SideEffectPolicy
 from .profile import detect_project
 from .sandbox import ContainerCommandRunner, SandboxConfig
 from .scheduler import ScheduledResult, schedule
-from .sdk import AgentRunner
+from .sdk import AgentRunner, SessionAgentRunner
 from .trace import Tracer
 from .transcripts import TranscriptRecorder
 from .verification import (
@@ -156,6 +156,13 @@ class EngineConfig:
       the change, and the attempt is rejected as vacuous (SWT-bench logic).
       Skipped for dry runs, and whenever verification is remote or degraded
       (re-running those "gates" on reverted code proves nothing).
+    - ``session_continuity``: keep one persistent SDK session per task across
+      the agentic engineer's retry attempts, instead of a fresh session every
+      attempt — attempt 2+ sends just the review feedback as a follow-up turn
+      rather than re-sending the whole task/conventions prompt. Opt-in
+      (default ``False``, behaviour then provably unchanged); only ever
+      affects the engineer's runner, and only in agentic mode. See
+      ``dev_team.sdk.SessionAgentRunner``.
     - ``remote_verify_status`` / ``remote_verify_trigger``: delegate
       verification to an external CI system (see
       :class:`~dev_team.verification.RemoteCIGate`) — the escape hatch for
@@ -192,6 +199,7 @@ class EngineConfig:
     remote_verify_trigger: Optional[Sequence[str]] = None
     remote_verify_max_polls: int = 30
     remote_verify_interval_seconds: float = 60.0
+    session_continuity: bool = False
     #: When set (and the workspace is real), the commands the engine runs — the
     #: gates, setup, and scans, i.e. the arbitrary-code-execution surface — are
     #: boxed in a container per this config. git porcelain self-delegates to the
@@ -566,10 +574,20 @@ class DeliveryEngine:
         self._profile = None
         self._conventions: Optional[str] = None
         self._scorecard: Dict[str, int] = {}
+        # Opt-in, engineer-only (ROADMAP #5): a persistent SDK session per
+        # task instead of a fresh one every retry attempt. Only makes sense
+        # in agentic mode (implement_in_place, the tool-using path this is
+        # designed for) — with a described-mode/simulated engineer there is
+        # no tool-loop exploration cost to amortise.
+        self._session_runner: Optional[SessionAgentRunner] = (
+            SessionAgentRunner()
+            if self.config.session_continuity and self.agentic
+            else None
+        )
 
-        def make(cls):
+        def make(cls, override_runner: Optional[AgentRunner] = None):
             wrapped = InstrumentedRunner(
-                runner,
+                override_runner if override_runner is not None else runner,
                 cls.role,
                 budget=self.budget,
                 tracer=self.tracer,
@@ -585,7 +603,7 @@ class DeliveryEngine:
 
         self.manager = make(ProductManagerAgent)
         self.architect = make(ArchitectAgent)
-        self.engineer = make(EngineerAgent)
+        self.engineer = make(EngineerAgent, override_runner=self._session_runner)
         self.reviewer = make(ReviewerAgent)
         self.qa = make(QAAgent)
         self.security = make(SecurityEngineerAgent)
@@ -1099,6 +1117,43 @@ class DeliveryEngine:
             return self.config.escalation_model
         return None
 
+    def _session_continuation(self, attempts: int) -> bool:
+        """Whether this attempt should send a compact, feedback-only prompt.
+
+        True once session continuity is active and a session for this task
+        could already be connected (i.e. not the very first attempt).
+        ``SessionAgentRunner`` independently reconnects with the task's full
+        prompt history whenever the session it holds turns out to be stale
+        (dropped transport, or an escalated model on the final attempt), so
+        this stays a pure prompt-shape hint — it never has to anticipate
+        those cases itself.
+        """
+
+        return self._session_runner is not None and attempts > 1
+
+    def _session_task_key(self, task_id: str) -> Optional[str]:
+        """``task_id`` when a session-holding runner is in play, else ``None``.
+
+        Kept ``None`` whenever continuity is off so the engineer's calls stay
+        indistinguishable from any other role's — the raw runner behind
+        :class:`~dev_team.instrument.InstrumentedRunner` (a plain
+        ``ClaudeAgentRunner``, or any test double) has no ``task_key``
+        parameter at all.
+        """
+
+        return task_id if self._session_runner is not None else None
+
+    async def _close_session(self, task_key: str) -> None:
+        """Tear down this task's session, if continuity opened one.
+
+        Called from every exit of a task's attempt loop (success, attempts
+        exhausted, or an exception propagating out) so a session never
+        outlives the task it was opened for.
+        """
+
+        if self._session_runner is not None:
+            await self._session_runner.close(task_key)
+
     async def _review_plan(
         self, request: FeatureRequest, plan: Plan, prior: Optional[str]
     ) -> Optional[Plan]:
@@ -1197,68 +1252,73 @@ class DeliveryEngine:
         test_report: Optional[TestReport] = None
         attempts = 0
 
-        while attempts < self.config.max_task_attempts:
-            attempts += 1
-            model = self._attempt_model(attempts)
-            task.status = TaskStatus.IN_PROGRESS
-            span = self.tracer.start("task", task.id, attempt=str(attempts))
+        try:
+            while attempts < self.config.max_task_attempts:
+                attempts += 1
+                model = self._attempt_model(attempts)
+                task.status = TaskStatus.IN_PROGRESS
+                span = self.tracer.start("task", task.id, attempt=str(attempts))
 
-            if self.agentic:
-                # The agentic engineer mutates the shared working directory, so
-                # the whole attempt runs inside the integration lock.
-                async with self._integration_lock:
-                    try:
-                        implementation = await self.engineer.implement_in_place(
-                            task,
-                            design,
-                            feedback,
-                            cwd=str(self.workdir),
-                            conventions=self._conventions,
-                            model=model,
-                            tools=self.config.engineer_tools,
+                if self.agentic:
+                    # The agentic engineer mutates the shared working directory, so
+                    # the whole attempt runs inside the integration lock.
+                    async with self._integration_lock:
+                        try:
+                            implementation = await self.engineer.implement_in_place(
+                                task,
+                                design,
+                                feedback,
+                                cwd=str(self.workdir),
+                                conventions=self._conventions,
+                                model=model,
+                                tools=self.config.engineer_tools,
+                                task_key=self._session_task_key(task.id),
+                                continuation=self._session_continuation(attempts),
+                            )
+                        except BaseException:
+                            # implement_in_place edits the shared workdir directly.
+                            # A raising call (AgentResponseError, BudgetExceededError,
+                            # cancellation) leaves those edits on disk, outside any
+                            # rollback scope — _integrate never runs. Discard them
+                            # here, or the next task's _commit_wip banks this failed
+                            # task's half-written changes as if they were gated work.
+                            self._rollback(None, self.git)
+                            raise
+                        done, review, test_report, feedback = await self._integrate(
+                            task, implementation, span
                         )
-                    except BaseException:
-                        # implement_in_place edits the shared workdir directly.
-                        # A raising call (AgentResponseError, BudgetExceededError,
-                        # cancellation) leaves those edits on disk, outside any
-                        # rollback scope — _integrate never runs. Discard them
-                        # here, or the next task's _commit_wip banks this failed
-                        # task's half-written changes as if they were gated work.
-                        self._rollback(None, self.git)
-                        raise
-                    done, review, test_report, feedback = await self._integrate(
-                        task, implementation, span
+                        if done:
+                            self._commit_wip(task)
+                else:
+                    implementation = await self.engineer.implement(
+                        task,
+                        design,
+                        feedback,
+                        workspace_listing=[
+                            f
+                            for f in self.workspace.list_files()
+                            if not f.startswith(_INTERNAL_PREFIX)
+                        ],
+                        conventions=self._conventions,
+                        model=model,
                     )
-                    if done:
-                        self._commit_wip(task)
-            else:
-                implementation = await self.engineer.implement(
-                    task,
-                    design,
-                    feedback,
-                    workspace_listing=[
-                        f
-                        for f in self.workspace.list_files()
-                        if not f.startswith(_INTERNAL_PREFIX)
-                    ],
-                    conventions=self._conventions,
-                    model=model,
-                )
-                async with self._integration_lock:
-                    done, review, test_report, feedback = await self._integrate(
-                        task, implementation, span
-                    )
-                    if done:
-                        self._commit_wip(task)
+                    async with self._integration_lock:
+                        done, review, test_report, feedback = await self._integrate(
+                            task, implementation, span
+                        )
+                        if done:
+                            self._commit_wip(task)
 
-            if done:
-                task.status = TaskStatus.DONE
-                self._record_progress(task)
-                self.tracer.end(span, "done")
-                return TaskResult(task, attempts, implementation, review, test_report)
+                if done:
+                    task.status = TaskStatus.DONE
+                    self._record_progress(task)
+                    self.tracer.end(span, "done")
+                    return TaskResult(task, attempts, implementation, review, test_report)
 
-        task.status = TaskStatus.FAILED
-        return TaskResult(task, attempts, implementation, review, test_report)
+            task.status = TaskStatus.FAILED
+            return TaskResult(task, attempts, implementation, review, test_report)
+        finally:
+            await self._close_session(task.id)
 
     async def _develop_task_in_worktree(
         self,
@@ -1304,6 +1364,8 @@ class DeliveryEngine:
                     conventions=self._conventions,
                     model=self._attempt_model(attempts),
                     tools=self.config.engineer_tools,
+                    task_key=self._session_task_key(task.id),
+                    continuation=self._session_continuation(attempts),
                 )
                 done, review, test_report, feedback = await self._integrate(
                     task,
@@ -1328,6 +1390,7 @@ class DeliveryEngine:
             task.status = TaskStatus.FAILED
             return TaskResult(task, attempts, implementation, review, test_report)
         finally:
+            await self._close_session(task.id)
             async with self._integration_lock:
                 self.git.worktree_remove(wt_path)
                 self.git.delete_branch(task_branch)

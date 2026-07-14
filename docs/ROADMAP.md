@@ -107,6 +107,25 @@ it just isn't used for engineering attempts yet.)
 **Shape:** a session-holding `AgentRunner` built on `ClaudeSDKClient`, keyed
 per task, with explicit reset on rollback.
 
+**Shipped (v1, opt-in, engineer-only):** `SessionAgentRunner` (`sdk.py`) wraps
+one persistent `ClaudeSDKClient` per task key, mirroring `ClaudeChatBackend`'s
+proven connect/query/receive/disconnect shape. `DeliveryEngine` substitutes it
+for the engineer's runner only, and only when `EngineConfig.session_continuity`
+(`--session-continuity`) is set — default `False`, behaviour then provably
+unchanged. Attempt 1 sends the full task/conventions prompt as today; attempt
+2+ on the same task key reuses the connected client and sends just the review
+feedback as a follow-up turn. The session is torn down (`close(task_key)`)
+whenever the task's attempt loop exits, for any reason. Fail-secure on a
+dropped connection or a model change (`EngineConfig.escalation_model` on the
+final attempt — a client's model is fixed at `connect()`): the stale client is
+discarded and a fresh one is connected, replaying the task's full prompt
+history so the attempt still carries full context.
+
+**Remaining:** flipping the default once observed safe in the field; the same
+primitive for other roles if/when they gain their own retry loops; a
+scorecard field surfacing turns saved by continuity; continuity across the
+worktree squash-merge/re-gate cycle.
+
 ## 6. LLM retrospectives & benchmark history
 
 **Why:** v0.5's retrospectives are deterministic distillations, and evals run

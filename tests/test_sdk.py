@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 from claude_agent_sdk import ProcessError
@@ -13,6 +14,7 @@ from dev_team.sdk import (
     AgentResult,
     AgentRunner,
     ClaudeAgentRunner,
+    SessionAgentRunner,
     build_options,
     extract_text,
 )
@@ -190,3 +192,277 @@ def test_runner_never_swallows_cancellation(monkeypatch):
 
     with pytest.raises(asyncio.CancelledError):
         run(scenario())
+
+
+# --- SessionAgentRunner --------------------------------------------------
+
+
+class _SessionBlock:
+    def __init__(self, text):
+        self.text = text
+
+
+class _SessionMessage:
+    """A minimal message: text content only, no cost/model metadata."""
+
+    def __init__(self, texts):
+        self.content = [_SessionBlock(t) for t in texts]
+
+
+class _SessionResultMessage:
+    """A message carrying the cost/model/result metadata a real SDK result has."""
+
+    def __init__(
+        self,
+        texts,
+        *,
+        model=None,
+        total_cost_usd=None,
+        num_turns=0,
+        is_error=False,
+        result=None,
+    ):
+        self.content = [_SessionBlock(t) for t in texts]
+        self.model = model
+        self.total_cost_usd = total_cost_usd
+        self.num_turns = num_turns
+        self.is_error = is_error
+        self.result = result
+
+
+def _session_client_factory(responses):
+    """A fake ``ClaudeSDKClient`` factory; ``responses`` is popped per query().
+
+    An item that is an exception instance is raised from ``receive_response``
+    instead of yielded, simulating a dropped connection.
+    """
+
+    instances = []
+
+    class _Client:
+        def __init__(self, options):
+            self.options = options
+            self.connected = False
+            self.queries = []
+            instances.append(self)
+
+        async def connect(self):
+            self.connected = True
+
+        async def query(self, text):
+            self.queries.append(text)
+
+        async def receive_response(self):
+            item = responses.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            yield _SessionMessage([item])
+
+        async def disconnect(self):
+            self.connected = False
+
+    _Client.instances = instances
+    return _Client
+
+
+def test_session_agent_runner_satisfies_protocol():
+    assert isinstance(SessionAgentRunner(), AgentRunner)
+
+
+def test_session_runner_reuses_client_for_same_key():
+    client_cls = _session_client_factory(["one", "two"])
+    runner = SessionAgentRunner(client_factory=client_cls)
+
+    first = run(runner.run("hi", task_key="T1"))
+    second = run(runner.run("again", task_key="T1"))
+
+    assert first.text == "one"
+    assert second.text == "two"
+    assert len(client_cls.instances) == 1  # same client instance, two turns
+    assert client_cls.instances[0].queries == ["hi", "again"]
+
+
+def test_session_runner_isolates_different_keys():
+    client_cls = _session_client_factory(["a", "b"])
+    runner = SessionAgentRunner(client_factory=client_cls)
+
+    run(runner.run("hi", task_key="T1"))
+    run(runner.run("hi2", task_key="T2"))
+
+    assert len(client_cls.instances) == 2
+    assert client_cls.instances[0].queries == ["hi"]
+    assert client_cls.instances[1].queries == ["hi2"]
+
+
+def test_session_runner_close_disconnects_and_a_later_call_reconnects():
+    client_cls = _session_client_factory(["a", "b"])
+    runner = SessionAgentRunner(client_factory=client_cls)
+
+    run(runner.run("hi", task_key="T1"))
+    first_client = client_cls.instances[0]
+    run(runner.close("T1"))
+    assert first_client.connected is False
+
+    run(runner.run("again", task_key="T1"))
+    assert len(client_cls.instances) == 2
+    assert client_cls.instances[1] is not first_client
+
+
+def test_session_runner_close_without_a_session_is_a_noop():
+    runner = SessionAgentRunner(client_factory=_session_client_factory([]))
+    run(runner.close("never-opened"))  # must not raise
+
+
+def test_session_runner_falls_back_on_dropped_continuation():
+    client_cls = _session_client_factory(
+        ["first", ProcessError("dropped", exit_code=1), "recovered"]
+    )
+    runner = SessionAgentRunner(client_factory=client_cls)
+
+    first = run(runner.run("full context", task_key="T1"))
+    second = run(runner.run("just feedback", task_key="T1"))
+
+    assert first.text == "first"
+    assert second.text == "recovered"
+    assert second.is_error is False
+    assert len(client_cls.instances) == 2  # stale client discarded, fresh one used
+    assert client_cls.instances[0].connected is False
+    # the fresh session replayed the FULL history, not just this turn's
+    # compact prompt — the whole point of session continuity is that the
+    # caller may have sent only the feedback text this turn.
+    assert client_cls.instances[1].queries == ["full context\n\njust feedback"]
+
+
+def test_session_runner_reconnects_on_model_mismatch():
+    client_cls = _session_client_factory(["first", "escalated"])
+    runner = SessionAgentRunner(client_factory=client_cls)
+
+    run(runner.run("full context", task_key="T1", model="base-model"))
+    second = run(
+        runner.run("just feedback", task_key="T1", model="strong-model")
+    )
+
+    assert second.text == "escalated"
+    assert len(client_cls.instances) == 2
+    # the stale (wrong-model) client was discarded, never queried again
+    assert client_cls.instances[0].connected is False
+    assert client_cls.instances[0].queries == ["full context"]
+    # the new client was connected with the escalated model and carries
+    # full context (attempt 1's prompt + this turn's), not just this turn's
+    assert client_cls.instances[1].options.model == "strong-model"
+    assert client_cls.instances[1].queries == ["full context\n\njust feedback"]
+
+
+def test_session_runner_without_task_key_is_one_shot():
+    client_cls = _session_client_factory(["solo"])
+    runner = SessionAgentRunner(client_factory=client_cls)
+
+    result = run(runner.run("hi"))
+
+    assert result.text == "solo"
+    assert len(client_cls.instances) == 1
+    assert client_cls.instances[0].connected is False  # disconnected after use
+
+
+def test_session_runner_first_call_error_becomes_error_result():
+    client_cls = _session_client_factory([ProcessError("boom", exit_code=1)])
+    runner = SessionAgentRunner(client_factory=client_cls)
+
+    result = run(runner.run("hi", task_key="T1"))
+
+    assert result.is_error is True
+    assert "ProcessError" in result.text
+
+
+def test_session_runner_times_out_to_error_result():
+    class _SlowClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def connect(self):
+            pass
+
+        async def query(self, text):
+            await asyncio.sleep(30)
+
+        async def receive_response(self):
+            if False:  # pragma: no cover - never reached; makes this a generator
+                yield None
+
+        async def disconnect(self):
+            pass
+
+    runner = SessionAgentRunner(client_factory=_SlowClient, timeout_seconds=0.01)
+    result = run(runner.run("hi", task_key="T1"))
+    assert result.is_error is True
+    assert "TimeoutError" in result.text
+
+
+def test_session_runner_connects_with_expected_options():
+    client_cls = _session_client_factory(["x"])
+    runner = SessionAgentRunner(client_factory=client_cls)
+
+    run(
+        runner.run(
+            "hi",
+            task_key="T1",
+            system_prompt="sys",
+            allowed_tools=["Read"],
+            model="m",
+            cwd="/wd",
+        )
+    )
+
+    options = client_cls.instances[0].options
+    assert options.system_prompt == "sys"
+    assert options.allowed_tools == ["Read"]
+    assert options.model == "m"
+    assert options.cwd == "/wd"
+    assert options.permission_mode == "acceptEdits"
+
+
+def test_session_runner_captures_cost_and_model_metadata():
+    class _MetaClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def connect(self):
+            pass
+
+        async def query(self, text):
+            pass
+
+        async def receive_response(self):
+            yield _SessionResultMessage(["hi"], model="claude-real")
+            yield _SessionResultMessage(
+                [],
+                total_cost_usd=0.25,
+                num_turns=2,
+                is_error=False,
+                result="done",
+            )
+
+        async def disconnect(self):
+            pass
+
+    runner = SessionAgentRunner(client_factory=_MetaClient)
+    result = run(runner.run("prompt", task_key="T1"))
+
+    assert result.text == "hi\ndone"
+    assert result.cost_usd == 0.25
+    assert result.num_turns == 2
+    assert result.model == "claude-real"
+    assert result.is_error is False
+
+
+def test_session_runner_needs_no_special_credentials(monkeypatch):
+    # Same construction path as the already-accepted ClaudeChatBackend/
+    # ClaudeSDKClient: no env var is read, so an empty environment works fine
+    # as long as a client factory is supplied (as the real one is, in prod).
+    monkeypatch.setattr(os, "environ", {})
+    client_cls = _session_client_factory(["ok"])
+    runner = SessionAgentRunner(client_factory=client_cls)
+
+    result = run(runner.run("hi", task_key="T1"))
+
+    assert result.text == "ok"

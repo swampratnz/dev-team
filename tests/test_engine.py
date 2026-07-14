@@ -747,6 +747,277 @@ def test_agentic_can_be_disabled_on_local_workspace(tmp_path):
     assert engine.agentic is False
 
 
+# --- session continuity (ROADMAP #5) ---------------------------------------
+
+
+class _SessionBlock:
+    def __init__(self, text):
+        self.text = text
+
+
+class _SessionMessage:
+    def __init__(self, texts):
+        self.content = [_SessionBlock(t) for t in texts]
+
+
+def _session_client_factory(turns):
+    """A fake ``ClaudeSDKClient`` factory for ``SessionAgentRunner`` tests.
+
+    ``turns`` is consumed one per ``query()`` call, in order: an item is
+    either an exception instance (raised from ``receive_response``, e.g. a
+    dropped connection) or a ``(response_text, effect)`` pair, where
+    ``effect`` — when not ``None`` — is called first (mirroring how a real
+    agentic engineer's tool calls write files as a side effect before its
+    final JSON answer).
+    """
+
+    instances = []
+
+    class _Client:
+        def __init__(self, options):
+            self.options = options
+            self.connected = False
+            self.queries = []
+            instances.append(self)
+
+        async def connect(self):
+            self.connected = True
+
+        async def query(self, text):
+            self.queries.append(text)
+
+        async def receive_response(self):
+            item = turns.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            text, effect = item
+            if effect is not None:
+                effect()
+            yield _SessionMessage([text])
+
+        async def disconnect(self):
+            self.connected = False
+
+    _Client.instances = instances
+    return _Client
+
+
+def test_session_continuity_wires_only_the_engineers_runner(tmp_path):
+    from dev_team.sdk import SessionAgentRunner
+
+    runner = ScriptedRunner([])
+    engine = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(session_continuity=True),
+    )
+
+    assert isinstance(engine.engineer.runner.inner, SessionAgentRunner)
+    assert engine.engineer.runner.inner is engine._session_runner
+    for role in (
+        engine.manager,
+        engine.architect,
+        engine.reviewer,
+        engine.qa,
+        engine.security,
+        engine.writer,
+        engine.sre,
+        engine.devops,
+    ):
+        assert role.runner.inner is runner
+
+
+def test_session_continuity_off_never_constructs_a_session_runner(tmp_path, monkeypatch):
+    import dev_team.engine as engine_module
+
+    def _must_not_construct(*args, **kwargs):
+        raise AssertionError(
+            "SessionAgentRunner must not be constructed when session_continuity=False"
+        )
+
+    monkeypatch.setattr(engine_module, "SessionAgentRunner", _must_not_construct)
+
+    ws = LocalWorkspace(str(tmp_path))
+
+    class AgenticRunner(KeyedQueueRunner):
+        """Engineer 'does the work': writes the file as a tool side effect."""
+
+        async def run(self, prompt, *, system_prompt=None, **kwargs):
+            if system_prompt and "senior software engineer" in system_prompt:
+                (tmp_path / "a.py").write_text("x = 1\n")
+            return await super().run(prompt, system_prompt=system_prompt, **kwargs)
+
+    mapping = {
+        "product manager": [json_response(__plan())],
+        "software architect": [json_response(__design())],
+        "senior software engineer": [json_response(__impl()), json_response(__impl())],
+        "code reviewer": [json_response(__review(False)), json_response(__review(True))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    runner = AgenticRunner(mapping)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        # session_continuity defaults to False: not set here.
+        config=EngineConfig(
+            max_task_attempts=2, qa_tests=False, fail_to_pass_check=False
+        ),
+    )
+
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.task_results[0].attempts == 2  # genuinely multi-attempt
+    assert engine._session_runner is None
+    assert engine.engineer.runner.inner is runner
+
+
+def _session_continuity_engine(tmp_path, *, reviewer_responses, max_task_attempts=2):
+    ws = LocalWorkspace(str(tmp_path))
+    runner = KeyedQueueRunner({"code reviewer": list(reviewer_responses)})
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(
+            session_continuity=True,
+            qa_tests=False,
+            fail_to_pass_check=False,
+            max_task_attempts=max_task_attempts,
+            verify_command=("true",),
+        ),
+    )
+    return engine
+
+
+def test_session_continuity_closes_after_task_success_on_first_attempt(tmp_path):
+    engine = _session_continuity_engine(tmp_path, reviewer_responses=[json_response(__review(True))])
+    client_cls = _session_client_factory(
+        [(json_response(__impl()), lambda: (tmp_path / "a.py").write_text("x = 1\n"))]
+    )
+    engine._session_runner.client_factory = client_cls
+
+    task = Task(id="T1", title="Core", description="d", acceptance_criteria=["works"])
+    result = run(engine._attempt_task(task, Design(overview="o")))
+
+    assert result.succeeded is True
+    assert result.attempts == 1
+    assert len(client_cls.instances) == 1
+    assert engine._session_runner._sessions == {}  # closed on the success exit
+    assert client_cls.instances[0].connected is False
+
+
+def test_session_continuity_sends_compact_prompt_on_retry(tmp_path):
+    # attempt 1 rejected, attempt 2 approved: exercises the retry-with-
+    # continuity path end to end (AC5), and the success-after-retry close (AC4).
+    engine = _session_continuity_engine(
+        tmp_path,
+        reviewer_responses=[json_response(__review(False)), json_response(__review(True))],
+    )
+    client_cls = _session_client_factory(
+        [
+            (json_response(__impl()), lambda: (tmp_path / "a.py").write_text("x = 1\n")),
+            (json_response(__impl()), None),
+        ]
+    )
+    engine._session_runner.client_factory = client_cls
+
+    task = Task(id="T1", title="Core", description="d", acceptance_criteria=["works"])
+    result = run(engine._attempt_task(task, Design(overview="o")))
+
+    assert result.succeeded is True
+    assert result.attempts == 2
+    assert len(client_cls.instances) == 1  # one session, reused across both attempts
+    prompts = client_cls.instances[0].queries
+    assert len(prompts) == 2
+    # attempt 1 carries the full task/design context
+    assert "Core" in prompts[0]
+    assert "Design overview" in prompts[0]
+    # attempt 2 is compact: just the review feedback, none of attempt 1's
+    # task/design/acceptance-criteria content a fresh full-context prompt
+    # would include
+    assert "Design overview" not in prompts[1]
+    assert "Acceptance criteria" not in prompts[1]
+    assert "previous attempt was rejected" in prompts[1]
+    assert engine._session_runner._sessions == {}  # closed after success
+
+
+def test_session_continuity_closes_after_attempts_exhausted(tmp_path):
+    engine = _session_continuity_engine(
+        tmp_path,
+        reviewer_responses=[json_response(__review(False))],
+        max_task_attempts=2,
+    )
+    client_cls = _session_client_factory(
+        [
+            (json_response(__impl()), lambda: (tmp_path / "a.py").write_text("x = 1\n")),
+            (json_response(__impl()), None),
+        ]
+    )
+    engine._session_runner.client_factory = client_cls
+
+    task = Task(id="T1", title="Core", description="d", acceptance_criteria=["works"])
+    result = run(engine._attempt_task(task, Design(overview="o")))
+
+    assert result.succeeded is False
+    assert result.attempts == 2
+    assert len(client_cls.instances) == 1  # same session across both failed attempts
+    assert engine._session_runner._sessions == {}  # closed once attempts exhaust
+    assert client_cls.instances[0].connected is False
+
+
+def test_session_continuity_closes_after_unhandled_exception(tmp_path):
+    engine = _session_continuity_engine(
+        tmp_path, reviewer_responses=[json_response(__review(True))]
+    )
+    client_cls = _session_client_factory([RuntimeError("boom")])
+    engine._session_runner.client_factory = client_cls
+
+    task = Task(id="T1", title="Core", description="d", acceptance_criteria=["works"])
+    with pytest.raises(RuntimeError, match="boom"):
+        run(engine._attempt_task(task, Design(overview="o")))
+
+    assert engine._session_runner._sessions == {}  # closed even on an exception
+    assert client_cls.instances[0].connected is False
+
+
+def test_session_continuity_falls_back_to_escalated_model_with_full_context(tmp_path):
+    # session_continuity + escalation_model together: the final attempt must
+    # reconnect fresh on the escalated model rather than silently continuing
+    # the session on the original one (AC7's engine-level counterpart).
+    engine = _session_continuity_engine(
+        tmp_path,
+        reviewer_responses=[json_response(__review(False)), json_response(__review(True))],
+        max_task_attempts=2,
+    )
+    engine.config.escalation_model = "strong-model"
+    client_cls = _session_client_factory(
+        [
+            (json_response(__impl()), lambda: (tmp_path / "a.py").write_text("x = 1\n")),
+            (json_response(__impl()), None),
+        ]
+    )
+    engine._session_runner.client_factory = client_cls
+
+    task = Task(id="T1", title="Core", description="d", acceptance_criteria=["works"])
+    result = run(engine._attempt_task(task, Design(overview="o")))
+
+    assert result.succeeded is True
+    assert len(client_cls.instances) == 2  # the stale (base-model) client was discarded
+    assert client_cls.instances[0].connected is False
+    assert client_cls.instances[1].options.model == "strong-model"
+    # the reconnected client still carries full context, not just attempt 2's
+    # compact prompt, even though that is all _attempt_task itself sent
+    assert "Design overview" in client_cls.instances[1].queries[0]
+    assert engine._session_runner._sessions == {}
+
+
 # --- defaults & wiring ----------------------------------------------------
 
 
