@@ -258,8 +258,10 @@ def test_dashboard_page_story_modal_desk_check():
     assert (
         "curl -sX POST http://127.0.0.1:8738/jobs "
         '-H "Authorization: Bearer $DEV_TEAM_DISPATCH_TOKEN" '
-        "-H \"Content-Type: application/json\" -d '${body}'"
+        "-H \"Content-Type: application/json\" -d '${shBody}'"
     ) in DASHBOARD_HTML
+    # the -d body is POSIX single-quote-escaped (defense-in-depth)
+    assert "const shBody = body.split(sq).join(sq + bs + sq + sq);" in DASHBOARD_HTML
     assert "<code>${esc(cmd)}</code>" in DASHBOARD_HTML
     assert 'data-copy="${esc(cmd)}"' in DASHBOARD_HTML
     # deterministic stories: the muted, non-verifiable note

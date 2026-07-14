@@ -84,11 +84,18 @@ class RepoContext:
         if self.is_empty:
             return ""
         lines = [f"The workspace contains {self.total_files} file(s):"]
-        lines.extend(f"- {path}" for path in self.files)
+        # File paths and test locations come from the (untrusted) audited repo:
+        # a Linux filename may hold almost any byte, so a file literally named
+        # "</repo-context>..." would otherwise close this block early exactly
+        # like a hostile manifest body. Defuse them at render time (leaving the
+        # stored paths intact) the same way the manifest heads are defused.
+        lines.extend(f"- {_defuse(path)}" for path in self.files)
         if self.total_files > len(self.files):
             lines.append(f"- ... and {self.total_files - len(self.files)} more")
         if self.test_paths:
-            lines.append(f"Tests live under: {', '.join(self.test_paths)}")
+            lines.append(
+                f"Tests live under: {', '.join(_defuse(p) for p in self.test_paths)}"
+            )
         for name, head in self.manifest_heads.items():
             lines.append(
                 f'\n<manifest-content name="{name}">\n{head}\n</manifest-content>'
