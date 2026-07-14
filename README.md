@@ -89,7 +89,10 @@ QA, security, docs, reliability, and deployment.
   `packages.lock.json`) are checked against OSV.dev in one batch call
   (graceful offline fallback, `--no-osv-scan` to opt out), so CVE findings
   cite advisories, not recollections — and range-specified projects still
-  get their resolved versions scanned.
+  get their resolved versions scanned. Detected Node.js/Python/.NET runtime
+  versions get the same treatment against endoflife.date
+  (`--no-eol-scan` to opt out), so EOL/support-status findings for those
+  three runtimes are live too, not just training-data recollections.
 - ✅ **Learns the house style and follows it** — assessment captures a cited
   conventions profile (naming, layout, test patterns, plus `.editorconfig` /
   ReSharper `.DotSettings` / linter configs), persists it, and every later

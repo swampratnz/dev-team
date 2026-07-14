@@ -200,6 +200,18 @@ sections below are reconstructed from the repository history.
   when set, so pre-existing custom runners keep working.
 
 ### Assessment
+- **Live EOL/support-status scanning via endoflife.date** (`eolscan.py`,
+  mirroring `depscan.py`'s shape): Node.js/Python/.NET runtime versions
+  parsed deterministically from `package.json` (`engines.node`),
+  `.nvmrc`, `runtime.txt`, `.python-version`, or `global.json`
+  (`sdk.version`) are checked against endoflife.date, one request per
+  distinct detected product. Offline, a failed query, or an unresolved
+  release cycle degrades to a labelled model-knowledge/`unknown`
+  fallback rather than guessing; `--no-eol-scan` /
+  `AssessConfig.eol_scan` opts out. Findings land in the evidence block,
+  the report appendix, `--json` (`eol_scan`), and the report footer now
+  states which mode (live vs. model-knowledge) produced the EOL claims
+  alongside the existing OSV.dev CVE note.
 - **`rebuild` is a first-class classification**: the recommendation phase's
   fixed vocabulary now distinguishes an incremental `strangler-rewrite`
   from a big-bang `rebuild` (build a replacement from scratch; the old

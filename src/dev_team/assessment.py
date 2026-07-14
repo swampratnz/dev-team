@@ -54,6 +54,7 @@ from .conventions import (
 )
 from .deadcode import DeadCodeReport, detect_dead_code
 from .depscan import DependencyScan, Fetch, scan_dependencies
+from .eolscan import EolScan, Fetch as EolFetch, scan_eol
 from .errors import AgentResponseError, DevTeamError
 from .events import AgentEvent, Listener, emit
 from .execution import (
@@ -460,6 +461,9 @@ class AssessConfig:
         max_components: Cap on parallel component deep-dives.
         osv_scan: Query OSV.dev about exactly-pinned dependencies parsed
             from manifests (degrades gracefully offline).
+        eol_scan: Query endoflife.date about detected runtime versions
+            (Node.js/Python/.NET, parsed from manifests) (degrades
+            gracefully offline).
         save_conventions: Persist the captured house-conventions profile to
             ``.dev_team/conventions.json`` so later delivery runs follow it.
             This, the report, and the persisted result are the assessment's
@@ -492,6 +496,7 @@ class AssessConfig:
     component_fanout: bool = False
     max_components: int = 12
     osv_scan: bool = True
+    eol_scan: bool = True
     save_conventions: bool = True
     persist_result: bool = True
     update_backlog: bool = False
@@ -631,6 +636,7 @@ class AssessmentOutcome:
     aborted: bool = False
     dead_code: DeadCodeReport = field(default_factory=DeadCodeReport)
     dependency_scan: DependencyScan = field(default_factory=DependencyScan)
+    eol_scan: EolScan = field(default_factory=EolScan)
     detected_components: List[Component] = field(default_factory=list)
     conventions: Optional[ConventionsProfile] = None
     backlog_stories: List[str] = field(default_factory=list)
@@ -699,6 +705,7 @@ class AssessmentEngine:
         interaction: Optional[InteractionChannel] = None,
         command_runner: Optional[CommandRunner] = None,
         osv_fetch: Optional[Fetch] = None,
+        eol_fetch: Optional[EolFetch] = None,
         transcript_recorder: Optional[TranscriptRecorder] = None,
     ) -> None:
         self.workspace: Workspace = workspace or InMemoryWorkspace()
@@ -723,6 +730,7 @@ class AssessmentEngine:
                 self.command_runner, self.config.sandbox
             )
         self._osv_fetch = osv_fetch
+        self._eol_fetch = eol_fetch
 
         def make(cls):
             wrapped = InstrumentedRunner(
@@ -864,6 +872,15 @@ class AssessmentEngine:
                 f"OSV scan: {len(scan.vulnerabilities)} vulnerability record(s) "
                 f"across {len(scan.dependencies)} pinned dependencies",
             )
+        eol_scan = scan_eol(
+            self.workspace, fetch=self._eol_fetch, enabled=self.config.eol_scan
+        )
+        if eol_scan.queried:
+            self._event(
+                "eol",
+                f"EOL scan: {len(eol_scan.runtimes)} detected runtime(s) checked "
+                "against endoflife.date",
+            )
         components = detect_components(self.workspace, excludes)
         convention_sources = detect_convention_sources(self.workspace)
         ctx = build_repo_context(
@@ -879,6 +896,7 @@ class AssessmentEngine:
                 _components_block(components),
                 dead_code.render(),
                 scan.render(),
+                eol_scan.render(),
                 build_probe.render(),
             )
             if part
@@ -915,6 +933,7 @@ class AssessmentEngine:
                 aborted=True,
                 dead_code=dead_code,
                 dependency_scan=scan,
+                eol_scan=eol_scan,
                 detected_components=components,
                 build_probe=build_probe,
             )
@@ -984,6 +1003,7 @@ class AssessmentEngine:
             focus=focus,
             dead_code=dead_code,
             dependency_scan=scan,
+            eol_scan=eol_scan,
             detected_components=components,
             conventions=conventions_profile,
             build_probe=build_probe,
@@ -1132,6 +1152,7 @@ class AssessmentEngine:
         aborted: bool = False,
         dead_code: Optional[DeadCodeReport] = None,
         dependency_scan: Optional[DependencyScan] = None,
+        eol_scan: Optional[EolScan] = None,
         detected_components: Optional[List[Component]] = None,
         conventions: Optional[ConventionsProfile] = None,
         build_probe: Optional[BuildProbe] = None,
@@ -1150,6 +1171,7 @@ class AssessmentEngine:
             aborted=aborted,
             dead_code=dead_code,
             dependency_scan=dependency_scan or DependencyScan(),
+            eol_scan=eol_scan or EolScan(),
             detected_components=list(detected_components or []),
             conventions=conventions,
             build_probe=build_probe or BuildProbe(),
@@ -1191,6 +1213,7 @@ def outcome_to_dict(outcome: AssessmentOutcome) -> Dict:
         },
         "dead_code": outcome.dead_code.to_dict(),
         "dependency_scan": outcome.dependency_scan.to_dict(),
+        "eol_scan": outcome.eol_scan.to_dict(),
         "build_probe": outcome.build_probe.to_dict(),
         "blind_spots": list(outcome.blind_spots),
         "broken_citations": dict(outcome.broken_citations),
@@ -2114,6 +2137,7 @@ def render_report(outcome: AssessmentOutcome) -> str:
     for block in (
         outcome.dead_code.render(),
         outcome.dependency_scan.render(),
+        outcome.eol_scan.render(),
         outcome.build_probe.render(),
     ):
         if block:
@@ -2137,15 +2161,32 @@ def render_report(outcome: AssessmentOutcome) -> str:
             + ". Treat the underlying claim as unconfirmed, not just imprecisely cited.",
         ]
     lines.append("")
-    if outcome.dependency_scan.queried:
-        lines.append(
-            f"_Cost: ${outcome.cost_usd:.4f}. Dependency findings include a live "
-            "OSV.dev vulnerability scan of the exactly-pinned dependencies; other "
-            "CVE/EOL observations come from model knowledge._"
-        )
-    else:
-        lines.append(
-            f"_Cost: ${outcome.cost_usd:.4f}. Dependency/CVE observations come from "
-            "model knowledge, not a live vulnerability scan._"
-        )
+    lines.append(f"_Cost: ${outcome.cost_usd:.4f}. " + _live_scan_footer(outcome) + "_")
     return "\n".join(lines)
+
+
+def _live_scan_footer(outcome: AssessmentOutcome) -> str:
+    """Which CVE/EOL claims are live-checked vs. model knowledge."""
+
+    osv_live = outcome.dependency_scan.queried
+    eol_live = outcome.eol_scan.queried
+    if osv_live and eol_live:
+        return (
+            "Dependency findings include a live OSV.dev vulnerability scan of "
+            "the exactly-pinned dependencies and a live endoflife.date "
+            "EOL/support-status check of detected runtimes; other CVE "
+            "observations come from model knowledge."
+        )
+    if osv_live:
+        return (
+            "Dependency findings include a live OSV.dev vulnerability scan of "
+            "the exactly-pinned dependencies; other CVE/EOL observations come "
+            "from model knowledge."
+        )
+    if eol_live:
+        return (
+            "EOL/support-status findings include a live endoflife.date check "
+            "of detected runtimes; other CVE/EOL observations come from "
+            "model knowledge."
+        )
+    return "Dependency/CVE/EOL observations come from model knowledge, not a live scan."

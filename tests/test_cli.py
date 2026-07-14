@@ -752,6 +752,7 @@ def test_main_assess_new_flags_reach_config(tmp_path, capsys):
             "--max-tree-entries", "50",
             "--component-fanout",
             "--no-osv-scan",
+            "--no-eol-scan",
             "--backlog",
             "--no-conventions",
             "--json",
@@ -762,6 +763,7 @@ def test_main_assess_new_flags_reach_config(tmp_path, capsys):
     assert code == 0
     assert "junk/vendored.cs" not in json.dumps(payload["stats"])
     assert payload["dependency_scan"]["error"] == "scan disabled"
+    assert payload["eol_scan"]["error"] == "scan disabled"
     assert "components" in payload["phases"]
     assert payload["backlog_stories"]
     assert (repo / ".dev_team" / "backlog.json").exists()
@@ -792,6 +794,7 @@ def test_assess_only_flags_rejected_outside_assess():
         ["--max-tree-entries", "50"],
         ["--component-fanout"],
         ["--no-osv-scan"],
+        ["--no-eol-scan"],
         ["--backlog"],
         ["--no-conventions"],
         ["--build-probe"],
