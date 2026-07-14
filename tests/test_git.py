@@ -254,3 +254,24 @@ def test_push_raises_when_rejected():
     )
     with pytest.raises(GitError, match="git push"):
         GitRepo(cmd).push("dev-team/feat")
+
+
+def test_push_scrubs_credential_from_rejection_output():
+    # A verbose/GIT_TRACE run can echo the AUTHORIZATION: basic <base64> header
+    # (the credential push carries in env) back into git's output. The scrub
+    # redactor the token-owning caller supplies must strip it before it reaches
+    # the GitError, so a credential can never land in an error message — and
+    # from there in the event log, transcript, or an outcome report.
+    secret = "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hwX3NlY3JldA=="
+    cmd = FakeCommandRunner().add_rule(
+        "push",
+        CommandResult(["git", "push"], 128, "", f"fatal: rejected; sent header {secret}"),
+    )
+    with pytest.raises(GitError) as exc:
+        GitRepo(cmd).push(
+            "dev-team/feat",
+            env={"GIT_CONFIG_VALUE_0": secret},
+            scrub=lambda text: text.replace(secret, "***"),
+        )
+    msg = str(exc.value)
+    assert secret not in msg and "***" in msg
