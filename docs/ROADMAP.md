@@ -23,7 +23,7 @@ assessment with cited, phased audit reports (see `docs/ASSESSMENT.md`) — and
 items below are the known, deliberately deferred capabilities, roughly in
 priority order.
 
-## 1. Container-level sandboxing
+## 1. Container-level sandboxing *(in progress)*
 
 **Why:** running agent-authored tests is arbitrary code execution.
 `SideEffectPolicy` is defence-in-depth, not containment — and the agentic
@@ -33,6 +33,16 @@ engineer's own Bash tool is bounded only by SDK permissions and `max_turns`.
 container (no credentials, no network by default, workspace bind-mounted),
 so the isolation boundary matches the trust boundary; the same container
 hosts the engineer's tool loop.
+
+**Status:** the primitive has landed — `ContainerCommandRunner` +
+`SandboxConfig` (`dev_team.sandbox`, see [`docs/SANDBOX.md`](SANDBOX.md)): it
+wraps any `CommandRunner`, boxes every non-`git` command in a `docker`/`podman`
+run with no network, dropped capabilities, no-new-privileges and resource
+limits, and mounts only the workspace, while git porcelain stays on the host.
+Remaining phases: **(b)** wire it into the delivery gates / build probe and a
+`--sandbox` CLI opt-in (a gate/probe runner distinct from the host git runner);
+**(c)** deployment wiring so the engineer's own SDK tool loop runs inside the
+box too (process-level, since that loop bypasses the `CommandRunner`).
 
 ## 2. PR / CI integration
 
