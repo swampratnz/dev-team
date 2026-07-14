@@ -99,6 +99,14 @@ sections below are reconstructed from the repository history.
   The dashboard gained a "delete permanently" button on each archived run
   row, behind the same two-step confirm the backlog's story-delete already
   uses (`docs/DASHBOARD.md`).
+- **Spend rollup** (`docs/DISPATCH.md`): `GET /costs`, a pure, $0,
+  in-memory aggregate summing `cost_usd` across every `succeeded`/`failed`
+  job into `total_usd`, `by_mode`, and `jobs_counted`. Unlike
+  `GET /calibration`, this rolls up the in-memory registry rather than
+  disk — `deliver` job cost is never mirrored to disk, so a disk walk
+  would silently under-report. Respects the same archived-exclusion
+  (`?archived=1`) as `GET /jobs`, and needs no dashboard workspace to
+  answer (archived-exclusion simply no-ops without one).
 
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the
