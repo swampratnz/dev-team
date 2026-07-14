@@ -236,3 +236,34 @@ def test_render_delivery_summary_shows_branch():
 def test_render_delivery_summary_halted_without_baseline():
     text = render_delivery_summary(_outcome(halted_reason="working tree is dirty"))
     assert "Halted:  working tree is dirty" in text
+
+
+def test_delivery_to_dict_includes_unverified_claims_when_present():
+    from dev_team.models import Documentation
+
+    outcome = _outcome(documentation=Documentation(summary="d", unverified_claims=["docs/x.md: cites 'y.py'"]))
+    data = delivery_to_dict(outcome)
+    assert data["unverified_claims"] == ["docs/x.md: cites 'y.py'"]
+
+
+def test_delivery_to_dict_unverified_claims_empty_without_documentation():
+    assert delivery_to_dict(_outcome())["unverified_claims"] == []
+
+
+def test_render_delivery_summary_shows_unverified_claims_when_present():
+    from dev_team.models import Documentation
+
+    outcome = _outcome(documentation=Documentation(summary="d", unverified_claims=["bad citation"]))
+    text = render_delivery_summary(outcome)
+    assert "Unverified doc claims: 1" in text
+    assert "bad citation" in text
+
+
+def test_render_delivery_summary_omits_unverified_claims_when_absent():
+    from dev_team.models import Documentation
+
+    empty_docs = render_delivery_summary(_outcome(documentation=Documentation(summary="d")))
+    assert "Unverified doc claims" not in empty_docs
+
+    no_docs = render_delivery_summary(_outcome())
+    assert "Unverified doc claims" not in no_docs

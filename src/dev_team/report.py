@@ -116,6 +116,9 @@ def delivery_to_dict(outcome: "DeliveryOutcome") -> Dict[str, Any]:
         "halted_reason": outcome.halted_reason,
         "baseline_green": outcome.baseline.passed if outcome.baseline else None,
         "scorecard": dict(outcome.scorecard),
+        "unverified_claims": (
+            list(outcome.documentation.unverified_claims) if outcome.documentation else []
+        ),
     }
 
 
@@ -155,6 +158,11 @@ def render_delivery_summary(outcome: "DeliveryOutcome") -> str:
     if outcome.scorecard:
         counts = ", ".join(f"{k}={v}" for k, v in sorted(outcome.scorecard.items()))
         lines.append(f"Scorecard: {counts}")
+    if outcome.documentation and outcome.documentation.unverified_claims:
+        lines.append(
+            f"Unverified doc claims: {len(outcome.documentation.unverified_claims)}"
+        )
+        lines.extend(f"  {c}" for c in outcome.documentation.unverified_claims)
     if outcome.budget_exhausted:
         lines.append("Budget: EXHAUSTED (run stopped early; resume to continue)")
     if outcome.resumed_task_ids:

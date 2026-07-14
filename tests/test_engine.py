@@ -108,6 +108,7 @@ def test_deliver_happy_path():
     assert outcome.workspace_files == ["src/x.py", "tests/test_x.py"]
     assert outcome.security.approved is True
     assert outcome.documentation is not None
+    assert outcome.documentation.unverified_claims == []
     assert outcome.reliability.production_ready is True
     assert outcome.deployment is not None
     assert outcome.blackboard.decisions[0].id == "ADR-001"
@@ -115,6 +116,36 @@ def test_deliver_happy_path():
     assert outcome.budget_exhausted is False
     # cross-run memory was persisted
     assert ws.exists(".dev_team/memory.json")
+
+
+def test_deliver_surfaces_unverified_doc_claims_without_blocking():
+    responses = dict(engine_responses())
+    responses["technical writer"] = json_response(
+        {
+            "summary": "d",
+            "sections": [],
+            "files": [
+                {
+                    "path": "docs/feature.md",
+                    "change_type": "create",
+                    "summary": "docs",
+                    "content": "See `src/missing.py` for the implementation.",
+                }
+            ],
+        }
+    )
+    runner = ScriptedRunner(by_system_prompt=responses)
+    ws = InMemoryWorkspace()
+    cmd = FakeCommandRunner()
+    engine = _engine(runner, workspace=ws, git=_git_with_changes(cmd))
+    outcome = run(engine.deliver(_request()))
+
+    # advisory only: the run still succeeds, commits, and the doc file lands
+    assert outcome.success is True
+    assert outcome.committed is True
+    assert "docs/feature.md" in ws.list_files()
+    assert len(outcome.documentation.unverified_claims) == 1
+    assert "src/missing.py" in outcome.documentation.unverified_claims[0]
 
 
 def test_deliver_records_transcripts_when_recorder_is_set():
