@@ -49,7 +49,7 @@ inner runner's timeout handling and secret-env scrubbing.
 | Gate commands (the verify command / agent-authored tests) | ✅ via `--sandbox` |
 | Build probe / setup / dependency-scan commands | ✅ via `--sandbox` |
 | git porcelain (commit, branch, worktree, `git log`) | ❌ by design — host |
-| The agentic engineer's own SDK tool loop (Bash/Edit via the Claude CLI) | ✅ when the whole process runs in a container/VM — see below |
+| The agentic engineer's own SDK tool loop (Bash/Edit via the Claude CLI) | ❌ not by this primitive — needs the outer process container/VM (§5d), see below |
 
 The engineer's tool loop runs via the Claude CLI **on the host**, outside any
 `CommandRunner`, so this primitive cannot box it. Containing *that* means running
