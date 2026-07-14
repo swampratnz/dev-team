@@ -120,6 +120,20 @@ sections below are reconstructed from the repository history.
   cap. A log-write failure (disk full, unwritable jobs root) is swallowed
   at the handler level and never affects a response already sent to the
   caller.
+- **`citation_broken` on every enumerated finding** (`docs/DISPATCH.md`):
+  the follow-up the $0 `broken_citations` check (above) named and deferred
+  on purpose — `list_findings` now joins its own already-persisted
+  `broken_citations` (per-phase, keyed the same way `list_findings`
+  enumerates) onto each finding's `evidence`, so `GET /jobs/{id}/findings`
+  surfaces which findings are already known, at $0, to be citing a
+  fabricated path — before anyone spends a real `verify` job checking one.
+  Pure in-memory dict lookup, no new I/O or agent call. Fail-secure: a
+  missing `broken_citations` key (assessments persisted before #42), a
+  phase absent from it, a malformed (non-list) per-phase value, or empty
+  `evidence` all degrade to `citation_broken: false` rather than raising or
+  over-flagging — under-flagging is the accepted direction, never promoted
+  to a positive signal. `find_finding` inherits the field for free via its
+  existing delegation to `list_findings`.
 
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the

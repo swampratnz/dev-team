@@ -1436,6 +1436,35 @@ def _as_finding(phase: str, role: str, finding_id: str, item: Dict) -> Optional[
     }
 
 
+def _broken_citation_evidence(data: Dict, phase: str) -> List[str]:
+    """The raw broken-citation strings for ``phase``, fail-secure to ``[]``.
+
+    Mirrors the "ambiguous input is never promoted to a positive signal"
+    posture of :func:`broken_citations` itself: a missing ``broken_citations``
+    key (assessments persisted before #42), a phase absent from it, or a
+    malformed (non-list) value for the phase all degrade to "no broken
+    citations" rather than raising.
+    """
+
+    broken_citations = data.get("broken_citations")
+    if not isinstance(broken_citations, dict):
+        return []
+    entries = broken_citations.get(phase)
+    if not isinstance(entries, list):
+        return []
+    return entries
+
+
+def _citation_broken(evidence: str, broken_evidence: List[str]) -> bool:
+    """Whether ``evidence`` exactly matches a phase's broken-citation list.
+
+    Empty evidence never matches — an item with no cited evidence can't be
+    citing a fabricated path.
+    """
+
+    return bool(evidence) and evidence in broken_evidence
+
+
 def list_findings(data: Dict) -> List[Dict]:
     """Enumerate the re-verifiable LLM claims in a serialised assessment.
 
@@ -1444,7 +1473,11 @@ def list_findings(data: Dict) -> List[Dict]:
     enumerated — a failed phase's data is unvalidated (same guard as
     :func:`dict_to_backlog`). Each finding carries a positional id
     (``"risk.secrets[0]"``), the auditing role, the claim text, its cited
-    evidence, and a short content hash of the claim.
+    evidence, a short content hash of the claim, and ``citation_broken`` —
+    ``True`` when that evidence string is one :func:`broken_citations`
+    already flagged as a citation that looks like a bare path but doesn't
+    exist, letting a caller triage which findings are already known, at $0,
+    to be citing a fabricated path (see #56).
     """
 
     phases = data.get("phases") or {}
@@ -1452,14 +1485,19 @@ def list_findings(data: Dict) -> List[Dict]:
     for phase, list_keys in _FINDING_LISTS.items():
         payload = _phase_payload(phases, phase)
         role = str((phases.get(phase) or {}).get("role", ""))
+        broken_evidence = _broken_citation_evidence(data, phase)
         for key in list_keys:
             for index, item in enumerate(_items(payload, key)):
                 finding = _as_finding(phase, role, f"{phase}.{key}[{index}]", item)
                 if finding is not None:
+                    finding["citation_broken"] = _citation_broken(
+                        finding["evidence"], broken_evidence
+                    )
                     findings.append(finding)
     # Component deep-dives nest their findings one level deeper.
     payload = _phase_payload(phases, "components")
     role = str((phases.get("components") or {}).get("role", ""))
+    broken_evidence = _broken_citation_evidence(data, "components")
     for c_index, component in enumerate(_items(payload, "components")):
         for f_index, item in enumerate(_items(component, "findings")):
             finding = _as_finding(
@@ -1469,6 +1507,9 @@ def list_findings(data: Dict) -> List[Dict]:
                 item,
             )
             if finding is not None:
+                finding["citation_broken"] = _citation_broken(
+                    finding["evidence"], broken_evidence
+                )
                 findings.append(finding)
     return findings
 

@@ -2757,7 +2757,7 @@ def test_findings_and_verifications_are_disk_keyed_with_error_contract():
     ids = [f["id"] for f in payload["findings"]]
     assert "recommendation.plan[0]" in ids
     assert set(payload["findings"][0]) == {
-        "id", "phase", "role", "claim", "evidence", "hash",
+        "id", "phase", "role", "claim", "evidence", "hash", "citation_broken",
     }
     # unknown job / traversal-shaped ids fail closed as 404
     for job_id in ("ghost", "../escape"):
@@ -2771,6 +2771,43 @@ def test_findings_and_verifications_are_disk_keyed_with_error_contract():
         409, {"error": "findings need a dashboard workspace"})
     assert bare.verifications("any") == (
         409, {"error": "verifications need a dashboard workspace"})
+
+
+def test_list_job_findings_surfaces_citation_broken():
+    """GET /jobs/{id}/findings joins broken_citations onto matching findings."""
+
+    payload = {
+        "classification": "dependency-surgery",
+        "phases": {
+            "risk": {
+                "role": "security-engineer",
+                "ok": True,
+                "error": None,
+                "data": {
+                    "secrets": [
+                        {"claim": "connection string committed",
+                         "evidence": "does/not/exist.py"},
+                        {"claim": "API key logged", "evidence": "src/real/file.py"},
+                    ],
+                },
+            }
+        },
+        "broken_citations": {"risk": ["does/not/exist.py"]},
+        "dead_code": {"findings": []},
+        "dependency_scan": {"vulnerabilities": []},
+    }
+    dash = InMemoryWorkspace()
+    dash.write_text("audit/assess-cb/assessment.json", json.dumps(payload))
+    dash.write_text(
+        "audit/assess-cb/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-cb"}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, resp = disp.list_job_findings("assess-cb")
+    assert status == 200
+    by_id = {f["id"]: f for f in resp["findings"]}
+    assert by_id["risk.secrets[0]"]["citation_broken"] is True
+    assert by_id["risk.secrets[1]"]["citation_broken"] is False
 
 
 def test_verify_job_end_to_end_on_a_fresh_dispatcher():

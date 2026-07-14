@@ -366,7 +366,7 @@ record it.
 {"job_id":"assess-…","findings":[
   {"id":"risk.secrets[0]","phase":"risk","role":"security-engineer",
    "claim":"connection string committed","evidence":"Web.config",
-   "hash":"1f0c94ab23de"}]}
+   "hash":"1f0c94ab23de","citation_broken":false}]}
 ```
 
 Positional ids (`phase.list[i]`; component deep-dives nest as
@@ -374,7 +374,13 @@ Positional ids (`phase.list[i]`; component deep-dives nest as
 enumerated, and the deterministic `dead_code`/`dependency_scan` outputs are
 excluded (exact program results, not model claims). `hash` is a short
 content hash of the claim so a caller can spot drift between enumeration
-and verification. `404 {"error":"no assessment for that job"}` when
+and verification. `citation_broken` is `true` when the finding's `evidence`
+is one the $0 citation check already flagged as a cited path that doesn't
+exist in the repo (see `broken_citations` in the assess phase output) — a
+signal to help triage which findings are worth spending a real `verify` job
+on, never a substitute for one; it degrades to `false` on any missing or
+malformed data (including assessments persisted before this field existed).
+`404 {"error":"no assessment for that job"}` when
 `audit/{id}/assessment.json` is absent.
 
 ### `POST /jobs` with `{"mode":"verify",…}` — submit a re-check
