@@ -157,6 +157,16 @@ def test_default_http_post_uses_urllib(monkeypatch):
     assert captured["body"]["head"] == "dev-team/health"
 
 
+def test_repr_does_not_leak_the_token():
+    # token (and http) are field(repr=False): a traceback, logger.debug, or a
+    # config dump of the publisher must never print the credential verbatim
+    # (CLAUDE.md §2/§6; mirrors sdk.py's repr=False on its client).
+    secret = "ghp_supersecretvalue123"
+    text = repr(GitHubPullRequestPublisher(token=secret, http=_RecordingHttp()))
+    assert secret not in text
+    assert "***" not in text  # the field is simply absent, not masked into the repr
+
+
 def test_fake_publisher_records_and_returns():
     fake = FakePullRequestPublisher(result=PullRequest(9, "https://x/9"))
     out = fake.open(_req(title="feat"))

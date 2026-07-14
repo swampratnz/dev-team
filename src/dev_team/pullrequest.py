@@ -86,9 +86,9 @@ class GitHubPullRequestPublisher:
     never placed anywhere else; ``http`` is injectable for testing.
     """
 
-    token: str
+    token: str = field(repr=False)  # never let a repr/traceback/config dump print it
     api_base: str = _API_BASE
-    http: Optional[Http] = None
+    http: Optional[Http] = field(default=None, repr=False)  # a bound fake may capture secrets
 
     def open(self, request: PullRequestRequest) -> PullRequest:
         url = f"{self.api_base}/repos/{request.owner}/{request.name}/pulls"
