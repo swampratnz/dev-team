@@ -7,6 +7,7 @@ argv construction and the git-on-host policy without a container engine.
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass, field
 from typing import List, Mapping, Optional, Sequence, Tuple
 
@@ -157,20 +158,62 @@ def test_read_only_omitted_by_default():
     assert "--tmpfs" not in argv
 
 
-def test_env_is_forwarded_sorted_via_dash_e_only():
-    spy = _Spy()
-    ContainerCommandRunner(spy).run(
-        ["pytest"], cwd="/ws", env={"B": "2", "A": "1"}
+def test_env_is_forwarded_via_a_secure_env_file_not_argv():
+    # A secret handed through env must reach the container as real env, never as
+    # argv (ps / CommandResult.command / an audit report). It rides in via a
+    # mode-0600, workspace-external, cleaned-up --env-file.
+    captured = {}
+
+    class _EnvSpy:
+        result = CommandResult(["x"], 0, "", "")
+
+        def run(self, command, *, cwd=None, timeout=None, env=None):
+            argv = list(command)
+            path = argv[argv.index("--env-file") + 1]
+            captured["argv"] = argv
+            captured["path"] = path
+            captured["mode"] = stat.S_IMODE(os.stat(path).st_mode)
+            with open(path, encoding="utf-8") as handle:
+                captured["content"] = handle.read()
+            return self.result
+
+    ContainerCommandRunner(_EnvSpy()).run(
+        ["pytest"], cwd="/ws", env={"B": "2", "TOKEN": "s3cr3t", "A": "1"}
     )
-    argv = _argv(spy)
-    env_values = [argv[i + 1] for i, a in enumerate(argv) if a == "--env"]
-    assert env_values == ["A=1", "B=2"]  # sorted, deterministic
+    # the secret never appears in the argv, and nothing is inlined as --env
+    assert not any("s3cr3t" in a for a in captured["argv"])
+    assert "--env" not in captured["argv"]
+    # the env-file is 0600, lives outside the mounted workspace, and holds the
+    # sorted entries
+    assert captured["mode"] == 0o600
+    assert not captured["path"].startswith("/ws")
+    assert captured["content"] == "A=1\nB=2\nTOKEN=s3cr3t\n"
+    # ...and it is deleted after the run
+    assert not os.path.exists(captured["path"])
 
 
-def test_no_env_means_no_dash_e():
+def test_env_file_is_cleaned_up_even_when_the_command_raises():
+    seen = {}
+
+    class _RaisingSpy:
+        def run(self, command, *, cwd=None, timeout=None, env=None):
+            argv = list(command)
+            seen["path"] = argv[argv.index("--env-file") + 1]
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        ContainerCommandRunner(_RaisingSpy()).run(
+            ["pytest"], cwd="/ws", env={"A": "1"}
+        )
+    assert not os.path.exists(seen["path"])
+
+
+def test_no_env_means_no_env_file():
     spy = _Spy()
     ContainerCommandRunner(spy).run(["pytest"], cwd="/ws")
-    assert "--env" not in _argv(spy)
+    argv = _argv(spy)
+    assert "--env-file" not in argv
+    assert "--env" not in argv
 
 
 def test_custom_engine_image_mount_and_extra_args():

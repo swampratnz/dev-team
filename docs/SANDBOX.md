@@ -31,8 +31,12 @@ through) that wraps **another** `CommandRunner` and, for each command:
   - **only the workspace mounted** — `cwd` (which the engine roots at the
     workspace or a per-task worktree) is bind-mounted to `/workspace` and is the
     single writable, shared surface; nothing else on the host is visible;
-  - **only the caller-supplied `env`** forwarded (via `-e`) — never the host
-    environment, so credentials never enter the box.
+  - **only the caller-supplied `env`** forwarded — never the host environment.
+    It rides in via a mode-`0600`, workspace-external, always-deleted
+    `--env-file` (never inline `--env KEY=VALUE`), so a credential passed
+    through it never lands in the container CLI's argv (`ps` /
+    `CommandResult.command` / an audit report) and the boxed code can't read the
+    file either.
 
 Because it only *builds* the container argv and delegates execution to the inner
 runner, it is fully testable without a container engine, and it inherits the

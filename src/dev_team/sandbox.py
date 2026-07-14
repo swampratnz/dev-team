@@ -27,7 +27,11 @@ Three design choices make this both correct and testable:
 - **the workspace is the trust boundary.** ``cwd`` — which the engine always
   roots at the workspace (or a per-task worktree) — is the *only* host path
   bind-mounted into the container, and only the caller-supplied ``env`` is
-  forwarded (via ``-e``), never the host environment. Secrets never enter the box.
+  forwarded, never the host environment. That ``env`` rides in via a
+  mode-``0600``, workspace-external, always-deleted ``--env-file`` — never inline
+  ``--env KEY=VALUE`` — so a credential handed through it never lands in the
+  container CLI's argv (``ps`` / ``CommandResult.command`` / an audit report) and
+  the boxed code cannot read the file either.
 
 What this does **not** contain: the agentic engineer's own SDK tool loop runs via
 the Claude CLI on the host, outside any :class:`CommandRunner`, so containing
@@ -39,6 +43,7 @@ isolation is a separate (deployment) concern.
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
@@ -135,18 +140,31 @@ class ContainerCommandRunner:
         if args and _program(args[0]) in self.config.host_programs:
             # Host orchestration (git): run outside the sandbox, unchanged.
             return self.inner.run(args, cwd=cwd, timeout=timeout, env=env)
-        wrapped = self._containerise(args, cwd=cwd, env=env)
-        # The container CLI itself runs from ``cwd`` on the host; the *app* env
-        # rides in via ``-e`` (built above), so the CLI process gets no app env
-        # and the inner runner's secret scrubbing still applies to the host env.
-        return self.inner.run(wrapped, cwd=cwd, timeout=timeout)
+        forwarded = _clean_env(env)
+        if not forwarded:
+            wrapped = self._containerise(args, cwd=cwd, env_file=None)
+            return self.inner.run(wrapped, cwd=cwd, timeout=timeout)
+        # Forwarded env goes via a mode-0600, workspace-external, always
+        # cleaned-up --env-file, never inline --env KEY=VALUE: a secret handed
+        # through env must not land in the container CLI's argv (which becomes
+        # CommandResult.command, and from there `ps` and audit reports). The
+        # file lives outside the bind-mount, so the boxed code can't read it.
+        fd, env_path = tempfile.mkstemp(prefix="dev-team-sandbox-", suffix=".env")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                for key, value in forwarded.items():
+                    handle.write(f"{key}={value}\n")
+            wrapped = self._containerise(args, cwd=cwd, env_file=env_path)
+            return self.inner.run(wrapped, cwd=cwd, timeout=timeout)
+        finally:
+            os.unlink(env_path)
 
     def _containerise(
         self,
         args: List[str],
         *,
         cwd: Optional[str],
-        env: Optional[Mapping[str, str]],
+        env_file: Optional[str],
     ) -> List[str]:
         """Build the ``docker run`` argv that runs ``args`` in a container."""
 
@@ -179,8 +197,8 @@ class ContainerCommandRunner:
             run += ["--pids-limit", str(cfg.pids_limit)]
         run += ["--volume", f"{host_dir}:{mount}"]
         run += ["--workdir", mount]
-        for key, value in _clean_env(env).items():
-            run += ["--env", f"{key}={value}"]
+        if env_file is not None:
+            run += ["--env-file", env_file]
         run += list(cfg.extra_run_args)
         run.append(cfg.image)
         run += args
