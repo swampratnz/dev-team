@@ -111,6 +111,7 @@ def delivery_to_dict(outcome: "DeliveryOutcome") -> Dict[str, Any]:
             outcome.reliability.production_ready if outcome.reliability else None
         ),
         "committed": outcome.committed,
+        "pull_request_url": outcome.pull_request_url,
         "budget_exhausted": outcome.budget_exhausted,
         "resumed_task_ids": list(outcome.resumed_task_ids),
         "cost_usd": outcome.cost_usd,
@@ -162,6 +163,8 @@ def render_delivery_summary(outcome: "DeliveryOutcome") -> str:
         state = "ready" if outcome.reliability.production_ready else "NOT READY"
         lines.append(f"Reliability: {state}")
     lines.append(f"Committed: {'yes' if outcome.committed else 'no'}")
+    if outcome.pull_request_url:
+        lines.append(f"Pull request: {outcome.pull_request_url}")
     if outcome.scorecard:
         counts = ", ".join(f"{k}={v}" for k, v in sorted(outcome.scorecard.items()))
         lines.append(f"Scorecard: {counts}")

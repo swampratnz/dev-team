@@ -240,6 +240,11 @@ class DeliveryOutcome:
     baseline: Optional[DoDReport] = None
     halted_reason: Optional[str] = None
     scorecard: Dict[str, int] = field(default_factory=dict)
+    #: URL of the pull request opened for this delivery, when the caller asked
+    #: for one (``--pull-request``) and the delivery had a committed branch to
+    #: publish. ``None`` otherwise. Set after ``deliver`` returns, by the
+    #: delivery target — the engine itself never opens a PR.
+    pull_request_url: Optional[str] = None
 
     @property
     def tasks_complete(self) -> bool:

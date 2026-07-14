@@ -288,6 +288,23 @@ def test_render_delivery_summary_halted_without_baseline():
     assert "Halted:  working tree is dirty" in text
 
 
+def test_render_delivery_summary_shows_pull_request_when_opened():
+    text = render_delivery_summary(
+        _outcome(committed=True, pull_request_url="https://github.com/acme/mono/pull/9")
+    )
+    assert "Pull request: https://github.com/acme/mono/pull/9" in text
+    # ...and the line is absent when no PR was opened.
+    assert "Pull request:" not in render_delivery_summary(_outcome())
+
+
+def test_delivery_to_dict_carries_pull_request_url():
+    assert delivery_to_dict(_outcome())["pull_request_url"] is None
+    assert (
+        delivery_to_dict(_outcome(pull_request_url="https://x/pull/1"))["pull_request_url"]
+        == "https://x/pull/1"
+    )
+
+
 def test_delivery_to_dict_includes_unverified_claims_when_present():
     from dev_team.models import Documentation
 

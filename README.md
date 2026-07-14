@@ -410,6 +410,22 @@ before any agent spend — if the working tree is dirty
 `--setup-command "npm install"`, `--branch NAME`, `--max-concurrency N`,
 `--no-commit`, `--json`.
 
+Deliver all the way to a **pull request** — clone the repo, do the work, then
+push the `dev-team/<feature>` branch and open a PR whose body is the run
+summary:
+
+```bash
+dev-team "Health endpoint" "Add a /health endpoint returning 200" \
+    --deliver --repo acme/api --pull-request
+```
+
+`--pull-request` requires `--repo` (so the GitHub repo, remote, and token are
+known) and a commit; add `--pr-base BRANCH` to target a base other than `main`
+and `--pr-draft` to open it as a draft. The token used to clone pushes and
+opens the PR — it rides only in git's per-command auth header and the API
+`Authorization` header, never in argv, `.git/config`, or logs — and the PR URL
+is printed and included in the run summary/JSON.
+
 Output as JSON for scripting:
 
 ```bash
