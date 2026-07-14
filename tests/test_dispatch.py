@@ -2934,17 +2934,36 @@ def test_findings_and_verifications_routes_require_auth():
 # --- access log ----------------------------------------------------------
 
 
+def _access_records(root, *, expect, timeout=5.0, limit=300):
+    """Access-log records, once at least ``expect`` of them are present.
+
+    The dispatch handler appends each line in its ``finally`` — just after the
+    response has returned to the client, and not synchronized with the client
+    receiving it — so a test that reads the log the instant a call returns can
+    race the handler's write (most visibly when it asserts an exact count).
+    Poll until the expected number lands rather than assuming the append is
+    synchronous with the response; returns as soon as they are there.
+    """
+
+    deadline = time.monotonic() + timeout
+    while True:
+        records = read_access_log(str(root), limit=limit)
+        if len(records) >= expect or time.monotonic() >= deadline:
+            return records
+        time.sleep(0.01)
+
+
 def test_access_log_records_unauthenticated_health_get(tmp_path):
     with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
         _call(server, "/health", token=None)
-    records = read_access_log(str(tmp_path))
+    records = _access_records(tmp_path, expect=1)
     assert records[-1] == {**records[-1], "method": "GET", "path": "/health", "status": 200}
 
 
 def test_access_log_records_authorised_get_jobs(tmp_path):
     with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
         _call(server, "/jobs")
-    records = read_access_log(str(tmp_path))
+    records = _access_records(tmp_path, expect=1)
     assert records[-1] == {**records[-1], "method": "GET", "path": "/jobs", "status": 200}
 
 
@@ -2953,7 +2972,7 @@ def test_access_log_records_401_and_never_leaks_the_bad_token(tmp_path):
     with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
         status, _ = _call(server, "/jobs", token=fake_token)
     assert status == 401
-    records = read_access_log(str(tmp_path))
+    records = _access_records(tmp_path, expect=1)
     assert records[-1] == {**records[-1], "status": 401}
     raw = (Path(tmp_path) / "access.jsonl").read_text()
     assert fake_token not in raw
@@ -2967,6 +2986,7 @@ def test_access_log_never_persists_a_post_body_marker(tmp_path):
             body={"mode": "deliver", "repo": "acme/mono", "title": "t",
                   "description": marker},
         )
+    _access_records(tmp_path, expect=1)  # wait for the append before reading raw
     raw = (Path(tmp_path) / "access.jsonl").read_text()
     assert marker not in raw
 
@@ -2974,7 +2994,7 @@ def test_access_log_never_persists_a_post_body_marker(tmp_path):
 def test_access_log_records_404_for_an_unknown_path(tmp_path):
     with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
         _call(server, "/nope")
-    records = read_access_log(str(tmp_path))
+    records = _access_records(tmp_path, expect=1)
     assert records[-1] == {**records[-1], "method": "GET", "path": "/nope", "status": 404}
 
 
@@ -2998,6 +3018,7 @@ def test_access_log_lives_at_jobs_root_and_is_created_lazily(tmp_path):
         _call(server, "/nope")  # 404
         _call(server, "/jobs")  # 200
     assert target.exists()
+    _access_records(tmp_path, expect=4)  # wait for all four appends to land
     lines = target.read_text().splitlines()
     assert len(lines) >= 4
     for line in lines:
@@ -3015,7 +3036,7 @@ def test_access_log_skips_a_connection_closed_before_any_response(tmp_path):
         sock.close()
         status, payload = _call(server, "/health", token=None)
         assert status == 200
-    records = read_access_log(str(tmp_path))
+    records = _access_records(tmp_path, expect=1)
     assert [r["path"] for r in records] == ["/health"]
 
 
@@ -3029,5 +3050,5 @@ def test_access_log_concurrent_requests_never_lose_an_entry(tmp_path):
             t.start()
         for t in threads:
             t.join()
-    records = read_access_log(str(tmp_path), limit=1000)
+    records = _access_records(tmp_path, expect=20, limit=1000)
     assert len(records) == 20
