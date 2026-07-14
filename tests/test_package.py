@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_exposed():
@@ -23,3 +26,10 @@ def test_public_symbols_importable():
 def test_main_module_imports():
     module = importlib.import_module("dev_team.__main__")
     assert hasattr(module, "main")
+
+
+def test_assessment_sample_doc_ships():
+    sample = _REPO_ROOT / "docs" / "examples" / "assessment-sample.md"
+    assert sample.is_file(), sample
+    # The sample mirrors render_report, which always emits a Classification.
+    assert "Classification:" in sample.read_text(encoding="utf-8")

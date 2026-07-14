@@ -115,6 +115,26 @@ def test_task_from_dict_defaults():
     assert task.status is TaskStatus.PENDING
 
 
+def test_task_id_is_slugified_to_safe_value():
+    # Model-authored ids flow into worktree paths and branch names, so unsafe
+    # characters (separators, ``..``, spaces) are collapsed to ``-``.
+    assert parsing.task_from_dict({"id": "../etc"}, 0).id == "etc"
+    assert parsing.task_from_dict({"id": "a b"}, 0).id == "a-b"
+    assert parsing.task_from_dict({"id": "a/b"}, 0).id == "a-b"
+
+
+def test_task_id_preserves_existing_ids_and_case():
+    # "T1" must round-trip unchanged: no lowercasing, no separators added, so
+    # existing dependency references and checkpoints keep matching.
+    assert parsing.task_from_dict({"id": "T1"}, 0).id == "T1"
+    assert parsing.task_from_dict({"id": "Feat_2-A"}, 0).id == "Feat_2-A"
+
+
+def test_task_id_all_unsafe_falls_back_to_positional():
+    # An id that reduces to nothing after slugifying uses the positional id.
+    assert parsing.task_from_dict({"id": "///"}, 3).id == "T4"
+
+
 def test_plan_from_dict():
     plan = parsing.plan_from_dict(
         {"summary": "s", "tasks": [{"id": "A"}, "ignored", {"id": "B"}]}

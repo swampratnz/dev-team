@@ -54,6 +54,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from .accesslog import AccessLog
+from .approval import PolicyApprovalGate
 from .assessment import (
     AssessConfig,
     calibration_summary,
@@ -110,10 +111,18 @@ DEFAULT_QUEUE_CAP = 16
 #: request into memory — an unauthenticated-adjacent resource-exhaustion path.
 _MAX_BODY = 1 << 20
 
-#: How many of the newest jobs ``GET /jobs`` lists, and how many progress
+#: How many of the newest jobs ``GET /jobs`` lists by default, the hard
+#: ceiling a caller-supplied ``?limit=`` is clamped to, and how many progress
 #: events ``GET /jobs/{id}`` carries.
 _LIST_LIMIT = 25
+_LIST_LIMIT_MAX = 100
 _PROGRESS_LIMIT = 12
+
+#: Wall-clock ceiling for a single job. The single-flight worker runs one job
+#: at a time, so a job that hangs (a stuck clone, an agent session that never
+#: returns) would wedge the queue forever; the worker aborts it past this bound
+#: and moves on. Injectable via the ``job_timeout`` constructor param for tests.
+_JOB_TIMEOUT_SECONDS = 3600.0
 
 #: The run modes the service accepts. ``verify`` re-checks one finding from
 #: a previously mirrored assessment against a fresh clone of its repository.
@@ -184,6 +193,23 @@ class JobRecord:
     error: Optional[str] = None
     outcome: Any = None
     workspace: Optional[Workspace] = None
+    # The run's :class:`~dev_team.budget.Budget`, attached by ``run_job`` as
+    # soon as it is created so a job that fails (or is timed out) mid-run can
+    # report the partial spend it already banked, rather than a hard 0.0. Stays
+    # ``None`` for a failure before the budget exists (e.g. a clone that raised).
+    budget: Optional[Budget] = None
+
+
+def _failed_cost(record: JobRecord) -> float:
+    """The real spend to attribute to a job that failed or was aborted.
+
+    A job that burned budget before raising (or being timed out) reports the
+    partial spend banked on its :class:`~dev_team.budget.Budget`; one that died
+    before the budget was ever created — a clone failure, or a timeout during
+    materialise — correctly reports ``0.0``.
+    """
+
+    return record.budget.spent if record.budget is not None else 0.0
 
 
 def _default_materialise(spec: JobSpec, dest: str) -> Workspace:
@@ -221,12 +247,14 @@ class Dispatcher:
         queue_cap: int = DEFAULT_QUEUE_CAP,
         dashboard_workspace: Optional[Workspace] = None,
         record_transcripts: bool = False,
+        job_timeout: float = _JOB_TIMEOUT_SECONDS,
     ) -> None:
         self.token = token
         self._runner = runner
         self._materialise = materialise or _default_materialise
         self._clock = clock
         self._jobs_root = jobs_root
+        self._job_timeout = job_timeout
         # Constructing this touches no filesystem state (see AccessLog's
         # docstring) — safe to do unconditionally here even though most
         # Dispatcher instances (every non-HTTP unit test) never end up
@@ -286,7 +314,16 @@ class Dispatcher:
             self._thread = None
 
     def _worker_loop(self) -> None:
-        """Own an asyncio loop and run queued jobs strictly one at a time."""
+        """Own an asyncio loop and run queued jobs strictly one at a time.
+
+        Each job runs under a wall-clock ceiling (:attr:`_job_timeout`): a job
+        that hangs would otherwise wedge the single-flight queue forever, so on
+        timeout the worker aborts it, marks it failed, and moves on to the next
+        job. ``asyncio.wait_for`` can only unwind the coroutine at an ``await``
+        point — a job blocked in synchronous CPU/IO is not interruptible — but
+        the stuck cases this guards (an agent session or clone that never
+        returns) are all awaiting.
+        """
 
         loop = asyncio.new_event_loop()
         try:
@@ -294,9 +331,33 @@ class Dispatcher:
                 item = self._queue.get()
                 if item is _SHUTDOWN:
                     return
-                loop.run_until_complete(self._execute(item))
+                try:
+                    loop.run_until_complete(
+                        asyncio.wait_for(self._execute(item), timeout=self._job_timeout)
+                    )
+                except asyncio.TimeoutError:
+                    self._fail_timed_out(item)
         finally:
             loop.close()
+
+    def _fail_timed_out(self, job_id: str) -> None:
+        """Mark a job failed after it blew the wall-clock ceiling.
+
+        ``wait_for`` cancels the ``_execute`` coroutine on timeout, so its own
+        completion bookkeeping (the terminal-state flip and the completion
+        event) never runs — this does both here instead, attributing whatever
+        the run had already spent (:func:`_failed_cost`).
+        """
+
+        record = self._registry[job_id]
+        with self._lock:
+            record.state = "failed"
+            record.error = (
+                f"job exceeded the {self._job_timeout:g}s time limit and was aborted"
+            )
+            record.cost_usd = _failed_cost(record)
+            record.ended = self._clock()
+        self._events[job_id].set()
 
     # -- submit / query ------------------------------------------------------
 
@@ -449,20 +510,33 @@ class Dispatcher:
         with self._lock:
             return self._registry.get(job_id)
 
-    def recent(self, *, include_archived: bool = False) -> List[JobRecord]:
-        """The newest-first records, capped at :data:`_LIST_LIMIT`.
+    def recent(
+        self,
+        *,
+        limit: int = _LIST_LIMIT,
+        offset: int = 0,
+        include_archived: bool = False,
+    ) -> List[JobRecord]:
+        """A newest-first page of records.
 
-        Archived jobs (per their mirrored ``meta.json``) are excluded by
-        default; ``include_archived=True`` (``GET /jobs?archived=1``) reveals
-        them too.
+        ``limit`` defaults to :data:`_LIST_LIMIT` and is clamped to
+        ``[1, _LIST_LIMIT_MAX]``; ``offset`` (how many newest records to skip)
+        is clamped to ``>= 0``. The defaults reproduce the historical
+        behaviour — the newest :data:`_LIST_LIMIT` jobs — so callers that pass
+        neither are unaffected. Clamping here (not just at the HTTP edge) keeps
+        the slice sane for every caller. Archived jobs (per their mirrored
+        ``meta.json``) are excluded by default; ``include_archived=True``
+        (``GET /jobs?archived=1``) reveals them too.
         """
 
+        limit = max(1, min(limit, _LIST_LIMIT_MAX))
+        offset = max(0, offset)
         with self._lock:
             ordered = [self._registry[j] for j in self._order]
         records = list(reversed(ordered))
         if not include_archived:
             records = [r for r in records if not self._is_archived(r.spec.id)]
-        return records[:_LIST_LIMIT]
+        return records[offset : offset + limit]
 
     def wait(self, job_id: str, timeout: float = 5.0) -> bool:
         """Block until ``job_id`` reaches a terminal state (test aid)."""
@@ -493,7 +567,7 @@ class Dispatcher:
             with self._lock:
                 record.state = "failed"
                 record.error = str(exc)
-                record.cost_usd = 0.0
+                record.cost_usd = _failed_cost(record)
                 record.ended = self._clock()
         else:
             with self._lock:
@@ -516,7 +590,7 @@ class Dispatcher:
         record.workspace = workspace
         if spec.mode == "verify":
             # No DevTeam: one fresh skeptical agent re-checks one claim.
-            return await self._run_verify(spec, workspace)
+            return await self._run_verify(record, spec, workspace)
         # The job's own workspace is always journalled (drives GET /jobs/{id}
         # progress). When a dashboard workspace is configured, fan the same
         # events out to it too — same run id, so the standing dashboard shows
@@ -534,6 +608,10 @@ class Dispatcher:
             interaction=None,
         )
         budget = Budget(limit_usd=spec.budget_usd)
+        # Attach the budget to the record immediately, so a failure (or a
+        # worker timeout) partway through the run can report the spend already
+        # banked instead of a hard 0.0 (see _failed_cost).
+        record.budget = budget
         # When enabled, transcripts land where the dashboard can read them: the
         # shared dashboard workspace when configured (same place its events are
         # mirrored), else the job's own workspace. Same run id as the events.
@@ -570,11 +648,20 @@ class Dispatcher:
                 workspace=workspace,
                 budget=budget,
                 config=EngineConfig(commit=True),
+                # Unattended delivery must not silently push/deploy/rm: gate
+                # high-risk commands behind an explicit human approval instead
+                # of the engine's default no-op AutoApprover. The risk="medium"
+                # feature commit is still auto-approved, so dispatch delivery
+                # keeps committing — it just cannot escalate to a push/deploy
+                # on its own (CLAUDE.md sections 1, 6, 8).
+                approval=PolicyApprovalGate(block_risks=("high",)),
                 **kwargs,
             )
         return outcome, outcome.cost_usd
 
-    async def _run_verify(self, spec: JobSpec, workspace: Workspace) -> Tuple[Any, float]:
+    async def _run_verify(
+        self, record: JobRecord, spec: JobSpec, workspace: Workspace
+    ) -> Tuple[Any, float]:
         """Re-check the resolved finding against the fresh clone of its repo.
 
         A FRESH skeptical agent (see :func:`~dev_team.assessment.verify_finding`)
@@ -594,11 +681,15 @@ class Dispatcher:
         # unconditionally (no `or`) so there is no in-dispatch branch to leave
         # uncovered; the None->real fallback lives in DevTeam, already tested.
         runner = DevTeam(self._runner, config=TeamConfig()).runner
+        # Attach the budget to the record before the agent runs, so a failure
+        # partway through reports partial spend, not a hard 0.0 (see run_job).
+        budget = Budget(limit_usd=spec.budget_usd)
+        record.budget = budget
         result = await verify_finding(
             runner,
             workspace,
             spec.finding,
-            budget=Budget(limit_usd=spec.budget_usd),
+            budget=budget,
             source_job=spec.source_job,
         )
         if not result["success"]:
@@ -1300,11 +1391,14 @@ class Dispatcher:
         if record.state not in _TERMINAL:
             return 409, {"error": "not finished", "state": record.state}
         if record.state == "failed":
+            # Serve the real (possibly partial) spend banked before the
+            # failure, not a literal 0 — a job that burned budget and then
+            # raised must not report $0 (see _failed_cost / run_job).
             return 200, {
                 "kind": record.spec.mode,
                 "success": False,
                 "error": record.error,
-                "cost_usd": 0,
+                "cost_usd": record.cost_usd,
             }
         if record.state == "cancelled":
             # A cancelled job never ran, so record.outcome stays None —
@@ -1393,6 +1487,25 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             self.end_headers()
             self.wfile.write(body)
 
+        def _int_param(
+            self, query: Dict[str, List[str]], name: str, default: int
+        ) -> int:
+            """A non-negative-ish int query param, or ``default`` when absent/junk.
+
+            Query values are attacker-controlled, so a missing or non-numeric
+            ``?limit=``/``?offset=`` falls back to the default rather than
+            erroring; :meth:`Dispatcher.recent` clamps the value to a sane
+            range. Mirrors the lenient exact-match handling of ``?archived=``.
+            """
+
+            values = query.get(name)
+            if not values:
+                return default
+            try:
+                return int(values[0])
+            except ValueError:
+                return default
+
         def _authorised(self) -> bool:
             """Constant-time bearer check over the whole header value.
 
@@ -1431,17 +1544,21 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             if path == "/jobs":
                 # ?archived=1 reveals archived jobs too; any other value (or
-                # its absence) keeps the default exclusion.
-                include_archived = (
-                    parse_qs(split.query).get("archived", ["0"])[0] == "1"
-                )
+                # its absence) keeps the default exclusion. ?limit=/?offset=
+                # page the newest-first list (bounds enforced by recent()).
+                query = parse_qs(split.query)
+                include_archived = query.get("archived", ["0"])[0] == "1"
+                limit = self._int_param(query, "limit", _LIST_LIMIT)
+                offset = self._int_param(query, "offset", 0)
                 self._json(
                     200,
                     {
                         "jobs": [
                             dispatcher.summary(r)
                             for r in dispatcher.recent(
-                                include_archived=include_archived
+                                limit=limit,
+                                offset=offset,
+                                include_archived=include_archived,
                             )
                         ]
                     },
@@ -1682,6 +1799,7 @@ class DispatchServer:
         queue_cap: int = DEFAULT_QUEUE_CAP,
         dashboard_workspace: Optional[Workspace] = None,
         record_transcripts: bool = False,
+        job_timeout: float = _JOB_TIMEOUT_SECONDS,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -1692,6 +1810,7 @@ class DispatchServer:
             queue_cap=queue_cap,
             dashboard_workspace=dashboard_workspace,
             record_transcripts=record_transcripts,
+            job_timeout=job_timeout,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()

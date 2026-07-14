@@ -140,6 +140,20 @@ class ChatSession:
         if request is None:
             return
         mode = "delivery" if deliver else "simulation"
+        # Running the team costs money (delivery also writes files and commits),
+        # so show the distilled brief and require an explicit go-ahead. Anything
+        # that is not a clear yes — including EOF — cancels (fail safe).
+        self._write(f"distilled brief ({mode}):")
+        self._write(f"  title:       {request.title}")
+        self._write(f"  description: {request.description}")
+        if request.constraints:
+            self._write("  constraints:")
+            for constraint in request.constraints:
+                self._write(f"    - {constraint}")
+        answer = await self._read(f"hand this to the team for {mode}? [y/N] ")
+        if answer is None or answer.strip().lower() not in ("y", "yes"):
+            self._write("cancelled; keep refining the brief (/quit to leave)")
+            return
         self._write(
             f"handing off to the team ({mode}): {request.title} — "
             f"{request.description}"

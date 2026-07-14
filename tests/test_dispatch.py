@@ -21,7 +21,11 @@ from test_assessment import assess_responses
 from dev_team import __version__
 from dev_team import dispatch as dispatch_mod
 from dev_team.accesslog import read_access_log
+from dev_team.approval import ApprovalRequest, PolicyApprovalGate
 from dev_team.backlog import BacklogStore
+from dev_team.budget import Budget
+from dev_team.policy import EXIT_DENIED
+from dev_team.sdk import AgentResult
 from dev_team.dispatch import (
     Dispatcher,
     DispatchServer,
@@ -38,11 +42,23 @@ from dev_team.testing import ScriptedRunner
 
 TOKEN = "s3cr3t-token"
 
+# A minimal non-empty file set so a fake clone looks like a real checkout: the
+# assess engine refuses an empty workspace before spending on any agent, and a
+# real clone is never empty. Content is irrelevant to the scripted assess
+# responses — only that files exist.
+_CLONE_FILES = {"README.md": "# repo", "src/app.py": "x = 1"}
+
+
+def _clone_ws():
+    """A fresh in-memory workspace seeded like a real (non-empty) clone."""
+
+    return InMemoryWorkspace(dict(_CLONE_FILES))
+
 
 def _mem_materialise(spec, dest):
     """A fake clone: no disk, no network — just a fresh in-memory workspace."""
 
-    return InMemoryWorkspace()
+    return _clone_ws()
 
 
 def _assess_runner():
@@ -144,6 +160,26 @@ def test_submit_assigns_positions_and_recent_is_newest_first():
     assert disp.get("unknown") is None
 
 
+def test_recent_paginates_with_bounded_limit_and_offset():
+    # U10(c): >25 jobs must be reachable via limit/offset, with the defaults
+    # reproducing the historical newest-first cap of 25.
+    disp = Dispatcher(token="x", queue_cap=100)  # worker not started: all queued
+    ids = [
+        disp.submit(disp.build_spec({"mode": "assess", "repo": f"a/r{i}"}))[0]
+        for i in range(30)
+    ]
+    newest_first = list(reversed(ids))
+    assert [r.spec.id for r in disp.recent()] == newest_first[:25]  # default cap kept
+    assert [r.spec.id for r in disp.recent(limit=10)] == newest_first[:10]
+    assert [r.spec.id for r in disp.recent(limit=10, offset=10)] == newest_first[10:20]
+    assert disp.recent(offset=100) == []  # offset past the end is empty, not an error
+    # bounds are clamped: limit floors to 1 and ceils to _LIST_LIMIT_MAX,
+    # a negative offset floors to 0.
+    assert len(disp.recent(limit=0)) == 1
+    assert len(disp.recent(limit=10_000)) == 30  # clamp to 100, only 30 exist
+    assert [r.spec.id for r in disp.recent(offset=-5, limit=3)] == newest_first[:3]
+
+
 def test_submit_raises_queue_full_at_cap():
     disp = Dispatcher(token="x", queue_cap=2)
     disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
@@ -187,6 +223,44 @@ def test_run_job_deliver_path():
     assert outcome.success is True
 
 
+def test_dispatch_deliver_gates_high_risk_commands(monkeypatch):
+    # S1: unattended dispatch delivery must not run with the no-op
+    # AutoApprover, which auto-grants the high-risk push/deploy/rm gate.
+    # run_job must hand team.deliver a PolicyApprovalGate(block_risks=("high",))
+    # so a dispatched deliver still commits the risk="medium" feature but a
+    # high-risk push/deploy is denied. Spy on make_engine to capture both the
+    # approval gate wired in and the guarded command runner it built.
+    captured = {}
+    real_make_engine = dispatch_mod.DevTeam.make_engine
+
+    def spy_make_engine(self, **kwargs):
+        engine = real_make_engine(self, **kwargs)
+        captured["approval"] = kwargs.get("approval")
+        captured["engine"] = engine
+        return engine
+
+    monkeypatch.setattr(dispatch_mod.DevTeam, "make_engine", spy_make_engine)
+
+    disp = Dispatcher(token="x", runner=_deliver_runner(), materialise=_mem_materialise)
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d"}
+    )
+    spec.id = "deliver-gate"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+
+    approval = captured["approval"]
+    assert isinstance(approval, PolicyApprovalGate)
+    # The engine's guarded command runner denies a high-risk push/deploy ...
+    runner = captured["engine"].command_runner
+    assert runner.run(["git", "push"]).exit_code == EXIT_DENIED
+    assert runner.run(["deploy", "prod"]).exit_code == EXIT_DENIED
+    # ... while the risk="medium" feature commit is still auto-approved, so
+    # dispatch delivery keeps committing.
+    assert approval.review(
+        ApprovalRequest(action="commit feature", detail="", risk="medium")
+    ).approved is True
+
+
 def test_worker_runs_a_successful_job():
     disp = Dispatcher(token="x", runner=_assess_runner(), materialise=_mem_materialise)
     disp.start()
@@ -213,7 +287,79 @@ def test_worker_marks_a_failing_job_failed():
         record = disp.get(job_id)
         assert record.state == "failed"
         assert "clone exploded" in record.error
+        # The clone raised before any Budget was created, so the recorded cost
+        # is a genuine 0.0 (no budget attached) — not the old hard-coded 0.
+        assert record.budget is None
         assert record.cost_usd == 0.0
+    finally:
+        disp.stop()
+
+
+def test_failed_job_reports_real_partial_spend():
+    # E4/U6: a job that burned budget before raising must report that partial
+    # spend, not a hard-coded 0.0. Drive _execute with a run_job that attaches
+    # a budget, spends on it, then raises — exactly the mid-run-failure shape.
+    disp = Dispatcher(token="x")
+    spec = JobSpec(mode="assess", repo="a/b", title="t", description="",
+                   budget_usd=None, id="assess-spend")
+    record = JobRecord(spec=spec)
+    disp._registry[spec.id] = record
+    disp._events[spec.id] = threading.Event()
+
+    async def spend_then_raise(rec):
+        budget = Budget()
+        rec.budget = budget
+        budget.record("architect", AgentResult(text="", cost_usd=0.75, num_turns=1))
+        raise RuntimeError("blew up after spending")
+
+    disp.run_job = spend_then_raise  # instance override; _execute calls self.run_job
+    asyncio.run(disp._execute(spec.id))
+
+    assert record.state == "failed"
+    assert "blew up after spending" in record.error
+    assert record.budget.spent == 0.75
+    assert record.cost_usd == record.budget.spent > 0
+    # /result and /costs both serve the real partial spend, not 0
+    assert disp.result(record) == (
+        200,
+        {"kind": "assess", "success": False,
+         "error": record.error, "cost_usd": 0.75},
+    )
+    assert disp.costs() == (
+        200, {"total_usd": 0.75, "by_mode": {"assess": 0.75}, "jobs_counted": 1})
+
+
+def test_worker_times_out_a_hung_job_and_keeps_serving():
+    # E5(a): a job whose _execute hangs at an await point must not wedge the
+    # single-flight worker — it is aborted past the injected wall-clock ceiling,
+    # marked failed with a timeout error, and the worker serves the next job.
+    started = threading.Event()
+
+    async def hang(record):
+        started.set()
+        await asyncio.sleep(3600)  # far past the 0.05s ceiling; never resolves
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=_mem_materialise,
+        job_timeout=0.05,
+    )
+    disp.run_job = hang  # first job hangs; instance override _execute calls
+    disp.start()
+    try:
+        hung_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/hang"}))
+        assert started.wait(5)
+        assert disp.wait(hung_id, 5) is True
+        record = disp.get(hung_id)
+        assert record.state == "failed"
+        assert "time limit" in record.error
+        assert record.cost_usd == 0.0  # no budget was ever created for it
+
+        # The worker survived the timeout: restore the real run_job and prove
+        # the next job still runs to completion.
+        del disp.run_job
+        next_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "acme/mono"}))
+        assert disp.wait(next_id, 5) is True
+        assert disp.get(next_id).state == "succeeded"
     finally:
         disp.stop()
 
@@ -278,7 +424,7 @@ def test_run_job_records_transcripts_into_the_dashboard_workspace():
 def test_run_job_records_transcripts_into_job_workspace_without_dashboard():
     from dev_team.transcripts import list_transcripts
 
-    job_ws = InMemoryWorkspace()
+    job_ws = _clone_ws()
     disp = Dispatcher(
         token="x",
         runner=_assess_runner(),
@@ -348,7 +494,7 @@ def test_run_job_assess_with_backlog_updates_job_and_dashboard_backlogs():
     from dev_team.backlog import BacklogStore
 
     dash = InMemoryWorkspace()
-    job_ws = InMemoryWorkspace()
+    job_ws = _clone_ws()
     disp = Dispatcher(
         token="x",
         runner=_assess_runner(),
@@ -379,7 +525,7 @@ def test_run_job_assess_with_backlog_updates_job_and_dashboard_backlogs():
 def test_run_job_assess_with_backlog_but_no_dashboard_workspace():
     from dev_team.backlog import BacklogStore
 
-    job_ws = InMemoryWorkspace()
+    job_ws = _clone_ws()
     disp = Dispatcher(
         token="x", runner=_assess_runner(), materialise=lambda spec, dest: job_ws
     )
@@ -654,11 +800,14 @@ def test_costs_sums_across_all_three_modes():
     assert payload["jobs_counted"] == 3
 
 
-def test_costs_counts_a_failed_job_at_zero_cost():
+def test_costs_counts_a_failed_jobs_real_partial_spend():
+    # E4/U6: a failed job now carries the real (partial) spend it burned before
+    # failing, and /costs must count that toward the rollup — not treat every
+    # failed job as $0.
     disp = Dispatcher(token="x")
-    _insert_job(disp, "assess-1", "assess", "failed", 0.0)
+    _insert_job(disp, "assess-1", "assess", "failed", 1.5)
     assert disp.costs() == (
-        200, {"total_usd": 0.0, "by_mode": {"assess": 0.0}, "jobs_counted": 1})
+        200, {"total_usd": 1.5, "by_mode": {"assess": 1.5}, "jobs_counted": 1})
 
 
 def test_costs_excludes_queued_and_running_jobs():
@@ -1535,6 +1684,9 @@ def test_purge_http_route_round_trips(tmp_path):
 
     def materialise(spec, dest):
         Path(dest).mkdir(parents=True, exist_ok=True)
+        # A real clone is never empty — seed a file so the assess engine's
+        # empty-workspace guard does not fail the job.
+        (Path(dest) / "README.md").write_text("# repo\n")
         return LocalWorkspace(dest)
 
     with running(runner=_assess_runner(), materialise=materialise,
@@ -1618,7 +1770,7 @@ def test_cancel_http_route_unknown_and_running_and_double_cancel():
     def materialise(spec, dest):
         first_in.set()
         release.wait(5)
-        return InMemoryWorkspace()
+        return _clone_ws()
 
     with running(runner=_assess_runner(), materialise=materialise) as server:
         assert _call(server, "/jobs/ghost/cancel", method="POST") == (
@@ -1662,6 +1814,27 @@ def test_jobs_list_archived_query_param_reveals_archived_jobs():
         assert [j["id"] for j in payload["jobs"]] == [job["id"]]
 
 
+def test_jobs_list_http_route_paginates_with_limit_and_offset():
+    # U10(c): the GET /jobs route threads bounded ?limit=/?offset= into
+    # recent(); jobs are inserted directly to page over >25 without 30 runs.
+    with running(materialise=_mem_materialise) as server:
+        for i in range(30):
+            _insert_job(server.dispatcher, f"assess-{i:02d}", "assess", "queued", None)
+        newest_first = [f"assess-{i:02d}" for i in range(29, -1, -1)]
+
+        status, payload = _call(server, "/jobs?limit=5")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == newest_first[:5]
+
+        _, payload = _call(server, "/jobs?limit=5&offset=5")
+        assert [j["id"] for j in payload["jobs"]] == newest_first[5:10]
+
+        # absent params keep the default cap of 25; a non-numeric value falls
+        # back to that same default rather than erroring.
+        assert len(_call(server, "/jobs")[1]["jobs"]) == 25
+        assert len(_call(server, "/jobs?limit=notanint")[1]["jobs"]) == 25
+
+
 def test_worker_is_single_flight_and_ordered():
     order = []
     first_in = threading.Event()
@@ -1672,7 +1845,7 @@ def test_worker_is_single_flight_and_ordered():
         if len(order) == 1:
             first_in.set()
             release.wait(5)  # hold job 1 so job 2 must wait its turn
-        return InMemoryWorkspace()
+        return _clone_ws()
 
     disp = Dispatcher(token="x", runner=_assess_runner(), materialise=materialise)
     disp.start()
@@ -1980,11 +2153,13 @@ def test_failed_job_status_and_result():
         assert "materialise failed" in job["error"]
         status, result = _call(server, f"/jobs/{job_id}/result")
         assert status == 200
+        # materialise raised before any budget existed, so the served cost is
+        # a genuine 0.0 (no partial spend to report), not a hard-coded 0.
         assert result == {
             "kind": "assess",
             "success": False,
             "error": job["error"],
-            "cost_usd": 0,
+            "cost_usd": 0.0,
         }
 
 

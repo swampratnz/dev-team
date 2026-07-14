@@ -104,12 +104,25 @@ class RepoRef:
         return f"{self.owner}__{self.name}"
 
 
-def parse_repo(ref: str) -> RepoRef:
+#: URL schemes a ``://`` reference may use. Only these transports are safe to
+#: hand to ``git``: ``file://`` (a local mirror) and git's RCE-capable
+#: ``ext::``/``fd::`` helper transports are excluded, so a scheme reachable
+#: from the authenticated dispatch API can never turn a repo reference into
+#: local file access or arbitrary command execution. ``file://`` is re-admitted
+#: only when a trusted caller opts in with ``allow_local=True`` (tests and
+#: local mirrors), never on the default authenticated path.
+_ALLOWED_URL_SCHEMES = frozenset({"https", "ssh", "git"})
+
+
+def parse_repo(ref: str, *, allow_local: bool = False) -> RepoRef:
     """Resolve ``owner/name``, an HTTPS/SSH URL, or any git URL to a ref.
 
-    A bare slug means GitHub. Full URLs pass through verbatim (any host,
-    including ``file://`` for tests and mirrors); the last two path segments
-    name the workspace directory.
+    A bare slug means GitHub. A ``scheme://`` URL passes through verbatim (any
+    host) only for the transports in :data:`_ALLOWED_URL_SCHEMES`; the last two
+    path segments name the workspace directory. ``file://`` is accepted only
+    when ``allow_local=True`` (a trusted local caller — never the authenticated
+    dispatch path), and RCE-capable helper transports such as ``ext::`` are
+    always refused. The ``git@host:path`` shorthand is unaffected.
     """
 
     text = ref.strip()
@@ -123,6 +136,10 @@ def parse_repo(ref: str) -> RepoRef:
         return RepoRef(owner=owner, name=name, url=text)
     if "://" in text:
         _reject_embedded_credentials(text)
+        scheme = urlsplit(text).scheme
+        allowed = _ALLOWED_URL_SCHEMES | {"file"} if allow_local else _ALLOWED_URL_SCHEMES
+        if scheme not in allowed:
+            raise SourceError(f"unsupported URL scheme {scheme!r}")
         path = text.split("://", 1)[1]
         path = path.split("/", 1)[1] if "/" in path else ""
         owner, name = _owner_name_from_path(path, ref)

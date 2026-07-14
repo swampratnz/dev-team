@@ -42,10 +42,18 @@ An interactive run pauses at the moments a human actually wants a say:
    policy gates (`push`, `deploy`, `rm`), ask for a yes/no with the risk and
    detail shown.
 
-Every prompt has a sensible default (shown first), and a closed stdin falls
-back to it — a detached interactive run degrades to autonomous instead of
-crashing. On resume from a checkpoint the plan is *not* re-reviewed: it was
-approved by the run that created it, and the banked work matches it.
+Every prompt shows a default first, for a present human who just presses
+enter — but a closed stdin does **not** silently take that default. A
+detached interactive run (piped, `nohup`, a CI or oneshot unit with no
+terminal) **fails closed**: on EOF each question falls back to its *fail-safe*
+choice, not its default. Plan review aborts before any work (or spend beyond
+planning) starts, and every approval — the feature commit and each gated
+`push`/`deploy`/`rm` — is denied. So a run that loses its human never
+degrades to autonomous and never crashes on the missing input; it stops.
+(The one prompt whose fail-safe *is* its default is failed-task escalation:
+it falls back to `skip`, leaving the task failed rather than retrying blind.)
+On resume from a checkpoint the plan is *not* re-reviewed: it was approved by
+the run that created it, and the banked work matches it.
 
 ## Chat (`--chat`)
 

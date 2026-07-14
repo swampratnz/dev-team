@@ -72,7 +72,7 @@ QA, security, docs, reliability, and deployment.
   VSTest/xUnit failure parsing) and produces a phased, path-cited assessment
   — buildability, dependency/secret/data risk, test reality, and a verdict
   from a fixed vocabulary (revive-in-place, dependency-surgery,
-  strangler-rewrite, rebuild-from-scratch, archive) with a sequenced
+  strangler-rewrite, rebuild, archive) with a sequenced
   remediation plan — without mutating the repo. Opt-in `--build-probe` runs
   the project's own setup/verify commands so buildability rests on real exit
   codes, and the report names its **audit blind spots** (top-level
@@ -125,6 +125,60 @@ delivery), grounded in real multi-agent frameworks — see
 tracks how each release built on it and what is still deliberately out;
 [`docs/INTERACTION.md`](docs/INTERACTION.md) covers working *with* the team
 interactively.
+
+---
+
+## First 10 minutes
+
+The fastest way in is to point the team at a repo you already have and read
+what it says back — an assessment is read-only, so nothing you run here can
+change your code.
+
+1. **Install** (a venv keeps it off your system Python):
+
+   ```bash
+   python -m venv .venv && source .venv/bin/activate
+   pip install -e '.[test]'
+   ```
+
+   The agents drive the Claude Code CLI at runtime — install it too
+   (`npm install -g @anthropic-ai/claude-code`); see
+   [DEPLOYMENT.md](DEPLOYMENT.md#1-prerequisites).
+
+2. **Authenticate.** Set one credential in the environment — a Claude
+   subscription token (from `claude setup-token`) or a Claude API key:
+
+   ```bash
+   export CLAUDE_CODE_OAUTH_TOKEN=...   # from: claude setup-token
+   # ...or: export ANTHROPIC_API_KEY=sk-ant-...
+   ```
+
+   The CLI fails fast with guidance if neither is present.
+
+3. **Assess a small repo.** Title and description scope the audit; the budget
+   is a graceful stop-line:
+
+   ```bash
+   dev-team --assess --workspace ./some-repo \
+       "First look" "what shape is this codebase in?" --budget-usd 5
+   ```
+
+   It writes a cited markdown report to `./some-repo/audit/assessment.md`
+   (`--report` to change the path; `--json` for the structured shape) and
+   never touches the code under audit.
+
+4. **Watch it (optional).** In another terminal, open the read-only dashboard
+   over the same workspace:
+
+   ```bash
+   dev-team --dashboard --workspace ./some-repo    # http://127.0.0.1:8737/
+   ```
+
+See [`docs/examples/assessment-sample.md`](docs/examples/assessment-sample.md)
+for a full, illustrative sample report before you spend a cent, and
+[`docs/ASSESSMENT.md`](docs/ASSESSMENT.md) for everything `--assess` can do.
+Ready to have the team *change* code instead of just reading it? That is
+`--deliver` — see *Usage* below.
 
 ---
 

@@ -39,6 +39,30 @@ def path_excluded(path: str, exclude_globs: Sequence[str]) -> bool:
     return any(fnmatch.fnmatch(path, pattern) for pattern in exclude_globs)
 
 
+#: Structural fence tokens whose literal appearance inside untrusted manifest
+#: text could try to break out of the block it is interpolated into.
+_FENCE_TOKENS = ("</manifest-content>", "</repo-context>")
+
+
+def _defuse(text: str) -> str:
+    """Neutralise structural fence tokens in untrusted manifest/README text.
+
+    The manifest head is interpolated raw between ``<manifest-content>`` … tags
+    that later nest inside assessment's ``<repo-context>`` block. A hostile file
+    whose body contains a literal ``</manifest-content>`` or ``</repo-context>``
+    could otherwise try to close the block early and smuggle instructions after
+    it. Insert a zero-width space into each closing token so it reads
+    identically to a human but no longer matches the structural tag. Only the
+    untrusted head is defused; the renderer's own emitted tags are untouched.
+    """
+
+    for token in _FENCE_TOKENS:
+        # Zero-width space (U+200B) between "<" and "/": invisible to a human,
+        # but the token no longer matches the structural closing tag.
+        text = text.replace(token, "<\u200b" + token[1:])
+    return text
+
+
 @dataclass
 class RepoContext:
     """What the workspace holds, in prompt-ready form."""
@@ -60,11 +84,18 @@ class RepoContext:
         if self.is_empty:
             return ""
         lines = [f"The workspace contains {self.total_files} file(s):"]
-        lines.extend(f"- {path}" for path in self.files)
+        # File paths and test locations come from the (untrusted) audited repo:
+        # a Linux filename may hold almost any byte, so a file literally named
+        # "</repo-context>..." would otherwise close this block early exactly
+        # like a hostile manifest body. Defuse them at render time (leaving the
+        # stored paths intact) the same way the manifest heads are defused.
+        lines.extend(f"- {_defuse(path)}" for path in self.files)
         if self.total_files > len(self.files):
             lines.append(f"- ... and {self.total_files - len(self.files)} more")
         if self.test_paths:
-            lines.append(f"Tests live under: {', '.join(self.test_paths)}")
+            lines.append(
+                f"Tests live under: {', '.join(_defuse(p) for p in self.test_paths)}"
+            )
         for name, head in self.manifest_heads.items():
             lines.append(
                 f'\n<manifest-content name="{name}">\n{head}\n</manifest-content>'
@@ -105,7 +136,9 @@ def build_repo_context(
             head = content[:manifest_head_chars]
             if len(head) < len(content):
                 head += "\n... (truncated)"
-            heads[name] = head
+            # The head is untrusted repo content; neutralise any structural
+            # fence tokens before it is interpolated into the prompt block.
+            heads[name] = _defuse(head)
     test_locations = set()
     for path in files:
         root = path.split("/")[0]

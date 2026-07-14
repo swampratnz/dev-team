@@ -54,7 +54,7 @@ from .conventions import (
 )
 from .deadcode import DeadCodeReport, detect_dead_code
 from .depscan import DependencyScan, Fetch, scan_dependencies
-from .errors import AgentResponseError
+from .errors import AgentResponseError, DevTeamError
 from .events import AgentEvent, Listener, emit
 from .execution import (
     CommandRunner,
@@ -871,6 +871,17 @@ class AssessmentEngine:
             if part
         )
         focus = self.config.focus
+
+        # A mistyped or empty workspace has nothing to audit, so refuse before
+        # the first (paid) agent phase rather than burn model spend on a
+        # repository that isn't there. The deterministic inventory above is
+        # free; the phases below are not.
+        if not self.workspace.list_files() or stats.total_files == 0:
+            self.tracer.end(run_span, "empty-workspace")
+            raise DevTeamError(
+                f"Nothing to assess: no files found under {self.workdir!r}. "
+                "Check the workspace path (or exclude globs) before assessing."
+            )
 
         phases: Dict[str, PhaseResult] = {}
         phases["inventory"] = await self._phase(
@@ -1790,16 +1801,44 @@ def _items(data: Dict, key: str) -> List[Dict]:
     return [item for item in value if isinstance(item, dict)]
 
 
-def _cited(lines: List[str], items: List[Dict], *fields: str) -> None:
-    """Append '- field1 — field2 (evidence)' bullets for each item."""
+def _has_claim(item: Dict) -> bool:
+    """Whether ``item`` carries claim text — i.e. :func:`list_findings` would
+    enumerate it as a re-verifiable finding (see :data:`_CLAIM_FIELDS`)."""
 
-    for item in items:
+    for name in _CLAIM_FIELDS:
+        value = item.get(name)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _cited(
+    lines: List[str],
+    items: List[Dict],
+    *fields: str,
+    id_prefix: Optional[str] = None,
+) -> None:
+    """Append '- field1 — field2 (evidence)' bullets for each item.
+
+    When ``id_prefix`` is given, the list is one of :data:`_FINDING_LISTS`, so
+    each re-verifiable bullet is suffixed with its positional finding id
+    (``[risk.secrets[0]]``) — the exact id :func:`list_findings` mints, using
+    the same ``_items`` enumeration — so a reader can re-verify it by id. The
+    index counts every item (matching :func:`list_findings`), even those with
+    no claim text, but only claim-bearing bullets carry an id (those are the
+    ones :func:`find_finding` can resolve).
+    """
+
+    for index, item in enumerate(items):
         body = " — ".join(
             str(item[f]) for f in fields if item.get(f) not in (None, "")
         )
         evidence = item.get("evidence")
         suffix = f" (evidence: {evidence})" if evidence else ""
-        lines.append(f"- {body or '(unspecified)'}{suffix}")
+        id_suffix = ""
+        if id_prefix is not None and _has_claim(item):
+            id_suffix = f" [{id_prefix}[{index}]]"
+        lines.append(f"- {body or '(unspecified)'}{suffix}{id_suffix}")
 
 
 def render_report(outcome: AssessmentOutcome) -> str:
@@ -1837,10 +1876,15 @@ def render_report(outcome: AssessmentOutcome) -> str:
             plan = _items(rec.data, "plan")
             if plan:
                 lines += ["", "### Remediation plan", ""]
-                for i, step in enumerate(plan, 1):
+                # rec.ok holds here (this is the else branch), so plan ids line
+                # up with list_findings' recommendation.plan[i] enumeration.
+                for i, step in enumerate(plan):
                     effort = step.get("effort", "?")
                     detail = step.get("detail", "")
-                    lines.append(f"{i}. {step.get('step', '(step)')} — *{effort}*. {detail}".rstrip())
+                    text = f"{i + 1}. {step.get('step', '(step)')} — *{effort}*. {detail}".rstrip()
+                    if _has_claim(step):
+                        text += f" [recommendation.plan[{i}]]"
+                    lines.append(text)
 
     sections = (
         ("inventory", "Phase 1 — Inventory"),
@@ -1882,22 +1926,44 @@ def render_report(outcome: AssessmentOutcome) -> str:
             findings = _items(result.data, "findings")
             if findings:
                 lines += ["", "### Findings", ""]
-                _cited(lines, findings, "claim")
+                # Only an ok phase is enumerable by list_findings, so mint ids
+                # (find_finding can't resolve a failed phase's bullets).
+                _cited(
+                    lines,
+                    findings,
+                    "claim",
+                    id_prefix="inventory.findings" if result.ok else None,
+                )
         elif key == "buildability":
             lines += ["", f"**Builds today: {result.data.get('verdict', 'unknown')}**"]
             blockers = _items(result.data, "blockers")
             if blockers:
                 lines += ["", "### Blockers", ""]
-                _cited(lines, blockers, "claim", "category")
+                _cited(
+                    lines,
+                    blockers,
+                    "claim",
+                    "category",
+                    id_prefix="buildability.blockers" if result.ok else None,
+                )
             runtimes = _items(result.data, "runtime_requirements")
             if runtimes:
                 lines += ["", "### Runtime requirements", ""]
+                # Not a _FINDING_LISTS list: no id (find_finding can't resolve).
                 _cited(lines, runtimes, "runtime", "required")
         elif key == "risk":
             deps = _items(result.data, "dependencies")
             if deps:
                 lines += ["", "### Dependencies", ""]
-                _cited(lines, deps, "name", "version", "status", "action")
+                _cited(
+                    lines,
+                    deps,
+                    "name",
+                    "version",
+                    "status",
+                    "action",
+                    id_prefix="risk.dependencies" if result.ok else None,
+                )
             for sub, heading in (
                 ("secrets", "Secrets"),
                 ("data_layer", "Data layer"),
@@ -1905,11 +1971,22 @@ def render_report(outcome: AssessmentOutcome) -> str:
                 items = _items(result.data, sub)
                 if items:
                     lines += ["", f"### {heading}", ""]
-                    _cited(lines, items, "claim")
+                    _cited(
+                        lines,
+                        items,
+                        "claim",
+                        id_prefix=f"risk.{sub}" if result.ok else None,
+                    )
             services = _items(result.data, "external_services")
             if services:
                 lines += ["", "### External services", ""]
-                _cited(lines, services, "name", "risk")
+                _cited(
+                    lines,
+                    services,
+                    "name",
+                    "risk",
+                    id_prefix="risk.external_services" if result.ok else None,
+                )
         else:  # coverage
             for sub, heading in (
                 ("tests", "Test infrastructure"),
@@ -1918,7 +1995,12 @@ def render_report(outcome: AssessmentOutcome) -> str:
                 items = _items(result.data, sub)
                 if items:
                     lines += ["", f"### {heading}", ""]
-                    _cited(lines, items, "claim")
+                    _cited(
+                        lines,
+                        items,
+                        "claim",
+                        id_prefix=f"coverage.{sub}" if result.ok else None,
+                    )
 
     conventions = outcome.phases.get("conventions")
     if conventions is not None:
@@ -1931,7 +2013,13 @@ def render_report(outcome: AssessmentOutcome) -> str:
         items = _items(conventions.data, "conventions")
         if items:
             lines.append("")
-            _cited(lines, items, "aspect", "convention")
+            _cited(
+                lines,
+                items,
+                "aspect",
+                "convention",
+                id_prefix="conventions.conventions" if conventions.ok else None,
+            )
         if outcome.conventions is not None and outcome.conventions.sources:
             lines += [
                 "",
@@ -1943,7 +2031,10 @@ def render_report(outcome: AssessmentOutcome) -> str:
     if component_phase is not None and component_phase.data:
         lines += ["", "## Component deep-dives", ""]
         lines.append(str(component_phase.data.get("summary", "")))
-        for entry in _items(component_phase.data, "components"):
+        # Enumerate components positionally so deep-dive finding ids match
+        # list_findings' components.components[i].findings[j] scheme. Only an
+        # ok phase is enumerable there, so gate the ids on it.
+        for c_index, entry in enumerate(_items(component_phase.data, "components")):
             lines += ["", f"### {entry.get('name', '?')} (`{entry.get('path', '?')}`)", ""]
             if entry.get("error"):
                 lines.append(f"_Deep-dive failed: {entry['error']}_")
@@ -1953,7 +2044,16 @@ def render_report(outcome: AssessmentOutcome) -> str:
             findings = [f for f in entry.get("findings", []) if isinstance(f, dict)]
             if findings:
                 lines.append("")
-                _cited(lines, findings, "claim")
+                _cited(
+                    lines,
+                    findings,
+                    "claim",
+                    id_prefix=(
+                        f"components.components[{c_index}].findings"
+                        if component_phase.ok
+                        else None
+                    ),
+                )
 
     lines += ["", "## Appendix — deterministic inventory", ""]
     lines.append(outcome.stats.render())

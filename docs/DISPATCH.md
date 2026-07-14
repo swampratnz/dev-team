@@ -145,7 +145,9 @@ id → `404 {"error":"unknown job"}`.
   `{"kind":"verify","source_job":str,"finding_id":str,`
   `"verdict":"confirmed|refuted|needs-context","rationale":str,`
   `"citations":[{"path":str,"note":str}],"cost_usd":num}`.
-- **failed**: `{"kind":<mode>,"success":false,"error":str,"cost_usd":0}`.
+- **failed**: `{"kind":<mode>,"success":false,"error":str,"cost_usd":num}` —
+  the real (possibly partial) spend banked before the failure; `0` only when
+  the job failed before any budget existed (e.g. a clone failure).
 - **cancelled**: `{"kind":<mode>,"success":false,"error":"cancelled","cost_usd":0}`.
 - still **queued/running**: `409 {"error":"not finished","state":<state>}`.
 - unknown id → `404`.

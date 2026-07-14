@@ -176,10 +176,97 @@ To run it on a schedule, pair the service with a systemd timer
 (`dev-team@health.timer`).
 
 Note: `--interactive` and `--chat` are terminal features — use them in an
-SSH session, not in the unit (a oneshot service has no stdin; interactive
-prompts would fall back to their defaults, i.e. run autonomously). To drive
-runs from a web UI or chat bot instead, see
-[`docs/INTERACTION.md`](docs/INTERACTION.md).
+SSH session, not in the unit. A oneshot service has no stdin, and an
+interactive prompt with no stdin **fails closed** (plan review aborts, every
+approval is denied) rather than running autonomously — so a detached `-i` run
+is more likely to stop than to quietly do the work. To drive runs from a web
+UI or chat bot instead, see [`docs/INTERACTION.md`](docs/INTERACTION.md).
+
+## 5c. Standing services (dispatch + dashboard)
+
+The oneshot unit above runs one job and exits. A server that accepts jobs
+*remotely* and shows them in a browser instead runs **two long-lived units**
+that share one workspace: the dispatch service **writes** runs into it, the
+dashboard **reads** them back out.
+
+### Dispatch — the remote job runner
+
+[`deploy/dev-team-dispatch.service`](deploy/dev-team-dispatch.service) is a
+hardened singleton that serves the authenticated HTTP API (`--dispatch`):
+submit / poll / fetch **assess**, **deliver**, and **verify** jobs, run one at
+a time (single-flight, since the box has one shared Claude subscription). It
+binds the **tailnet IP only** — never the public internet, because it holds
+Claude credentials and executes agent code — and authenticates every route
+except `GET /health` with a bearer token. Full API in
+[`docs/DISPATCH.md`](docs/DISPATCH.md).
+
+```bash
+sudo cp deploy/dev-team-dispatch.service /etc/systemd/system/
+sudo mkdir -p /etc/dev-team /opt/dev-team/workspace
+sudo chown devteam:devteam /opt/dev-team/workspace
+
+sudo tee /etc/dev-team/dev-team.env >/dev/null <<'EOF'
+CLAUDE_CODE_OAUTH_TOKEN=<token from claude setup-token>
+# ...or instead: ANTHROPIC_API_KEY=sk-ant-...
+DEV_TEAM_DISPATCH_TOKEN=<32-byte hex, e.g. from: openssl rand -hex 32>
+# GITHUB_TOKEN=github_pat_...   # only to clone private repos
+EOF
+sudo chmod 600 /etc/dev-team/dev-team.env
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now dev-team-dispatch.service
+```
+
+Its `ExecStart` passes `--dashboard-workspace /opt/dev-team/workspace`, so
+although each job runs in its own isolated clone under `/opt/dev-team/jobs/<id>`,
+it **also** journals its events into that shared workspace and mirrors each
+assessment's report and structured result there. That shared workspace is the
+hand-off to the dashboard. (The same env-file gotcha as 5b applies: keep every
+value on its own line, with no trailing inline `#` comment.)
+
+### Dashboard — the read-only viewer
+
+[`deploy/dev-team-dashboard.service`](deploy/dev-team-dashboard.service) serves
+the web dashboard (`--dashboard`) over that **same** `/opt/dev-team/workspace`.
+It is a **separate, read-only process** — it renders the journal, backlog,
+memory, conventions, and reports but never writes them — and it runs **no
+agents**, so its unit deliberately holds **no Claude credentials**: only
+`DEV_TEAM_DASHBOARD_TOKEN`, in its own `/etc/dev-team/dashboard.env`. Full
+panel list in [`docs/DASHBOARD.md`](docs/DASHBOARD.md).
+
+```bash
+sudo cp deploy/dev-team-dashboard.service /etc/systemd/system/
+
+sudo tee /etc/dev-team/dashboard.env >/dev/null <<'EOF'
+DEV_TEAM_DASHBOARD_TOKEN=<url-safe token, e.g. from: python -c 'import secrets; print(secrets.token_urlsafe(32))'>
+EOF
+sudo chmod 600 /etc/dev-team/dashboard.env
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now dev-team-dashboard.service
+# http://127.0.0.1:8737/  (bound to loopback — reach it over an SSH port-forward)
+```
+
+Set a token even on the loopback bind: a standing service on a shared host is
+reachable by anyone with local or SSH access, and the dashboard exposes the
+assessment reports (and, with transcripts enabled, raw repo content). The
+tokenless "open" mode is for localhost development only.
+
+### How the pair fits together
+
+```
+ dispatch (:8738, tailnet)  ──writes──▶  /opt/dev-team/workspace  ◀──reads──  dashboard (:8737, loopback)
+   holds Claude creds +                   shared journal, reports,             holds only
+   DEV_TEAM_DISPATCH_TOKEN                 and backlog                          DEV_TEAM_DASHBOARD_TOKEN
+```
+
+Two processes, two tokens, two env files — one shared workspace. The dashboard
+starts **read-only**: the Kanban board's edit controls answer `501` until you
+also hand the dashboard the dispatch bearer token. To enable board editing,
+add `--dispatch-url http://127.0.0.1:8738` to the dashboard unit's `ExecStart`
+and `DEV_TEAM_DISPATCH_TOKEN=...` to `dashboard.env`; edits then proxy to the
+dispatch service, which owns every backlog write (see
+[`docs/DASHBOARD.md`](docs/DASHBOARD.md)).
 
 ## 6. Security notes
 

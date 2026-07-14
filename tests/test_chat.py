@@ -161,22 +161,62 @@ def test_chat_help_and_unknown_command():
 
 
 def test_chat_run_hands_off_simulation():
-    session, backend, runs, out = _session(["/run", "/quit"])
+    # U11: the distilled brief is shown and an explicit "y" confirms the handoff.
+    session, backend, runs, out = _session(["/run", "y", "/quit"])
     assert run(session.run()) == 0
     assert runs == [(FeatureRequest(title="Login", description="Add login"), False)]
-    assert "handing off to the team (simulation)" in out.getvalue()
-    assert "run succeeded" in out.getvalue()
+    text = out.getvalue()
+    assert "distilled brief (simulation):" in text
+    assert "handing off to the team (simulation)" in text
+    assert "run succeeded" in text
 
 
 def test_chat_deliver_hands_off_delivery():
-    session, _, runs, out = _session(["/deliver", "/quit"])
+    session, _, runs, out = _session(["/deliver", "y", "/quit"])
     run(session.run())
     assert runs[0][1] is True
     assert "handing off to the team (delivery)" in out.getvalue()
 
 
+def test_chat_declining_cancels_handoff():
+    # U11: anything other than an affirmative cancels; run_feature is not called.
+    session, _, runs, out = _session(["/run", "n", "/quit"])
+    assert run(session.run()) == 0
+    assert runs == []
+    assert "cancelled" in out.getvalue()
+    assert "handing off" not in out.getvalue()
+
+
+def test_chat_eof_at_confirmation_cancels():
+    # U11: EOF at the confirmation prompt fails safe (cancel), never a handoff.
+    session, _, runs, out = _session(["/run"])  # no answer line → EOF
+    assert run(session.run()) == 0
+    assert runs == []
+    assert "cancelled" in out.getvalue()
+
+
+def test_chat_handoff_shows_brief_with_constraints():
+    # U11: constraints are surfaced in the confirmation brief.
+    backend = FakeBackend(
+        brief=json.dumps(
+            {
+                "title": "Login",
+                "description": "Add login",
+                "constraints": ["fast", "secure"],
+            }
+        )
+    )
+    session, _, runs, out = _session(["/run", "y", "/quit"], backend)
+    assert run(session.run()) == 0
+    text = out.getvalue()
+    assert "constraints:" in text
+    assert "- fast" in text
+    assert "- secure" in text
+    assert runs and runs[0][0].constraints == ["fast", "secure"]
+
+
 def test_chat_failed_run_exit_code_survives_quit():
-    session, _, runs, out = _session(["/run", "/quit"], run_result=1)
+    session, _, runs, out = _session(["/run", "y", "/quit"], run_result=1)
     assert run(session.run()) == 1
     assert "finished with issues" in out.getvalue()
 

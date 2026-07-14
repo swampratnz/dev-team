@@ -79,6 +79,28 @@ def test_parse_repo_allows_ssh_scheme_transport_user():
     assert ref.url == "ssh://git@github.com/acme/thing.git"
 
 
+def test_parse_repo_rejects_file_scheme_by_default():
+    # SECURITY (S3): file:// is local file access, reachable from the
+    # authenticated dispatch API — refused unless a trusted caller opts in.
+    with pytest.raises(SourceError, match="unsupported URL scheme 'file'"):
+        parse_repo("file:///etc")
+
+
+def test_parse_repo_allows_file_scheme_only_with_allow_local():
+    ref = parse_repo("file:///srv/mirror/thing.git", allow_local=True)
+    assert ref.url == "file:///srv/mirror/thing.git"
+    assert (ref.owner, ref.name) == ("mirror", "thing")
+
+
+def test_parse_repo_rejects_rce_capable_ext_transport():
+    # SECURITY (S3): git's ext:: helper transport runs an arbitrary command;
+    # it is never a legitimate repo reference and must be refused (even with
+    # allow_local, which only re-admits file://).
+    for allow_local in (False, True):
+        with pytest.raises(SourceError):
+            parse_repo("ext::sh -c id", allow_local=allow_local)
+
+
 # --- env file & token resolution ---------------------------------------------------
 
 
@@ -306,7 +328,11 @@ def test_clone_and_update_a_real_repository(tmp_path):
     upstream.add_paths(["README.md"])
     upstream.commit("initial")
 
-    ref = parse_repo(f"file://{source.as_posix()}")  # forward slashes on every OS
+    # allow_local=True re-admits the file:// transport for a trusted local
+    # caller (the default authenticated path rejects it — see the scheme tests).
+    ref = parse_repo(
+        f"file://{source.as_posix()}", allow_local=True
+    )  # forward slashes on every OS
     runner = SubprocessCommandRunner()
     dest = str(tmp_path / "work" / ref.workspace_name)
     assert clone_or_update(ref, dest, runner=runner) == dest

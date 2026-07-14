@@ -332,6 +332,15 @@ def _retrospective(
 # A snapshot maps path -> prior content, or None when the file did not exist.
 _Snapshot = Dict[str, Optional[str]]
 
+
+class _StashRestoreFailed(Exception):
+    """Internal signal: a fail-to-pass stash pop failed to restore the tree.
+
+    Raised inside :meth:`DeliveryEngine._tests_are_vacuous` when the shelved
+    implementation could not be popped back cleanly, and handled at its call
+    site as a gate failure. It never escapes the engine.
+    """
+
 # Written on greenfield agentic deliveries so add-by-path staging (and human
 # eyes) never see bytecode, caches, or the engine's own bookkeeping.
 _DEFAULT_GITIGNORE = """\
@@ -612,7 +621,7 @@ class DeliveryEngine:
         }
 
         self._baseline_failures = None
-        baseline = self._check_baseline()
+        baseline = await self._check_baseline()
         if baseline is not None and not baseline.passed:
             if self.config.require_green_baseline:
                 self.tracer.end(run_span, "halted")
@@ -983,7 +992,7 @@ class DeliveryEngine:
             timeout=self.config.gate_timeout_seconds,
         )
 
-    def _check_baseline(self) -> Optional[DoDReport]:
+    async def _check_baseline(self) -> Optional[DoDReport]:
         """Evaluate the gates before any work starts, when there is anything
         to evaluate.
 
@@ -993,6 +1002,11 @@ class DeliveryEngine:
         breakage from breakage the team introduces — without it, a legacy
         repo's one flaky test fails every task and the engineer gets blamed
         for code it never touched.
+
+        The evaluation runs off the event loop: a remote-CI gate polls with
+        blocking ``time.sleep`` for up to its whole timeout (~1800s), which
+        would otherwise starve the loop (and every concurrent task) here just
+        as it does at per-task integration time.
         """
 
         product_files = [
@@ -1002,7 +1016,9 @@ class DeliveryEngine:
         ]
         if not product_files:
             return None
-        report = self.definition_of_done.evaluate(self._gate_context())
+        report = await asyncio.to_thread(
+            self.definition_of_done.evaluate, self._gate_context()
+        )
         status = "green" if report.passed else "RED"
         self._event("baseline", f"Baseline gates: {status}", detail=report.summary())
         return report
@@ -1173,15 +1189,25 @@ class DeliveryEngine:
                 # The agentic engineer mutates the shared working directory, so
                 # the whole attempt runs inside the integration lock.
                 async with self._integration_lock:
-                    implementation = await self.engineer.implement_in_place(
-                        task,
-                        design,
-                        feedback,
-                        cwd=str(self.workdir),
-                        conventions=self._conventions,
-                        model=model,
-                        tools=self.config.engineer_tools,
-                    )
+                    try:
+                        implementation = await self.engineer.implement_in_place(
+                            task,
+                            design,
+                            feedback,
+                            cwd=str(self.workdir),
+                            conventions=self._conventions,
+                            model=model,
+                            tools=self.config.engineer_tools,
+                        )
+                    except BaseException:
+                        # implement_in_place edits the shared workdir directly.
+                        # A raising call (AgentResponseError, BudgetExceededError,
+                        # cancellation) leaves those edits on disk, outside any
+                        # rollback scope — _integrate never runs. Discard them
+                        # here, or the next task's _commit_wip banks this failed
+                        # task's half-written changes as if they were gated work.
+                        self._rollback(None, self.git)
+                        raise
                     done, review, test_report, feedback = await self._integrate(
                         task, implementation, span
                     )
@@ -1440,7 +1466,40 @@ class DeliveryEngine:
                     self.tracer.end(span, "gates-failed")
                     return False, review, test_report, _review_from_dod(dod)
 
-            if await self._tests_are_vacuous(implementation, ws, repo, cwd, snapshot):
+            try:
+                vacuous = await self._tests_are_vacuous(
+                    implementation, ws, repo, cwd, snapshot
+                )
+            except _StashRestoreFailed:
+                # The fail-to-pass check could not restore the shelved change.
+                # Treat it as a gate failure: roll back and reject rather than
+                # accept a task whose implementation is no longer on disk.
+                self._scorecard["gate_failures"] = (
+                    self._scorecard.get("gate_failures", 0) + 1
+                )
+                self._rollback(snapshot, repo)
+                task.status = TaskStatus.CHANGES_REQUESTED
+                self.tracer.end(span, "stash-restore-failed")
+                feedback = Review(
+                    approved=False,
+                    summary="The implementation could not be verified: restoring "
+                    "it after the fail-to-pass check failed (stash pop conflict).",
+                    comments=[
+                        ReviewComment(
+                            severity=Severity.MAJOR,
+                            message="Re-run the task; the working tree could not be "
+                            "restored after shelving the change for the "
+                            "fail-to-pass check.",
+                        )
+                    ],
+                )
+                test_report = TestReport(
+                    passed=False,
+                    coverage=0.0,
+                    summary="rejected: the shelved implementation could not be restored",
+                )
+                return False, review, test_report, feedback
+            if vacuous:
                 self._scorecard["vacuous_test_rejections"] = (
                     self._scorecard.get("vacuous_test_rejections", 0) + 1
                 )
@@ -1534,7 +1593,21 @@ class DeliveryEngine:
                         self.definition_of_done.evaluate, self._gate_context(cwd=cwd)
                     )
                 finally:
-                    repo.stash_pop()
+                    popped = repo.stash_pop()
+            # The pop result is checked outside the lock (it does no git work):
+            # a failed/conflicting pop means the implementation is no longer
+            # intact on disk (still shelved, or the tree holds conflict
+            # markers). Accepting now would mark the task DONE over a broken
+            # tree while silently discarding the work, so abort — the call site
+            # turns this into a gate failure.
+            if not popped:
+                self._event(
+                    "fail-to-pass",
+                    "Restoring the shelved implementation failed (stash pop "
+                    "conflict); rejecting the attempt rather than banking a "
+                    "task whose code was not restored",
+                )
+                raise _StashRestoreFailed
         else:
             # impl_paths were filtered on existence, so every current read works.
             current = {p: ws.read_text(p) for p in impl_paths}
@@ -1862,6 +1935,10 @@ class DeliveryEngine:
         if not decision.approved:
             self._event("commit", "Skipping commit: approval denied", detail=decision.reason)
             return False
+        # Captured before any reset so the except branch can undo a soft reset
+        # whose follow-up commit failed (see below). ``None`` while no reset
+        # has moved the tip, so the else branch never triggers a restore.
+        head: Optional[str] = None
         try:
             if self._baseline_sha is not None:
                 # Accepted tasks already live as WIP commits on the delivery
@@ -1894,6 +1971,14 @@ class DeliveryEngine:
                 self.git.commit(f"{request.title} ({', '.join(done)})")
         except GitError as exc:
             self._event("commit", "Commit failed", detail=str(exc))
+            # The soft reset already moved the tip back to the baseline, so the
+            # banked WIP commits now live only in the reflog. A failed final
+            # commit would strand them there and brick resume. Restore the tip
+            # to the pre-reset HEAD so those commits (and a resumable state)
+            # return before we bail out. ``head`` is None only in the no-baseline
+            # branch, where nothing moved the tip and there is nothing to undo.
+            if head is not None:
+                self.git.reset_hard(head)
             return False
         self._event("commit", f"Committed {len(done)} task(s)")
         return True

@@ -70,12 +70,16 @@ class InstrumentedRunner:
             raise
         if self.tracer is not None:
             self.tracer.end(span, "error" if result.is_error else "ok")
-        if self.budget is not None:
-            self.budget.record(self.role, result)
         # Capture the raw I/O on both the success and the error-result paths
         # (the raising path returned above, so it has no result to record).
+        # This runs BEFORE the budget is enforced: budget.record raises once
+        # the ceiling is crossed, and the call whose cost tips it over has
+        # still been paid for — its transcript must be audited, not lost to
+        # the exception.
         if self.transcript_recorder is not None:
             self._record(system_prompt, prompt, result)
+        if self.budget is not None:
+            self.budget.record(self.role, result)
         return result
 
     def _record(
