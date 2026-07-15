@@ -566,6 +566,39 @@ def _gitignore_ignores(existing: str, entry: str) -> bool:
     return False
 
 
+# Path segments and basenames that denote *test* code (or its harness config)
+# rather than product code. The fail-to-pass check must revert only the
+# implementation and keep the tests: an agentic engineer writes and reports its
+# task's own tests in implementation.files, so without this the check reverts
+# the very tests that would catch the regression — and every task after the
+# first looks vacuous (the earlier tasks' tests still pass unchanged).
+_TEST_DIR_SEGMENTS = frozenset({"tests", "test", "__tests__"})
+_TEST_CONFIG_BASENAMES = frozenset({"conftest.py", "pytest.ini", "tox.ini"})
+
+
+def _is_test_path(path: str) -> bool:
+    """Whether ``path`` is test code or its harness config, not product code.
+
+    Recognises the common conventions across ecosystems: a ``tests``/``test``/
+    ``__tests__`` directory anywhere in the path, a ``test_*``/``*_test``
+    basename, a ``*.test.*``/``*.spec.*`` (JS/TS) or ``*_test.go`` file, and
+    pytest harness config (``conftest.py``/``pytest.ini``/``tox.ini``).
+    Conservative by design: keeping a borderline file *out* of the revert set
+    only makes the vacuous check retain more tests, which is the safe direction.
+    """
+
+    parts = path.replace("\\", "/").split("/")
+    if any(seg in _TEST_DIR_SEGMENTS for seg in parts[:-1]):
+        return True
+    name = parts[-1]
+    if name in _TEST_CONFIG_BASENAMES:
+        return True
+    if name.endswith("_test.go") or ".test." in name or ".spec." in name:
+        return True
+    stem = name.split(".", 1)[0]
+    return stem.startswith("test_") or stem.endswith("_test")
+
+
 def _branch_slug(title: str) -> str:
     """Derive a git-safe branch segment from a feature title."""
 
@@ -2207,9 +2240,13 @@ class DeliveryEngine:
 
         A suite that passes without the change never tested it (SWT-bench's
         fail-to-pass principle). The check reverts only the implementation's
-        files — QA's test files stay — reruns the gates, and restores the
-        change afterwards. Skipped for dry runs, when disabled, or when there
-        is nothing on disk to revert.
+        product files — every test file stays, including the ones the engineer
+        authored for this task (it is told to write tests and reports them in
+        ``implementation.files``; reverting those would strip the very tests
+        meant to catch the regression, and each task after the first would look
+        vacuous because the earlier tasks' tests still pass). It then reruns the
+        gates and restores the change. Skipped for dry runs, when disabled, or
+        when there is nothing (no product file) on disk to revert.
         """
 
         if not self.config.fail_to_pass_check or not self.config.qa_tests:
@@ -2221,7 +2258,9 @@ class DeliveryEngine:
         if isinstance(self.command_runner.inner, DryRunCommandRunner):
             return False
         impl_paths = [
-            c.path for c in implementation.files if c.path and ws.exists(c.path)
+            c.path
+            for c in implementation.files
+            if c.path and ws.exists(c.path) and not _is_test_path(c.path)
         ]
         if not impl_paths:
             return False
