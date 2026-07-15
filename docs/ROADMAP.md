@@ -118,6 +118,18 @@ it just isn't used for engineering attempts yet.)
 **Shape:** a session-holding `AgentRunner` built on `ClaudeSDKClient`, keyed
 per task, with explicit reset on rollback.
 
+**Shipped:** opt-in via `EngineConfig.reuse_engineer_session` /
+`--reuse-engineer-session` (default off; agentic, non-worktree only). `sdk.AgentSession`
+/ `ClaudeAgentSession` hold a tool-enabled `ClaudeSDKClient` open across a task's
+attempts (metered per turn by `instrument.InstrumentedSession`); the engineer's
+first attempt sends the full prompt and each retry
+(`EngineerAgent.implement_over_session`) sends only the feedback, so the model
+keeps the code it read and its prior attempt instead of restarting cold. A
+session turn that errors is discarded and the attempt retried once on the proven
+cold path (`_engineer_attempt`); per-attempt model escalation applies only to
+that cold path (the session's model is fixed). Worktree mode and an on-by-default
+flip are the remaining follow-ups.
+
 ## 6. LLM retrospectives & benchmark history
 
 **Why:** v0.5's retrospectives are deterministic distillations, and evals run

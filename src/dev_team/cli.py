@@ -519,6 +519,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(0 = off, the default; with --deliver).",
     )
     delivery.add_argument(
+        "--reuse-engineer-session",
+        action="store_true",
+        help="Reuse one SDK session across a task's engineer attempts so a "
+        "retry continues rather than restarts cold, saving tokens (agentic "
+        "runs only; off by default; with --deliver).",
+    )
+    delivery.add_argument(
         "--pull-request",
         action="store_true",
         help="After a committed delivery, push the branch and open a GitHub "
@@ -758,6 +765,7 @@ def _reject_deliver_only_flags(
             "--max-replan-rounds",
             args.max_replan_rounds != parser.get_default("max_replan_rounds"),
         ),
+        ("--reuse-engineer-session", args.reuse_engineer_session),
         ("--remote-verify-status", args.remote_verify_status is not None),
         ("--remote-verify-trigger", args.remote_verify_trigger is not None),
     ]
@@ -814,6 +822,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         commit=not args.no_commit,
         branch=args.branch,
         max_replan_rounds=args.max_replan_rounds,
+        reuse_engineer_session=args.reuse_engineer_session,
         allow_dirty_baseline=args.allow_dirty_baseline,
         require_green_baseline=not args.proceed_on_red_baseline,
         remote_verify_status=(

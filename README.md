@@ -416,6 +416,13 @@ with a different approach, or drop it — and re-runs the mutated plan, bounded 
 `N` rounds and the budget. Interactive runs supervise each proposal (apply /
 revise / reject); unattended runs apply it autonomously.
 
+`--reuse-engineer-session` (default off, agentic runs only) holds one SDK session
+open across a task's engineer attempts, so a retry continues the prior
+conversation — the code it read, the changes it made — and sends only the
+feedback rather than re-establishing everything from cold. It's the biggest
+token saving on retried tasks; a session that errors falls back to a cold
+attempt.
+
 Deliver all the way to a **pull request** — clone the repo, do the work, then
 push the `dev-team/<feature>` branch and open a PR whose body is the run
 summary:

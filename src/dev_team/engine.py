@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .agents import (
     ArchitectAgent,
@@ -50,7 +50,8 @@ from .budget import Budget, BudgetExceededError
 from .changes import ChangeApplier
 from .context import build_repo_context
 from .conventions import ConventionsStore
-from .errors import DependencyCycleError, DevTeamError
+from .agents.engineer import TOOLS as ENGINEER_TOOLS
+from .errors import AgentResponseError, DependencyCycleError, DevTeamError
 from .events import AgentEvent, Listener, emit
 from .failures import new_failures, parse_failed_tests
 from .execution import (
@@ -64,7 +65,7 @@ from .execution import (
     Workspace,
 )
 from .git import GitError, GitRepo
-from .instrument import InstrumentedRunner
+from .instrument import InstrumentedRunner, InstrumentedSession
 from .interaction import (
     InteractionChannel,
     ask_in_thread,
@@ -105,7 +106,7 @@ from .profile import detect_project
 from .replan import Replan, ReplanError, apply_replan
 from .sandbox import ContainerCommandRunner, SandboxConfig
 from .scheduler import ScheduledResult, schedule
-from .sdk import AgentRunner
+from .sdk import AgentRunner, AgentSession, ClaudeAgentSession
 from .trace import Tracer
 from .transcripts import TranscriptRecorder
 from .verification import (
@@ -186,6 +187,14 @@ class EngineConfig:
     write_gitignore: bool = True
     gate_timeout_seconds: Optional[float] = 1800.0
     engineer_tools: Optional[Sequence[str]] = None
+    #: Reuse one persistent SDK session across a task's engineer attempts, so a
+    #: retry continues the prior conversation (the code it read, the changes it
+    #: made) rather than restarting cold — the big token saving on the shared
+    #: pool. Off by default (opt-in); agentic, non-worktree only. A session turn
+    #: that errors falls back to a cold attempt, and per-attempt model
+    #: escalation does not apply on the session path (the session's model is
+    #: fixed for its life). See ROADMAP #5.
+    reuse_engineer_session: bool = False
     worktrees: bool = False
     lint_command: Optional[Sequence[str]] = None
     security_scan_command: Optional[Sequence[str]] = None
@@ -481,8 +490,13 @@ class DeliveryEngine:
         roster: Optional[Roster] = None,
         interaction: Optional[InteractionChannel] = None,
         transcript_recorder: Optional[TranscriptRecorder] = None,
+        engineer_session_factory: Optional[Callable[[], AgentSession]] = None,
     ) -> None:
         self.config = config or EngineConfig()
+        # Test seam: builds the raw engineer session (a ClaudeAgentSession in
+        # production). The engine wraps whatever this returns in an
+        # InstrumentedSession, so metering is identical either way.
+        self._engineer_session_factory = engineer_session_factory
         self.workspace: Workspace = workspace or InMemoryWorkspace()
         self.budget = budget or Budget()
         self.tracer = tracer or Tracer()
@@ -1352,69 +1366,156 @@ class DeliveryEngine:
         review: Optional[Review] = None
         test_report: Optional[TestReport] = None
         attempts = 0
+        # One persistent session per task (opt-in), reused across attempts so a
+        # retry continues rather than restarts cold. None when off or not
+        # agentic; closed in the finally.
+        session = self._open_engineer_session()
 
-        while attempts < self.config.max_task_attempts:
-            attempts += 1
-            model = self._attempt_model(attempts)
-            task.status = TaskStatus.IN_PROGRESS
-            span = self.tracer.start("task", task.id, attempt=str(attempts))
+        try:
+            while attempts < self.config.max_task_attempts:
+                attempts += 1
+                model = self._attempt_model(attempts)
+                task.status = TaskStatus.IN_PROGRESS
+                span = self.tracer.start("task", task.id, attempt=str(attempts))
 
-            if self.agentic:
-                # The agentic engineer mutates the shared working directory, so
-                # the whole attempt runs inside the integration lock.
-                async with self._integration_lock:
-                    try:
-                        implementation = await self.engineer.implement_in_place(
-                            task,
-                            design,
-                            feedback,
-                            cwd=str(self.workdir),
-                            conventions=self._conventions,
-                            model=model,
-                            tools=self.config.engineer_tools,
+                if self.agentic:
+                    # The agentic engineer mutates the shared working directory,
+                    # so the whole attempt runs inside the integration lock.
+                    async with self._integration_lock:
+                        try:
+                            implementation, session = await self._engineer_attempt(
+                                task, design, feedback, session,
+                                continued=attempts > 1, model=model,
+                            )
+                        except BaseException:
+                            # The engineer edits the shared workdir directly. A
+                            # raising call (AgentResponseError, budget, cancel)
+                            # leaves those edits on disk outside any rollback
+                            # scope — _integrate never runs. Discard them here,
+                            # or the next task's _commit_wip banks this failed
+                            # task's half-written changes as gated work.
+                            self._rollback(None, self.git)
+                            raise
+                        done, review, test_report, feedback = await self._integrate(
+                            task, implementation, span
                         )
-                    except BaseException:
-                        # implement_in_place edits the shared workdir directly.
-                        # A raising call (AgentResponseError, BudgetExceededError,
-                        # cancellation) leaves those edits on disk, outside any
-                        # rollback scope — _integrate never runs. Discard them
-                        # here, or the next task's _commit_wip banks this failed
-                        # task's half-written changes as if they were gated work.
-                        self._rollback(None, self.git)
-                        raise
-                    done, review, test_report, feedback = await self._integrate(
-                        task, implementation, span
+                        if done:
+                            self._commit_wip(task)
+                else:
+                    implementation, done, review, test_report, feedback = (
+                        await self._attempt_described(task, design, feedback, model, span)
                     )
-                    if done:
-                        self._commit_wip(task)
-            else:
-                implementation = await self.engineer.implement(
-                    task,
-                    design,
-                    feedback,
-                    workspace_listing=[
-                        f
-                        for f in self.workspace.list_files()
-                        if not f.startswith(_INTERNAL_PREFIX)
-                    ],
-                    conventions=self._conventions,
-                    model=model,
-                )
-                async with self._integration_lock:
-                    done, review, test_report, feedback = await self._integrate(
-                        task, implementation, span
-                    )
-                    if done:
-                        self._commit_wip(task)
 
+                if done:
+                    task.status = TaskStatus.DONE
+                    self._record_progress(task)
+                    self.tracer.end(span, "done")
+                    return TaskResult(task, attempts, implementation, review, test_report)
+
+            task.status = TaskStatus.FAILED
+            return TaskResult(task, attempts, implementation, review, test_report)
+        finally:
+            if session is not None:
+                await session.aclose()
+
+    async def _attempt_described(self, task, design, feedback, model, span):
+        """One described-mode attempt (in-memory / dry-run; no session).
+
+        Returns ``(implementation, done, review, test_report, feedback)`` for
+        the caller's loop to act on.
+        """
+
+        implementation = await self.engineer.implement(
+            task,
+            design,
+            feedback,
+            workspace_listing=[
+                f
+                for f in self.workspace.list_files()
+                if not f.startswith(_INTERNAL_PREFIX)
+            ],
+            conventions=self._conventions,
+            model=model,
+        )
+        async with self._integration_lock:
+            done, review, test_report, feedback = await self._integrate(
+                task, implementation, span
+            )
             if done:
-                task.status = TaskStatus.DONE
-                self._record_progress(task)
-                self.tracer.end(span, "done")
-                return TaskResult(task, attempts, implementation, review, test_report)
+                self._commit_wip(task)
+        return implementation, done, review, test_report, feedback
 
-        task.status = TaskStatus.FAILED
-        return TaskResult(task, attempts, implementation, review, test_report)
+    def _open_engineer_session(self) -> Optional[AgentSession]:
+        """Open an instrumented engineer session for a task, or ``None``.
+
+        ``None`` unless ``reuse_engineer_session`` is set and the run is agentic
+        (the described/in-memory path has no real workspace to run tools in).
+        The raw session comes from the injected factory (tests) or a
+        :class:`ClaudeAgentSession` fixed to the engineer's system prompt,
+        tools, cwd, and model; it is wrapped in an :class:`InstrumentedSession`
+        so every turn meters and traces exactly like a runner call.
+        """
+
+        if not (self.config.reuse_engineer_session and self.agentic):
+            return None
+        if self._engineer_session_factory is not None:
+            inner: AgentSession = self._engineer_session_factory()
+        else:
+            tools = (
+                list(self.config.engineer_tools)
+                if self.config.engineer_tools is not None
+                else list(ENGINEER_TOOLS)
+            )
+            inner = ClaudeAgentSession(
+                system_prompt=self.engineer.effective_system_prompt,
+                allowed_tools=tools,
+                model=self.engineer.model,
+                cwd=str(self.workdir),
+            )
+        return InstrumentedSession(
+            inner,
+            "engineer",
+            budget=self.budget,
+            tracer=self.tracer,
+            transcript_recorder=self.transcript_recorder,
+            system_prompt=self.engineer.effective_system_prompt,
+        )
+
+    async def _engineer_attempt(self, task, design, feedback, session, *, continued, model):
+        """Run one engineer attempt, over the session when there is one.
+
+        Returns ``(implementation, session)``. A session turn that fails
+        (:class:`AgentResponseError`, e.g. the persistent client wedged) is not
+        fatal: the session is discarded and the attempt retried once on the
+        proven cold :meth:`implement_in_place` path — so ``session`` comes back
+        ``None`` and every later attempt stays cold. Per-attempt model
+        escalation applies only to that cold path; the session's model is fixed.
+        """
+
+        if session is not None:
+            try:
+                implementation = await self.engineer.implement_over_session(
+                    session, task, design, feedback,
+                    conventions=self._conventions, continued=continued,
+                )
+                return implementation, session
+            except AgentResponseError:
+                await session.aclose()
+                self._event(
+                    "engineer",
+                    f"Engineer session failed for {task.id}; falling back to a cold attempt",
+                )
+                session = None
+        implementation = await self.engineer.implement_in_place(
+            task,
+            design,
+            feedback,
+            cwd=str(self.workdir),
+            conventions=self._conventions,
+            model=model,
+            tools=self.config.engineer_tools,
+        )
+        return implementation, session
 
     async def _develop_task_in_worktree(
         self,
