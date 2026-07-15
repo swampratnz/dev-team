@@ -81,6 +81,7 @@ _STOPWORDS = frozenset(
     "should must can may via per".split()
 )
 
+
 def _tokenize(text: str) -> List[str]:
     """Lowercased word/identifier tokens, camelCase-split, stopwords dropped."""
 
