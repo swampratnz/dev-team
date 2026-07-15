@@ -44,13 +44,18 @@ class ArchitectAgent(BaseAgent):
         plan: Plan,
         *,
         repo_context: Optional[str] = None,
+        relevant_code: Optional[str] = None,
         prior_decisions: Optional[Sequence[str]] = None,
     ) -> Design:
         """Produce a technical design for ``request`` given ``plan``.
 
-        ``repo_context`` describes the existing codebase so the design extends
-        what is actually there; ``prior_decisions`` are the team's recent ADRs
-        (most recent last) that this design must stay consistent with.
+        ``repo_context`` describes the existing codebase (its file tree and
+        manifest heads) so the design extends what is actually there;
+        ``relevant_code`` is the retrieved body of the files most relevant to
+        the feature (already fenced as untrusted ``<file-content>`` blocks), so
+        the design fits the real code rather than just its names;
+        ``prior_decisions`` are the team's recent ADRs (most recent last) that
+        this design must stay consistent with.
         """
 
         task_lines = "\n".join(
@@ -60,6 +65,11 @@ class ArchitectAgent(BaseAgent):
             "\nExisting codebase (design must fit into it):\n"
             f"<repo-context>\n{repo_context}\n</repo-context>\n"
             if repo_context
+            else ""
+        )
+        relevant = (
+            f"\nMost relevant existing code:\n{relevant_code}\n"
+            if relevant_code
             else ""
         )
         decisions = ""
@@ -79,7 +89,7 @@ Description:
 
 Planned tasks:
 {task_lines}
-{existing}{decisions}
+{existing}{relevant}{decisions}
 Consider at least one alternative approach and state the tradeoff that decided
 against it. Self-check for anti-patterns before answering.
 

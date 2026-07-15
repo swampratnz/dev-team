@@ -104,6 +104,7 @@ from .persona import Roster
 from .policy import GuardedCommandRunner, SideEffectPolicy
 from .profile import detect_project
 from .replan import Replan, ReplanError, apply_replan
+from .retrieval import char_budget_for_tokens, estimate_tokens, retrieve
 from .sandbox import ContainerCommandRunner, SandboxConfig
 from .scheduler import ScheduledResult, schedule
 from .sdk import AgentRunner, AgentSession, ClaudeAgentSession
@@ -195,6 +196,13 @@ class EngineConfig:
     #: escalation does not apply on the session path (the session's model is
     #: fixed for its life). See ROADMAP #5.
     reuse_engineer_session: bool = False
+    #: Retrieve the workspace's most-relevant code into the architect's prompt
+    #: (and, later, the described engineer's), instead of only the repo map's
+    #: path tree. Off by default (opt-in); deterministic lexical ranking, see
+    #: ``dev_team.retrieval`` / ROADMAP #4.
+    retrieval: bool = False
+    #: Per-role budget, in estimated tokens, for retrieved code in a prompt.
+    retrieval_token_budget: int = 3000
     worktrees: bool = False
     lint_command: Optional[Sequence[str]] = None
     security_scan_command: Optional[Sequence[str]] = None
@@ -229,6 +237,8 @@ class EngineConfig:
             raise ValueError("remote_verify_max_polls must be at least 1")
         if self.max_replan_rounds < 0:
             raise ValueError("max_replan_rounds must be non-negative")
+        if self.retrieval_token_budget < 0:
+            raise ValueError("retrieval_token_budget must be non-negative")
         if self.remote_verify_interval_seconds < 0:
             raise ValueError("remote_verify_interval_seconds must be non-negative")
         if self.remote_verify_trigger is not None and self.remote_verify_status is None:
@@ -769,6 +779,9 @@ class DeliveryEngine:
                 request,
                 plan,
                 repo_context=repo_ctx.render() or None,
+                relevant_code=self._retrieve_context(
+                    f"{request.title}\n{request.description}"
+                ),
                 prior_decisions=prior_decisions or None,
             )
         except BudgetExceededError:
@@ -1134,6 +1147,31 @@ class DeliveryEngine:
         if attempts == self.config.max_task_attempts:
             return self.config.escalation_model
         return None
+
+    def _retrieve_context(self, query: str) -> Optional[str]:
+        """The workspace's most-relevant code for ``query`` as a prompt block.
+
+        ``None`` unless retrieval is enabled. Deterministic lexical ranking
+        bounded by the per-role token budget; the amount pulled in is logged so
+        the added context is never silent.
+        """
+
+        if not self.config.retrieval:
+            return None
+        result = retrieve(
+            self.workspace,
+            query,
+            char_budget=char_budget_for_tokens(self.config.retrieval_token_budget),
+        )
+        if result.is_empty:
+            return None
+        block = result.render()
+        self._event(
+            "retrieval",
+            f"Retrieved {len(result.files)} relevant file(s) of {result.considered}",
+            detail=f"~{estimate_tokens(block)} tokens of context",
+        )
+        return block
 
     async def _review_plan(
         self, request: FeatureRequest, plan: Plan, prior: Optional[str]

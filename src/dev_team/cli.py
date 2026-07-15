@@ -526,6 +526,20 @@ def build_parser() -> argparse.ArgumentParser:
         "runs only; off by default; with --deliver).",
     )
     delivery.add_argument(
+        "--retrieval",
+        action="store_true",
+        help="Retrieve the most relevant existing code into the architect's "
+        "prompt (deterministic lexical ranking) instead of only the file tree "
+        "(off by default; with --deliver).",
+    )
+    delivery.add_argument(
+        "--retrieval-tokens",
+        type=int,
+        default=3000,
+        metavar="N",
+        help="Per-role token budget for retrieved code (with --retrieval).",
+    )
+    delivery.add_argument(
         "--pull-request",
         action="store_true",
         help="After a committed delivery, push the branch and open a GitHub "
@@ -766,6 +780,8 @@ def _reject_deliver_only_flags(
             args.max_replan_rounds != parser.get_default("max_replan_rounds"),
         ),
         ("--reuse-engineer-session", args.reuse_engineer_session),
+        ("--retrieval", args.retrieval),
+        ("--retrieval-tokens", args.retrieval_tokens != parser.get_default("retrieval_tokens")),
         ("--remote-verify-status", args.remote_verify_status is not None),
         ("--remote-verify-trigger", args.remote_verify_trigger is not None),
     ]
@@ -823,6 +839,8 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         branch=args.branch,
         max_replan_rounds=args.max_replan_rounds,
         reuse_engineer_session=args.reuse_engineer_session,
+        retrieval=args.retrieval,
+        retrieval_token_budget=args.retrieval_tokens,
         allow_dirty_baseline=args.allow_dirty_baseline,
         require_green_baseline=not args.proceed_on_red_baseline,
         remote_verify_status=(
