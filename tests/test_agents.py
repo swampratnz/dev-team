@@ -322,6 +322,24 @@ def test_engineer_with_feedback_comments():
     assert "fix x" in runner.calls[0]["prompt"]
 
 
+def test_engineer_includes_retrieved_relevant_code():
+    runner = _runner(impl_dict())
+    agent = EngineerAgent(runner)
+    run(
+        agent.implement(
+            _task(["works"]),
+            Design(overview="o"),
+            relevant_code='<file-content path="x.py">the code</file-content>',
+        )
+    )
+    prompt = runner.calls[0]["prompt"]
+    assert "Most relevant existing code" in prompt
+    assert '<file-content path="x.py">the code</file-content>' in prompt
+    # the described engineer now receives untrusted file content, so its system
+    # prompt must carry the prompt-injection guard
+    assert "untrusted data under review" in runner.calls[0]["system_prompt"]
+
+
 def test_feedback_section_variants():
     assert "first attempt" in _feedback_section(None)
     with_comments = _feedback_section(

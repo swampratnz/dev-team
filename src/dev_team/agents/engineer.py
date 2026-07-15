@@ -19,7 +19,7 @@ from typing import Optional, Sequence
 from .. import parsing
 from ..models import Design, Implementation, Review, Task
 from ..sdk import AgentSession
-from .base import BaseAgent
+from .base import UNTRUSTED_CONTENT_NOTE, BaseAgent
 
 _SYSTEM = """\
 You are a senior software engineer. You implement one task at a time, writing
@@ -70,6 +70,19 @@ def _conventions_section(conventions: Optional[str]) -> str:
     if not conventions:
         return ""
     return f"\n{conventions}\n"
+
+
+def _relevant_section(relevant_code: Optional[str]) -> str:
+    """Render the retrieved most-relevant code, when retrieval is enabled.
+
+    ``relevant_code`` is already fenced as untrusted ``<file-content>`` blocks;
+    it lets the described engineer see the body of the files it is most likely
+    to touch, not just their paths in the listing.
+    """
+
+    if not relevant_code:
+        return ""
+    return f"\nMost relevant existing code:\n{relevant_code}\n"
 
 
 def _task_section(task: Task, design: Design) -> str:
@@ -140,7 +153,7 @@ class EngineerAgent(BaseAgent):
 
     role = "engineer"
     stage = "implementation"
-    system_prompt = _SYSTEM
+    system_prompt = _SYSTEM + UNTRUSTED_CONTENT_NOTE
 
     async def implement(
         self,
@@ -150,9 +163,15 @@ class EngineerAgent(BaseAgent):
         *,
         workspace_listing: Optional[Sequence[str]] = None,
         conventions: Optional[str] = None,
+        relevant_code: Optional[str] = None,
         model: Optional[str] = None,
     ) -> Implementation:
-        """Implement ``task`` by describing every file change as JSON."""
+        """Implement ``task`` by describing every file change as JSON.
+
+        ``relevant_code`` is the retrieved body of the files most relevant to
+        the task (already fenced as untrusted ``<file-content>`` blocks), so the
+        engineer writes against the real code, not just the file listing.
+        """
 
         prompt = f"""\
 Implement the following task.
@@ -160,6 +179,7 @@ Implement the following task.
 {_task_section(task, design)}
 
 {_listing_section(workspace_listing)}
+{_relevant_section(relevant_code)}
 {_conventions_section(conventions)}
 {_feedback_section(feedback)}
 

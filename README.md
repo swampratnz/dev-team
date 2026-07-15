@@ -424,9 +424,10 @@ token saving on retried tasks; a session that errors falls back to a cold
 attempt.
 
 `--retrieval` (default off) puts the most *relevant* existing code in front of
-the architect, not just the repo's file tree: a deterministic lexical ranker
-(BM25 over file content, filenames and symbols weighted up) selects the top
-files for the feature and injects bounded excerpts, capped by
+the architect and the described engineer, not just the repo's file tree: a
+deterministic lexical ranker (BM25 over file content, filenames and symbols
+weighted up) selects the top files — for the feature when designing, for the
+task when implementing — and injects bounded excerpts, capped by
 `--retrieval-tokens N` (per role). No embedding provider or network call — it's
 exact and free, like the repo map.
 

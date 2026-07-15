@@ -112,10 +112,13 @@ BM25 over tokenised file content with filename/symbol up-weighting) rather than
 embeddings — no provider, no network, exactly testable, matching the repo map's
 stance. Opt-in via `EngineConfig.retrieval` / `--retrieval`, bounded by a
 per-role token budget (`retrieval_token_budget` / `--retrieval-tokens`, via a
-char≈token estimator). Wired into the architect's prompt so it designs against
-the most-relevant real code, not just the file tree. Remaining: the described
-engineer, then summarised blackboard hand-offs (today the persisted hand-off is
-only decisions + retro notes + a bare artifact *count*).
+char≈token estimator). Wired into the architect's prompt (so it designs against
+the most-relevant real code, not just the file tree) and into the described
+engineer's prompt (so it writes against the body of the files it will touch,
+not just their paths in the listing — the untrusted-content guard now covers
+the engineer too, since retrieved code enters its prompt). Remaining: summarised
+blackboard hand-offs (today the persisted hand-off is only decisions + retro
+notes + a bare artifact *count*).
 
 ## 5. Session continuity across attempts
 

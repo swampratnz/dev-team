@@ -2769,3 +2769,21 @@ def test_retrieve_context_is_none_when_nothing_matches():
     ws = InMemoryWorkspace({"src/login.py": "def login(): pass"})
     eng = _engine(ScriptedRunner([]), workspace=ws, config=EngineConfig(retrieval=True))
     assert eng._retrieve_context("zeta omega quux") is None
+
+
+def test_described_engineer_receives_retrieved_context():
+    # A file whose content overlaps the scripted task (title "Task 1",
+    # description "do the thing", criteria "it works") so retrieval ranks it in.
+    ws = InMemoryWorkspace(
+        {"src/thing.py": "def thing():\n    # it works\n    return 'the thing'\n"}
+    )
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws, config=EngineConfig(retrieval=True))
+    run(engine.deliver(_request()))
+    engineer_calls = [
+        c for c in runner.calls if "Implement the following task" in c["prompt"]
+    ]
+    assert engineer_calls
+    assert any(
+        '<file-content path="src/thing.py">' in c["prompt"] for c in engineer_calls
+    )
