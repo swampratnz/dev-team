@@ -197,6 +197,13 @@ class EngineConfig:
     #: Ignored when ``verify_command`` / ``remote_verify_status`` is set (the
     #: caller already chose the gate). See ``docs/ROADMAP.md``.
     require_recognised_project: bool = False
+    #: Fraction of the cost budget held back during task work so the security
+    #: review that authorises the commit can still run — otherwise task work can
+    #: spend the whole ceiling and leave a fully built delivery unable to bank
+    #: itself (security is skipped, and the commit is gated on security
+    #: approval). Applies only to a committing run with a ``--budget-usd``
+    #: ceiling; released before the security stage. ``0.0`` disables it.
+    finalization_reserve_fraction: float = 0.10
     branch: Optional[str] = None
     use_branch: bool = True
     allow_dirty_baseline: bool = False
@@ -259,6 +266,8 @@ class EngineConfig:
             raise ValueError("remote_verify_max_polls must be at least 1")
         if self.max_replan_rounds < 0:
             raise ValueError("max_replan_rounds must be non-negative")
+        if not 0.0 <= self.finalization_reserve_fraction < 1.0:
+            raise ValueError("finalization_reserve_fraction must be in [0.0, 1.0)")
         if self.retrieval_token_budget < 0:
             raise ValueError("retrieval_token_budget must be non-negative")
         if self.remote_verify_interval_seconds < 0:
@@ -1047,6 +1056,7 @@ class DeliveryEngine:
             results[task.id] = outcome
             return outcome.succeeded
 
+        self._reserve_finalization_budget()
         try:
             await schedule(
                 pending,
@@ -1067,6 +1077,7 @@ class DeliveryEngine:
             )
 
         plan = await self._replan_loop(request, plan, results, worker)
+        self._release_finalization_budget()
 
         task_results: List[TaskResult] = []
         for task in plan.tasks:
@@ -1152,6 +1163,38 @@ class DeliveryEngine:
             )
         )
         self._event("score", "Run score recorded", detail=self.scores.latest_delta())
+
+    def _reserve_finalization_budget(self) -> None:
+        """Hold back part of the budget so the security review + commit can run.
+
+        Task work would otherwise spend the whole ceiling, leaving the security
+        review unrun — and since the commit is gated on security approval, a
+        fully built delivery would bank nothing. Engages only for a committing
+        run with a cost ceiling; released by :meth:`_release_finalization_budget`
+        before the security stage. See ``docs/ROADMAP.md``.
+        """
+
+        fraction = self.config.finalization_reserve_fraction
+        if not (self._can_commit and self.budget.limit_usd is not None and fraction > 0):
+            return
+        reserve = self.budget.limit_usd * fraction
+        self.budget.set_reserve(reserve)
+        self._event(
+            "budget",
+            f"Reserved ${reserve:.2f} of the ${self.budget.limit_usd:.2f} budget "
+            "for the security review + commit",
+        )
+
+    def _release_finalization_budget(self) -> None:
+        """Release the finalization reserve before the security review runs."""
+
+        if self.budget.reserved_usd:
+            self._event(
+                "budget",
+                "Task phase complete; releasing the finalization reserve for "
+                "the security review",
+            )
+            self.budget.set_reserve(0.0)
 
     # -- run preparation -------------------------------------------------------
 

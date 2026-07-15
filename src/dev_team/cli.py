@@ -498,6 +498,16 @@ def build_parser() -> argparse.ArgumentParser:
         "guessing a pytest verify command (with --deliver). By default the "
         "greenfield pytest fallback runs, but announces itself loudly.",
     )
+    delivery.add_argument(
+        "--finalization-reserve",
+        type=float,
+        default=0.10,
+        metavar="FRACTION",
+        help="Fraction of --budget-usd held back during task work so the "
+        "security review that authorises the commit can still run (default "
+        "0.10; 0 disables). Prevents a budget-limited run from building work "
+        "it then can't bank (with --deliver).",
+    )
     misc.add_argument(
         "--budget-usd",
         type=float,
@@ -820,6 +830,10 @@ def _reject_deliver_only_flags(
         ("--allow-dirty-baseline", args.allow_dirty_baseline),
         ("--proceed-on-red-baseline", args.proceed_on_red_baseline),
         ("--require-recognised-project", args.require_recognised_project),
+        (
+            "--finalization-reserve",
+            args.finalization_reserve != parser.get_default("finalization_reserve"),
+        ),
         ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
         ("--no-commit", args.no_commit),
         (
@@ -893,6 +907,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         allow_dirty_baseline=args.allow_dirty_baseline,
         require_green_baseline=not args.proceed_on_red_baseline,
         require_recognised_project=args.require_recognised_project,
+        finalization_reserve_fraction=args.finalization_reserve,
         remote_verify_status=(
             tuple(shlex.split(args.remote_verify_status))
             if args.remote_verify_status
