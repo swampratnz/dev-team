@@ -18,6 +18,7 @@ from typing import Optional, Sequence
 
 from .. import parsing
 from ..models import Design, Implementation, Review, Task
+from ..sdk import AgentSession
 from .base import BaseAgent
 
 _SYSTEM = """\
@@ -87,6 +88,53 @@ Design overview:
 {design.overview}"""
 
 
+def _in_place_prompt(
+    task: Task, design: Design, feedback: Optional[Review], conventions: Optional[str]
+) -> str:
+    """The full agentic-implementation prompt (first turn / cold attempt)."""
+
+    return f"""\
+Implement the following task in the current working directory. Use your tools:
+read the existing code before changing it, create or edit files directly,
+write automated tests for the acceptance criteria, and run the test suite to
+check your work before answering. If the task is fixing incorrect behaviour,
+write a test that reproduces the problem FIRST, watch it fail, then implement
+until it passes.
+
+{_task_section(task, design)}
+{_conventions_section(conventions)}
+{_feedback_section(feedback)}
+
+When the work is complete, respond with JSON of the form (no file contents —
+the files on disk are the deliverable):
+{{
+  "summary": "what you built",
+  "files": [
+    {{"path": "src/x.py", "change_type": "create", "summary": "..."}}
+  ],
+  "notes": "anything reviewers should know"
+}}"""
+
+
+def _continuation_prompt(feedback: Optional[Review]) -> str:
+    """The short follow-up turn for a session retry.
+
+    The model already holds the task, design, and the code it wrote earlier in
+    this session, so nothing is re-sent but the feedback — that is the whole
+    point of continuity.
+    """
+
+    return f"""\
+Your previous attempt was rejected. The code you wrote is still in the working
+directory — continue from it, do not start over. Address the feedback below,
+update the tests, and re-run them before answering.
+
+{_feedback_section(feedback)}
+
+Respond with the same JSON shape as before (paths and summaries; no file
+contents)."""
+
+
 class EngineerAgent(BaseAgent):
     """Produces an :class:`Implementation` for a task."""
 
@@ -147,28 +195,37 @@ Respond with JSON of the form:
         summaries — the workspace itself is the source of truth for content).
         """
 
-        prompt = f"""\
-Implement the following task in the current working directory. Use your tools:
-read the existing code before changing it, create or edit files directly,
-write automated tests for the acceptance criteria, and run the test suite to
-check your work before answering. If the task is fixing incorrect behaviour,
-write a test that reproduces the problem FIRST, watch it fail, then implement
-until it passes.
-
-{_task_section(task, design)}
-{_conventions_section(conventions)}
-{_feedback_section(feedback)}
-
-When the work is complete, respond with JSON of the form (no file contents —
-the files on disk are the deliverable):
-{{
-  "summary": "what you built",
-  "files": [
-    {{"path": "src/x.py", "change_type": "create", "summary": "..."}}
-  ],
-  "notes": "anything reviewers should know"
-}}"""
         data = await self.ask_json(
-            prompt, allowed_tools=tools if tools is not None else TOOLS, cwd=cwd, model=model
+            _in_place_prompt(task, design, feedback, conventions),
+            allowed_tools=tools if tools is not None else TOOLS,
+            cwd=cwd,
+            model=model,
         )
+        return parsing.implementation_from_dict(data, task.id)
+
+    async def implement_over_session(
+        self,
+        session: AgentSession,
+        task: Task,
+        design: Design,
+        feedback: Optional[Review] = None,
+        *,
+        conventions: Optional[str] = None,
+        continued: bool = False,
+    ) -> Implementation:
+        """Implement over a persistent session, continuing a prior attempt.
+
+        The ``session`` already carries the engineer's tools, cwd, system
+        prompt, and model, so a turn sends only the prompt. On the first turn
+        (``continued`` is ``False``) the full task/design prompt goes out; on a
+        continuation the model already holds the task and the code it wrote, so
+        only the feedback is sent — re-establishing nothing — which is the token
+        saving session continuity exists for.
+        """
+
+        if continued:
+            prompt = _continuation_prompt(feedback)
+        else:
+            prompt = _in_place_prompt(task, design, feedback, conventions)
+        data = await self.ask_json(prompt, session=session)
         return parsing.implementation_from_dict(data, task.id)

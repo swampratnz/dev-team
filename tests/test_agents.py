@@ -321,6 +321,54 @@ def test_feedback_section_variants():
     assert "(no specific comments)" in no_comments
 
 
+def test_engineer_over_session_first_turn_sends_the_full_prompt():
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    session = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
+    agent = EngineerAgent(_runner(impl_dict()))  # runner unused; the session drives
+    impl = run(agent.implement_over_session(session, _task(["works"]), Design(overview="o")))
+    assert isinstance(impl, Implementation)
+    assert "Implement the following task" in session.prompts[0]
+    assert "first attempt" in session.prompts[0]  # _feedback_section(None)
+
+
+def test_engineer_over_session_continuation_sends_feedback_only():
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    session = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
+    agent = EngineerAgent(_runner(impl_dict()))
+    feedback = Review(
+        approved=False,
+        summary="needs work",
+        comments=[ReviewComment(severity=Severity.MAJOR, message="fix x")],
+    )
+    run(
+        agent.implement_over_session(
+            session, _task(), Design(overview="o"), feedback, continued=True
+        )
+    )
+    prompt = session.prompts[0]
+    assert "continue from it, do not start over" in prompt
+    assert "fix x" in prompt
+    # a continuation must NOT re-send the full task/tool preamble — that is the
+    # whole token saving.
+    assert "read the existing code before changing it" not in prompt
+
+
+def test_base_agent_ask_uses_the_session_not_the_runner():
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    class _BoomRunner:
+        async def run(self, *args, **kwargs):
+            raise AssertionError("the runner must not be used when a session is given")
+
+    session = FakeAgentSession(results=[AgentResult(text="hi", num_turns=2)])
+    agent = EngineerAgent(_BoomRunner())
+    result = run(agent.ask("do it", session=session))
+    assert result.text == "hi"
+    assert session.prompts == ["do it"]
+
+
 # --- reviewer -----------------------------------------------------------
 
 
