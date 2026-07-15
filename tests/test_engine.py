@@ -2480,6 +2480,45 @@ def test_replan_loop_stops_the_round_when_budget_dies_mid_proposal():
     assert calls == ["T1"]  # broke after the first task, never tried T2
 
 
+def test_replan_loop_cascade_skips_a_dependent_of_a_still_failed_task():
+    # Regression for the silent-corruption bug: B depends on the failed A and was
+    # cascade-skipped (no result). In a round where A's re-plan is rejected but
+    # C's is applied, rescheduling must keep A in the graph so B is cascade-
+    # skipped again — never run on work A never produced.
+    eng = _rp_engine()
+    eng.config.max_replan_rounds = 1
+    # failed order is plan order [A, C]: reject A's proposal, apply C's.
+    eng.interaction = ScriptedChannel(script=[Reply(choice="reject"), Reply(choice="apply")])
+    a, ra = _failed("A")
+    c, rc = _failed("C")
+    b = Task(id="B", title="B", description="", acceptance_criteria=["ok"], dependencies=["A"])
+    plan = Plan(summary="s", tasks=[a, b, c])
+    results = {"A": ra, "C": rc}  # B absent: it was cascade-skipped on the first pass
+
+    async def replan(request, plan, task, evidence, *, revision_feedback=None):
+        return Replan(
+            ReplanAction.REPLACE, task.id,
+            [Task(id=f"{task.id}2", title="x", description="", acceptance_criteria=["ok"])],
+        )
+
+    eng.manager.replan = replan
+    developed = []
+
+    async def worker(task):
+        existing = results.get(task.id)
+        if existing is not None:
+            return existing.succeeded
+        developed.append(task.id)
+        task.status = TaskStatus.DONE
+        results[task.id] = TaskResult(task=task, attempts=1)
+        return True
+
+    new_plan = run(eng._replan_loop(_request(), plan, results, worker))
+    assert [t.id for t in new_plan.tasks] == ["A", "B", "C2"]  # C replaced, A/B kept
+    assert developed == ["C2"]  # only the replacement ran
+    assert "B" not in results and "B" not in developed  # B never ran on unmet A
+
+
 def test_deliver_replans_a_failed_task_end_to_end():
     # A full delivery where T2 (depends on the passing T1) fails review; with
     # --max-replan-rounds 1 the manager replaces it with T2b, which passes, and
