@@ -245,6 +245,17 @@ sections below are reconstructed from the repository history.
   list. Prose and multi-part citations are deliberately left unflagged to
   keep the heuristic false-positive-free.
 
+### Documentation
+- **`docs/TROUBLESHOOTING.md`**: a symptom-first operator runbook
+  consolidating operational knowledge previously scattered across
+  `DEPLOYMENT.md`, `docs/DISPATCH.md`, `docs/DASHBOARD.md`, and
+  `docs/PIPELINE.md` — the "401 Invalid bearer token" env-file gotcha, the
+  dispatch service's restart/queue-loss recovery, reading the access and
+  event logs, a `needs-human` decision table across the six pipeline
+  loops, and a dashboard/dispatch HTTP status quick-reference.
+  `DEPLOYMENT.md`'s two env-file gotcha callouts now cross-link it. Docs
+  only — no `src/` change, no new credential surface.
+
 ## [0.7.0] — Legacy-repo analysis: dead code, live CVEs, conventions, remote CI
 
 ### Assessment
