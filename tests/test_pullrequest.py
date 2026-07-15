@@ -280,6 +280,37 @@ def test_clamp_poll_interval_seconds_floor():
     assert pr._clamp_poll_interval_seconds(0) == pr.MIN_CHECKS_POLL_INTERVAL_SECONDS == 5.0
 
 
+def test_clamp_poll_interval_seconds_ceiling():
+    assert (
+        pr._clamp_poll_interval_seconds(999999)
+        == pr.MAX_CHECKS_POLL_INTERVAL_SECONDS
+        == 60.0
+    )
+
+
+def test_watch_ceilings_an_excessively_large_poll_interval():
+    # If poll_interval_seconds=999999 were honoured literally, the single
+    # sleep() between polls would block far longer than timeout_seconds
+    # itself — an unbounded-sleep gap even though timeout is capped, since
+    # the timeout check runs before the sleep. Assert the *actual* sleep
+    # duration is clamped to the ceiling, not the caller-supplied value.
+    calls = {"n": 0}
+
+    def http(url, headers):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"check_runs": [_run(status="in_progress", conclusion=None)]}
+        return {"check_runs": [_run(conclusion="success")]}
+
+    sleeps = []
+    client = GitHubCheckRunsClient(
+        token="T", http=http, sleep=lambda s: sleeps.append(s), clock=lambda: 0.0,
+    )
+    result = client.watch("acme", "mono", "sha1", poll_interval_seconds=999999)
+    assert result.state == "success"
+    assert sleeps == [pr.MAX_CHECKS_POLL_INTERVAL_SECONDS]
+
+
 def test_watch_clamps_excessive_timeout_before_polling_begins():
     # If timeout_seconds=999999 were honoured literally, elapsed=901 would
     # never trip a timeout and the finite `ticks` iterator would be exhausted
@@ -401,6 +432,7 @@ def test_watch_no_exception_escapes_for_transport_or_auth_failures():
         _http_error(403, b"{}"),
         _http_error(404, b"{}"),
         urllib.error.URLError("down"),
+        json.JSONDecodeError("bad json", "<html>not json</html>", 0),
     ):
 
         def http(url, headers, _error=error):
@@ -409,6 +441,44 @@ def test_watch_no_exception_escapes_for_transport_or_auth_failures():
         # Must return a result, never raise.
         result = GitHubCheckRunsClient(token="T", http=http).watch("acme", "mono", "sha1")
         assert result.state == "unknown"
+
+
+def test_watch_malformed_json_body_is_caught_and_returns_unknown():
+    # json.loads raising json.JSONDecodeError (a ValueError subclass) inside
+    # the default transport must not escape watch() uncaught — it would
+    # otherwise turn an already-successful PR-open into a crashed run.
+    def http(url, headers):
+        raise json.JSONDecodeError("Expecting value", "<html>not json</html>", 0)
+
+    result = GitHubCheckRunsClient(token="T", http=http).watch("acme", "mono", "sha1")
+    assert result.state == "unknown"
+    assert "malformed response" in result.error
+
+
+def test_watch_non_dict_json_body_is_caught_and_returns_unknown():
+    # A syntactically-valid but unexpected shape (e.g. a proxy/gateway
+    # returning `null` or a bare list on 200) must not crash the CLI with a
+    # raw AttributeError from `.get` on a non-dict (BPG §4: never trust
+    # upstream output).
+    for response in (None, [], "unexpected"):
+
+        def http(url, headers, _response=response):
+            return _response
+
+        result = GitHubCheckRunsClient(token="T", http=http).watch("acme", "mono", "sha1")
+        assert result.state == "unknown"
+        assert "malformed response" in result.error
+
+
+def test_watch_malformed_response_error_is_scrubbed_of_the_token():
+    secret = "ghp_secretvalue123"
+
+    def http(url, headers):
+        raise ValueError(f"token {secret} rejected")
+
+    result = GitHubCheckRunsClient(token=secret, http=http).watch("acme", "mono", "sha1")
+    assert secret not in result.error
+    assert "***" in result.error
 
 
 def test_default_http_get_uses_urllib(monkeypatch):

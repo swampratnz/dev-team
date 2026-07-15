@@ -1545,6 +1545,25 @@ def test_main_deliver_watch_checks_transport_failure_never_affects_exit_code(
     assert code == 0
 
 
+def test_main_deliver_watch_checks_malformed_body_never_affects_exit_code(
+    tmp_path, monkeypatch
+):
+    # [security/fail-secure] a malformed (non-JSON, or syntactically-valid but
+    # non-dict) response body must be caught inside .watch() itself — not
+    # escape as a raw ValueError/AttributeError and turn an already-successful
+    # PR-open into a crashed `error:` exit code (BPG §4: never trust upstream
+    # output).
+    import dev_team.pullrequest as pr_module
+
+    def bad_json_http_get(url, headers):
+        raise json.JSONDecodeError("Expecting value", "<html>not json</html>", 0)
+
+    monkeypatch.setattr(pr_module, "_http_get", bad_json_http_get)
+    seen = {}
+    code = _pr_deliver(tmp_path, monkeypatch, seen, "--watch-checks")
+    assert code == 0
+
+
 def test_main_chat_deliver_pull_request_threads_ref_and_token(
     tmp_path, monkeypatch, capsys
 ):

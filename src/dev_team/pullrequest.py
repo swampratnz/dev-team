@@ -56,11 +56,14 @@ _API_BASE = "https://api.github.com"
 _API_VERSION = "2022-11-28"
 _HTTP_TIMEOUT_SECONDS = 30.0
 
-#: Hard ceilings on :meth:`GitHubCheckRunsClient.watch`'s timeout/poll-interval,
-#: enforced in code before any polling begins (BPG §4 resource-bounding): a
-#: misconfigured caller cannot wedge the calling process indefinitely.
+#: Hard ceilings/floor on :meth:`GitHubCheckRunsClient.watch`'s
+#: timeout/poll-interval, enforced in code before any polling begins (BPG §4
+#: resource-bounding): a misconfigured caller cannot wedge the calling
+#: process indefinitely — including via a single oversized ``sleep()`` between
+#: polls, which the ``timeout_seconds`` ceiling alone would not bound.
 MAX_CHECKS_TIMEOUT_SECONDS = 900.0
 MIN_CHECKS_POLL_INTERVAL_SECONDS = 5.0
+MAX_CHECKS_POLL_INTERVAL_SECONDS = 60.0
 
 #: Check-run conclusions that count as a pass; anything else completed is a
 #: failure. A closed enum with an explicit default — an unrecognised
@@ -200,9 +203,12 @@ def _clamp_timeout_seconds(timeout_seconds: float) -> float:
 
 
 def _clamp_poll_interval_seconds(poll_interval_seconds: float) -> float:
-    """Floor to the hard minimum — never honoured literally (BPG §4)."""
+    """Clamp to the hard ceiling/floor — never honoured literally (BPG §4)."""
 
-    return max(poll_interval_seconds, MIN_CHECKS_POLL_INTERVAL_SECONDS)
+    return min(
+        max(poll_interval_seconds, MIN_CHECKS_POLL_INTERVAL_SECONDS),
+        MAX_CHECKS_POLL_INTERVAL_SECONDS,
+    )
 
 
 @dataclass(frozen=True)
@@ -251,10 +257,12 @@ class GitHubCheckRunsClient:
     :class:`dev_team.verification.RemoteCIGate`'s clock-injection pattern) so
     tests never perform a real wait. :meth:`watch` clamps its
     ``timeout_seconds``/``poll_interval_seconds`` to a hard ceiling/floor
-    before polling begins, and never raises: a transport/auth failure is
-    caught and surfaced as ``state="unknown"`` (fail-secure) rather than
-    propagated — the PR is already open and real, so a failed watch must
-    never flip the caller's success/exit code.
+    (both bounds, for each) before polling begins, and never raises: a
+    transport/auth failure, or a response GitHub returns that is not the
+    well-formed JSON object we expect (BPG §4 — never trust an upstream
+    service's output), is caught and surfaced as ``state="unknown"``
+    (fail-secure) rather than propagated — the PR is already open and real,
+    so a failed watch must never flip the caller's success/exit code.
     """
 
     token: str = field(repr=False)  # never let a repr/traceback/config dump print it
@@ -293,6 +301,14 @@ class GitHubCheckRunsClient:
                 return CheckRunsResult(
                     state="unknown",
                     error=self._scrub(f"could not reach {self.api_base}: {exc.reason}"),
+                )
+            except (ValueError, AttributeError, TypeError) as exc:
+                # A malformed body (bad JSON) or a syntactically-valid but
+                # unexpected shape (not a dict, e.g. a gateway returning
+                # `null`/a list on 200) — never trust upstream output (BPG §4).
+                return CheckRunsResult(
+                    state="unknown",
+                    error=self._scrub(f"malformed response fetching check runs: {exc}"),
                 )
             state = aggregate_check_runs(check_runs)
             if state != "pending":

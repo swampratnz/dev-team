@@ -14,10 +14,13 @@ sections below are reconstructed from the repository history.
   objects to `pending`/`success`/`failure`/`no_checks` against a closed enum
   — an unrecognised `conclusion` string never resolves to success
   (fail-secure). `timeout_seconds`/`poll_interval_seconds` are hard-clamped
-  (≤900s / ≥5s) before any polling begins, and a transport/auth failure
-  (403/404/`URLError`) is caught and surfaced as `state="unknown"` rather
-  than raised — the PR is already open and real, so a failed watch never
-  flips the exit code.
+  (≤900s / 5s–60s) before any polling begins, and a transport/auth failure
+  (403/404/`URLError`), or a response body that isn't the well-formed JSON
+  object expected (malformed JSON, or a syntactically-valid non-dict shape
+  such as a gateway returning `null`/a list on 200 — BPG §4, never trust
+  upstream output), is caught and surfaced as `state="unknown"` rather than
+  raised — the PR is already open and real, so a failed watch never flips
+  the exit code.
 - Wired to the CLI as **`--watch-checks`** (with `--checks-timeout-seconds`),
   valid only combined with `--pull-request`, reusing the exact token already
   resolved for it (no new credential surface). The result is surfaced in
