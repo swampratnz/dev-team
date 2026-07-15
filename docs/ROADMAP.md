@@ -107,7 +107,7 @@ keeps evidence high while cost stays flat.
 per-role token budgets; summarised hand-offs on the blackboard instead of raw
 artifacts.
 
-**In progress:** a *deterministic lexical* retriever (`dev_team.retrieval`,
+**Shipped:** a *deterministic lexical* retriever (`dev_team.retrieval`,
 BM25 over tokenised file content with filename/symbol up-weighting) rather than
 embeddings — no provider, no network, exactly testable, matching the repo map's
 stance. Opt-in via `EngineConfig.retrieval` / `--retrieval`, bounded by a
@@ -116,9 +116,13 @@ char≈token estimator). Wired into the architect's prompt (so it designs agains
 the most-relevant real code, not just the file tree) and into the described
 engineer's prompt (so it writes against the body of the files it will touch,
 not just their paths in the listing — the untrusted-content guard now covers
-the engineer too, since retrieved code enters its prompt). Remaining: summarised
-blackboard hand-offs (today the persisted hand-off is only decisions + retro
-notes + a bare artifact *count*).
+the engineer too, since retrieved code enters its prompt). The cross-run
+blackboard hand-off is now *summarised* rather than counted: the persisted
+memory that seeds the next run's planning prompt renders a bounded, per-kind
+digest of what earlier runs produced (each artifact's own one-line summary —
+what was built, what the tests cover, the security verdict), grouped and capped
+with explicit "... and N more" tails, instead of the old bare artifact *count*.
+Decisions and retro notes accumulate across runs as before.
 
 ## 5. Session continuity across attempts
 
