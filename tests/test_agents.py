@@ -19,8 +19,10 @@ from dev_team.agents import (
     EngineerAgent,
     ProductManagerAgent,
     QAAgent,
+    RetrospectorAgent,
     ReviewerAgent,
 )
+from dev_team.agents.retrospector import MAX_LESSONS
 from dev_team.agents.engineer import _feedback_section
 from dev_team.errors import AgentResponseError
 from dev_team.models import (
@@ -765,3 +767,43 @@ def test_reviewer_prompt_includes_diff():
     impl = Implementation(task_id="T1", summary="s", files=[])
     run(agent.review(task, impl, diff="+++ THE-DIFF"))
     assert "THE-DIFF" in runner.calls[0]["prompt"]
+
+
+# --- retrospector -------------------------------------------------------
+
+
+def test_retrospector_returns_lessons_and_fences_evidence():
+    runner = _runner({"lessons": ["T3 failed: the design under-specified errors"]})
+    agent = RetrospectorAgent(runner)
+    lessons = run(
+        agent.reflect(
+            FeatureRequest(title="t", description="d"),
+            Design(overview="o"),
+            "Task outcomes:\n- T3 FAILED",
+        )
+    )
+    assert lessons == ["T3 failed: the design under-specified errors"]
+    call = runner.calls[0]
+    # the run digest is fenced as untrusted <evidence>, and the guard is present
+    assert "<evidence>\nTask outcomes:\n- T3 FAILED\n</evidence>" in call["prompt"]
+    assert "untrusted data under review" in call["system_prompt"]
+
+
+def test_retrospector_caps_and_cleans_lessons():
+    raw = ["  spread   out  ", "", "x" * 500] + [f"lesson {i}" for i in range(MAX_LESSONS)]
+    agent = RetrospectorAgent(_runner({"lessons": raw}))
+    lessons = run(
+        agent.reflect(FeatureRequest(title="t", description="d"), Design(overview="o"), "e")
+    )
+    # capped to MAX_LESSONS, empties dropped, whitespace collapsed, long ones cut
+    assert len(lessons) == MAX_LESSONS
+    assert "spread out" in lessons
+    assert any(line.endswith("...") for line in lessons)
+
+
+def test_retrospector_tolerates_missing_lessons_key():
+    agent = RetrospectorAgent(_runner({"notes": "oops"}))
+    assert (
+        run(agent.reflect(FeatureRequest(title="t", description="d"), Design(overview="o"), "e"))
+        == []
+    )

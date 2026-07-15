@@ -432,6 +432,14 @@ task when implementing — and injects bounded excerpts, capped by
 `--retrieval-tokens N` (per role). No embedding provider or network call — it's
 exact and free, like the repo map.
 
+`--llm-retrospective` (default off) runs a retrospective agent after delivery
+that reads a compact digest of the run — each task's outcome, the scorecard, the
+trace's shape, the spend — and distils a few *root-cause* lessons (naming a
+cause and a change), richer than the always-on deterministic retrospective it
+complements. It never gates the run (it runs under the graceful specialist
+wrapper and is skipped once the budget is spent), and its lessons merge into the
+cross-run memory that seeds the next run's plan.
+
 Deliver all the way to a **pull request** — clone the repo, do the work, then
 push the `dev-team/<feature>` branch and open a PR whose body is the run
 summary:

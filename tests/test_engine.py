@@ -18,6 +18,7 @@ from helpers import (
 from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.budget import Budget, BudgetExceededError
 from dev_team.engine import (
+    _MAX_EVIDENCE_CHARS,
     _MAX_HANDOFF_ARTIFACTS,
     _MAX_HANDOFF_PER_KIND,
     DeliveryEngine,
@@ -26,6 +27,7 @@ from dev_team.engine import (
     _dod_to_test_report,
     _prior_context,
     _review_from_dod,
+    _run_evidence,
     _summarise_artifacts,
 )
 from dev_team.execution import (
@@ -46,6 +48,7 @@ from dev_team.models import (
     FeatureRequest,
     Implementation,
     Plan,
+    Review,
     SecurityReport,
     Task,
     TaskResult,
@@ -872,6 +875,95 @@ def test_summarise_artifacts_caps_total_across_kinds():
     built = [ln for ln in lines if ln.startswith("- built")]
     assert len(built) == _MAX_HANDOFF_ARTIFACTS
     assert any("more artifact(s) of other kinds" in ln for ln in lines)
+
+
+# -- LLM retrospective (--llm-retrospective, ROADMAP #6) -----------------
+
+
+def test_run_evidence_digest():
+    tracer = Tracer(clock=_Clock())
+    tracer.event("agent", "engineer")
+    tracer.end(tracer.start("run", "deliver"), "halted")  # a non-clean span
+    done = Task(id="T1", title="Login", description="d")
+    done.status = TaskStatus.DONE
+    failed = Task(id="T2", title="Logout", description="d")  # stays not-DONE
+    results = [
+        TaskResult(task=done, attempts=1),
+        TaskResult(
+            task=failed, attempts=3, review=Review(approved=False, summary="fix errors")
+        ),
+    ]
+    text = _run_evidence(
+        results,
+        SecurityReport(approved=True, summary="ok"),
+        {"gate_failures": 3, "review_rejections": 1},
+        tracer.spans,
+        1.2345,
+    )
+    assert 'T1 "Login": 1 attempt(s), succeeded' in text
+    assert 'T2 "Logout": 3 attempt(s), FAILED; last review: fix errors' in text
+    assert "Scorecard: gate_failures=3, review_rejections=1" in text
+    assert "Security: approved - ok" in text
+    assert "agentx1" in text and "runx1" in text  # trace shape, by kind
+    assert "- [run] deliver: halted" in text  # notable span surfaced
+    assert "Budget spent: $1.2345" in text
+
+
+def test_run_evidence_minimal_and_bounds():
+    # nothing optional present: no security / trace / budget lines
+    minimal = _run_evidence([], None, {}, [], None)
+    assert minimal.startswith("Task outcomes:")
+    assert "Security" not in minimal
+    assert "Trace:" not in minimal
+    assert "Budget" not in minimal
+
+    # more notable spans than the cap -> the overflow is reported, not dropped
+    tracer = Tracer(clock=_Clock())
+    for i in range(13):
+        tracer.end(tracer.start("gate", f"g{i}"), "failed")
+    many = _run_evidence([], None, {}, tracer.spans, None)
+    assert "- ... and 3 more" in many  # 13 - 10
+
+    # a pathological run is char-capped
+    big = [
+        TaskResult(task=Task(id=f"T{i}", title="x" * 200, description=""), attempts=1)
+        for i in range(200)
+    ]
+    capped = _run_evidence(big, None, {}, [], None)
+    assert capped.endswith("... (truncated)")
+    assert len(capped) <= _MAX_EVIDENCE_CHARS + len("\n... (truncated)")
+
+
+def test_llm_retrospective_off_by_default():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    run(_engine(runner).deliver(_request()))
+    assert not any(
+        "retrospective analyst" in (c["system_prompt"] or "") for c in runner.calls
+    )
+
+
+def test_llm_retrospective_merges_lessons_into_notes():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, config=EngineConfig(llm_retrospective=True))
+    outcome = run(engine.deliver(_request()))
+    assert any(
+        "retrospective analyst" in (c["system_prompt"] or "") for c in runner.calls
+    )
+    retro = outcome.blackboard.get("retrospective")
+    assert retro and any("error contract implicit" in note for note in retro)
+
+
+def test_llm_retrospective_with_no_lessons_adds_nothing():
+    responses = dict(engine_responses())
+    responses["retrospective analyst"] = json_response({"lessons": []})
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(runner, config=EngineConfig(llm_retrospective=True))
+    outcome = run(engine.deliver(_request()))
+    # it ran, but a clean happy-path run with no lessons leaves no retro notes
+    assert any(
+        "retrospective analyst" in (c["system_prompt"] or "") for c in runner.calls
+    )
+    assert outcome.blackboard.get("retrospective") is None
 
 
 def test_delivery_outcome_property_edges():

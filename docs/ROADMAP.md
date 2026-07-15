@@ -157,6 +157,20 @@ causes; a standing benchmark suite run in CI against the real runner
 (budget-capped, nightly) with score history so prompt/orchestration changes
 show up as deltas.
 
+**In progress:** the LLM retrospective agent has landed. Opt-in via
+`EngineConfig.llm_retrospective` / `--llm-retrospective` (default off), it runs
+after delivery over a compact, bounded run digest (`_run_evidence`: task
+outcomes, the scorecard, the trace's shape, and the spend — never the raw
+transcript, fenced as untrusted `<evidence>`) and returns a few *root-cause*
+lessons that name a cause and a change, richer than the always-on deterministic
+distillation it complements. It runs under the graceful specialist wrapper and
+is skipped once the budget is spent, so it never gates a delivery; its lessons
+merge into the persisted retrospective that seeds the next run's plan. Remaining:
+a deterministic **score-history** trail (per-run metrics persisted with
+run-over-run deltas), then a standing **benchmark suite in CI** against the real
+runner (budget-capped) — the latter deferred pending a governance decision on
+scheduled real spend and SDK credentials in CI.
+
 ## 7. Richer interaction surfaces
 
 **Why:** the interactive core (plan review, escalation, approvals, chat)

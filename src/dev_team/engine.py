@@ -38,6 +38,7 @@ from .agents import (
     EngineerAgent,
     ProductManagerAgent,
     QAAgent,
+    RetrospectorAgent,
     ReviewerAgent,
     SecurityEngineerAgent,
     SREAgent,
@@ -108,7 +109,7 @@ from .retrieval import char_budget_for_tokens, estimate_tokens, retrieve
 from .sandbox import ContainerCommandRunner, SandboxConfig
 from .scheduler import ScheduledResult, schedule
 from .sdk import AgentRunner, AgentSession, ClaudeAgentSession
-from .trace import Tracer
+from .trace import Tracer, TraceSpan
 from .transcripts import TranscriptRecorder
 from .verification import (
     CommandGate,
@@ -203,6 +204,13 @@ class EngineConfig:
     retrieval: bool = False
     #: Per-role budget, in estimated tokens, for retrieved code in a prompt.
     retrieval_token_budget: int = 3000
+    #: Run an LLM retrospective agent after delivery that mines the run's
+    #: evidence (trace, scorecard, task outcomes) for *root-cause* lessons,
+    #: richer than the always-on deterministic distillation. Off by default
+    #: (opt-in) — it adds one end-of-run LLM call; it never gates the run and is
+    #: skipped when the budget is spent. Its lessons merge into the persisted
+    #: retrospective that seeds the next run's plan. See ROADMAP #6.
+    llm_retrospective: bool = False
     worktrees: bool = False
     lint_command: Optional[Sequence[str]] = None
     security_scan_command: Optional[Sequence[str]] = None
@@ -416,6 +424,59 @@ def _retrospective(
     if security is not None and not security.approved:
         notes.append(f"security blocked the release: {security.summary}")
     return notes
+
+
+# The LLM retrospective is fed a compact digest, never the raw transcript.
+_MAX_EVIDENCE_CHARS = 4000
+_MAX_EVIDENCE_NOTABLE_SPANS = 10
+
+
+def _run_evidence(
+    task_results: List[TaskResult],
+    security: Optional[SecurityReport],
+    scorecard: Mapping[str, int],
+    spans: Sequence[TraceSpan],
+    budget_spent: Optional[float],
+) -> str:
+    """A compact, bounded digest of a finished run for the retrospector.
+
+    Deterministic and pure, so the LLM retrospective is fed exactly what the
+    tests assert — task outcomes, the scorecard, the trace's shape, and the
+    spend — rather than the raw transcript. Bounded overall by a char cap.
+    """
+
+    lines: List[str] = ["Task outcomes:"]
+    for tr in task_results:
+        status = "succeeded" if tr.succeeded else "FAILED"
+        note = ""
+        if tr.review is not None and not tr.review.approved:
+            note = f"; last review: {tr.review.summary}"
+        lines.append(
+            f'- {tr.task.id} "{tr.task.title}": {tr.attempts} attempt(s), {status}{note}'
+        )
+    lines.append("Scorecard: " + ", ".join(f"{k}={scorecard[k]}" for k in sorted(scorecard)))
+    if security is not None:
+        verdict = "approved" if security.approved else "BLOCKED"
+        lines.append(f"Security: {verdict} - {security.summary}")
+    counts: Dict[str, int] = {}
+    for span in spans:
+        counts[span.kind] = counts.get(span.kind, 0) + 1
+    if counts:
+        lines.append("Trace: " + ", ".join(f"{k}x{counts[k]}" for k in sorted(counts)))
+    notable = [s for s in spans if s.status not in ("ok", "done")]
+    if notable:
+        lines.append("Notable spans (did not end cleanly):")
+        for span in notable[:_MAX_EVIDENCE_NOTABLE_SPANS]:
+            lines.append(f"- [{span.kind}] {span.name}: {span.status}")
+        extra = len(notable) - _MAX_EVIDENCE_NOTABLE_SPANS
+        if extra > 0:
+            lines.append(f"- ... and {extra} more")
+    if budget_spent is not None:
+        lines.append(f"Budget spent: ${budget_spent:.4f}")
+    text = "\n".join(lines)
+    if len(text) > _MAX_EVIDENCE_CHARS:
+        text = text[:_MAX_EVIDENCE_CHARS].rstrip() + "\n... (truncated)"
+    return text
 
 
 # A snapshot maps path -> prior content, or None when the file did not exist.
@@ -674,6 +735,7 @@ class DeliveryEngine:
         self.writer = make(TechnicalWriterAgent)
         self.sre = make(SREAgent)
         self.devops = make(DevOpsAgent)
+        self.retrospector = make(RetrospectorAgent)
 
     def _event(self, stage: str, message: str, detail: Optional[str] = None) -> None:
         emit(
@@ -935,6 +997,12 @@ class DeliveryEngine:
         committed = self._commit_if_approved(request, task_results, security)
         self._finalise_backlog(backlog, stories, task_results)
         notes = _retrospective(task_results, security)
+        if self.config.llm_retrospective and not self._budget_exhausted:
+            lessons = await self._specialist(
+                self._mine_retrospective(request, design, task_results, security)
+            )
+            if lessons:
+                notes = notes + lessons
         if notes:
             self.blackboard.put("retrospective", notes)
         self.blackboard.put("scorecard", dict(self._scorecard))
@@ -1180,6 +1248,30 @@ class DeliveryEngine:
         except DevTeamError as exc:
             self._event("specialist", "Specialist stage failed", detail=str(exc))
             return None
+
+    async def _mine_retrospective(
+        self,
+        request: FeatureRequest,
+        design: Design,
+        task_results: List[TaskResult],
+        security: Optional[SecurityReport],
+    ) -> List[str]:
+        """Ask the retrospector for root-cause lessons from the run's evidence."""
+
+        evidence = _run_evidence(
+            task_results,
+            security,
+            self._scorecard,
+            self.tracer.spans,
+            self.budget.spent if self.budget is not None else None,
+        )
+        lessons = await self.retrospector.reflect(request, design, evidence)
+        if lessons:
+            self._event(
+                "retrospective",
+                f"Retrospective mined {len(lessons)} root-cause lesson(s)",
+            )
+        return lessons
 
     def _on_scheduled(self, result: ScheduledResult) -> None:
         detail = result.error

@@ -6,6 +6,7 @@ from .devops import DevOpsAgent
 from .engineer import EngineerAgent
 from .manager import ProductManagerAgent
 from .qa import QAAgent
+from .retrospector import RetrospectorAgent
 from .reviewer import ReviewerAgent
 from .security import SecurityEngineerAgent
 from .sre import SREAgent
@@ -18,6 +19,7 @@ __all__ = [
     "EngineerAgent",
     "ProductManagerAgent",
     "QAAgent",
+    "RetrospectorAgent",
     "ReviewerAgent",
     "SecurityEngineerAgent",
     "SREAgent",

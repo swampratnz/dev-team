@@ -183,6 +183,23 @@ def test_engine_config_threads_reuse_engineer_session():
     assert _engine_config(off).reuse_engineer_session is False
 
 
+def test_main_llm_retrospective_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--llm-retrospective"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--llm-retrospective" in err and "--deliver" in err
+
+
+def test_engine_config_threads_llm_retrospective():
+    from dev_team.cli import _engine_config, build_parser
+
+    on = build_parser().parse_args(["T", "D", "--deliver", "--llm-retrospective"])
+    assert _engine_config(on).llm_retrospective is True
+    off = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(off).llm_retrospective is False
+
+
 def test_main_deliver_only_flags_all_reported(capsys):
     argv = [
         "Login", "Add login",

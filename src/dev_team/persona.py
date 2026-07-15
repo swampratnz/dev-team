@@ -129,6 +129,14 @@ DEFAULT_CAST: Mapping[str, Persona] = {
             "treats deployment as code with a tested rollback path."
         ),
     ),
+    "retrospective": Persona(
+        name="Remy",
+        role="retrospective",
+        style=(
+            "You run blameless retrospectives: you trace a bad outcome back to "
+            "its root cause and turn it into one concrete change for next time."
+        ),
+    ),
 }
 
 
