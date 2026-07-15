@@ -8,7 +8,7 @@ from ..errors import AgentResponseError, JSONExtractionError
 from ..events import AgentEvent, Listener, emit
 from ..json_utils import extract_json
 from ..persona import Persona
-from ..sdk import AgentResult, AgentRunner
+from ..sdk import AgentResult, AgentRunner, AgentSession
 
 # Tools granted to evidence-reading roles (reviewer, security, QA, SRE): they
 # may inspect the workspace but never edit or execute anything in it.
@@ -99,17 +99,28 @@ class BaseAgent:
         allowed_tools: Optional[Sequence[str]] = None,
         cwd: Optional[str] = None,
         model: Optional[str] = None,
+        session: Optional[AgentSession] = None,
     ) -> AgentResult:
-        """Send ``prompt`` to the model and return the raw result."""
+        """Send ``prompt`` to the model and return the raw result.
+
+        When ``session`` is given the turn goes to that persistent conversation
+        instead of a fresh runner call — the session already carries the system
+        prompt, tools, cwd, and model from its construction, so ``allowed_tools``
+        / ``cwd`` / ``model`` are ignored here and only the prompt text is sent.
+        This is the seam session continuity rides on.
+        """
 
         self._emit("working")
-        result = await self.runner.run(
-            prompt,
-            system_prompt=self.effective_system_prompt,
-            allowed_tools=allowed_tools,
-            model=model or self.model,
-            cwd=cwd,
-        )
+        if session is not None:
+            result = await session.send(prompt)
+        else:
+            result = await self.runner.run(
+                prompt,
+                system_prompt=self.effective_system_prompt,
+                allowed_tools=allowed_tools,
+                model=model or self.model,
+                cwd=cwd,
+            )
         self._emit("completed", detail=f"{result.num_turns} turn(s)")
         return result
 
@@ -120,6 +131,7 @@ class BaseAgent:
         allowed_tools: Optional[Sequence[str]] = None,
         cwd: Optional[str] = None,
         model: Optional[str] = None,
+        session: Optional[AgentSession] = None,
     ) -> Any:
         """Send ``prompt`` and parse the response as a JSON object.
 
@@ -136,7 +148,11 @@ class BaseAgent:
         last_text = ""
         for attempt in range(self.json_retries + 1):
             result = await self.ask(
-                attempt_prompt, allowed_tools=allowed_tools, cwd=cwd, model=model
+                attempt_prompt,
+                allowed_tools=allowed_tools,
+                cwd=cwd,
+                model=model,
+                session=session,
             )
             last_text = result.text
             reason = None
