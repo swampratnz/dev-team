@@ -188,6 +188,43 @@ def test_manager_replan_prompt_carries_failed_task_evidence_and_fences_it():
     assert "- T1: scaffold" in prompt
 
 
+def test_manager_replan_handles_a_lone_failed_task_with_no_deps_or_criteria():
+    # A single-task plan whose only task fails: no siblings to wire against, no
+    # upstream deps, no acceptance criteria — every "or (none)" fallback fires.
+    runner = _runner({"action": "drop", "replacements": []})
+    agent = ProductManagerAgent(runner)
+    lone = Task(id="T1", title="do it all", description="", acceptance_criteria=[])
+    run(
+        agent.replan(
+            FeatureRequest(title="t", description="d"),
+            Plan(summary="s", tasks=[lone]),
+            lone,
+            evidence="e",
+        )
+    )
+    prompt = runner.calls[0]["prompt"]
+    assert "- (none)" in prompt  # no sibling tasks
+    assert "upstream dependencies: (none)" in prompt
+    assert "  - (none)" in prompt  # no acceptance criteria
+
+
+def test_manager_replan_bounds_oversized_evidence():
+    runner = _runner({"action": "drop", "replacements": []})
+    agent = ProductManagerAgent(runner)
+    failed = _failed_task()
+    run(
+        agent.replan(
+            FeatureRequest(title="t", description="d"),
+            _plan_with(failed),
+            failed,
+            evidence="x" * 9000,
+        )
+    )
+    # untrusted evidence is capped like static-analysis/scanner output elsewhere
+    assert "x" * 4000 in runner.calls[0]["prompt"]
+    assert "x" * 4001 not in runner.calls[0]["prompt"]
+
+
 def test_manager_replan_folds_supervisor_feedback():
     runner = _runner({"action": "drop", "replacements": []})
     agent = ProductManagerAgent(runner)
