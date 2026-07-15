@@ -1,0 +1,62 @@
+name: Benchmark
+
+# Standing benchmark suite (ROADMAP #6). Runs the real team over a fixed set of
+# feature requests and scores the deliveries, so a prompt or orchestration
+# change shows up as a movement in the pass rate rather than a vibe.
+#
+# DISABLED BY DEFAULT. It spends real budget against the shared Max pool and
+# needs Claude credentials, so nothing runs until an admin deliberately opts in:
+#   1. Set the repository variable RUN_BENCHMARKS to `true`
+#      (Settings -> Secrets and variables -> Actions -> Variables).
+#   2. Add a credential secret — CLAUDE_CODE_OAUTH_TOKEN (Max/Pro, from
+#      `claude setup-token`) and/or ANTHROPIC_API_KEY (pay-as-you-go).
+# Clear the variable to stop it again. Both the nightly run and manual dispatch
+# are gated by the variable, so the suite is completely inert until enabled.
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # nightly, 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      budget_usd:
+        description: "Per-case spend cap in USD"
+        default: "2.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    # The single enable/disable switch: unset (the default) keeps the whole job
+    # from running, so the suite never spends until it is deliberately enabled.
+    if: ${{ vars.RUN_BENCHMARKS == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Run benchmark suite
+        env:
+          # Reference both; whichever secret is set is used by the runner.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The dispatch input is passed through an env var, never interpolated
+          # into the script text, so it cannot break out of the command and run
+          # arbitrary shell in a step that holds the credential secrets. The
+          # shell applies the 2.0 default, and dev-team-benchmark's argparse
+          # rejects any non-numeric value before anything else runs.
+          BUDGET_USD: ${{ github.event.inputs.budget_usd }}
+        run: dev-team-benchmark --budget-usd "${BUDGET_USD:-2.0}"
