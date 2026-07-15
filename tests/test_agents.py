@@ -122,6 +122,125 @@ def test_manager_fences_prior_context():
     assert "untrusted data under review" in runner.calls[0]["system_prompt"]
 
 
+def _failed_task():
+    return Task(
+        id="T2",
+        title="wire the widget",
+        description="connect it",
+        acceptance_criteria=["renders"],
+        dependencies=["T1"],
+    )
+
+
+def _plan_with(failed):
+    return Plan(
+        summary="s",
+        tasks=[Task(id="T1", title="scaffold", description=""), failed],
+    )
+
+
+def test_manager_replan_returns_decision_and_uses_caller_task_id():
+    from dev_team.replan import Replan, ReplanAction
+
+    payload = {
+        "action": "split",
+        "rationale": "too coupled",
+        "replacements": [
+            {"id": "T2a", "title": "part a", "acceptance_criteria": ["a"], "dependencies": ["T1"]},
+            {"id": "T2b", "title": "part b", "acceptance_criteria": ["b"], "dependencies": ["T2a"]},
+        ],
+    }
+    runner = _runner(payload)
+    agent = ProductManagerAgent(runner)
+    failed = _failed_task()
+    decision = run(
+        agent.replan(
+            FeatureRequest(title="t", description="d"),
+            _plan_with(failed),
+            failed,
+            evidence="tests: 2 failing",
+        )
+    )
+    assert isinstance(decision, Replan)
+    assert decision.action is ReplanAction.SPLIT
+    assert decision.failed_task_id == "T2"  # from the caller, not the model
+    assert [t.id for t in decision.replacements] == ["T2a", "T2b"]
+
+
+def test_manager_replan_prompt_carries_failed_task_evidence_and_fences_it():
+    runner = _runner({"action": "drop", "replacements": []})
+    agent = ProductManagerAgent(runner)
+    failed = _failed_task()
+    run(
+        agent.replan(
+            FeatureRequest(title="goal", description="d"),
+            _plan_with(failed),
+            failed,
+            evidence="review: flaky selector",
+        )
+    )
+    prompt = runner.calls[0]["prompt"]
+    assert "T2" in prompt and "wire the widget" in prompt
+    # the evidence is fenced as untrusted content
+    assert "<evidence>\nreview: flaky selector\n</evidence>" in prompt
+    # the sibling task is offered for dependency wiring; the failed task is not
+    # listed as a dependency target
+    assert "- T1: scaffold" in prompt
+
+
+def test_manager_replan_handles_a_lone_failed_task_with_no_deps_or_criteria():
+    # A single-task plan whose only task fails: no siblings to wire against, no
+    # upstream deps, no acceptance criteria — every "or (none)" fallback fires.
+    runner = _runner({"action": "drop", "replacements": []})
+    agent = ProductManagerAgent(runner)
+    lone = Task(id="T1", title="do it all", description="", acceptance_criteria=[])
+    run(
+        agent.replan(
+            FeatureRequest(title="t", description="d"),
+            Plan(summary="s", tasks=[lone]),
+            lone,
+            evidence="e",
+        )
+    )
+    prompt = runner.calls[0]["prompt"]
+    assert "- (none)" in prompt  # no sibling tasks
+    assert "upstream dependencies: (none)" in prompt
+    assert "  - (none)" in prompt  # no acceptance criteria
+
+
+def test_manager_replan_bounds_oversized_evidence():
+    runner = _runner({"action": "drop", "replacements": []})
+    agent = ProductManagerAgent(runner)
+    failed = _failed_task()
+    run(
+        agent.replan(
+            FeatureRequest(title="t", description="d"),
+            _plan_with(failed),
+            failed,
+            evidence="x" * 9000,
+        )
+    )
+    # untrusted evidence is capped like static-analysis/scanner output elsewhere
+    assert "x" * 4000 in runner.calls[0]["prompt"]
+    assert "x" * 4001 not in runner.calls[0]["prompt"]
+
+
+def test_manager_replan_folds_supervisor_feedback():
+    runner = _runner({"action": "drop", "replacements": []})
+    agent = ProductManagerAgent(runner)
+    failed = _failed_task()
+    run(
+        agent.replan(
+            FeatureRequest(title="t", description="d"),
+            _plan_with(failed),
+            failed,
+            evidence="e",
+            revision_feedback="don't just drop it",
+        )
+    )
+    assert "don't just drop it" in runner.calls[0]["prompt"]
+
+
 # --- architect ----------------------------------------------------------
 
 

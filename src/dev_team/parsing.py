@@ -31,6 +31,7 @@ from .models import (
     TestKind,
     TestReport,
 )
+from .replan import Replan, ReplanAction
 
 E = TypeVar("E")
 
@@ -180,6 +181,36 @@ def plan_from_dict(data: Any) -> Plan:
         for index, item in enumerate(as_obj_list(data, "tasks"))
     ]
     return Plan(summary=as_str(data, "summary"), tasks=tasks)
+
+
+def replan_from_dict(data: Any, failed_task_id: str) -> Replan:
+    """Build a :class:`~dev_team.replan.Replan` for ``failed_task_id``.
+
+    ``failed_task_id`` comes from the caller — the engine knows which task
+    failed, so the model never has to (and never gets to) name it. The action
+    is taken from the model when it is a valid choice, otherwise inferred from
+    the replacement count so it always agrees with the tasks actually supplied
+    (0 → drop, 1 → replace, ≥2 → split); a stated action inconsistent with the
+    count is left to :func:`~dev_team.replan.apply_replan` to reject.
+    """
+
+    data = as_dict(data)
+    replacements = [
+        task_from_dict(item, index)
+        for index, item in enumerate(as_obj_list(data, "replacements"))
+    ]
+    if not replacements:
+        inferred = ReplanAction.DROP
+    elif len(replacements) == 1:
+        inferred = ReplanAction.REPLACE
+    else:
+        inferred = ReplanAction.SPLIT
+    return Replan(
+        action=as_enum(ReplanAction, data.get("action"), inferred),
+        failed_task_id=failed_task_id,
+        replacements=replacements,
+        rationale=as_str(data, "rationale"),
+    )
 
 
 def design_from_dict(data: Any) -> Design:
