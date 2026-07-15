@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 from .budget import Budget
-from .sdk import AgentResult, AgentRunner
+from .sdk import AgentResult, AgentRunner, AgentSession
 from .trace import Tracer
 from .transcripts import TranscriptRecorder
 
@@ -91,6 +91,64 @@ class InstrumentedRunner:
             self.transcript_recorder.record(
                 role=self.role,
                 system_prompt=system_prompt,
+                prompt=prompt,
+                result=result,
+            )
+        except Exception:  # noqa: BLE001 - recording is forgiving, like the eventlog
+            pass
+
+
+@dataclass
+class InstrumentedSession:
+    """An :class:`~dev_team.sdk.AgentSession` that meters and traces each turn.
+
+    The session equivalent of :class:`InstrumentedRunner`: every
+    :meth:`send` records cost against the budget, opens/closes a trace span, and
+    captures the transcript — identical accounting, so reusing a session across
+    attempts never loses budget or audit coverage. ``system_prompt`` is fixed
+    for the session's life, so it is held here for transcript attribution rather
+    than passed per turn.
+    """
+
+    inner: AgentSession
+    role: str
+    budget: Optional[Budget] = None
+    tracer: Optional[Tracer] = None
+    transcript_recorder: Optional[TranscriptRecorder] = None
+    system_prompt: Optional[str] = None
+
+    async def send(self, prompt: str) -> AgentResult:
+        if self.budget is not None:
+            self.budget.check()  # pre-flight: refuse to spend past the ceiling
+        span = None
+        if self.tracer is not None:
+            span = self.tracer.start("agent", self.role)
+        try:
+            result = await self.inner.send(prompt)
+        except BaseException:
+            if self.tracer is not None:
+                self.tracer.end(span, "exception")
+            raise
+        if self.tracer is not None:
+            self.tracer.end(span, "error" if result.is_error else "ok")
+        # Record before enforcing the budget: the call that tips the ceiling has
+        # still been paid for, so its transcript must be audited, not lost.
+        if self.transcript_recorder is not None:
+            self._record(prompt, result)
+        if self.budget is not None:
+            self.budget.record(self.role, result)
+        return result
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
+
+    def _record(self, prompt: str, result: AgentResult) -> None:
+        """Best-effort transcript write; a failure must never break a run."""
+
+        try:
+            self.transcript_recorder.record(
+                role=self.role,
+                system_prompt=self.system_prompt,
                 prompt=prompt,
                 result=result,
             )

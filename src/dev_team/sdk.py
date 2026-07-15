@@ -167,32 +167,41 @@ class ClaudeAgentRunner:
     async def _consume(
         self, prompt: str, options: ClaudeAgentOptions, model: Optional[str]
     ) -> AgentResult:
-        texts: List[str] = []
-        cost = 0.0
-        num_turns = 0
-        used_model = model or self.default_model
-        is_error = False
+        return await _drain(query(prompt=prompt, options=options), model or self.default_model)
 
-        async for message in query(prompt=prompt, options=options):
-            texts.extend(extract_text(message))
-            block_model = getattr(message, "model", None)
-            if isinstance(block_model, str):
-                used_model = block_model
-            if hasattr(message, "total_cost_usd"):
-                cost = getattr(message, "total_cost_usd", 0.0) or 0.0
-                num_turns = getattr(message, "num_turns", 0) or 0
-                is_error = bool(getattr(message, "is_error", False))
-                result_text = getattr(message, "result", None)
-                if isinstance(result_text, str) and result_text.strip():
-                    texts.append(result_text)
 
-        return AgentResult(
-            text="\n".join(texts),
-            cost_usd=cost,
-            num_turns=num_turns,
-            model=used_model,
-            is_error=is_error,
-        )
+async def _drain(messages: Any, default_model: Optional[str]) -> AgentResult:
+    """Fold an SDK message stream into an :class:`AgentResult`.
+
+    Shared by the one-shot :func:`query` path (:class:`ClaudeAgentRunner`) and
+    the persistent-session path (:class:`ClaudeAgentSession`) so both distil
+    text, cost, turns, model, and the error flag identically.
+    """
+
+    texts: List[str] = []
+    cost = 0.0
+    num_turns = 0
+    used_model = default_model
+    is_error = False
+    async for message in messages:
+        texts.extend(extract_text(message))
+        block_model = getattr(message, "model", None)
+        if isinstance(block_model, str):
+            used_model = block_model
+        if hasattr(message, "total_cost_usd"):
+            cost = getattr(message, "total_cost_usd", 0.0) or 0.0
+            num_turns = getattr(message, "num_turns", 0) or 0
+            is_error = bool(getattr(message, "is_error", False))
+            result_text = getattr(message, "result", None)
+            if isinstance(result_text, str) and result_text.strip():
+                texts.append(result_text)
+    return AgentResult(
+        text="\n".join(texts),
+        cost_usd=cost,
+        num_turns=num_turns,
+        model=used_model,
+        is_error=is_error,
+    )
 
 
 def _default_client_factory(options: ClaudeAgentOptions) -> Any:
@@ -261,3 +270,101 @@ class ClaudeChatBackend:
         if self._client is not None:
             await self._client.disconnect()
             self._client = None
+
+
+@runtime_checkable
+class AgentSession(Protocol):
+    """A persistent, tool-enabled conversation reused across turns.
+
+    Unlike :meth:`AgentRunner.run` (a fresh SDK session per call), an
+    ``AgentSession`` holds one client open, so a later turn retains everything
+    from earlier ones — the code the model read, the changes it made. Each turn
+    returns a full :class:`AgentResult`, so it meters exactly as ``run`` does.
+    """
+
+    async def send(self, prompt: str) -> AgentResult:
+        """Send one turn in the open conversation and return its result."""
+        ...
+
+    async def aclose(self) -> None:
+        """Release the underlying session."""
+        ...
+
+
+@dataclass
+class ClaudeAgentSession:
+    """A tool-enabled :class:`AgentSession` on a persistent ``ClaudeSDKClient``.
+
+    Like :class:`ClaudeChatBackend`, but the session carries
+    ``allowed_tools``/``cwd``/``permission_mode`` so the model can read, edit,
+    and run inside ``cwd`` across turns — the transport an engineer needs to
+    *continue* a prior attempt rather than restart it cold. The system prompt,
+    tools, and cwd are fixed for the session's life; only the per-turn prompt
+    varies. A failed turn (SDK/OS error or timeout) returns an error
+    :class:`AgentResult` rather than raising, matching
+    :class:`ClaudeAgentRunner`, so a caller can fall back to a fresh session;
+    :class:`asyncio.CancelledError` always propagates.
+    """
+
+    system_prompt: Optional[str] = None
+    allowed_tools: Optional[Sequence[str]] = None
+    model: Optional[str] = None
+    cwd: Optional[str] = None
+    permission_mode: str = "acceptEdits"
+    max_turns: Optional[int] = None
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    client_factory: Optional[Callable[[ClaudeAgentOptions], Any]] = None
+    _client: Any = field(default=None, repr=False, compare=False)
+
+    async def _ensure_client(self) -> Any:
+        if self._client is None:
+            options = build_options(
+                system_prompt=self.system_prompt,
+                allowed_tools=self.allowed_tools,
+                model=self.model,
+                permission_mode=self.permission_mode,
+                cwd=self.cwd,
+                max_turns=self.max_turns,
+            )
+            factory = self.client_factory or _default_client_factory
+            self._client = factory(options)
+            await self._client.connect()
+        return self._client
+
+    async def send(self, prompt: str) -> AgentResult:
+        try:
+            client = await self._ensure_client()
+            await client.query(prompt)
+            return await asyncio.wait_for(
+                _drain(client.receive_response(), self.model),
+                timeout=self.timeout_seconds,
+            )
+        except (ClaudeSDKError, OSError, UnicodeDecodeError, TimeoutError) as exc:
+            return AgentResult(text=f"{type(exc).__name__}: {exc}", is_error=True)
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.disconnect()
+            self._client = None
+
+
+@dataclass
+class FakeAgentSession:
+    """A scripted :class:`AgentSession` for tests.
+
+    Records every prompt; returns the queued results in order (repeating the
+    last), or an empty success when none are queued.
+    """
+
+    results: List[AgentResult] = field(default_factory=list)
+    prompts: List[str] = field(default_factory=list)
+    closed: bool = False
+
+    async def send(self, prompt: str) -> AgentResult:
+        self.prompts.append(prompt)
+        if not self.results:
+            return AgentResult(text="", num_turns=1)
+        return self.results.pop(0) if len(self.results) > 1 else self.results[0]
+
+    async def aclose(self) -> None:
+        self.closed = True

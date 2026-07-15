@@ -190,3 +190,144 @@ def test_runner_never_swallows_cancellation(monkeypatch):
 
     with pytest.raises(asyncio.CancelledError):
         run(scenario())
+
+
+# --- ClaudeAgentSession / FakeAgentSession ------------------------------
+
+
+class _SessionClient:
+    """A fake persistent SDK client: connect / query / receive_response / disconnect."""
+
+    instances = []
+
+    def __init__(self, options):
+        self.options = options
+        self.connected = False
+        self.disconnected = False
+        self.queries = []
+        _SessionClient.instances.append(self)
+
+    async def connect(self):
+        self.connected = True
+
+    async def query(self, text):
+        self.queries.append(text)
+
+    async def receive_response(self):
+        yield Assistant([Block("did it")], model="claude-real")
+        yield ResultMsg(total_cost_usd=0.3, num_turns=2, is_error=False, result="summary")
+
+    async def disconnect(self):
+        self.disconnected = True
+
+
+def test_session_reuses_one_client_across_turns():
+    from dev_team.sdk import ClaudeAgentSession
+
+    _SessionClient.instances = []
+    session = ClaudeAgentSession(
+        system_prompt="be an engineer",
+        allowed_tools=["Read", "Write"],
+        model="claude-x",
+        cwd="/work",
+        client_factory=_SessionClient,
+    )
+    r1 = run(session.send("attempt 1"))
+    r2 = run(session.send("address the feedback"))
+    assert r1.text == "did it\nsummary"
+    assert r1.cost_usd == 0.3 and r1.num_turns == 2 and r1.model == "claude-real"
+    assert r2.text == "did it\nsummary"
+    assert len(_SessionClient.instances) == 1  # one persistent client, two turns
+    client = _SessionClient.instances[0]
+    assert client.queries == ["attempt 1", "address the feedback"]
+    assert client.options.system_prompt == "be an engineer"
+    assert client.options.allowed_tools == ["Read", "Write"]
+    assert client.options.model == "claude-x"
+    assert client.options.cwd == "/work"
+
+
+def test_session_aclose_disconnects_and_resets():
+    from dev_team.sdk import ClaudeAgentSession
+
+    _SessionClient.instances = []
+    session = ClaudeAgentSession(client_factory=_SessionClient)
+    run(session.send("hi"))
+    client = _SessionClient.instances[0]
+    run(session.aclose())
+    assert client.disconnected is True
+    assert session._client is None
+
+
+def test_session_maps_sdk_errors_to_error_result():
+    from dev_team.sdk import ClaudeAgentSession
+
+    class BoomClient:
+        def __init__(self, options):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def query(self, text):
+            raise ProcessError("CLI exploded", exit_code=1)
+
+        async def receive_response(self):
+            yield Assistant([Block("unreached")])
+
+        async def disconnect(self):
+            pass
+
+    result = run(ClaudeAgentSession(client_factory=BoomClient).send("x"))
+    assert result.is_error is True
+    assert "ProcessError" in result.text
+
+
+def test_session_times_out_to_error_result():
+    from dev_team.sdk import ClaudeAgentSession
+
+    class SlowClient:
+        def __init__(self, options):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def query(self, text):
+            pass
+
+        async def receive_response(self):
+            await asyncio.sleep(30)
+            yield Assistant([Block("late")])
+
+        async def disconnect(self):
+            pass
+
+    result = run(ClaudeAgentSession(client_factory=SlowClient, timeout_seconds=0.01).send("x"))
+    assert result.is_error is True
+    assert "TimeoutError" in result.text
+
+
+def test_fake_agent_session_records_prompts_and_repeats_last_result():
+    from dev_team.sdk import FakeAgentSession
+
+    session = FakeAgentSession(results=[AgentResult(text="a"), AgentResult(text="b")])
+    assert run(session.send("p1")).text == "a"
+    assert run(session.send("p2")).text == "b"
+    assert run(session.send("p3")).text == "b"  # last result repeats
+    assert session.prompts == ["p1", "p2", "p3"]
+    run(session.aclose())
+    assert session.closed is True
+
+
+def test_fake_agent_session_defaults_to_empty_success():
+    from dev_team.sdk import FakeAgentSession
+
+    result = run(FakeAgentSession().send("p"))
+    assert result.text == "" and result.is_error is False
+
+
+def test_session_aclose_without_a_client_is_a_noop():
+    from dev_team.sdk import ClaudeAgentSession
+
+    # aclose before any send: no client was ever opened, so it just returns.
+    run(ClaudeAgentSession(client_factory=_SessionClient).aclose())
