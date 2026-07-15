@@ -23,6 +23,7 @@ from dev_team.interaction import (
     Reply,
     ScriptedChannel,
     ask_in_thread,
+    ci_fix_question,
     plan_review_question,
     render_plan,
     render_replan,
@@ -379,3 +380,19 @@ def test_queue_channel_is_importable_from_package_root():
 
     assert dev_team.QueueChannel is QueueChannel
     assert isinstance(queue.Queue(), type(QueueChannel().questions))
+
+
+def test_ci_fix_question_is_autonomous_by_default_and_fails_safe_to_skip():
+    q = ci_fix_question(2, ["test (3.12)", "lint"], "boom summary", asked_by="Sam")
+    assert q.topic == "ci-fix"
+    assert "test (3.12), lint" in q.prompt and "round 2" in q.prompt
+    assert q.context == "boom summary"
+    assert [c.key for c in q.choices] == ["apply", "skip"]
+    # unattended -> fix autonomously; the EOF fail-safe leaves it for a human
+    assert AutoChannel().ask(q) == Reply(choice="apply")
+    assert q.fail_safe_key == "skip"
+
+
+def test_ci_fix_question_handles_no_named_failures():
+    q = ci_fix_question(1, [], "s", asked_by="Sam")
+    assert "the checks" in q.prompt

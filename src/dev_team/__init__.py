@@ -69,7 +69,7 @@ from .budget import Budget, BudgetExceededError, UsageMeter, UsageRecord
 from .changes import AppliedChange, ApplyResult, ChangeApplier
 from .config import TeamConfig
 from .context import RepoContext, build_repo_context
-from .delivery_target import DeliveryTargetError, publish_pull_request
+from .delivery_target import DeliveryTargetError, publish_pull_request, push_branch
 from .engine import DeliveryEngine, DeliveryOutcome, EngineConfig, RemediationOutcome
 from .errors import (
     AgentResponseError,
@@ -323,6 +323,7 @@ __all__ = [
     "FakePullRequestPublisher",
     "PullRequestError",
     "publish_pull_request",
+    "push_branch",
     "ChecksOutcome",
     "ChecksReader",
     "GitHubChecksReader",

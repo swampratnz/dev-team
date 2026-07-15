@@ -892,14 +892,18 @@ def test_deliver_remote_verify_builds_remote_gate(tmp_path, monkeypatch):
 
     captured = {}
 
+    class _FakeEngine:
+        async def deliver(self, request):
+            raise SystemExit(0)
+
     class _FakeTeam:
         def __init__(self, *a, **k):
             self.interaction = None
             self.roster = None
 
-        async def deliver(self, request, **kwargs):
+        def make_engine(self, **kwargs):
             captured["config"] = kwargs["config"]
-            raise SystemExit(0)
+            return _FakeEngine()
 
     monkeypatch.setattr(cli_module, "DevTeam", _FakeTeam)
     with pytest.raises(SystemExit):
@@ -1543,6 +1547,205 @@ def test_main_watch_checks_timeout_polls_are_derived(tmp_path, monkeypatch, caps
     # 100s / 20s interval -> 5 polls, watching the delivered branch
     assert seen["max_polls"] == 5 and seen["interval"] == 20.0
     assert seen["ref"].startswith("dev-team/")
+
+
+# --- --watch-fix-rounds (close the loop) ------------------------------------
+
+
+def test_main_watch_fix_rounds_requires_watch_checks():
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["T", "D", "--deliver", "--repo", "acme/mono", "--pull-request",
+             "--watch-fix-rounds", "2"],
+            runner=ScriptedRunner([]),
+        )
+    assert exc.value.code == 2
+
+
+def test_main_watch_fix_rounds_negative_rejected():
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["T", "D", "--deliver", "--repo", "acme/mono", "--pull-request",
+             "--watch-checks", "--watch-fix-rounds", "-1"],
+            runner=ScriptedRunner([]),
+        )
+    assert exc.value.code == 2
+
+
+def test_main_watch_fix_rounds_invokes_the_loop(tmp_path, monkeypatch):
+    import dev_team.cli as cli_module
+    from dev_team.checks import ChecksOutcome
+
+    monkeypatch.setattr(
+        cli_module, "watch_checks", lambda *a, **k: ChecksOutcome("failure", failed=("t",))
+    )
+    called = []
+
+    async def fake_loop(engine, team, outcome, args, ref, token):
+        called.append(outcome.checks.state)
+
+    monkeypatch.setattr(cli_module, "_run_ci_fix_loop", fake_loop)
+    _pr_deliver(tmp_path, monkeypatch, {}, "--watch-checks", "--watch-fix-rounds", "1")
+    assert called == ["failure"]  # _deliver invoked the loop with the failed watch
+
+
+def _fix_outcome(state="failure"):
+    from dev_team.checks import ChecksOutcome
+    from dev_team.engine import DeliveryOutcome
+    from dev_team.models import Design, FeatureRequest
+
+    return DeliveryOutcome(
+        request=FeatureRequest(title="F", description="d"),
+        plan_summary="p",
+        design=Design(overview="o"),
+        task_results=[],
+        committed=True,
+        branch="dev-team/f",
+        checks=ChecksOutcome(state, failed=("test (3.12)",), summary="boom"),
+    )
+
+
+class _FakeEngine:
+    def __init__(self, results):
+        self._results = list(results)
+        self.calls = []
+
+    async def remediate_checks(self, summary):
+        self.calls.append(summary)
+        result = self._results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _fix_team(interaction=None):
+    import types
+
+    from dev_team.persona import Roster
+
+    return types.SimpleNamespace(interaction=interaction, roster=Roster.default())
+
+
+def _run_fix_loop(monkeypatch, engine, outcome, *, team=None, rounds=2, rewatch=()):
+    import types
+
+    import dev_team.cli as cli_module
+    from dev_team.checks import ChecksOutcome
+    from dev_team.sources import RepoRef
+    from helpers import run
+
+    pushes = []
+    monkeypatch.setattr(
+        cli_module, "push_branch", lambda *a, **k: pushes.append(k.get("force_with_lease"))
+    )
+    states = list(rewatch)
+
+    def fake_rewatch(o, a, ref, token):
+        if states:
+            o.checks = ChecksOutcome(states.pop(0), summary="rewatch")
+
+    monkeypatch.setattr(cli_module, "_watch_pr_checks", fake_rewatch)
+    args = types.SimpleNamespace(watch_fix_rounds=rounds, workspace="/ws", watch_timeout=600.0)
+    run(
+        cli_module._run_ci_fix_loop(
+            engine, team or _fix_team(), outcome, args, RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), "tok"
+        )
+    )
+    return pushes
+
+
+def test_watch_fix_loop_fixes_and_repushes(monkeypatch):
+    from dev_team.engine import RemediationOutcome
+
+    engine = _FakeEngine([RemediationOutcome(True, "fixed")])
+    outcome = _fix_outcome("failure")
+    pushes = _run_fix_loop(monkeypatch, engine, outcome, rewatch=["success"])
+    assert engine.calls == ["boom"]  # remediated once, keyed on the CI summary
+    assert pushes == [True]  # force-with-lease push of the fix
+    assert outcome.checks.state == "success"  # re-watch saw green, loop stopped
+
+
+def test_watch_fix_loop_stops_when_no_fix(monkeypatch):
+    from dev_team.engine import RemediationOutcome
+
+    engine = _FakeEngine([RemediationOutcome(False, "could not fix")])
+    outcome = _fix_outcome("failure")
+    pushes = _run_fix_loop(monkeypatch, engine, outcome)
+    assert engine.calls == ["boom"] and pushes == []
+    assert outcome.checks.state == "failure"
+
+
+def test_watch_fix_loop_human_apply_then_skip(monkeypatch):
+    from dev_team.engine import RemediationOutcome
+    from dev_team.interaction import Reply, ScriptedChannel
+
+    engine = _FakeEngine([RemediationOutcome(True, "fixed")])
+    outcome = _fix_outcome("failure")
+    # round 1: human approves the fix; re-watch stays failing; round 2: human skips
+    team = _fix_team(interaction=ScriptedChannel(script=[Reply("apply"), Reply("skip")]))
+    pushes = _run_fix_loop(monkeypatch, engine, outcome, team=team, rewatch=["failure"])
+    assert engine.calls == ["boom"] and pushes == [True]
+
+
+def test_watch_fix_loop_human_skip_first_round(monkeypatch):
+    from dev_team.interaction import Reply, ScriptedChannel
+
+    engine = _FakeEngine([])
+    outcome = _fix_outcome("failure")
+    team = _fix_team(interaction=ScriptedChannel(script=[Reply("skip")]))
+    pushes = _run_fix_loop(monkeypatch, engine, outcome, team=team)
+    assert engine.calls == [] and pushes == []  # never remediated
+
+
+def test_watch_fix_loop_exhausts_rounds(monkeypatch):
+    from dev_team.engine import RemediationOutcome
+
+    engine = _FakeEngine([RemediationOutcome(True, "f1"), RemediationOutcome(True, "f2")])
+    outcome = _fix_outcome("failure")
+    pushes = _run_fix_loop(monkeypatch, engine, outcome, rounds=2, rewatch=["failure", "failure"])
+    assert len(engine.calls) == 2 and pushes == [True, True]
+    assert outcome.checks.state == "failure"
+
+
+def test_watch_fix_loop_stops_on_budget(monkeypatch):
+    from dev_team.budget import BudgetExceededError
+
+    engine = _FakeEngine([BudgetExceededError(1.0, 0.5)])
+    outcome = _fix_outcome("failure")
+    pushes = _run_fix_loop(monkeypatch, engine, outcome)
+    assert engine.calls == ["boom"] and pushes == []
+
+
+def test_watch_fix_loop_does_not_chase_a_timeout(monkeypatch):
+    engine = _FakeEngine([])
+    pushes = _run_fix_loop(monkeypatch, engine, _fix_outcome("timeout"))
+    assert engine.calls == [] and pushes == []
+
+
+def test_watch_fix_loop_stops_on_push_failure(monkeypatch):
+    import dev_team.cli as cli_module
+    from dev_team.engine import RemediationOutcome
+    from dev_team.git import GitError
+    from dev_team.sources import RepoRef
+    from helpers import run
+
+    def boom_push(*a, **k):
+        raise GitError("push rejected")
+
+    monkeypatch.setattr(cli_module, "push_branch", boom_push)
+    monkeypatch.setattr(cli_module, "_watch_pr_checks", lambda *a, **k: None)
+    import types
+
+    engine = _FakeEngine([RemediationOutcome(True, "fixed")])
+    outcome = _fix_outcome("failure")
+    args = types.SimpleNamespace(watch_fix_rounds=2, workspace="/ws", watch_timeout=600.0)
+    run(
+        cli_module._run_ci_fix_loop(
+            engine, _fix_team(), outcome, args, RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), "tok"
+        )
+    )
+    assert engine.calls == ["boom"]  # fixed once, but the push failed -> stopped
+    assert outcome.checks.state == "failure"  # never re-watched
 
 
 def test_main_chat_deliver_pull_request_threads_ref_and_token(

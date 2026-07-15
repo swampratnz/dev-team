@@ -37,6 +37,25 @@ def _outcome(**kwargs):
     return DeliveryOutcome(**defaults)
 
 
+def test_push_branch_force_with_lease_carries_scrubbed_auth():
+    from dev_team.delivery_target import push_branch
+
+    cmd = FakeCommandRunner()
+    push_branch("dev-team/health", ref=_ref(), token="TOK", git=GitRepo(cmd), force_with_lease=True)
+    assert cmd.calls[-1] == [
+        "git", "push", "--force-with-lease", "origin", "dev-team/health"
+    ]
+    assert "TOK" not in " ".join(cmd.calls[-1])
+    assert "AUTHORIZATION: basic " in cmd.envs[-1]["GIT_CONFIG_VALUE_0"]
+
+
+def test_push_branch_requires_a_token():
+    from dev_team.delivery_target import push_branch
+
+    with pytest.raises(DeliveryTargetError):
+        push_branch("dev-team/health", ref=_ref(), token="", git=GitRepo(FakeCommandRunner()))
+
+
 def test_publish_pushes_the_branch_and_opens_a_pr():
     ref = _ref()
     outcome = _outcome()

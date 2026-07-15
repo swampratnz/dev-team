@@ -22,12 +22,12 @@ from .assessment import (
     verify_finding,
 )
 from .backlog import BacklogStore
-from .budget import Budget
+from .budget import Budget, BudgetExceededError
 from .chat import ChatSession, chat_system_prompt
 from .config import TeamConfig
 from .dashboard import DashboardServer
 from .checks import ChecksError, GitHubChecksReader, watch_checks
-from .delivery_target import DeliveryTargetError, publish_pull_request
+from .delivery_target import DeliveryTargetError, publish_pull_request, push_branch
 from .dispatch import DispatchServer
 from .engine import EngineConfig
 from .errors import DevTeamError
@@ -35,7 +35,7 @@ from .eventlog import EventLog, compose
 from .events import AgentEvent, Listener
 from .execution import DEFAULT_EXCLUDED_DIRS, LocalWorkspace, SubprocessCommandRunner
 from .git import GitError, GitRepo
-from .interaction import ChannelApprovalGate, ConsoleChannel
+from .interaction import ChannelApprovalGate, ConsoleChannel, ask_in_thread, ci_fix_question
 from .models import FeatureRequest
 from .persona import Roster
 from .pullrequest import GitHubPullRequestPublisher, PullRequestError
@@ -580,6 +580,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="How long to watch the PR's checks before giving up "
         "(default: 600; with --watch-checks).",
     )
+    delivery.add_argument(
+        "--watch-fix-rounds",
+        type=int,
+        default=0,
+        metavar="N",
+        help="On a failed --watch-checks, let the team fix the CI failure and "
+        "force-push to the PR branch, re-watching after each fix, up to N "
+        "rounds (0 = off, the default; requires --watch-checks).",
+    )
     misc.add_argument(
         "--json",
         action="store_true",
@@ -706,11 +715,16 @@ def _validate_args(
         ("--pr-draft", args.pr_draft),
         ("--watch-checks", args.watch_checks),
         ("--watch-timeout", args.watch_timeout != parser.get_default("watch_timeout")),
+        ("--watch-fix-rounds", args.watch_fix_rounds != 0),
     ]
     if not args.pull_request:
         extra = [name for name, passed in pr_tuning if passed]
         if extra:
             parser.error(f"{', '.join(extra)}: only valid with --pull-request")
+    if args.watch_fix_rounds < 0:
+        parser.error("--watch-fix-rounds must be non-negative")
+    if args.watch_fix_rounds and not args.watch_checks:
+        parser.error("--watch-fix-rounds requires --watch-checks (there is no watch to fix)")
     if args.sandbox and not (args.deliver or args.assess):
         parser.error("--sandbox: only valid with --deliver or --assess")
     sandbox_tuning = [
@@ -935,18 +949,22 @@ async def _deliver(
     recorder = _transcript_recorder(args, run)
     if recorder is not None:
         kwargs["transcript_recorder"] = recorder
-    outcome = await team.deliver(
-        request,
+    # Hold the engine (rather than team.deliver) so the CI-fix loop can reuse it
+    # to remediate on the same workspace/gates/git after the PR's checks fail.
+    engine = team.make_engine(
         workspace=LocalWorkspace(args.workspace),
         budget=budget,
         config=_engine_config(args),
         **kwargs,
     )
+    outcome = await engine.deliver(request)
     # --pull-request is the human's opt-in to publish; a failure to open the PR
     # is reflected in the exit code but never masks the delivery result itself.
     pr_ok = True
     if args.pull_request:
         pr_ok = _open_pull_request(outcome, args, repo_ref, github_token)
+        if pr_ok and args.watch_fix_rounds > 0:
+            await _run_ci_fix_loop(engine, team, outcome, args, repo_ref, github_token)
     if args.json:
         print(json.dumps(delivery_to_dict(outcome), indent=2))
     else:
@@ -1021,6 +1039,54 @@ def _watch_pr_checks(outcome, args, ref: "RepoRef", token: str) -> None:
         return
     outcome.checks = result
     print(f"checks: {result.state} — {result.summary}", file=sys.stderr)
+
+
+async def _run_ci_fix_loop(engine, team, outcome, args, ref, token) -> None:
+    """Close the loop: fix a failed PR watch, re-push, and re-watch, bounded.
+
+    Only failed watches are chased — a ``pending``/``timeout`` state is left
+    alone (chasing a timeout would fix nothing). Each round is supervised by a
+    human when an interaction channel is attached (apply/skip), and runs
+    autonomously otherwise; a fix that lands is force-pushed to the PR branch
+    and the checks are re-watched. The loop stops on success, on a round that
+    produces no committed fix, when the rounds or the budget run out, or when a
+    human skips.
+    """
+
+    asked_by = team.roster.display_name("engineer")
+    for round_num in range(1, args.watch_fix_rounds + 1):
+        checks = outcome.checks
+        if checks is None or checks.state != "failure":
+            return
+        if team.interaction is not None:
+            reply = await ask_in_thread(
+                team.interaction,
+                ci_fix_question(round_num, checks.failed, checks.summary, asked_by=asked_by),
+            )
+            if reply.choice != "apply":
+                print(f"CI fix skipped by human at round {round_num}", file=sys.stderr)
+                return
+        try:
+            result = await engine.remediate_checks(checks.summary)
+        except BudgetExceededError:
+            print("CI fix stopped: budget exhausted", file=sys.stderr)
+            return
+        if not result.fixed:
+            print(f"CI fix round {round_num}: no fix applied ({result.summary})", file=sys.stderr)
+            return
+        try:
+            push_branch(
+                outcome.branch,
+                ref=ref,
+                token=token or "",
+                git=GitRepo(SubprocessCommandRunner(cwd=args.workspace), cwd=args.workspace),
+                force_with_lease=True,
+            )
+        except (DeliveryTargetError, GitError) as exc:
+            print(f"CI fix round {round_num}: could not push the fix: {exc}", file=sys.stderr)
+            return
+        print(f"CI fix round {round_num}: pushed a fix; re-watching checks", file=sys.stderr)
+        _watch_pr_checks(outcome, args, ref, token or "")
 
 
 async def _assess(
