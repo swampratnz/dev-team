@@ -1043,6 +1043,12 @@ class DeliveryEngine:
             if existing is not None:
                 return existing.succeeded
             if self._budget_exhausted or self.budget.exhausted:
+                # A budget pre-flight skip still means the run was budget-limited,
+                # so record it: the finalization reserve stops task work *at* the
+                # effective ceiling, where record() (strict >) never raises — so
+                # without this the except branch below wouldn't fire and the
+                # outcome/report would omit the "stopped early; resume" signal.
+                self._budget_exhausted = True
                 task.status = TaskStatus.FAILED
                 results[task.id] = TaskResult(task=task, attempts=0)
                 return False
@@ -1056,28 +1062,34 @@ class DeliveryEngine:
             results[task.id] = outcome
             return outcome.succeeded
 
+        # The reserve must be released before the security stage no matter how
+        # the task phase ends — an exception escaping schedule()/_replan_loop()
+        # (cancellation, an unexpected SDK error) would otherwise leak it into a
+        # reused budget (--chat threads one Budget across /deliver calls),
+        # permanently shrinking the next delivery's ceiling.
         self._reserve_finalization_budget()
         try:
-            await schedule(
-                pending,
-                worker,
-                max_concurrency=self.config.max_concurrency,
-                listener=self._on_scheduled,
-            )
-        except DependencyCycleError as exc:
-            # lint_plan catches cycles pre-flight, but a plan can still slip
-            # through (a revision that stays cyclic, or a resumed checkpoint).
-            # A cycle must not unwind deliver() and lose the outcome, trace,
-            # and checkpoint: mark the un-run tasks FAILED (handled by the
-            # task_results loop below), record it, and finish gracefully.
-            self._event(
-                "cycle",
-                "Plan has a dependency cycle; remaining tasks cannot run",
-                detail=str(exc),
-            )
-
-        plan = await self._replan_loop(request, plan, results, worker)
-        self._release_finalization_budget()
+            try:
+                await schedule(
+                    pending,
+                    worker,
+                    max_concurrency=self.config.max_concurrency,
+                    listener=self._on_scheduled,
+                )
+            except DependencyCycleError as exc:
+                # lint_plan catches cycles pre-flight, but a plan can still slip
+                # through (a revision that stays cyclic, or a resumed checkpoint).
+                # A cycle must not unwind deliver() and lose the outcome, trace,
+                # and checkpoint: mark the un-run tasks FAILED (handled by the
+                # task_results loop below), record it, and finish gracefully.
+                self._event(
+                    "cycle",
+                    "Plan has a dependency cycle; remaining tasks cannot run",
+                    detail=str(exc),
+                )
+            plan = await self._replan_loop(request, plan, results, worker)
+        finally:
+            self._release_finalization_budget()
 
         task_results: List[TaskResult] = []
         for task in plan.tasks:

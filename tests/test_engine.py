@@ -556,8 +556,29 @@ def test_finalization_reserve_lets_the_security_review_run():
     # sacrificing T2 — but the security review (the commit gate) still runs.
     outcome = run(_budget_reserve_engine(0.3).deliver(_request()))
     assert outcome.tasks_complete is False  # T2 was sacrificed to the reserve
+    # the run reports it was budget-limited even though task work stopped *at*
+    # the reserved ceiling (a pre-flight skip, not a raised BudgetExceededError)
+    assert outcome.budget_exhausted is True
     assert outcome.security is not None  # ...but security still ran
     assert outcome.security.approved is True
+
+
+def test_finalization_reserve_released_when_task_phase_raises(monkeypatch):
+    # A crash escaping the task phase must not leak the reserve into a reused
+    # budget (--chat threads one Budget across /deliver calls); the finally
+    # releases it before the exception propagates.
+    engine = _committing_engine(
+        ScriptedRunner(by_system_prompt=engine_responses()),
+        budget=Budget(limit_usd=10.0),
+    )
+
+    async def explode(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(engine, "_replan_loop", explode)
+    with pytest.raises(RuntimeError):
+        run(engine.deliver(_request()))
+    assert engine.budget.reserved_usd == 0.0
 
 
 def test_without_a_reserve_task_work_starves_the_security_review():
