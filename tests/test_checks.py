@@ -209,6 +209,26 @@ def test_default_http_get_uses_urllib(monkeypatch):
     assert captured["auth"] == "Bearer TOK"
 
 
+def test_reader_surfaces_malformed_body_as_checks_error(monkeypatch):
+    # a bad 200 body makes the default transport's json.loads raise
+    # JSONDecodeError (a ValueError); it must become a ChecksError, not crash
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"<html>not json</html>"
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout=None: _Response())
+    with pytest.raises(ChecksError) as excinfo:
+        GitHubChecksReader(token="secret-tok").status("o", "r", "sha")
+    assert "malformed response" in str(excinfo.value)
+    assert "secret-tok" not in str(excinfo.value)
+
+
 # --- watch_checks --------------------------------------------------------
 
 

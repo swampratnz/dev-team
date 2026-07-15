@@ -182,6 +182,12 @@ class GitHubChecksReader:
             raise ChecksError(
                 self._scrub(f"could not reach {self.api_base}: {exc.reason}")
             ) from exc
+        except ValueError as exc:
+            # A malformed body (the default transport's json.loads raises
+            # JSONDecodeError, a ValueError) is a read failure like any other —
+            # surface it as a ChecksError so callers degrade gracefully instead
+            # of crashing on an uncaught exception.
+            raise ChecksError(self._scrub(f"malformed response from {self.api_base}")) from exc
         if not isinstance(response, dict):
             raise ChecksError("unexpected response from the GitHub checks API")
         return response
