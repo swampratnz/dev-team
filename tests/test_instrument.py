@@ -160,3 +160,121 @@ def test_transcript_write_failure_never_breaks_the_run():
     # a recording failure is swallowed; the call still returns its result
     result = run(runner.run("p"))
     assert result.text == "ok"
+
+
+# --- InstrumentedSession -----------------------------------------------------
+
+
+def test_session_records_budget_and_trace():
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import FakeAgentSession
+
+    inner = FakeAgentSession(results=[AgentResult(text="hi", cost_usd=0.5, num_turns=2)])
+    budget = Budget()
+    tracer = Tracer(clock=_Clock())
+    session = InstrumentedSession(inner, "engineer", budget=budget, tracer=tracer)
+    result = run(session.send("prompt"))
+    assert result.text == "hi"
+    assert budget.spent == 0.5
+    assert tracer.spans[0].kind == "agent"
+    assert tracer.spans[0].name == "engineer"
+    assert tracer.spans[0].status == "ok"
+    assert inner.prompts == ["prompt"]
+
+
+def test_session_error_result_marks_span_error():
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import FakeAgentSession
+
+    inner = FakeAgentSession(results=[AgentResult(text="", is_error=True)])
+    tracer = Tracer(clock=_Clock())
+    run(InstrumentedSession(inner, "qa", tracer=tracer).send("p"))
+    assert tracer.spans[0].status == "error"
+
+
+def test_session_works_without_budget_or_tracer_and_closes():
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import FakeAgentSession
+
+    inner = FakeAgentSession(results=[AgentResult(text="ok")])
+    session = InstrumentedSession(inner, "pm")
+    assert run(session.send("p")).text == "ok"
+    run(session.aclose())
+    assert inner.closed is True
+
+
+def test_session_exception_closes_span_and_records_nothing():
+    from dev_team.instrument import InstrumentedSession
+
+    class BoomSession:
+        async def send(self, prompt):
+            raise RuntimeError("boom")
+
+        async def aclose(self):
+            pass
+
+    budget = Budget()
+    tracer = Tracer(clock=_Clock())
+    session = InstrumentedSession(BoomSession(), "engineer", budget=budget, tracer=tracer)
+    try:
+        run(session.send("p"))
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the raise is the point
+        raise AssertionError("expected RuntimeError")
+    assert tracer.spans[0].status == "exception"
+    assert budget.meter.call_count == 0
+
+
+def test_session_transcript_written_before_budget_enforcement():
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import FakeAgentSession
+
+    inner = FakeAgentSession(results=[AgentResult(text="pricey", cost_usd=2.0, num_turns=1)])
+    ws = InMemoryWorkspace()
+    recorder = TranscriptRecorder(ws, run="deliver-1")
+    session = InstrumentedSession(
+        inner, "engineer", budget=Budget(limit_usd=1.0),
+        transcript_recorder=recorder, system_prompt="be an engineer",
+    )
+    try:
+        run(session.send("do it"))
+    except BudgetExceededError:
+        pass
+    else:  # pragma: no cover - the raise is the point
+        raise AssertionError("expected BudgetExceededError")
+    record = read_transcript(ws, "deliver-1", "engineer", 1)
+    assert record["response"] == "pricey"
+    assert record["system_prompt"] == "be an engineer"
+
+
+def test_session_transcript_write_failure_never_breaks_the_run():
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import FakeAgentSession
+
+    class BoomRecorder:
+        def record(self, **kwargs):
+            raise OSError("disk full")
+
+    inner = FakeAgentSession(results=[AgentResult(text="ok")])
+    session = InstrumentedSession(inner, "engineer", transcript_recorder=BoomRecorder())
+    assert run(session.send("p")).text == "ok"
+
+
+def test_session_exception_without_tracer_still_propagates():
+    from dev_team.instrument import InstrumentedSession
+
+    class BoomSession:
+        async def send(self, prompt):
+            raise RuntimeError("boom")
+
+        async def aclose(self):  # pragma: no cover - not reached
+            pass
+
+    session = InstrumentedSession(BoomSession(), "engineer")  # no tracer
+    try:
+        run(session.send("p"))
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the raise is the point
+        raise AssertionError("expected RuntimeError")

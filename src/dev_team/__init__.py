@@ -93,7 +93,7 @@ from .execution import (
     WorkspaceError,
 )
 from .git import GitError, GitRepo
-from .instrument import InstrumentedRunner
+from .instrument import InstrumentedRunner, InstrumentedSession
 from .interaction import (
     AutoChannel,
     ChannelApprovalGate,
@@ -153,7 +153,14 @@ from .pullrequest import (
 from .replan import Replan, ReplanAction, ReplanError, apply_replan
 from .sandbox import ContainerCommandRunner, SandboxConfig, SandboxError
 from .scheduler import ScheduledResult, ScheduleStatus, schedule
-from .sdk import AgentResult, AgentRunner, ClaudeAgentRunner
+from .sdk import (
+    AgentResult,
+    AgentRunner,
+    AgentSession,
+    ClaudeAgentRunner,
+    ClaudeAgentSession,
+    FakeAgentSession,
+)
 from .sources import (
     RepoRef,
     SourceError,
@@ -231,7 +238,11 @@ __all__ = [
     "AgentResult",
     "AgentRunner",
     "ClaudeAgentRunner",
+    "AgentSession",
+    "ClaudeAgentSession",
+    "FakeAgentSession",
     "InstrumentedRunner",
+    "InstrumentedSession",
     # execution
     "Workspace",
     "InMemoryWorkspace",
