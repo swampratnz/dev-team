@@ -508,6 +508,15 @@ def build_parser() -> argparse.ArgumentParser:
         "0.10; 0 disables). Prevents a budget-limited run from building work "
         "it then can't bank (with --deliver).",
     )
+    delivery.add_argument(
+        "--no-frontend-craft",
+        action="store_true",
+        help="Do not apply the built-in design baseline (type/spacing/color "
+        "tokens, responsive layout, accessibility defaults) on web-UI "
+        "deliveries. By default it is folded into the engineer's and "
+        "reviewer's guidance so a from-scratch frontend is not visually bare "
+        "(with --deliver).",
+    )
     misc.add_argument(
         "--budget-usd",
         type=float,
@@ -834,6 +843,7 @@ def _reject_deliver_only_flags(
             "--finalization-reserve",
             args.finalization_reserve != parser.get_default("finalization_reserve"),
         ),
+        ("--no-frontend-craft", args.no_frontend_craft),
         ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
         ("--no-commit", args.no_commit),
         (
@@ -908,6 +918,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         require_green_baseline=not args.proceed_on_red_baseline,
         require_recognised_project=args.require_recognised_project,
         finalization_reserve_fraction=args.finalization_reserve,
+        frontend_craft=not args.no_frontend_craft,
         remote_verify_status=(
             tuple(shlex.split(args.remote_verify_status))
             if args.remote_verify_status

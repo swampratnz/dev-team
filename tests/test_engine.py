@@ -581,6 +581,56 @@ def test_finalization_reserve_released_when_task_phase_raises(monkeypatch):
     assert engine.budget.reserved_usd == 0.0
 
 
+def _web_request():
+    return FeatureRequest(title="Web UI", description="server-rendered HTML pages with CSS")
+
+
+def test_frontend_craft_folds_the_baseline_into_conventions_for_a_web_ui():
+    events = []
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, listener=events.append)
+    run(engine.deliver(_web_request()))
+    assert engine._conventions is not None
+    assert "Frontend design baseline" in engine._conventions
+    assert any(e.stage == "frontend" for e in events)
+
+
+def test_frontend_craft_off_leaves_conventions_untouched():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, config=EngineConfig(frontend_craft=False))
+    run(engine.deliver(_web_request()))
+    assert engine._conventions is None  # nothing learned, nothing added
+
+
+def test_frontend_craft_skipped_for_a_backend_delivery():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner)
+    request = FeatureRequest(
+        title="Log parser", description="Read JSON logs and compute stats in a CLI"
+    )
+    run(engine.deliver(request))
+    assert engine._conventions is None
+
+
+def test_frontend_craft_preserves_learned_conventions():
+    from dev_team.conventions import ConventionsProfile, ConventionsStore
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    ws = InMemoryWorkspace()
+    ConventionsStore(ws).save(
+        ConventionsProfile(
+            summary="Use snake_case.",
+            conventions=[{"aspect": "naming", "convention": "snake_case"}],
+        )
+    )
+    engine = _engine(runner, workspace=ws)
+    learned = ConventionsStore(ws).load().render()
+    run(engine.deliver(_web_request()))
+    # the learned conventions survive, with the design baseline appended
+    assert engine._conventions.startswith(learned)
+    assert "Frontend design baseline" in engine._conventions
+
+
 def test_without_a_reserve_task_work_starves_the_security_review():
     # Same costs, no reserve: T2 also runs, spending past the ceiling, so the
     # security review is starved and the build cannot be banked.

@@ -50,6 +50,7 @@ from .backlog import BacklogStore, ItemStatus
 from .budget import Budget, BudgetExceededError
 from .checks import ChecksOutcome
 from .fences import defuse
+from .frontend import FRONTEND_GUIDANCE, looks_like_frontend, merge_conventions
 from .changes import ChangeApplier
 from .context import build_repo_context
 from .conventions import ConventionsStore
@@ -204,6 +205,13 @@ class EngineConfig:
     #: approval). Applies only to a committing run with a ``--budget-usd``
     #: ceiling; released before the security stage. ``0.0`` disables it.
     finalization_reserve_fraction: float = 0.10
+    #: Fold a design baseline (type/spacing/color tokens, responsive layout,
+    #: component and accessibility defaults) into the house conventions for web
+    #: UI deliveries, so a from-scratch frontend is not visually bare. The
+    #: engineer builds to it; the reviewer flags deviations at minor severity —
+    #: a nudge, never a gate. Engages only when the delivery looks like a
+    #: frontend (see ``dev_team.frontend``). On by default.
+    frontend_craft: bool = True
     branch: Optional[str] = None
     use_branch: bool = True
     allow_dirty_baseline: bool = False
@@ -1009,6 +1017,18 @@ class DeliveryEngine:
             consequences=design.rationale,
         )
         self._event("designed", "Design ready")
+
+        if self.config.frontend_craft and looks_like_frontend(request, design):
+            # A web UI delivery: fold the design baseline into the conventions
+            # the engineer builds to and the reviewer flags deviations from
+            # (minor severity — a nudge, never a gate), so a from-scratch
+            # frontend is not visually bare.
+            self._conventions = merge_conventions(self._conventions, FRONTEND_GUIDANCE)
+            self._event(
+                "frontend",
+                "Frontend delivery — applying the design baseline "
+                "(engineer builds to it; reviewer flags deviations as minor)",
+            )
 
         if self._checkpoint is not None:
             if not self._checkpoint.baseline_sha:
