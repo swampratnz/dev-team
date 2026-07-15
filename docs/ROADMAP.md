@@ -99,10 +99,16 @@ discarded, leaving the branch untouched; a passing gate with no change reports
 no-fix rather than an empty commit). It never pushes or opens PRs — the caller
 drives that.
 
-**Remaining:** the bounded CLI loop — on a failed `--watch-checks`, call
-`remediate_checks`, force-with-lease push the fix, and re-watch, up to
-`--watch-fix-rounds N` and within budget; autonomous when unattended,
-human-supervised (apply/skip per round) when an interaction channel is attached.
+**Loop closed (shipped):** opt-in `--watch-fix-rounds N` (default 0 = watch +
+report only; requires `--watch-checks`). On a failed watch the CLI holds the
+delivery engine and loops up to N rounds — `remediate_checks` → `push_branch`
+the fix to the PR branch (`--force-with-lease`, the token hygiene shared with
+the publish path) → re-watch — stopping on green, on a round that fixes
+nothing, on a push failure, on budget exhaustion, or when a human skips. It runs
+autonomously when unattended and asks apply/skip per round (`ci_fix_question`)
+when an interaction channel is attached; a `pending`/`timeout` watch is left
+alone rather than chased. With that, **ROADMAP #2 is complete**: deliver → push
+→ open PR → watch required checks → fix a failure and re-push, closing the loop.
 
 ## 3. Dynamic re-planning
 

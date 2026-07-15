@@ -33,6 +33,39 @@ class DeliveryTargetError(DevTeamError):
     """The delivery could not be published as a pull request."""
 
 
+def push_branch(
+    branch: str,
+    *,
+    ref: RepoRef,
+    token: str,
+    git: GitRepo,
+    remote: str = "origin",
+    set_upstream: bool = False,
+    force_with_lease: bool = False,
+) -> None:
+    """Push ``branch`` to ``remote`` with token hygiene baked in.
+
+    The credential rides only in the per-command ``http.extraheader`` env and is
+    scrubbed from any error — never left to the caller to remember. Used both
+    for the initial publish push and for re-pushing a CI fix to an open PR's
+    branch (``force_with_lease``, never a bare ``--force``).
+    """
+
+    if not token:
+        raise DeliveryTargetError(
+            "a GitHub token is required to push the branch; none was resolved "
+            "(set --env-file or GITHUB_TOKEN)"
+        )
+    git.push(
+        branch,
+        remote=remote,
+        set_upstream=set_upstream,
+        force_with_lease=force_with_lease,
+        env=git_auth_env(ref, token),
+        scrub=lambda text: scrub_credentials(text, token),
+    )
+
+
 def publish_pull_request(
     outcome: "DeliveryOutcome",
     *,
@@ -70,13 +103,14 @@ def publish_pull_request(
             "a GitHub token is required to push the branch and open the pull "
             "request; none was resolved (set --env-file or GITHUB_TOKEN)"
         )
-    git.push(
+    push_branch(
         outcome.branch,
+        ref=ref,
+        token=token,
+        git=git,
         remote=remote,
         set_upstream=True,
         force_with_lease=force_with_lease,
-        env=git_auth_env(ref, token),
-        scrub=lambda text: scrub_credentials(text, token),
     )
     request = PullRequestRequest(
         owner=ref.owner,

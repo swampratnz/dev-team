@@ -345,6 +345,31 @@ def render_replan(decision: Replan) -> str:
     return "\n".join(lines)
 
 
+def ci_fix_question(
+    round_num: int, failed: Sequence[str], summary: str, *, asked_by: str
+) -> Question:
+    """Supervise one round of autonomous CI-fix-and-repush on an open PR.
+
+    Default (unattended :class:`AutoChannel`) answer: apply — the team fixes and
+    re-pushes autonomously when no human is watching. With no input available
+    (EOF) the fail-safe is ``skip``: a detached run must not force-push a fix
+    to an open PR that no human blessed.
+    """
+
+    checks = ", ".join(failed) or "the checks"
+    return Question(
+        topic="ci-fix",
+        prompt=f"CI is failing ({checks}). Fix it and re-push (round {round_num})?",
+        choices=(
+            Choice("apply", "let the engineer fix it and force-push to the PR branch"),
+            Choice("skip", "leave the PR's CI failure for a human"),
+        ),
+        context=summary,
+        asked_by=asked_by,
+        fail_safe_key="skip",
+    )
+
+
 def replan_review_question(decision: Replan, *, asked_by: str) -> Question:
     """Supervise a manager-proposed re-plan: apply, revise, or reject.
 
