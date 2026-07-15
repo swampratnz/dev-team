@@ -27,6 +27,7 @@ from typing import Callable, Optional, Protocol, Sequence, TextIO, runtime_check
 from .approval import ApprovalDecision, ApprovalRequest
 from .errors import DevTeamError
 from .models import Plan
+from .replan import Replan
 
 
 @dataclass(frozen=True)
@@ -325,4 +326,43 @@ def task_failure_question(
         context=evidence,
         asked_by=asked_by,
         fail_safe_key="skip",
+    )
+
+
+def render_replan(decision: Replan) -> str:
+    """A human-readable rendering of a proposed re-plan for supervision."""
+
+    lines = [f"Proposed: {decision.action.value} task {decision.failed_task_id}"]
+    if decision.rationale:
+        lines.append(f"Why: {decision.rationale}")
+    if decision.replacements:
+        lines.append("Replacement tasks:")
+        for task in decision.replacements:
+            deps = f" (after {', '.join(task.dependencies)})" if task.dependencies else ""
+            lines.append(f"  {task.id}: {task.title}{deps}")
+    else:
+        lines.append("(no replacement tasks — the failed task is dropped)")
+    return "\n".join(lines)
+
+
+def replan_review_question(decision: Replan, *, asked_by: str) -> Question:
+    """Supervise a manager-proposed re-plan: apply, revise, or reject.
+
+    Default (unattended :class:`AutoChannel`) answer: apply — the manager
+    re-plans autonomously when no human is watching. With no input available
+    (EOF) the fail-safe is ``reject``: a detached run must not silently rewrite
+    its own plan and push work down a new path no human blessed.
+    """
+
+    return Question(
+        topic="replan-review",
+        prompt=f"Apply this re-plan for {decision.failed_task_id}?",
+        choices=(
+            Choice("apply", "apply the re-plan"),
+            Choice("revise", "propose a different re-plan", accepts_text=True),
+            Choice("reject", "leave the task failed"),
+        ),
+        context=render_replan(decision),
+        asked_by=asked_by,
+        fail_safe_key="reject",
     )

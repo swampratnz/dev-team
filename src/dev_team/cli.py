@@ -510,6 +510,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not git-commit the delivered work (with --deliver).",
     )
     delivery.add_argument(
+        "--max-replan-rounds",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Rounds of dynamic re-planning after the schedule leaves tasks "
+        "failed: the manager splits/replaces/drops each and the plan re-runs "
+        "(0 = off, the default; with --deliver).",
+    )
+    delivery.add_argument(
         "--pull-request",
         action="store_true",
         help="After a committed delivery, push the branch and open a GitHub "
@@ -745,6 +754,10 @@ def _reject_deliver_only_flags(
         ("--proceed-on-red-baseline", args.proceed_on_red_baseline),
         ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
         ("--no-commit", args.no_commit),
+        (
+            "--max-replan-rounds",
+            args.max_replan_rounds != parser.get_default("max_replan_rounds"),
+        ),
         ("--remote-verify-status", args.remote_verify_status is not None),
         ("--remote-verify-trigger", args.remote_verify_trigger is not None),
     ]
@@ -800,6 +813,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         ),
         commit=not args.no_commit,
         branch=args.branch,
+        max_replan_rounds=args.max_replan_rounds,
         allow_dirty_baseline=args.allow_dirty_baseline,
         require_green_baseline=not args.proceed_on_red_baseline,
         remote_verify_status=(

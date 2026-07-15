@@ -137,6 +137,14 @@ def test_main_deliver_only_flag_without_deliver_exits_2(capsys):
     assert "--deliver" in err
 
 
+def test_main_max_replan_rounds_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--max-replan-rounds", "2"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--max-replan-rounds" in err and "--deliver" in err
+
+
 def test_main_deliver_only_flags_all_reported(capsys):
     argv = [
         "Login", "Add login",
@@ -314,6 +322,7 @@ def test_main_deliver_passes_new_flags(tmp_path):
             "--allow-dirty-baseline",
             "--proceed-on-red-baseline",
             "--setup-command", "python -c pass",
+            "--max-replan-rounds", "1",
         ),
         runner=runner,
     )

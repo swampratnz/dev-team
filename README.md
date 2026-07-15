@@ -410,6 +410,12 @@ before any agent spend — if the working tree is dirty
 `--setup-command "npm install"`, `--branch NAME`, `--max-concurrency N`,
 `--no-commit`, `--json`.
 
+When a task exhausts its attempts, `--max-replan-rounds N` (default 0, off) lets
+the product manager re-plan around it — split it into smaller tasks, replace it
+with a different approach, or drop it — and re-runs the mutated plan, bounded by
+`N` rounds and the budget. Interactive runs supervise each proposal (apply /
+revise / reject); unattended runs apply it autonomously.
+
 Deliver all the way to a **pull request** — clone the repo, do the work, then
 push the `dev-team/<feature>` branch and open a PR whose body is the run
 summary:

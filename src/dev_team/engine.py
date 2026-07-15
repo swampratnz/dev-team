@@ -69,6 +69,7 @@ from .interaction import (
     InteractionChannel,
     ask_in_thread,
     plan_review_question,
+    replan_review_question,
     task_failure_question,
 )
 from .memory import (
@@ -101,6 +102,7 @@ from .ordering import lint_plan
 from .persona import Roster
 from .policy import GuardedCommandRunner, SideEffectPolicy
 from .profile import detect_project
+from .replan import Replan, ReplanError, apply_replan
 from .sandbox import ContainerCommandRunner, SandboxConfig
 from .scheduler import ScheduledResult, schedule
 from .sdk import AgentRunner
@@ -192,6 +194,14 @@ class EngineConfig:
     remote_verify_trigger: Optional[Sequence[str]] = None
     remote_verify_max_polls: int = 30
     remote_verify_interval_seconds: float = 60.0
+    #: How many rounds of dynamic re-planning to run after the schedule leaves
+    #: tasks failed. 0 (the default) keeps the current behaviour — a failed task
+    #: just stays failed. When >0, the product manager proposes a mutation
+    #: (split/replace/drop) for each still-failed task and the not-yet-attempted
+    #: tasks of the mutated plan are re-scheduled, bounded by this count and the
+    #: budget. A human supervises each mutation when an interaction channel is
+    #: attached; otherwise it applies autonomously. See ``docs/ROADMAP.md`` #3.
+    max_replan_rounds: int = 0
     #: When set (and the workspace is real), the commands the engine runs — the
     #: gates, setup, and scans, i.e. the arbitrary-code-execution surface — are
     #: boxed in a container per this config. git porcelain self-delegates to the
@@ -208,6 +218,8 @@ class EngineConfig:
             raise ValueError("json_retries must be non-negative")
         if self.remote_verify_max_polls < 1:
             raise ValueError("remote_verify_max_polls must be at least 1")
+        if self.max_replan_rounds < 0:
+            raise ValueError("max_replan_rounds must be non-negative")
         if self.remote_verify_interval_seconds < 0:
             raise ValueError("remote_verify_interval_seconds must be non-negative")
         if self.remote_verify_trigger is not None and self.remote_verify_status is None:
@@ -785,6 +797,14 @@ class DeliveryEngine:
             self._event("resumed", f"Restored {len(resumed)} task(s) from checkpoint")
 
         async def worker(task: Task) -> bool:
+            # Idempotent by task id: an already-attempted task reports its prior
+            # outcome instead of re-running. This lets a re-plan round hand the
+            # scheduler the *whole* plan (so a still-failed prerequisite stays in
+            # the graph and correctly cascade-skips its dependents) while the
+            # done/failed tasks are no-ops rather than re-executions.
+            existing = results.get(task.id)
+            if existing is not None:
+                return existing.succeeded
             if self._budget_exhausted or self.budget.exhausted:
                 task.status = TaskStatus.FAILED
                 results[task.id] = TaskResult(task=task, attempts=0)
@@ -817,6 +837,8 @@ class DeliveryEngine:
                 "Plan has a dependency cycle; remaining tasks cannot run",
                 detail=str(exc),
             )
+
+        plan = await self._replan_loop(request, plan, results, worker)
 
         task_results: List[TaskResult] = []
         for task in plan.tasks:
@@ -1134,6 +1156,144 @@ class DeliveryEngine:
                 "planned", "Revised plan ready", detail=f"{len(plan.tasks)} task(s)"
             )
 
+    def _failure_evidence(self, result: Optional[TaskResult]) -> str:
+        """A compact, human-readable summary of why a task failed.
+
+        Feeds both the interactive retry escalation and the re-planner, so the
+        manager (or the human) sees the same review/test evidence.
+        """
+
+        parts = []
+        if result is not None:
+            if result.review is not None:
+                parts.append(f"review: {result.review.summary}")
+            if result.test_report is not None:
+                parts.append(f"tests: {result.test_report.summary}")
+        return "\n".join(parts) or "no evidence captured"
+
+    async def _replan_loop(
+        self,
+        request: FeatureRequest,
+        plan: Plan,
+        results: Dict[str, TaskResult],
+        worker,
+    ) -> Plan:
+        """Recover still-failed tasks by mutating the plan and re-scheduling.
+
+        Off unless ``config.max_replan_rounds`` > 0. Each round the manager
+        proposes a mutation (split/replace/drop) for every still-failed task; a
+        human supervises it through the interaction channel when one is
+        attached, otherwise it applies autonomously. The mutated plan's
+        not-yet-attempted tasks (the replacements and any dependents unblocked
+        by the change) are re-scheduled through the same ``worker``, so their
+        results land in ``results`` exactly as the first pass did. Bounded by
+        the round count and the budget; returns the final (possibly mutated)
+        plan.
+        """
+
+        rounds = self.config.max_replan_rounds
+        while rounds > 0 and not (self._budget_exhausted or self.budget.exhausted):
+            failed = [
+                t for t in plan.tasks
+                if t.id in results and not results[t.id].succeeded
+            ]
+            if not failed:
+                break
+            mutated = False
+            for task in failed:
+                decision = await self._propose_replan(request, plan, task, results)
+                if self._budget_exhausted:
+                    break  # budget died mid-round; remaining tasks would only repeat it
+                if decision is None:
+                    continue
+                try:
+                    plan = apply_replan(plan, decision)
+                except ReplanError as exc:
+                    self._event(
+                        "replan",
+                        f"Discarded an invalid re-plan for {task.id}",
+                        detail=str(exc),
+                    )
+                    continue
+                mutated = True
+                self._event(
+                    "replan",
+                    f"Re-planned {task.id}: {decision.action.value}",
+                    detail=decision.rationale or None,
+                )
+            if not mutated:
+                break
+            # Persist the mutated plan *before* rescheduling, so a crash mid-round
+            # resumes on the new plan (matching the replacement tasks that
+            # _record_progress marks done) rather than the stale pre-re-plan one.
+            self._checkpoint_plan(plan)
+            rounds -= 1
+            if not any(t.id not in results for t in plan.tasks):
+                break  # nothing new to attempt this round
+            # Reschedule the WHOLE plan, not just the new tasks: the worker
+            # no-ops already-attempted ids, and passing the full graph keeps
+            # every dependency edge intact so a dependent of a still-failed task
+            # is cascade-skipped rather than run on work that never succeeded.
+            # No DependencyCycleError guard: apply_replan re-lints every mutation,
+            # so the plan (and its scheduled subset) is always acyclic.
+            await schedule(
+                plan.tasks,
+                worker,
+                max_concurrency=self.config.max_concurrency,
+                listener=self._on_scheduled,
+            )
+        return plan
+
+    def _checkpoint_plan(self, plan: Plan) -> None:
+        """Persist ``plan`` into the resume checkpoint (best effort)."""
+
+        if self._checkpoint is not None and self.checkpoints is not None:
+            self._checkpoint.plan = _plan_to_dict(plan)
+            self.checkpoints.save(self._checkpoint)
+
+    async def _propose_replan(
+        self,
+        request: FeatureRequest,
+        plan: Plan,
+        task: Task,
+        results: Dict[str, TaskResult],
+    ) -> Optional[Replan]:
+        """Get a re-plan decision for one failed task, or ``None`` to leave it.
+
+        The manager proposes; when an interaction channel is attached a human
+        supervises (apply / revise-with-text / reject), otherwise the proposal
+        applies autonomously. Budget exhaustion stops re-planning.
+        """
+
+        evidence = self._failure_evidence(results.get(task.id))
+        feedback: Optional[str] = None
+        while True:
+            try:
+                decision = await self.manager.replan(
+                    request, plan, task, evidence, revision_feedback=feedback
+                )
+            except BudgetExceededError:
+                self._budget_exhausted = True
+                self._event("budget", f"Budget exhausted re-planning {task.id}")
+                return None
+            if self.interaction is None:
+                return decision  # autonomous: apply the manager's proposal
+            reply = await ask_in_thread(
+                self.interaction,
+                replan_review_question(
+                    decision, asked_by=self.roster.display_name("product-manager")
+                ),
+            )
+            if reply.choice == "apply":
+                return decision
+            if reply.choice == "reject":
+                self._event("replan", f"Re-plan for {task.id} rejected; left failed")
+                return None
+            feedback = reply.text or "Propose a different re-plan."
+            self._event(
+                "replan", f"Re-plan revision requested for {task.id}", detail=feedback
+            )
+
     async def _escalate_failure(
         self, task: Task, result: TaskResult
     ) -> Optional[Review]:
@@ -1147,16 +1307,12 @@ class DeliveryEngine:
 
         if self.interaction is None or self.budget.exhausted:
             return None
-        parts = []
-        if result.review is not None:
-            parts.append(f"review: {result.review.summary}")
-        if result.test_report is not None:
-            parts.append(f"tests: {result.test_report.summary}")
-        evidence = "\n".join(parts) or "no evidence captured"
         reply = await ask_in_thread(
             self.interaction,
             task_failure_question(
-                task.id, evidence, asked_by=self.roster.display_name("engineer")
+                task.id,
+                self._failure_evidence(result),
+                asked_by=self.roster.display_name("engineer"),
             ),
         )
         if reply.choice != "retry":
