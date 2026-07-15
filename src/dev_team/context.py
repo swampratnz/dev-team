@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
 
 from .execution import Workspace
+from .fences import defuse
 
 # Root-level files whose beginnings orient a planner better than any listing.
 _MANIFESTS = (
@@ -39,11 +40,6 @@ def path_excluded(path: str, exclude_globs: Sequence[str]) -> bool:
     return any(fnmatch.fnmatch(path, pattern) for pattern in exclude_globs)
 
 
-#: Structural fence tokens whose literal appearance inside untrusted manifest
-#: text could try to break out of the block it is interpolated into.
-_FENCE_TOKENS = ("</manifest-content>", "</repo-context>")
-
-
 def _defuse(text: str) -> str:
     """Neutralise structural fence tokens in untrusted manifest/README text.
 
@@ -56,11 +52,7 @@ def _defuse(text: str) -> str:
     untrusted head is defused; the renderer's own emitted tags are untouched.
     """
 
-    for token in _FENCE_TOKENS:
-        # Zero-width space (U+200B) between "<" and "/": invisible to a human,
-        # but the token no longer matches the structural closing tag.
-        text = text.replace(token, "<\u200b" + token[1:])
-    return text
+    return defuse(text, "manifest-content", "repo-context")
 
 
 @dataclass

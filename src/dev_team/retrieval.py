@@ -23,6 +23,7 @@ from typing import List, Sequence
 
 from .context import path_excluded
 from .execution import Workspace
+from .fences import defuse
 
 # BM25 parameters (the standard defaults).
 _K1 = 1.5
@@ -80,11 +81,6 @@ _STOPWORDS = frozenset(
     "should must can may via per".split()
 )
 
-#: Closing fence of the block a rendered excerpt sits in; neutralised in
-#: untrusted content so a file body (or a hostile filename) cannot close it early.
-_FENCE = "</file-content>"
-
-
 def _tokenize(text: str) -> List[str]:
     """Lowercased word/identifier tokens, camelCase-split, stopwords dropped."""
 
@@ -105,7 +101,7 @@ def _file_terms(path: str, content: str) -> List[str]:
 def _defuse(text: str) -> str:
     """Neutralise the ``</file-content>`` fence in untrusted text (zero-width space)."""
 
-    return text.replace(_FENCE, "<​" + _FENCE[1:])
+    return defuse(text, "file-content")
 
 
 @dataclass(frozen=True)

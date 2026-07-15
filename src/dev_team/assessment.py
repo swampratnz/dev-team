@@ -47,6 +47,7 @@ from .agents.base import READ_ONLY_TOOLS
 from .backlog import Backlog, BacklogStore, Story
 from .budget import Budget, BudgetExceededError
 from .context import build_repo_context, path_excluded
+from .fences import defuse
 from .conventions import (
     ConventionsProfile,
     ConventionsStore,
@@ -888,18 +889,24 @@ class AssessmentEngine:
             max_tree_entries=self.config.max_tree_entries,
             exclude_globs=excludes,
         )
-        evidence = "\n\n".join(
-            part
-            for part in (
-                ctx.render(),
-                stats.render(),
-                _components_block(components),
-                dead_code.render(),
-                scan.render(),
-                eol_scan.render(),
-                build_probe.render(),
-            )
-            if part
+        # The evidence nests inside a <repo-context> block in every prompt
+        # below; defuse the closing tag once here so an untrusted path or
+        # scanner line in any render() cannot close the block early.
+        evidence = defuse(
+            "\n\n".join(
+                part
+                for part in (
+                    ctx.render(),
+                    stats.render(),
+                    _components_block(components),
+                    dead_code.render(),
+                    scan.render(),
+                    eol_scan.render(),
+                    build_probe.render(),
+                )
+                if part
+            ),
+            "repo-context",
         )
         focus = self.config.focus
 
@@ -1699,7 +1706,7 @@ async def verify_finding(
     root = getattr(workspace, "root", None)
     prompt = VERIFY_PROMPT.format(
         phase=finding.get("phase", "unknown"),
-        claim=finding.get("claim", ""),
+        claim=defuse(finding.get("claim", ""), "finding-claim"),
         evidence=finding.get("evidence") or "(none cited)",
     )
     base = {"finding_id": finding.get("id"), "source_job": source_job}
