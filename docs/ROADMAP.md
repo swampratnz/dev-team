@@ -107,6 +107,16 @@ keeps evidence high while cost stays flat.
 per-role token budgets; summarised hand-offs on the blackboard instead of raw
 artifacts.
 
+**In progress:** a *deterministic lexical* retriever (`dev_team.retrieval`,
+BM25 over tokenised file content with filename/symbol up-weighting) rather than
+embeddings — no provider, no network, exactly testable, matching the repo map's
+stance. Opt-in via `EngineConfig.retrieval` / `--retrieval`, bounded by a
+per-role token budget (`retrieval_token_budget` / `--retrieval-tokens`, via a
+char≈token estimator). Wired into the architect's prompt so it designs against
+the most-relevant real code, not just the file tree. Remaining: the described
+engineer, then summarised blackboard hand-offs (today the persisted hand-off is
+only decisions + retro notes + a bare artifact *count*).
+
 ## 5. Session continuity across attempts
 
 **Why:** each engineer attempt is a fresh SDK session; on retry it re-explores

@@ -423,6 +423,13 @@ feedback rather than re-establishing everything from cold. It's the biggest
 token saving on retried tasks; a session that errors falls back to a cold
 attempt.
 
+`--retrieval` (default off) puts the most *relevant* existing code in front of
+the architect, not just the repo's file tree: a deterministic lexical ranker
+(BM25 over file content, filenames and symbols weighted up) selects the top
+files for the feature and injects bounded excerpts, capped by
+`--retrieval-tokens N` (per role). No embedding provider or network call — it's
+exact and free, like the repo map.
+
 Deliver all the way to a **pull request** — clone the repo, do the work, then
 push the `dev-team/<feature>` branch and open a PR whose body is the run
 summary:

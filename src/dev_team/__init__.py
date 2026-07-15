@@ -151,7 +151,13 @@ from .pullrequest import (
     PullRequestRequest,
 )
 from .replan import Replan, ReplanAction, ReplanError, apply_replan
-from .retrieval import Retrieval, RetrievedFile, retrieve
+from .retrieval import (
+    Retrieval,
+    RetrievedFile,
+    char_budget_for_tokens,
+    estimate_tokens,
+    retrieve,
+)
 from .sandbox import ContainerCommandRunner, SandboxConfig, SandboxError
 from .scheduler import ScheduledResult, ScheduleStatus, schedule
 from .sdk import (
@@ -299,6 +305,8 @@ __all__ = [
     "Retrieval",
     "RetrievedFile",
     "retrieve",
+    "estimate_tokens",
+    "char_budget_for_tokens",
     "PullRequest",
     "PullRequestRequest",
     "PullRequestPublisher",

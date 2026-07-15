@@ -2,8 +2,19 @@
 
 from __future__ import annotations
 
+import dataclasses
+
+import pytest
+
 from dev_team.execution import InMemoryWorkspace
-from dev_team.retrieval import Retrieval, RetrievedFile, _tokenize, retrieve
+from dev_team.retrieval import (
+    Retrieval,
+    RetrievedFile,
+    _tokenize,
+    char_budget_for_tokens,
+    estimate_tokens,
+    retrieve,
+)
 
 
 def _ws(files):
@@ -138,3 +149,15 @@ def test_retrieved_file_is_frozen_and_carries_score():
     item = retrieve(ws, "alpha").files[0]
     assert isinstance(item, RetrievedFile)
     assert item.path == "a.py" and item.score > 0 and "alpha" in item.excerpt
+    # actually frozen: a rank/excerpt can't be mutated after retrieval
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        item.score = 0.0
+
+
+def test_estimate_tokens_and_char_budget_are_inverse_ish():
+    assert estimate_tokens("") == 0
+    assert estimate_tokens("abcd") == 1  # ~4 chars/token
+    assert estimate_tokens("abcde") == 2  # ceil
+    # a token budget maps to a >= char budget, never negative
+    assert char_budget_for_tokens(100) == 400
+    assert char_budget_for_tokens(-5) == 0

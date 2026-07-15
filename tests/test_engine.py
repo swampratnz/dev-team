@@ -2740,3 +2740,32 @@ def test_attempt_task_opens_and_closes_the_session(tmp_path):
     run(eng._attempt_task(_rp_task(), Design(overview="o")))
     assert sessions and sessions[0].closed is True  # opened per task, closed in finally
     assert sessions[0].prompts  # the engineer turn went over the session
+
+
+# --- retrieval into the architect prompt (--retrieval) ------------------
+
+
+def test_engine_config_rejects_negative_retrieval_budget():
+    with pytest.raises(ValueError, match="retrieval_token_budget"):
+        EngineConfig(retrieval_token_budget=-1)
+
+
+def test_retrieve_context_is_none_when_retrieval_is_off():
+    eng = _engine(ScriptedRunner([]))  # retrieval defaults off
+    assert eng._retrieve_context("user login authentication") is None
+
+
+def test_retrieve_context_returns_a_fenced_block_when_on():
+    ws = InMemoryWorkspace(
+        {"src/login.py": "def login(user):\n    return authenticate(user)\n"}
+    )
+    eng = _engine(ScriptedRunner([]), workspace=ws, config=EngineConfig(retrieval=True))
+    block = eng._retrieve_context("implement user login authentication")
+    assert block is not None
+    assert '<file-content path="src/login.py">' in block
+
+
+def test_retrieve_context_is_none_when_nothing_matches():
+    ws = InMemoryWorkspace({"src/login.py": "def login(): pass"})
+    eng = _engine(ScriptedRunner([]), workspace=ws, config=EngineConfig(retrieval=True))
+    assert eng._retrieve_context("zeta omega quux") is None

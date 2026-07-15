@@ -46,6 +46,24 @@ DEFAULT_PER_FILE_CHARS = 3_000
 #: never exceeds ``char_budget``.
 _MARKER = "\n... (truncated)"
 
+#: Rough average characters per token for code and prose. Enough to budget
+#: prompt context without pulling in a tokenizer dependency (there is none) or
+#: making a network call — deliberately an estimate, matching this module's
+#: deterministic, dependency-free stance.
+_CHARS_PER_TOKEN = 4
+
+
+def estimate_tokens(text: str) -> int:
+    """A cheap, deterministic token-count estimate for budgeting/reporting."""
+
+    return (len(text) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
+
+
+def char_budget_for_tokens(tokens: int) -> int:
+    """The char budget a ``tokens`` budget maps to, for :func:`retrieve`."""
+
+    return max(0, tokens) * _CHARS_PER_TOKEN
+
 _WORD = re.compile(r"[a-z0-9]+")
 # Split an identifier at camelCase humps so "buildRepoContext" also yields
 # build / repo / context; underscores and other punctuation fall to _WORD.

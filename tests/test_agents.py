@@ -252,6 +252,21 @@ def test_architect_with_tasks():
     assert design.components[0].name == "Core"
 
 
+def test_architect_includes_retrieved_relevant_code():
+    runner = _runner(design_dict())
+    agent = ArchitectAgent(runner)
+    run(
+        agent.design(
+            FeatureRequest(title="t", description="d"),
+            Plan(summary="s", tasks=[Task(id="T1", title="A", description="")]),
+            relevant_code='<file-content path="x.py">the code</file-content>',
+        )
+    )
+    prompt = runner.calls[0]["prompt"]
+    assert "Most relevant existing code" in prompt
+    assert '<file-content path="x.py">the code</file-content>' in prompt
+
+
 def test_architect_without_tasks():
     runner = _runner(design_dict())
     agent = ArchitectAgent(runner)

@@ -153,6 +153,24 @@ def test_main_reuse_engineer_session_rejected_without_deliver(capsys):
     assert "--reuse-engineer-session" in err and "--deliver" in err
 
 
+def test_main_retrieval_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--retrieval"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--retrieval" in err and "--deliver" in err
+
+
+def test_engine_config_threads_retrieval():
+    from dev_team.cli import _engine_config, build_parser
+
+    args = build_parser().parse_args(
+        ["T", "D", "--deliver", "--retrieval", "--retrieval-tokens", "500"]
+    )
+    cfg = _engine_config(args)
+    assert cfg.retrieval is True and cfg.retrieval_token_budget == 500
+
+
 def test_engine_config_threads_reuse_engineer_session():
     # The flag reaches EngineConfig. Tested at the config layer (not via a real
     # delivery) because the CLI builds a real ClaudeAgentSession with no test
