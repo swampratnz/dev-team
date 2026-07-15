@@ -47,7 +47,7 @@ import queue
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -241,24 +241,69 @@ def _resolved_interactive_timeout(requested: Optional[float]) -> float:
 @dataclass
 class _TrackedChannel(QueueChannel):
     """A :class:`~dev_team.interaction.QueueChannel` that exposes its pending
-    question.
+    question and answers it race-free.
 
-    :meth:`ask` records the just-posted :class:`~dev_team.interaction.Question`
-    on :attr:`current` before blocking, and clears it in a ``finally`` once
-    answered or timed out. This gives ``GET /jobs/{id}/question`` a
-    non-destructive way to know "is there a pending question right now"
-    without consuming from :attr:`questions` — only the engine's own
-    blocking :meth:`ask` call should ever drain that queue.
+    :attr:`QueueChannel.replies` is one queue shared for the channel's whole
+    lifetime — reusing it here would let a reply meant for one ``ask()`` call
+    be validated against that question but actually delivered (a moment
+    later, after the validating lock is released) to a *different* question
+    the engine has since moved on to, e.g. once ``ask()`` has already timed
+    out and taken the default. Instead, :meth:`ask` mints a fresh
+    single-slot queue for each question and publishes ``(question, slot)``
+    together with :attr:`current` under :attr:`_answer_lock`; :meth:`submit_reply`
+    validates a choice against — and delivers it to — that exact ``(question,
+    slot)`` pair atomically under the same lock, so a choice can never be
+    handed to a question other than the live one it was validated against.
+
+    :attr:`current` remains for ``GET /jobs/{id}/question``'s non-destructive
+    peek; it is set alongside the pending slot and cleared in a ``finally``
+    once answered or timed out.
     """
 
     current: Optional[Question] = None
+    _pending: Optional[Tuple[Question, "queue.Queue[Reply]"]] = field(
+        default=None, repr=False, compare=False
+    )
+    _answer_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
     def ask(self, question: Question) -> Reply:
-        self.current = question
+        reply_slot: "queue.Queue[Reply]" = queue.Queue(maxsize=1)
+        with self._answer_lock:
+            self.current = question
+            self._pending = (question, reply_slot)
+        self.questions.put(question)
         try:
-            return super().ask(question)
+            return reply_slot.get(timeout=self.timeout)
+        except queue.Empty:
+            return Reply(choice=question.default.key)
         finally:
-            self.current = None
+            with self._answer_lock:
+                self.current = None
+                self._pending = None
+
+    def submit_reply(self, choice: str, text: str) -> Optional[bool]:
+        """Atomically validate and deliver a reply to the live ``ask()`` call.
+
+        Returns ``None`` if there is no live question right now, ``False``
+        if ``choice`` isn't among the live question's keys, ``True`` once the
+        reply has been handed to the exact ``ask()`` call that posted that
+        question. The validate-then-deliver happens under :attr:`_answer_lock`
+        — the same lock :meth:`ask` uses to publish/clear the pending
+        ``(question, slot)`` pair — so a question can never time out and be
+        replaced by a different one between validation and delivery.
+        """
+
+        with self._answer_lock:
+            pending = self._pending
+            if pending is None:
+                return None
+            question, reply_slot = pending
+            if question.find(choice) is None:
+                return False
+            reply_slot.put(Reply(choice=choice, text=text))
+            return True
 
 
 def _failed_cost(record: JobRecord) -> float:
@@ -929,12 +974,16 @@ class Dispatcher:
     ) -> Tuple[int, Dict[str, Any]]:
         """The ``POST /jobs/{id}/answer`` core: unblock a paused ``ask()``.
 
-        ``choice`` is validated against the LIVE question's choices — never
-        trusted as free-form — before anything is pushed onto
-        :attr:`QueueChannel.replies`, so an invalid choice can never unblock
-        the wrong (or any) answer. Touches nothing on ``record.spec``: this
-        cannot be used to approve a push/deploy/rm, which stays gated by the
-        unchanged ``PolicyApprovalGate`` wired in :meth:`run_job`.
+        ``choice`` is validated against — and delivered to — the LIVE
+        question atomically inside :meth:`_TrackedChannel.submit_reply`,
+        never trusted as free-form and never split across a
+        validate-then-deliver gap: an invalid choice can never unblock the
+        wrong (or any) answer, and a choice that *was* live when checked
+        can never end up delivered to a different question the engine has
+        since moved on to (e.g. after a timeout took the default). Touches
+        nothing on ``record.spec``: this cannot be used to approve a
+        push/deploy/rm, which stays gated by the unchanged
+        ``PolicyApprovalGate`` wired in :meth:`run_job`.
         """
 
         with self._lock:
@@ -942,16 +991,19 @@ class Dispatcher:
             if record is None:
                 return 404, {"error": "unknown job"}
             channel = record.channel
-            question = channel.current if channel is not None else None
-        if question is None:
+        if channel is None:
             return 409, {"error": "no pending question"}
         choice = body.get("choice")
-        if not isinstance(choice, str) or question.find(choice) is None:
+        if not isinstance(choice, str):
             return 400, {"error": "unknown choice"}
         text = body.get("text", "")
         if not isinstance(text, str):
             text = ""
-        channel.replies.put(Reply(choice=choice, text=text))
+        result = channel.submit_reply(choice, text)
+        if result is None:
+            return 409, {"error": "no pending question"}
+        if result is False:
+            return 400, {"error": "unknown choice"}
         return 202, {}
 
     # -- archive / unarchive (job lifecycle) ----------------------------------

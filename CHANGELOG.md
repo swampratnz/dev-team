@@ -159,6 +159,13 @@ sections below are reconstructed from the repository history.
   can never approve a push/deploy/rm. Zero marginal cost when `interactive`
   is omitted (the default): no `_TrackedChannel` is constructed and
   `interaction=None` is passed exactly as before.
+  **Race-free answer delivery**: `_TrackedChannel` mints a fresh single-use
+  reply slot per `ask()` call instead of reusing one `QueueChannel.replies`
+  queue for the channel's whole lifetime — `answer_question` validates
+  `choice` against, and delivers it to, that exact live `(question, slot)`
+  pair atomically under the channel's own lock (`submit_reply`), so a reply
+  can never be misdelivered to a later, unrelated question if the original
+  one has since timed out and moved on.
 
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the

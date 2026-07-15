@@ -1857,6 +1857,18 @@ def _await_channel(record, timeout=5.0):
     return record.channel
 
 
+def _await_pending(channel, timeout=5.0):
+    """Wait for a background ``channel.ask()`` call to publish its question
+    (near-instant: :meth:`_TrackedChannel.ask` sets it before blocking, but
+    the calling thread still needs to observe it)."""
+
+    deadline = time.time() + timeout
+    while channel.current is None:
+        if time.time() > deadline:
+            raise AssertionError("ask() never posted a question")
+        time.sleep(0.005)
+
+
 def test_build_spec_interactive_defaults_false_and_must_be_bool():
     disp = Dispatcher(token="x")
     spec = disp.build_spec(
@@ -2022,11 +2034,7 @@ def test_answer_question_rejects_unknown_choice_without_unblocking():
 
     thread = threading.Thread(target=ask)
     thread.start()
-    deadline = time.time() + 5
-    while channel.current is None:
-        if time.time() > deadline:
-            raise AssertionError("ask() never posted a question")
-        time.sleep(0.005)
+    _await_pending(channel)
 
     assert disp.answer_question(spec.id, {"choice": "nope"}) == (
         400, {"error": "unknown choice"})
@@ -2050,20 +2058,97 @@ def test_answer_question_non_string_choice_is_400():
 
 
 def test_answer_question_defaults_text_and_coerces_non_string():
+    # Drives real (threaded) ask() calls rather than poking channel.current
+    # directly: replies are now delivered to the single-use slot ask()
+    # itself minted (see _TrackedChannel), not a shared queue, so the only
+    # way to observe a delivered Reply is via the ask() call it belongs to.
     disp = Dispatcher(token="x")
     channel = dispatch_mod._TrackedChannel(timeout=5)
     spec = _interactive_spec("ans-txt")
     disp._registry[spec.id] = JobRecord(spec=spec, channel=channel)
 
-    channel.current = _sample_question()
-    assert disp.answer_question(spec.id, {"choice": "approve"}) == (202, {})
-    assert channel.replies.get(timeout=1) == Reply(choice="approve", text="")
+    box = {}
 
-    channel.current = _sample_question()
+    def ask():
+        box["reply"] = channel.ask(_sample_question())
+
+    thread = threading.Thread(target=ask)
+    thread.start()
+    _await_pending(channel)
+    assert disp.answer_question(spec.id, {"choice": "approve"}) == (202, {})
+    thread.join(timeout=5)
+    assert box["reply"] == Reply(choice="approve", text="")
+
+    thread = threading.Thread(target=ask)
+    thread.start()
+    _await_pending(channel)
     assert disp.answer_question(
         spec.id, {"choice": "approve", "text": 123}
     ) == (202, {})
-    assert channel.replies.get(timeout=1) == Reply(choice="approve", text="")
+    thread.join(timeout=5)
+    assert box["reply"] == Reply(choice="approve", text="")
+
+
+def test_answer_cannot_be_misdelivered_to_a_later_unrelated_question():
+    # Regression for the PR #89 review finding: a reply meant for one
+    # question must never resolve a *different* question the channel has
+    # since moved on to (e.g. after the first ask() timed out and took its
+    # default), even though both ask() calls share the same _TrackedChannel.
+    # The old implementation reused one `QueueChannel.replies` queue for the
+    # channel's whole lifetime, so any Reply pushed onto it was blindly
+    # consumed by whichever ask() call happened to be blocked next -
+    # regardless of whether the choice was even valid for that question.
+    disp = Dispatcher(token="x")
+    channel = dispatch_mod._TrackedChannel(timeout=0.05)
+    spec = _interactive_spec("race-1")
+    disp._registry[spec.id] = JobRecord(spec=spec, channel=channel)
+
+    question_a = Question(
+        topic="task-failure",
+        prompt="Task failed, what now?",
+        choices=(Choice("skip", "skip it"),
+                 Choice("retry", "retry it", accepts_text=True)),
+        context="boom",
+        asked_by="Priya",
+    )
+    box_a = {}
+    thread_a = threading.Thread(
+        target=lambda: box_a.__setitem__("reply", channel.ask(question_a))
+    )
+    thread_a.start()
+    _await_pending(channel)
+    thread_a.join(timeout=5)
+    assert not thread_a.is_alive()
+    assert box_a["reply"] == Reply(choice="skip")  # timed out -> default taken
+    assert channel._pending is None
+
+    question_b = Question(
+        topic="plan-review",
+        prompt="Approve this plan?",
+        choices=(Choice("approve", "go"),
+                 Choice("revise", "change it", accepts_text=True),
+                 Choice("abort", "stop")),
+        context="plan",
+        asked_by="Priya",
+    )
+    channel.timeout = 5  # give the test room to interact with question B
+    box_b = {}
+    thread_b = threading.Thread(
+        target=lambda: box_b.__setitem__("reply", channel.ask(question_b))
+    )
+    thread_b.start()
+    _await_pending(channel)
+
+    # A choice that was only ever meant for (and valid on) question A must
+    # not leak through to resolve question B, even though it targets the
+    # very next ask() call on the same channel.
+    assert disp.answer_question(spec.id, {"choice": "retry", "text": "try again"}) == (
+        400, {"error": "unknown choice"})
+    assert thread_b.is_alive(), "question B must still be waiting"
+
+    assert disp.answer_question(spec.id, {"choice": "approve"}) == (202, {})
+    thread_b.join(timeout=5)
+    assert box_b["reply"] == Reply(choice="approve")
 
 
 def test_answer_question_no_pending_question_is_409():
@@ -2153,7 +2238,15 @@ def test_question_and_answer_http_routes_round_trip():
 
         assert _call(server, "/jobs/http-qa/question") == (200, {"pending": False})
 
-        channel.current = _sample_question()
+        box = {}
+
+        def ask():
+            box["reply"] = channel.ask(_sample_question())
+
+        thread = threading.Thread(target=ask)
+        thread.start()
+        _await_pending(channel)
+
         status, payload = _call(server, "/jobs/http-qa/question")
         assert status == 200
         assert payload["pending"] is True
@@ -2167,9 +2260,8 @@ def test_question_and_answer_http_routes_round_trip():
             server, "/jobs/http-qa/answer", method="POST",
             body={"choice": "approve", "text": "go ahead"},
         ) == (202, {})
-        assert channel.replies.get(timeout=5) == Reply(
-            choice="approve", text="go ahead"
-        )
+        thread.join(timeout=5)
+        assert box["reply"] == Reply(choice="approve", text="go ahead")
 
         assert _call(server, "/jobs/unknown/question") == (
             404, {"error": "unknown job"})
