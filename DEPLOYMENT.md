@@ -170,7 +170,8 @@ journalctl -u dev-team@health.service -f
 > strip an inline comment — `CLAUDE_CODE_OAUTH_TOKEN=sk-ant-...  # my token`
 > makes the comment part of the token, and the run fails with a confusing
 > `401 Invalid bearer token` at the first Claude call. Put comments on their
-> own lines.
+> own lines. See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) if you
+> hit this after a service is already running.
 
 To run it on a schedule, pair the service with a systemd timer
 (`dev-team@health.timer`).
@@ -222,7 +223,9 @@ although each job runs in its own isolated clone under `/opt/dev-team/jobs/<id>`
 it **also** journals its events into that shared workspace and mirrors each
 assessment's report and structured result there. That shared workspace is the
 hand-off to the dashboard. (The same env-file gotcha as 5b applies: keep every
-value on its own line, with no trailing inline `#` comment.)
+value on its own line, with no trailing inline `#` comment. See
+[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) if you hit this after a
+service is already running.)
 
 ### Dashboard — the read-only viewer
 
