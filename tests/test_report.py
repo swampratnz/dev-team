@@ -164,6 +164,39 @@ def test_delivery_to_dict_full():
     assert data["workspace_files"] == ["src/x.py"]
 
 
+def test_delivery_to_dict_includes_checks():
+    from dev_team.checks import ChecksOutcome
+
+    data = delivery_to_dict(
+        _outcome(checks=ChecksOutcome("failure", failed=("test (3.12)", "lint")))
+    )
+    assert data["checks_state"] == "failure"
+    assert data["checks_failed"] == ["test (3.12)", "lint"]
+
+
+def test_delivery_to_dict_checks_absent_defaults():
+    data = delivery_to_dict(_outcome())
+    assert data["checks_state"] is None and data["checks_failed"] == []
+
+
+def test_render_delivery_summary_shows_failed_checks():
+    from dev_team.checks import ChecksOutcome
+
+    text = render_delivery_summary(
+        _outcome(committed=True, checks=ChecksOutcome("failure", failed=("test (3.12)",)))
+    )
+    assert "Checks: failure — test (3.12)" in text
+
+
+def test_render_delivery_summary_shows_passing_checks():
+    from dev_team.checks import ChecksOutcome
+
+    lines = render_delivery_summary(
+        _outcome(committed=True, checks=ChecksOutcome("success"))
+    ).splitlines()
+    assert "Checks: success" in lines  # exact line, no failed suffix
+
+
 def test_delivery_to_dict_scanner_failed():
     from dev_team.models import SecurityReport
 

@@ -26,6 +26,7 @@ from .budget import Budget
 from .chat import ChatSession, chat_system_prompt
 from .config import TeamConfig
 from .dashboard import DashboardServer
+from .checks import ChecksError, GitHubChecksReader, watch_checks
 from .delivery_target import DeliveryTargetError, publish_pull_request
 from .dispatch import DispatchServer
 from .engine import EngineConfig
@@ -564,6 +565,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open the --pull-request as a draft.",
     )
+    delivery.add_argument(
+        "--watch-checks",
+        action="store_true",
+        help="After opening the --pull-request, poll its CI checks until they "
+        "conclude; a failed/timed-out watch is reflected in the exit code "
+        "(requires --pull-request).",
+    )
+    delivery.add_argument(
+        "--watch-timeout",
+        type=float,
+        default=600.0,
+        metavar="SECONDS",
+        help="How long to watch the PR's checks before giving up "
+        "(default: 600; with --watch-checks).",
+    )
     misc.add_argument(
         "--json",
         action="store_true",
@@ -688,6 +704,8 @@ def _validate_args(
     pr_tuning = [
         ("--pr-base", args.pr_base is not None),
         ("--pr-draft", args.pr_draft),
+        ("--watch-checks", args.watch_checks),
+        ("--watch-timeout", args.watch_timeout != parser.get_default("watch_timeout")),
     ]
     if not args.pull_request:
         extra = [name for name, passed in pr_tuning if passed]
@@ -933,7 +951,10 @@ async def _deliver(
         print(json.dumps(delivery_to_dict(outcome), indent=2))
     else:
         print(render_delivery_summary(outcome))
-    return 0 if outcome.success and pr_ok else 1
+    # A watched CI failure (or timeout) means the delivery is not green
+    # end-to-end, so it is reflected in the exit code alongside the PR result.
+    checks_ok = outcome.checks is None or outcome.checks.ok
+    return 0 if outcome.success and pr_ok and checks_ok else 1
 
 
 def _open_pull_request(
@@ -965,7 +986,41 @@ def _open_pull_request(
         return False
     outcome.pull_request_url = pull_request.url
     print(f"opened pull request: {pull_request.url}", file=sys.stderr)
+    if args.watch_checks:
+        _watch_pr_checks(outcome, args, ref, token or "")
     return True
+
+
+#: Fixed poll cadence for --watch-checks; --watch-timeout sets how many polls.
+_WATCH_INTERVAL_SECONDS = 20.0
+
+
+def _watch_pr_checks(outcome, args, ref: "RepoRef", token: str) -> None:
+    """Poll the opened PR's checks until they conclude; record the outcome.
+
+    Sets ``outcome.checks`` so the summary/JSON and the exit code reflect CI.
+    A read failure is reported cleanly and leaves ``outcome.checks`` unset
+    rather than sinking a delivery whose PR did open.
+    """
+
+    max_polls = max(1, int(args.watch_timeout // _WATCH_INTERVAL_SECONDS))
+    reader = GitHubChecksReader(token=token)
+    print(f"watching checks on {outcome.branch} (up to {args.watch_timeout:.0f}s)...",
+          file=sys.stderr)
+    try:
+        result = watch_checks(
+            reader,
+            ref.owner,
+            ref.name,
+            outcome.branch,
+            max_polls=max_polls,
+            poll_interval_seconds=_WATCH_INTERVAL_SECONDS,
+        )
+    except ChecksError as exc:
+        print(f"could not read checks: {exc}", file=sys.stderr)
+        return
+    outcome.checks = result
+    print(f"checks: {result.state} — {result.summary}", file=sys.stderr)
 
 
 async def _assess(
