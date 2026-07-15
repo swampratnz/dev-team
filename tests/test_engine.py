@@ -26,6 +26,7 @@ from dev_team.engine import (
     DeliveryOutcome,
     EngineConfig,
     _dod_to_test_report,
+    _is_test_path,
     _prior_context,
     _review_from_dod,
     _run_evidence,
@@ -2203,6 +2204,65 @@ def test_fail_to_pass_conflicting_stash_pop_rejects_as_gate_failure(tmp_path):
     # surfaced as a gate failure, not a vacuous-test rejection
     assert outcome.blackboard.get("scorecard")["gate_failures"] >= 1
     assert "could not be restored" in outcome.task_results[0].test_report.summary
+
+
+def test_is_test_path_classifies_tests_and_product():
+    for p in [
+        "tests/test_x.py", "app/tests/test_y.py", "test/foo.py",
+        "src/__tests__/a.js", "conftest.py", "tests/conftest.py",
+        "pytest.ini", "tox.ini", "pkg/foo_test.go", "web/button.test.tsx",
+        "web/button.spec.ts", "test_top.py", "mod_test.py",
+    ]:
+        assert _is_test_path(p) is True, p
+    for p in [
+        "app/main.py", "src/x.py", "app/templating.py", "app/testing.py",
+        "app/content.py", "README.md", "app/static/style.css",
+    ]:
+        assert _is_test_path(p) is False, p
+
+
+def test_fail_to_pass_keeps_engineer_authored_tests(tmp_path):
+    # The real-world bug: the agentic engineer writes its task's own tests and
+    # reports them in implementation.files. The fail-to-pass check must revert
+    # only the product file and KEEP the test file — otherwise it strips the
+    # very tests that would catch the regression and the task looks vacuous.
+    ws = LocalWorkspace(str(tmp_path))
+
+    class AgenticRunner(ScriptedRunner):
+        async def run(self, prompt, *, system_prompt=None, **kwargs):
+            if system_prompt and "senior software engineer" in system_prompt:
+                (tmp_path / "src").mkdir(exist_ok=True)
+                (tmp_path / "src" / "x.py").write_text("x = 1\n")
+                (tmp_path / "tests").mkdir(exist_ok=True)
+                (tmp_path / "tests" / "test_x.py").write_text(
+                    "from src.x import x\n\n\ndef test_x():\n    assert x == 1\n"
+                )
+            return await super().run(prompt, system_prompt=system_prompt, **kwargs)
+
+    mapping = engine_responses()
+    mapping["senior software engineer"] = json_response(
+        {
+            "summary": "impl + engineer-authored tests",
+            "files": [
+                {"path": "src/x.py", "change_type": "create", "summary": "impl"},
+                {"path": "tests/test_x.py", "change_type": "create", "summary": "own tests"},
+            ],
+        }
+    )
+    runner = AgenticRunner(by_system_prompt=mapping)
+    cmd = GateCycleRunner()
+    engine = _engine(runner, workspace=ws, command_runner=cmd)
+    outcome = run(engine.deliver(_request()))
+
+    # The task is accepted (the reverted product tests genuinely fail), not
+    # falsely rejected as vacuous.
+    assert outcome.success is True
+    # The fail-to-pass revert set carried the product file, never the test file.
+    stash_pushes = [c for c in cmd.calls if c[:3] == ["git", "stash", "push"]]
+    assert stash_pushes
+    for push in stash_pushes:
+        assert "src/x.py" in push
+        assert "tests/test_x.py" not in push
 
 
 def test_devops_artifacts_are_written_and_committed():
