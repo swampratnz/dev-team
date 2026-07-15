@@ -217,6 +217,23 @@ def test_engine_config_threads_require_recognised_project():
     assert _engine_config(off).require_recognised_project is False
 
 
+def test_main_finalization_reserve_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--finalization-reserve", "0.2"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--finalization-reserve" in err and "--deliver" in err
+
+
+def test_engine_config_threads_finalization_reserve():
+    from dev_team.cli import _engine_config, build_parser
+
+    args = build_parser().parse_args(["T", "D", "--deliver", "--finalization-reserve", "0.25"])
+    assert _engine_config(args).finalization_reserve_fraction == 0.25
+    default = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(default).finalization_reserve_fraction == 0.10
+
+
 def test_main_deliver_only_flags_all_reported(capsys):
     argv = [
         "Login", "Add login",

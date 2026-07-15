@@ -197,6 +197,13 @@ class EngineConfig:
     #: Ignored when ``verify_command`` / ``remote_verify_status`` is set (the
     #: caller already chose the gate). See ``docs/ROADMAP.md``.
     require_recognised_project: bool = False
+    #: Fraction of the cost budget held back during task work so the security
+    #: review that authorises the commit can still run — otherwise task work can
+    #: spend the whole ceiling and leave a fully built delivery unable to bank
+    #: itself (security is skipped, and the commit is gated on security
+    #: approval). Applies only to a committing run with a ``--budget-usd``
+    #: ceiling; released before the security stage. ``0.0`` disables it.
+    finalization_reserve_fraction: float = 0.10
     branch: Optional[str] = None
     use_branch: bool = True
     allow_dirty_baseline: bool = False
@@ -259,6 +266,8 @@ class EngineConfig:
             raise ValueError("remote_verify_max_polls must be at least 1")
         if self.max_replan_rounds < 0:
             raise ValueError("max_replan_rounds must be non-negative")
+        if not 0.0 <= self.finalization_reserve_fraction < 1.0:
+            raise ValueError("finalization_reserve_fraction must be in [0.0, 1.0)")
         if self.retrieval_token_budget < 0:
             raise ValueError("retrieval_token_budget must be non-negative")
         if self.remote_verify_interval_seconds < 0:
@@ -1034,6 +1043,12 @@ class DeliveryEngine:
             if existing is not None:
                 return existing.succeeded
             if self._budget_exhausted or self.budget.exhausted:
+                # A budget pre-flight skip still means the run was budget-limited,
+                # so record it: the finalization reserve stops task work *at* the
+                # effective ceiling, where record() (strict >) never raises — so
+                # without this the except branch below wouldn't fire and the
+                # outcome/report would omit the "stopped early; resume" signal.
+                self._budget_exhausted = True
                 task.status = TaskStatus.FAILED
                 results[task.id] = TaskResult(task=task, attempts=0)
                 return False
@@ -1047,26 +1062,34 @@ class DeliveryEngine:
             results[task.id] = outcome
             return outcome.succeeded
 
+        # The reserve must be released before the security stage no matter how
+        # the task phase ends — an exception escaping schedule()/_replan_loop()
+        # (cancellation, an unexpected SDK error) would otherwise leak it into a
+        # reused budget (--chat threads one Budget across /deliver calls),
+        # permanently shrinking the next delivery's ceiling.
+        self._reserve_finalization_budget()
         try:
-            await schedule(
-                pending,
-                worker,
-                max_concurrency=self.config.max_concurrency,
-                listener=self._on_scheduled,
-            )
-        except DependencyCycleError as exc:
-            # lint_plan catches cycles pre-flight, but a plan can still slip
-            # through (a revision that stays cyclic, or a resumed checkpoint).
-            # A cycle must not unwind deliver() and lose the outcome, trace,
-            # and checkpoint: mark the un-run tasks FAILED (handled by the
-            # task_results loop below), record it, and finish gracefully.
-            self._event(
-                "cycle",
-                "Plan has a dependency cycle; remaining tasks cannot run",
-                detail=str(exc),
-            )
-
-        plan = await self._replan_loop(request, plan, results, worker)
+            try:
+                await schedule(
+                    pending,
+                    worker,
+                    max_concurrency=self.config.max_concurrency,
+                    listener=self._on_scheduled,
+                )
+            except DependencyCycleError as exc:
+                # lint_plan catches cycles pre-flight, but a plan can still slip
+                # through (a revision that stays cyclic, or a resumed checkpoint).
+                # A cycle must not unwind deliver() and lose the outcome, trace,
+                # and checkpoint: mark the un-run tasks FAILED (handled by the
+                # task_results loop below), record it, and finish gracefully.
+                self._event(
+                    "cycle",
+                    "Plan has a dependency cycle; remaining tasks cannot run",
+                    detail=str(exc),
+                )
+            plan = await self._replan_loop(request, plan, results, worker)
+        finally:
+            self._release_finalization_budget()
 
         task_results: List[TaskResult] = []
         for task in plan.tasks:
@@ -1152,6 +1175,38 @@ class DeliveryEngine:
             )
         )
         self._event("score", "Run score recorded", detail=self.scores.latest_delta())
+
+    def _reserve_finalization_budget(self) -> None:
+        """Hold back part of the budget so the security review + commit can run.
+
+        Task work would otherwise spend the whole ceiling, leaving the security
+        review unrun — and since the commit is gated on security approval, a
+        fully built delivery would bank nothing. Engages only for a committing
+        run with a cost ceiling; released by :meth:`_release_finalization_budget`
+        before the security stage. See ``docs/ROADMAP.md``.
+        """
+
+        fraction = self.config.finalization_reserve_fraction
+        if not (self._can_commit and self.budget.limit_usd is not None and fraction > 0):
+            return
+        reserve = self.budget.limit_usd * fraction
+        self.budget.set_reserve(reserve)
+        self._event(
+            "budget",
+            f"Reserved ${reserve:.2f} of the ${self.budget.limit_usd:.2f} budget "
+            "for the security review + commit",
+        )
+
+    def _release_finalization_budget(self) -> None:
+        """Release the finalization reserve before the security review runs."""
+
+        if self.budget.reserved_usd:
+            self._event(
+                "budget",
+                "Task phase complete; releasing the finalization reserve for "
+                "the security review",
+            )
+            self.budget.set_reserve(0.0)
 
     # -- run preparation -------------------------------------------------------
 

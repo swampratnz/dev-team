@@ -88,14 +88,31 @@ class Budget:
     the cost of every in-flight call, not zero — treat ``limit_usd`` as a
     stop-line the run halts at gracefully, not a hard cap that can interrupt
     an agent mid-call.
+
+    A releasable *reserve* (:meth:`set_reserve`) temporarily lowers the
+    effective ceiling below ``limit_usd`` so an earlier phase (task work) stops
+    early and leaves headroom for a later one (the security review that gates
+    the commit); releasing it (``set_reserve(0)``) restores the full ceiling.
+    The absolute ``limit_usd`` is never exceeded in either phase.
     """
 
     limit_usd: Optional[float] = None
     meter: UsageMeter = field(default_factory=UsageMeter)
+    reserved_usd: float = 0.0
 
     def __post_init__(self) -> None:
         if self.limit_usd is not None and self.limit_usd < 0:
             raise ValueError("limit_usd must be non-negative")
+        if self.reserved_usd < 0:
+            raise ValueError("reserved_usd must be non-negative")
+
+    @property
+    def _effective_limit(self) -> Optional[float]:
+        """The ceiling enforced right now: ``limit_usd`` minus any reserve."""
+
+        if self.limit_usd is None:
+            return None
+        return max(0.0, self.limit_usd - self.reserved_usd)
 
     @property
     def spent(self) -> float:
@@ -105,37 +122,53 @@ class Budget:
 
     @property
     def remaining(self) -> float:
-        """Remaining budget, or infinity when uncapped."""
+        """Remaining budget under the effective ceiling, or infinity when uncapped."""
 
-        if self.limit_usd is None:
+        limit = self._effective_limit
+        if limit is None:
             return float("inf")
-        return max(0.0, self.limit_usd - self.spent)
+        return max(0.0, limit - self.spent)
 
     @property
     def exhausted(self) -> bool:
-        """Whether spending has reached or passed the ceiling."""
+        """Whether spending has reached or passed the effective ceiling."""
 
-        return self.limit_usd is not None and self.spent >= self.limit_usd
+        limit = self._effective_limit
+        return limit is not None and self.spent >= limit
+
+    def set_reserve(self, amount: float) -> None:
+        """Hold back ``amount`` of the ceiling for a later phase (0 releases it).
+
+        Clamped to ``[0, limit_usd]``. Only meaningful for a capped budget; on
+        an uncapped one the effective ceiling stays infinite regardless.
+        """
+
+        amount = max(0.0, amount)
+        if self.limit_usd is not None:
+            amount = min(amount, self.limit_usd)
+        self.reserved_usd = amount
 
     def check(self) -> None:
         """Raise if the budget is already exhausted (pre-flight guard).
 
         Raises:
-            BudgetExceededError: If spend has already reached the limit.
+            BudgetExceededError: If spend has already reached the effective
+                ceiling (``limit_usd`` minus any active reserve).
         """
 
         if self.exhausted:
-            raise BudgetExceededError(self.spent, self.limit_usd or 0.0)
+            raise BudgetExceededError(self.spent, self._effective_limit or 0.0)
 
     def record(self, role: str, result: AgentResult) -> UsageRecord:
-        """Record usage, then enforce the ceiling.
+        """Record usage, then enforce the effective ceiling.
 
         Raises:
             BudgetExceededError: If the recorded usage pushed spend over the
-                limit.
+                effective ceiling (``limit_usd`` minus any active reserve).
         """
 
         entry = self.meter.record(role, result)
-        if self.limit_usd is not None and self.spent > self.limit_usd:
-            raise BudgetExceededError(self.spent, self.limit_usd)
+        limit = self._effective_limit
+        if limit is not None and self.spent > limit:
+            raise BudgetExceededError(self.spent, limit)
         return entry

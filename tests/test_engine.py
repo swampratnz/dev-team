@@ -470,6 +470,125 @@ def test_deliver_budget_death_mid_integration_rolls_back():
     assert "a.py" not in ws.list_files()
 
 
+def test_finalization_reserve_fraction_must_be_in_range():
+    with pytest.raises(ValueError):
+        EngineConfig(finalization_reserve_fraction=1.0)
+    with pytest.raises(ValueError):
+        EngineConfig(finalization_reserve_fraction=-0.1)
+
+
+def _committing_engine(runner, **kwargs):
+    """An engine that can commit (injected git) — so the reserve engages."""
+
+    kwargs.setdefault("git", GitRepo(FakeCommandRunner()))
+    return _engine(runner, **kwargs)
+
+
+def test_reserve_finalization_budget_engages_for_committing_run_with_limit():
+    engine = _committing_engine(ScriptedRunner([]), budget=Budget(limit_usd=20.0))
+    engine._reserve_finalization_budget()
+    assert engine.budget.reserved_usd == pytest.approx(2.0)  # default 0.10 * 20
+
+
+def test_reserve_finalization_budget_skipped_without_a_limit():
+    engine = _committing_engine(ScriptedRunner([]), budget=Budget())
+    engine._reserve_finalization_budget()
+    assert engine.budget.reserved_usd == 0.0
+
+
+def test_reserve_finalization_budget_skipped_when_run_cannot_commit():
+    # no injected git + in-memory workspace => cannot commit => no reserve
+    engine = _engine(ScriptedRunner([]), budget=Budget(limit_usd=20.0))
+    assert engine._can_commit is False
+    engine._reserve_finalization_budget()
+    assert engine.budget.reserved_usd == 0.0
+
+
+def test_release_finalization_budget_clears_the_reserve():
+    engine = _committing_engine(ScriptedRunner([]), budget=Budget(limit_usd=20.0))
+    engine._reserve_finalization_budget()
+    assert engine.budget.reserved_usd > 0
+    engine._release_finalization_budget()
+    assert engine.budget.reserved_usd == 0.0
+
+
+def _two_task_budget_mapping():
+    """A 2-task run keyed by role, with costed engineer/QA/security calls.
+
+    Tuned against a $10 budget: T1 spends engineer $5 + QA $2 = $7; the
+    security review costs $2. With a reserve that stops task work at $7, that
+    leaves the $2 review affordable; without it, T2 also runs and starves it.
+    """
+
+    base = engine_responses()  # approved verdicts for every role
+    plan = {
+        "summary": "s",
+        "tasks": [
+            {"id": "T1", "title": "a", "description": "", "dependencies": []},
+            {"id": "T2", "title": "b", "description": "", "dependencies": []},
+        ],
+    }
+    mapping = {key: [value] for key, value in base.items()}
+    mapping["product manager"] = [json_response(plan)]
+    mapping["senior software engineer"] = [
+        AgentResult(text=base["senior software engineer"], cost_usd=5.0, num_turns=1)
+    ]
+    mapping["quality assurance engineer"] = [
+        AgentResult(text=base["quality assurance engineer"], cost_usd=2.0, num_turns=1)
+    ]
+    mapping["application security engineer"] = [
+        AgentResult(text=base["application security engineer"], cost_usd=2.0, num_turns=1)
+    ]
+    return mapping
+
+
+def _budget_reserve_engine(fraction):
+    return _committing_engine(
+        KeyedQueueRunner(_two_task_budget_mapping()),
+        command_runner=DryRunCommandRunner(),
+        budget=Budget(limit_usd=10.0),
+        config=EngineConfig(finalization_reserve_fraction=fraction, max_concurrency=1),
+    )
+
+
+def test_finalization_reserve_lets_the_security_review_run():
+    # With the reserve, task work stops after T1 ($7 of the $10 budget),
+    # sacrificing T2 — but the security review (the commit gate) still runs.
+    outcome = run(_budget_reserve_engine(0.3).deliver(_request()))
+    assert outcome.tasks_complete is False  # T2 was sacrificed to the reserve
+    # the run reports it was budget-limited even though task work stopped *at*
+    # the reserved ceiling (a pre-flight skip, not a raised BudgetExceededError)
+    assert outcome.budget_exhausted is True
+    assert outcome.security is not None  # ...but security still ran
+    assert outcome.security.approved is True
+
+
+def test_finalization_reserve_released_when_task_phase_raises(monkeypatch):
+    # A crash escaping the task phase must not leak the reserve into a reused
+    # budget (--chat threads one Budget across /deliver calls); the finally
+    # releases it before the exception propagates.
+    engine = _committing_engine(
+        ScriptedRunner(by_system_prompt=engine_responses()),
+        budget=Budget(limit_usd=10.0),
+    )
+
+    async def explode(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(engine, "_replan_loop", explode)
+    with pytest.raises(RuntimeError):
+        run(engine.deliver(_request()))
+    assert engine.budget.reserved_usd == 0.0
+
+
+def test_without_a_reserve_task_work_starves_the_security_review():
+    # Same costs, no reserve: T2 also runs, spending past the ceiling, so the
+    # security review is starved and the build cannot be banked.
+    outcome = run(_budget_reserve_engine(0.0).deliver(_request()))
+    assert outcome.budget_exhausted is True
+    assert outcome.security is None
+
+
 def test_deliver_agentic_engineer_raise_discards_dirty_tree(tmp_path, monkeypatch):
     # The agentic mirror of the budget-death rollback above: the engineer
     # edits the shared workdir directly and then the paid call dies. The
