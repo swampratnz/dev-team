@@ -540,6 +540,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-role token budget for retrieved code (with --retrieval).",
     )
     delivery.add_argument(
+        "--llm-retrospective",
+        action="store_true",
+        help="After delivery, run an LLM retrospective that mines the run's "
+        "evidence for root-cause lessons feeding the next run's plan (adds one "
+        "LLM call; off by default; with --deliver).",
+    )
+    delivery.add_argument(
         "--pull-request",
         action="store_true",
         help="After a committed delivery, push the branch and open a GitHub "
@@ -782,6 +789,7 @@ def _reject_deliver_only_flags(
         ("--reuse-engineer-session", args.reuse_engineer_session),
         ("--retrieval", args.retrieval),
         ("--retrieval-tokens", args.retrieval_tokens != parser.get_default("retrieval_tokens")),
+        ("--llm-retrospective", args.llm_retrospective),
         ("--remote-verify-status", args.remote_verify_status is not None),
         ("--remote-verify-trigger", args.remote_verify_trigger is not None),
     ]
@@ -841,6 +849,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         reuse_engineer_session=args.reuse_engineer_session,
         retrieval=args.retrieval,
         retrieval_token_budget=args.retrieval_tokens,
+        llm_retrospective=args.llm_retrospective,
         allow_dirty_baseline=args.allow_dirty_baseline,
         require_green_baseline=not args.proceed_on_red_baseline,
         remote_verify_status=(

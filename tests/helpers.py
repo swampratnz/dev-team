@@ -159,6 +159,9 @@ def engine_responses(*, review=True, security=True, reliability=True):
         "technical writer": json_response(docs_dict()),
         "site reliability engineer": json_response(reliability_dict(reliability)),
         "DevOps engineer": json_response(deploy_dict()),
+        "retrospective analyst": json_response(
+            {"lessons": ["design left the error contract implicit; add a criterion"]}
+        ),
     }
 
 
