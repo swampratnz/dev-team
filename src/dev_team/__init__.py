@@ -115,6 +115,7 @@ from .memory import (
 )
 from .ordering import lint_plan, topological_order
 from .persona import DEFAULT_CAST, Persona, Roster
+from .scores import RunScore, ScoreHistory
 from .models import (
     ChangeType,
     Design,
@@ -322,6 +323,8 @@ __all__ = [
     "ProjectMemory",
     "CheckpointStore",
     "RunCheckpoint",
+    "ScoreHistory",
+    "RunScore",
     # evals
     "EvalCase",
     "EvalResult",

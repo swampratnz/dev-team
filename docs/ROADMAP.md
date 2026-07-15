@@ -165,10 +165,16 @@ transcript, fenced as untrusted `<evidence>`) and returns a few *root-cause*
 lessons that name a cause and a change, richer than the always-on deterministic
 distillation it complements. It runs under the graceful specialist wrapper and
 is skipped once the budget is spent, so it never gates a delivery; its lessons
-merge into the persisted retrospective that seeds the next run's plan. Remaining:
-a deterministic **score-history** trail (per-run metrics persisted with
-run-over-run deltas), then a standing **benchmark suite in CI** against the real
-runner (budget-capped) — the latter deferred pending a governance decision on
+merge into the persisted retrospective that seeds the next run's plan.
+
+The deterministic **score-history** trail has also landed (`dev_team.scores`):
+every delivery appends a compact `RunScore` (success, tasks, total attempts,
+cost, the scorecard counters) to a bounded `.dev_team/score-history.json`, and
+`ScoreHistory.render` shows each run's headline metrics with signed deltas from
+the run before it (a run also logs its delta as an event) — so a prompt or
+orchestration change shows up as a movement rather than a vibe. No LLM, no
+network. Remaining: a standing **benchmark suite in CI** against the real runner
+(budget-capped) feeding this trail — deferred pending a governance decision on
 scheduled real spend and SDK credentials in CI.
 
 ## 7. Richer interaction surfaces

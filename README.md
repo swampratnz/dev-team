@@ -243,7 +243,8 @@ fake implementation:
 - **Memory** — a shared `Blackboard`, `DecisionRecord` (ADR) log, cross-run
   `ProjectMemory` (fed back into planning as a bounded, per-kind digest of what
   earlier runs *built* — not just a count — alongside prior decisions and
-  retrospective notes), and a `CheckpointStore` for crash/budget-safe resume.
+  retrospective notes), a `ScoreHistory` trail (per-run metrics with
+  run-over-run deltas), and a `CheckpointStore` for crash/budget-safe resume.
 - **Governance** — `Budget` (graceful cost circuit-breaker), `Tracer` (audit
   spans), `ApprovalGate` (human-in-the-loop), and `SideEffectPolicy`
   guardrails. Policy is defence-in-depth, **not** a sandbox — running
