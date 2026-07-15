@@ -150,6 +150,7 @@ from .pullrequest import (
     PullRequestPublisher,
     PullRequestRequest,
 )
+from .replan import Replan, ReplanAction, ReplanError, apply_replan
 from .sandbox import ContainerCommandRunner, SandboxConfig, SandboxError
 from .scheduler import ScheduledResult, ScheduleStatus, schedule
 from .sdk import AgentResult, AgentRunner, ClaudeAgentRunner
@@ -279,6 +280,10 @@ __all__ = [
     "ContainerCommandRunner",
     "SandboxConfig",
     "SandboxError",
+    "Replan",
+    "ReplanAction",
+    "ReplanError",
+    "apply_replan",
     "PullRequest",
     "PullRequestRequest",
     "PullRequestPublisher",
