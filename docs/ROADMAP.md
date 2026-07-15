@@ -80,10 +80,17 @@ token-free digest), classifying on what a human sees — any failed check-run (o
 a failed combined status) fails the watch, and the combined status's noisy
 "pending" (which never clears on Actions-only repos) is ignored.
 
-**Remaining:** wiring the watcher into the delivery terminus (opt-in
-`--watch-checks`, surfacing the result in the summary/JSON and the exit code),
-then closing the loop — feeding a CI failure back as gate feedback so the team
-fixes it and re-pushes to the PR branch, bounded by rounds and budget.
+**Watch wired (shipped):** opt-in `--watch-checks` (with `--watch-timeout`,
+requires `--pull-request`). After the PR opens, the CLI polls its checks on the
+delivered branch via `GitHubChecksReader`/`watch_checks` and records the
+`ChecksOutcome` on `DeliveryOutcome.checks` — surfaced in the run summary and
+JSON (`checks_state`/`checks_failed`) and reflected in the exit code (a failed
+or timed-out watch makes the run non-zero even though the PR opened). A read
+error is reported cleanly and never sinks a delivery whose PR did open.
+
+**Remaining:** closing the loop — feeding a CI failure back as gate feedback so
+the team fixes it and re-pushes (force-with-lease) to the PR branch, bounded by
+rounds and budget, human-supervised when an interaction channel is attached.
 
 ## 3. Dynamic re-planning
 

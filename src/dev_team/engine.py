@@ -48,6 +48,7 @@ from .agents.techwriter import doc_claim_issues
 from .approval import ApprovalGate, ApprovalRequest, AutoApprover
 from .backlog import BacklogStore, ItemStatus
 from .budget import Budget, BudgetExceededError
+from .checks import ChecksOutcome
 from .changes import ChangeApplier
 from .context import build_repo_context
 from .conventions import ConventionsStore
@@ -285,6 +286,10 @@ class DeliveryOutcome:
     #: publish. ``None`` otherwise. Set after ``deliver`` returns, by the
     #: delivery target — the engine itself never opens a PR.
     pull_request_url: Optional[str] = None
+    #: The outcome of watching the opened PR's CI checks (``--watch-checks``),
+    #: or ``None`` when not watched. Set after ``deliver`` returns, alongside
+    #: ``pull_request_url`` — the engine itself never reaches the network.
+    checks: Optional[ChecksOutcome] = None
 
     @property
     def tasks_complete(self) -> bool:

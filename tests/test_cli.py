@@ -1468,13 +1468,81 @@ def test_main_pull_request_incompatible_with_no_commit():
 
 
 def test_main_pr_tuning_requires_pull_request():
-    for extra in (["--pr-base", "develop"], ["--pr-draft"]):
+    for extra in (
+        ["--pr-base", "develop"],
+        ["--pr-draft"],
+        ["--watch-checks"],
+        ["--watch-timeout", "60"],
+    ):
         with pytest.raises(SystemExit) as exc:
             main(
                 ["T", "D", "--deliver", "--repo", "acme/mono", *extra],
                 runner=ScriptedRunner([]),
             )
         assert exc.value.code == 2
+
+
+def test_main_watch_checks_success(tmp_path, monkeypatch, capsys):
+    import dev_team.cli as cli_module
+    from dev_team.checks import ChecksOutcome
+
+    monkeypatch.setattr(
+        cli_module, "watch_checks",
+        lambda *a, **k: ChecksOutcome("success", summary="all 2 check(s) passed"),
+    )
+    code = _pr_deliver(tmp_path, monkeypatch, {}, "--watch-checks")
+    out = capsys.readouterr()
+    assert code == 0
+    assert "Checks: success" in out.out  # surfaced in the summary
+    assert "checks: success" in out.err  # and as stderr progress
+
+
+def test_main_watch_checks_failure_sets_exit_code(tmp_path, monkeypatch, capsys):
+    import dev_team.cli as cli_module
+    from dev_team.checks import ChecksOutcome
+
+    monkeypatch.setattr(
+        cli_module, "watch_checks",
+        lambda *a, **k: ChecksOutcome("failure", failed=("test (3.12)",)),
+    )
+    code = _pr_deliver(tmp_path, monkeypatch, {}, "--watch-checks")
+    out = capsys.readouterr()
+    # the delivery is green and the PR opened, but CI failed -> non-zero exit
+    assert code == 1
+    assert "Checks: failure — test (3.12)" in out.out
+
+
+def test_main_watch_checks_read_error_is_graceful(tmp_path, monkeypatch, capsys):
+    import dev_team.cli as cli_module
+    from dev_team.checks import ChecksError
+
+    def boom(*a, **k):
+        raise ChecksError("GitHub returned 403 reading the checks")
+
+    monkeypatch.setattr(cli_module, "watch_checks", boom)
+    code = _pr_deliver(tmp_path, monkeypatch, {}, "--watch-checks")
+    err = capsys.readouterr().err
+    # an unread check must not sink a delivery whose PR did open
+    assert code == 0
+    assert "could not read checks: GitHub returned 403" in err
+
+
+def test_main_watch_checks_timeout_polls_are_derived(tmp_path, monkeypatch, capsys):
+    import dev_team.cli as cli_module
+    from dev_team.checks import ChecksOutcome
+
+    seen = {}
+
+    def fake_watch(reader, owner, name, ref, *, max_polls, poll_interval_seconds):
+        seen.update(max_polls=max_polls, interval=poll_interval_seconds, ref=ref)
+        return ChecksOutcome("success")
+
+    monkeypatch.setattr(cli_module, "watch_checks", fake_watch)
+    code = _pr_deliver(tmp_path, monkeypatch, {}, "--watch-checks", "--watch-timeout", "100")
+    assert code == 0
+    # 100s / 20s interval -> 5 polls, watching the delivered branch
+    assert seen["max_polls"] == 5 and seen["interval"] == 20.0
+    assert seen["ref"].startswith("dev-team/")
 
 
 def test_main_chat_deliver_pull_request_threads_ref_and_token(
