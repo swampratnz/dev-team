@@ -6,7 +6,7 @@ import asyncio
 import os
 
 import pytest
-from helpers import GateCycleRunner, engine_responses, qa_suite_dict, run
+from helpers import GateCycleRunner, engine_responses, qa_suite_dict, review_dict, run
 
 from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.budget import Budget, BudgetExceededError
@@ -2478,6 +2478,52 @@ def test_replan_loop_stops_the_round_when_budget_dies_mid_proposal():
     new_plan = run(eng._replan_loop(_request(), plan, results, worker))
     assert [t.id for t in new_plan.tasks] == ["T1", "T2"]  # unchanged
     assert calls == ["T1"]  # broke after the first task, never tried T2
+
+
+def test_deliver_replans_a_failed_task_end_to_end():
+    # A full delivery where T2 (depends on the passing T1) fails review; with
+    # --max-replan-rounds 1 the manager replaces it with T2b, which passes, and
+    # the reschedule hands the *whole* plan to the worker — T1 is a no-op via the
+    # idempotency check, T2b actually runs — so the delivery recovers.
+    two_task = {
+        "summary": "s",
+        "tasks": [
+            {"id": "T1", "title": "one", "description": "d",
+             "acceptance_criteria": ["a"], "dependencies": []},
+            {"id": "T2", "title": "two", "description": "d",
+             "acceptance_criteria": ["b"], "dependencies": ["T1"]},
+        ],
+    }
+    replan_json = {
+        "action": "replace",
+        "rationale": "different approach",
+        "replacements": [
+            {"id": "T2b", "title": "two-b", "description": "d",
+             "acceptance_criteria": ["b"], "dependencies": ["T1"]},
+        ],
+    }
+    mapping = {k: [v] for k, v in engine_responses().items()}
+    mapping["product manager"] = [json_response(two_task), json_response(replan_json)]
+    mapping["code reviewer"] = [
+        json_response(review_dict(True)),   # T1 passes
+        json_response(review_dict(False)),  # T2 fails all (single) attempt
+        json_response(review_dict(True)),   # T2b passes
+    ]
+    engine = _engine(
+        KeyedQueueRunner(mapping),
+        command_runner=FakeCommandRunner(),  # every gate passes; review drives outcome
+        config=EngineConfig(
+            max_task_attempts=1,
+            max_replan_rounds=1,
+            fail_to_pass_check=False,
+            verify_command=["true"],
+        ),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    ids = {tr.task.id for tr in outcome.task_results}
+    assert "T1" in ids and "T2b" in ids and "T2" not in ids
+    assert all(tr.task.status is TaskStatus.DONE for tr in outcome.task_results)
 
 
 def test_propose_replan_revises_then_applies():

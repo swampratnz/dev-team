@@ -797,6 +797,14 @@ class DeliveryEngine:
             self._event("resumed", f"Restored {len(resumed)} task(s) from checkpoint")
 
         async def worker(task: Task) -> bool:
+            # Idempotent by task id: an already-attempted task reports its prior
+            # outcome instead of re-running. This lets a re-plan round hand the
+            # scheduler the *whole* plan (so a still-failed prerequisite stays in
+            # the graph and correctly cascade-skips its dependents) while the
+            # done/failed tasks are no-ops rather than re-executions.
+            existing = results.get(task.id)
+            if existing is not None:
+                return existing.succeeded
             if self._budget_exhausted or self.budget.exhausted:
                 task.status = TaskStatus.FAILED
                 results[task.id] = TaskResult(task=task, attempts=0)
@@ -1220,13 +1228,16 @@ class DeliveryEngine:
             # _record_progress marks done) rather than the stale pre-re-plan one.
             self._checkpoint_plan(plan)
             rounds -= 1
-            pending = [t for t in plan.tasks if t.id not in results]
-            if not pending:
-                break
-            # No DependencyCycleError guard here: apply_replan re-lints every
-            # mutation, so the plan (and any subset of it) is always acyclic.
+            if not any(t.id not in results for t in plan.tasks):
+                break  # nothing new to attempt this round
+            # Reschedule the WHOLE plan, not just the new tasks: the worker
+            # no-ops already-attempted ids, and passing the full graph keeps
+            # every dependency edge intact so a dependent of a still-failed task
+            # is cascade-skipped rather than run on work that never succeeded.
+            # No DependencyCycleError guard: apply_replan re-lints every mutation,
+            # so the plan (and its scheduled subset) is always acyclic.
             await schedule(
-                pending,
+                plan.tasks,
                 worker,
                 max_concurrency=self.config.max_concurrency,
                 listener=self._on_scheduled,
