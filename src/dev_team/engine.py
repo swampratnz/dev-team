@@ -99,10 +99,10 @@ from .models import (
     TestReport,
 )
 from .ordering import lint_plan
-from .replan import Replan, ReplanError, apply_replan
 from .persona import Roster
 from .policy import GuardedCommandRunner, SideEffectPolicy
 from .profile import detect_project
+from .replan import Replan, ReplanError, apply_replan
 from .sandbox import ContainerCommandRunner, SandboxConfig
 from .scheduler import ScheduledResult, schedule
 from .sdk import AgentRunner
@@ -830,7 +830,7 @@ class DeliveryEngine:
                 detail=str(exc),
             )
 
-        plan = await self._replan_loop(request, plan, design, results, worker)
+        plan = await self._replan_loop(request, plan, results, worker)
 
         task_results: List[TaskResult] = []
         for task in plan.tasks:
@@ -1167,7 +1167,6 @@ class DeliveryEngine:
         self,
         request: FeatureRequest,
         plan: Plan,
-        design: Design,
         results: Dict[str, TaskResult],
         worker,
     ) -> Plan:
@@ -1195,6 +1194,8 @@ class DeliveryEngine:
             mutated = False
             for task in failed:
                 decision = await self._propose_replan(request, plan, task, results)
+                if self._budget_exhausted:
+                    break  # budget died mid-round; remaining tasks would only repeat it
                 if decision is None:
                     continue
                 try:
@@ -1214,6 +1215,10 @@ class DeliveryEngine:
                 )
             if not mutated:
                 break
+            # Persist the mutated plan *before* rescheduling, so a crash mid-round
+            # resumes on the new plan (matching the replacement tasks that
+            # _record_progress marks done) rather than the stale pre-re-plan one.
+            self._checkpoint_plan(plan)
             rounds -= 1
             pending = [t for t in plan.tasks if t.id not in results]
             if not pending:
@@ -1226,12 +1231,14 @@ class DeliveryEngine:
                 max_concurrency=self.config.max_concurrency,
                 listener=self._on_scheduled,
             )
-        if self._checkpoint is not None:
-            # A resume must see the plan the run actually finished on, not the
-            # pre-re-plan one; replacement ids are new, so their tasks simply
-            # re-run on resume (they carry no done-fingerprint).
-            self._checkpoint.plan = _plan_to_dict(plan)
         return plan
+
+    def _checkpoint_plan(self, plan: Plan) -> None:
+        """Persist ``plan`` into the resume checkpoint (best effort)."""
+
+        if self._checkpoint is not None and self.checkpoints is not None:
+            self._checkpoint.plan = _plan_to_dict(plan)
+            self.checkpoints.save(self._checkpoint)
 
     async def _propose_replan(
         self,

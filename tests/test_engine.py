@@ -2341,7 +2341,7 @@ def test_replan_loop_off_by_default_is_a_noop():
     async def worker(task):  # pragma: no cover - must never run
         raise AssertionError("no rescheduling when re-planning is off")
 
-    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    new_plan = run(eng._replan_loop(_request(), plan, results, worker))
     assert new_plan is plan and not called
 
 
@@ -2367,7 +2367,7 @@ def test_replan_loop_replaces_failed_task_and_reschedules():
         results[task.id] = TaskResult(task=task, attempts=1)
         return True
 
-    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    new_plan = run(eng._replan_loop(_request(), plan, results, worker))
     assert [t.id for t in new_plan.tasks] == ["T1", "T2b"]
     assert results["T2b"].succeeded  # the replacement was scheduled and passed
     assert eng._checkpoint.plan is not None  # checkpoint refreshed to the new plan
@@ -2390,7 +2390,7 @@ def test_replan_loop_stops_when_nothing_failed():
     async def worker(task):  # pragma: no cover - nothing to schedule
         raise AssertionError("unreachable")
 
-    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    new_plan = run(eng._replan_loop(_request(), plan, results, worker))
     assert new_plan is plan and not called
 
 
@@ -2414,7 +2414,7 @@ def test_replan_loop_leaves_task_failed_when_supervisor_rejects():
     async def worker(task):  # pragma: no cover - rejection means no reschedule
         raise AssertionError("a rejected re-plan must not reschedule")
 
-    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    new_plan = run(eng._replan_loop(_request(), plan, results, worker))
     assert [t.id for t in new_plan.tasks] == ["T1", "T2"]  # unchanged
 
 
@@ -2433,7 +2433,7 @@ def test_replan_loop_discards_an_invalid_mutation():
     async def worker(task):  # pragma: no cover - the mutation is discarded
         raise AssertionError("invalid mutation must not reschedule")
 
-    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    new_plan = run(eng._replan_loop(_request(), plan, results, worker))
     assert [t.id for t in new_plan.tasks] == ["T1"]  # discarded, left as-is
 
 
@@ -2453,8 +2453,31 @@ def test_replan_loop_drops_a_failed_task_with_nothing_left_to_schedule():
     async def worker(task):  # pragma: no cover - drop leaves nothing pending
         raise AssertionError("nothing to reschedule after a pure drop")
 
-    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    new_plan = run(eng._replan_loop(_request(), plan, results, worker))
     assert [t.id for t in new_plan.tasks] == ["T1"]  # T2 dropped
+
+
+def test_replan_loop_stops_the_round_when_budget_dies_mid_proposal():
+    eng = _rp_engine()
+    eng.config.max_replan_rounds = 1
+    t1, r1 = _failed("T1")
+    t2, r2 = _failed("T2")
+    plan = Plan(summary="s", tasks=[t1, t2])
+    results = {"T1": r1, "T2": r2}
+    calls = []
+
+    async def replan(request, plan, task, evidence, *, revision_feedback=None):
+        calls.append(task.id)
+        raise BudgetExceededError(10.0, 5.0)
+
+    eng.manager.replan = replan
+
+    async def worker(task):  # pragma: no cover - budget death means no reschedule
+        raise AssertionError("no reschedule after budget exhaustion")
+
+    new_plan = run(eng._replan_loop(_request(), plan, results, worker))
+    assert [t.id for t in new_plan.tasks] == ["T1", "T2"]  # unchanged
+    assert calls == ["T1"]  # broke after the first task, never tried T2
 
 
 def test_propose_replan_revises_then_applies():
