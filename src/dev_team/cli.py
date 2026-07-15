@@ -38,6 +38,7 @@ from .interaction import ChannelApprovalGate, ConsoleChannel
 from .models import FeatureRequest
 from .persona import Roster
 from .pullrequest import (
+    DEFAULT_CHECKS_TIMEOUT_SECONDS,
     MAX_CHECKS_TIMEOUT_SECONDS,
     GitHubCheckRunsClient,
     GitHubPullRequestPublisher,
@@ -546,7 +547,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SECONDS",
         help=f"Max time to poll under --watch-checks before giving up as "
-        f"pending (default 300; hard-clamped to {MAX_CHECKS_TIMEOUT_SECONDS:.0f}).",
+        f"pending (default {DEFAULT_CHECKS_TIMEOUT_SECONDS:.0f}; hard-clamped "
+        f"to {MAX_CHECKS_TIMEOUT_SECONDS:.0f}).",
     )
     misc.add_argument(
         "--json",
@@ -948,7 +950,7 @@ def _open_pull_request(
             outcome.branch,
             timeout_seconds=args.checks_timeout_seconds
             if args.checks_timeout_seconds is not None
-            else 300.0,
+            else DEFAULT_CHECKS_TIMEOUT_SECONDS,
         )
         outcome.pull_request_checks = checks.to_dict()
         print(f"PR checks: {checks.state}", file=sys.stderr)

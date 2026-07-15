@@ -1477,14 +1477,14 @@ def test_watch_checks_reuses_the_pull_request_token_no_new_credential(
 
 def test_main_deliver_watch_checks_surfaces_state(tmp_path, monkeypatch, capsys):
     import dev_team.cli as cli_module
-    from dev_team.pullrequest import CheckRunsResult
+    from dev_team.pullrequest import DEFAULT_CHECKS_TIMEOUT_SECONDS, CheckRunsResult
 
     class _FakeCheckRunsClient:
         def __init__(self, token):
             pass
 
         def watch(self, owner, name, ref, *, timeout_seconds):
-            assert timeout_seconds == 300.0  # the documented default
+            assert timeout_seconds == DEFAULT_CHECKS_TIMEOUT_SECONDS
             return CheckRunsResult(
                 state="failure",
                 check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}],

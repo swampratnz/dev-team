@@ -20,7 +20,11 @@ sections below are reconstructed from the repository history.
   such as a gateway returning `null`/a list on 200 — BPG §4, never trust
   upstream output), is caught and surfaced as `state="unknown"` rather than
   raised — the PR is already open and real, so a failed watch never flips
-  the exit code.
+  the exit code. `no_checks` (an empty `check_runs` list — common for the
+  first poll or two right after a PR opens, before Actions has registered a
+  check run for the freshly-pushed SHA) is retried the same as `pending`
+  rather than treated as an immediate terminal result, mirroring
+  `RemoteCIGate`'s "not yet passed" retry.
 - Wired to the CLI as **`--watch-checks`** (with `--checks-timeout-seconds`),
   valid only combined with `--pull-request`, reusing the exact token already
   resolved for it (no new credential surface). The result is surfaced in

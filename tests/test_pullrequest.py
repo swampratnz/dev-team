@@ -272,6 +272,45 @@ def test_watch_never_resolves_times_out_via_injected_clock():
     assert result.timed_out is True
 
 
+def test_watch_no_checks_is_retried_like_pending_until_populated():
+    # Right after a PR opens, GitHub's Checks API commonly returns an empty
+    # check_runs list for the first few polls, before Actions has registered
+    # a check run for the freshly-pushed SHA. no_checks must be retried the
+    # same as pending, not treated as an immediate terminal result.
+    calls = []
+
+    def http(url, headers):
+        calls.append(url)
+        if len(calls) < 3:
+            return {"check_runs": []}
+        return {"check_runs": [_run(conclusion="success")]}
+
+    sleeps = []
+    client = GitHubCheckRunsClient(
+        token="T", http=http, sleep=lambda s: sleeps.append(s), clock=lambda: 0.0,
+    )
+    result = client.watch("acme", "mono", "sha1")
+    assert result.state == "success"
+    assert len(calls) == 3  # exactly three polls, not more
+    assert len(sleeps) == 2  # slept between poll 1→2 and 2→3, never after success
+
+
+def test_watch_no_checks_that_never_populates_times_out_as_no_checks():
+    # A clock that jumps well past timeout_seconds on the very next read —
+    # this never performs a real wait (sleep is a no-op) and completes fast.
+    ticks = itertools.count(start=0.0, step=1000.0)
+
+    def http(url, headers):
+        return {"check_runs": []}
+
+    client = GitHubCheckRunsClient(
+        token="T", http=http, sleep=lambda s: None, clock=lambda: next(ticks),
+    )
+    result = client.watch("acme", "mono", "sha1", timeout_seconds=10, poll_interval_seconds=5)
+    assert result.state == "no_checks"
+    assert result.timed_out is True
+
+
 def test_clamp_timeout_seconds_ceiling():
     assert pr._clamp_timeout_seconds(999999) == pr.MAX_CHECKS_TIMEOUT_SECONDS == 900.0
 
@@ -504,8 +543,14 @@ def test_default_http_get_uses_urllib(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     # http=None -> the client falls back to the default _http_get transport.
-    result = GitHubCheckRunsClient(token="TOK").watch("acme", "mono", "sha1")
+    # timeout_seconds=0 -> no_checks is retryable, but the real monotonic
+    # clock trips the timeout immediately after the first poll, so this
+    # never performs a real sleep() despite using the default sleep/clock.
+    result = GitHubCheckRunsClient(token="TOK").watch(
+        "acme", "mono", "sha1", timeout_seconds=0
+    )
     assert result.state == "no_checks"
+    assert result.timed_out is True
     assert captured["method"] == "GET"
     assert captured["url"] == "https://api.github.com/repos/acme/mono/commits/sha1/check-runs"
     assert captured["auth"] == "Bearer TOK"

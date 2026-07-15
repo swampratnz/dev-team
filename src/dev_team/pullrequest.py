@@ -65,6 +65,10 @@ MAX_CHECKS_TIMEOUT_SECONDS = 900.0
 MIN_CHECKS_POLL_INTERVAL_SECONDS = 5.0
 MAX_CHECKS_POLL_INTERVAL_SECONDS = 60.0
 
+#: Default ``timeout_seconds`` for :meth:`GitHubCheckRunsClient.watch`, shared
+#: with the CLI (``cli.py``'s ``_open_pull_request``) so the two can't drift.
+DEFAULT_CHECKS_TIMEOUT_SECONDS = 300.0
+
 #: Check-run conclusions that count as a pass; anything else completed is a
 #: failure. A closed enum with an explicit default — an unrecognised
 #: conclusion string from GitHub is never trusted as success (fail-secure).
@@ -185,6 +189,11 @@ def aggregate_check_runs(check_runs: Sequence[Mapping]) -> str:
     empty list (CI hasn't indexed the SHA yet, or the repo has none
     configured). Untrusted API strings are matched against a closed enum with
     a safe default — an unfamiliar ``conclusion`` never resolves to success.
+
+    :meth:`GitHubCheckRunsClient.watch` treats ``no_checks`` the same as
+    ``pending`` (keep polling): right after a PR opens, GitHub's Checks API
+    commonly returns an empty list for the first few polls, before Actions has
+    registered a check run for the freshly-pushed SHA — see issue #71's review.
     """
 
     if not check_runs:
@@ -263,6 +272,11 @@ class GitHubCheckRunsClient:
     service's output), is caught and surfaced as ``state="unknown"``
     (fail-secure) rather than propagated — the PR is already open and real,
     so a failed watch must never flip the caller's success/exit code.
+    ``no_checks`` (an empty ``check_runs`` list) is retried the same as
+    ``pending`` rather than treated as terminal, mirroring
+    :class:`dev_team.verification.RemoteCIGate`'s "not yet passed" retry —
+    GitHub's Checks API commonly hasn't indexed the freshly-pushed SHA yet
+    on the first poll or two.
     """
 
     token: str = field(repr=False)  # never let a repr/traceback/config dump print it
@@ -277,7 +291,7 @@ class GitHubCheckRunsClient:
         name: str,
         ref: str,
         *,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float = DEFAULT_CHECKS_TIMEOUT_SECONDS,
         poll_interval_seconds: float = 10.0,
     ) -> CheckRunsResult:
         timeout_seconds = _clamp_timeout_seconds(timeout_seconds)
@@ -311,10 +325,10 @@ class GitHubCheckRunsClient:
                     error=self._scrub(f"malformed response fetching check runs: {exc}"),
                 )
             state = aggregate_check_runs(check_runs)
-            if state != "pending":
+            if state not in ("pending", "no_checks"):
                 return CheckRunsResult(state=state, check_runs=check_runs)
             if self.clock() - start >= timeout_seconds:
-                return CheckRunsResult(state="pending", check_runs=check_runs, timed_out=True)
+                return CheckRunsResult(state=state, check_runs=check_runs, timed_out=True)
             self.sleep(poll_interval_seconds)
 
     def _describe(self, exc: urllib.error.HTTPError) -> str:
