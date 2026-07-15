@@ -307,6 +307,34 @@ def test_session_times_out_to_error_result():
     assert "TimeoutError" in result.text
 
 
+def test_session_timeout_also_covers_a_hanging_query():
+    from dev_team.sdk import ClaudeAgentSession
+
+    # The timeout wraps the whole turn, so a hang in query() (not just the
+    # response stream) also surfaces as an error result.
+    class HangingQueryClient:
+        def __init__(self, options):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def query(self, text):
+            await asyncio.sleep(30)
+
+        async def receive_response(self):
+            yield Assistant([Block("unreached")])
+
+        async def disconnect(self):
+            pass
+
+    result = run(
+        ClaudeAgentSession(client_factory=HangingQueryClient, timeout_seconds=0.01).send("x")
+    )
+    assert result.is_error is True
+    assert "TimeoutError" in result.text
+
+
 def test_fake_agent_session_records_prompts_and_repeats_last_result():
     from dev_team.sdk import FakeAgentSession
 

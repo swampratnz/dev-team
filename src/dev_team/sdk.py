@@ -300,10 +300,20 @@ class ClaudeAgentSession:
     and run inside ``cwd`` across turns — the transport an engineer needs to
     *continue* a prior attempt rather than restart it cold. The system prompt,
     tools, and cwd are fixed for the session's life; only the per-turn prompt
-    varies. A failed turn (SDK/OS error or timeout) returns an error
+    varies.
+
+    A failed turn (SDK/OS error or timeout) returns an error
     :class:`AgentResult` rather than raising, matching
-    :class:`ClaudeAgentRunner`, so a caller can fall back to a fresh session;
+    :class:`ClaudeAgentRunner`; ``timeout_seconds`` bounds the *whole* turn
+    (connect, query, and response), not just the response stream, so a wedged
+    client can't block a shared-pool worker forever.
     :class:`asyncio.CancelledError` always propagates.
+
+    An error result may leave the underlying client wedged, and ``send`` reuses
+    it (``_ensure_client`` only reconnects when the client is ``None``). Callers
+    that want to retry should therefore *discard the session and construct a new
+    one* — "fall back to a fresh session" means a fresh :class:`ClaudeAgentSession`,
+    not another ``send`` on this instance.
     """
 
     system_prompt: Optional[str] = None
@@ -333,14 +343,19 @@ class ClaudeAgentSession:
 
     async def send(self, prompt: str) -> AgentResult:
         try:
-            client = await self._ensure_client()
-            await client.query(prompt)
-            return await asyncio.wait_for(
-                _drain(client.receive_response(), self.model),
-                timeout=self.timeout_seconds,
-            )
+            return await asyncio.wait_for(self._turn(prompt), timeout=self.timeout_seconds)
         except (ClaudeSDKError, OSError, UnicodeDecodeError, TimeoutError) as exc:
             return AgentResult(text=f"{type(exc).__name__}: {exc}", is_error=True)
+
+    async def _turn(self, prompt: str) -> AgentResult:
+        # The whole turn — connect, query, and drain — runs under send()'s
+        # timeout, matching ClaudeAgentRunner (which wraps all of _consume): a
+        # hang in connect() or query(), not just in the response stream, must
+        # still surface as an error result rather than blocking a shared-pool
+        # worker forever.
+        client = await self._ensure_client()
+        await client.query(prompt)
+        return await _drain(client.receive_response(), self.model)
 
     async def aclose(self) -> None:
         if self._client is not None:
