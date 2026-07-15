@@ -53,4 +53,10 @@ jobs:
           # Reference both; whichever secret is set is used by the runner.
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: dev-team-benchmark --budget-usd "${{ github.event.inputs.budget_usd || '2.0' }}"
+          # The dispatch input is passed through an env var, never interpolated
+          # into the script text, so it cannot break out of the command and run
+          # arbitrary shell in a step that holds the credential secrets. The
+          # shell applies the 2.0 default, and dev-team-benchmark's argparse
+          # rejects any non-numeric value before anything else runs.
+          BUDGET_USD: ${{ github.event.inputs.budget_usd }}
+        run: dev-team-benchmark --budget-usd "${BUDGET_USD:-2.0}"
