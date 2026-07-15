@@ -966,6 +966,29 @@ def test_llm_retrospective_with_no_lessons_adds_nothing():
     assert outcome.blackboard.get("retrospective") is None
 
 
+# -- score history trail (ROADMAP #6) ------------------------------------
+
+
+def test_delivery_records_a_score():
+    from dev_team.scores import ScoreHistory
+
+    ws = InMemoryWorkspace()
+    events = []
+    engine = _engine(
+        ScriptedRunner(by_system_prompt=engine_responses()),
+        workspace=ws,
+        listener=events.append,
+    )
+    outcome = run(engine.deliver(_request()))
+    (scored,) = ScoreHistory(ws).load()
+    assert scored.feature == outcome.request.title
+    assert scored.tasks_total == 1 and scored.tasks_succeeded == 1
+    assert scored.success is True
+    # the run surfaces a score event (no delta on the very first recorded run)
+    score_events = [e for e in events if e.stage == "score"]
+    assert score_events and score_events[-1].detail is None
+
+
 def test_delivery_outcome_property_edges():
     # No tasks -> not complete -> not success; budget None -> zero cost.
     outcome = DeliveryOutcome(

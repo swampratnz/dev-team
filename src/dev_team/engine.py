@@ -81,6 +81,7 @@ from .memory import (
     RunCheckpoint,
     task_fingerprint,
 )
+from .scores import RunScore, ScoreHistory
 from .models import (
     ChangeType,
     Design,
@@ -693,6 +694,7 @@ class DeliveryEngine:
             BacklogStore(self.workspace) if self.workdir is not None else None
         )
         self.memory = memory or ProjectMemory(self.workspace)
+        self.scores = ScoreHistory(self.workspace)
         self.checkpoints = checkpoints or (
             CheckpointStore(self.workspace) if self.config.resume else None
         )
@@ -1031,11 +1033,34 @@ class DeliveryEngine:
             baseline=baseline,
             scorecard=dict(self._scorecard),
         )
+        self._record_score(outcome)
         if outcome.success and self.checkpoints is not None:
             self.checkpoints.clear(request.title)
         verdict = "succeeded" if outcome.success else "with issues"
         self._event("done", f"Delivery finished {verdict}", detail=f"${outcome.cost_usd:.4f}")
         return outcome
+
+    def _record_score(self, outcome: DeliveryOutcome) -> None:
+        """Append this run's headline metrics to the persisted score trail.
+
+        Deterministic and always-on (like the memory save): the trail is how a
+        prompt/orchestration change shows up as a delta rather than a vibe. The
+        movement from the previous run, if any, is surfaced as an event.
+        """
+
+        self.scores.record(
+            RunScore(
+                feature=outcome.request.title,
+                success=outcome.success,
+                tasks_total=len(outcome.task_results),
+                tasks_succeeded=sum(1 for tr in outcome.task_results if tr.succeeded),
+                total_attempts=sum(tr.attempts for tr in outcome.task_results),
+                cost_usd=outcome.cost_usd,
+                committed=outcome.committed,
+                scorecard=dict(outcome.scorecard),
+            )
+        )
+        self._event("score", "Run score recorded", detail=self.scores.latest_delta())
 
     # -- run preparation -------------------------------------------------------
 
