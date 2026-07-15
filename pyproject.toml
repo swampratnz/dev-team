@@ -38,6 +38,7 @@ test = [
 
 [project.scripts]
 dev-team = "dev_team.cli:main"
+dev-team-benchmark = "dev_team.benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

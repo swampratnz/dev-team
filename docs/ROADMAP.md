@@ -173,9 +173,20 @@ cost, the scorecard counters) to a bounded `.dev_team/score-history.json`, and
 `ScoreHistory.render` shows each run's headline metrics with signed deltas from
 the run before it (a run also logs its delta as an event) — so a prompt or
 orchestration change shows up as a movement rather than a vibe. No LLM, no
-network. Remaining: a standing **benchmark suite in CI** against the real runner
-(budget-capped) feeding this trail — deferred pending a governance decision on
-scheduled real spend and SDK credentials in CI.
+network.
+
+The standing **benchmark suite** has also landed (`dev_team.benchmark`): a
+fixed set of `EvalCase`s run through the real team and scored by `evals.evaluate`
+(green, security-approved, production-ready, within a per-case budget), exposed
+as the `dev-team-benchmark` console entry point and wired into a nightly CI
+workflow (`.github/workflows/benchmark.yml`). That workflow is **disabled by
+default** — its one enable switch is the `RUN_BENCHMARKS` repository variable, so
+both the nightly run and manual dispatch stay completely inert (no spend, no
+credential use) until an admin sets it to `true` and provides a Claude
+credential secret — the governance guard for scheduled real spend. Remaining:
+persisting the benchmark's aggregate result into a durable cross-run trail
+(the per-delivery score mechanism above is in place; committing/retaining the
+benchmark aggregate across CI runs is the follow-up).
 
 ## 7. Richer interaction surfaces
 
