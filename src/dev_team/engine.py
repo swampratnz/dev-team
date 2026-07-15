@@ -141,6 +141,10 @@ class EngineConfig:
     - ``require_green_baseline``: refuse to start on a workspace whose gates
       are already red — inherited breakage otherwise poisons every task and
       gets blamed on the engineer.
+    - ``require_recognised_project``: refuse to start when no build manifest is
+      recognised, instead of guessing a ``pytest`` verify command. Off by
+      default (the greenfield-friendly fallback stands); when the fallback does
+      run it is announced loudly so a wrong-stack guess is never silent.
     - ``branch`` / ``use_branch``: agentic deliveries work on a dedicated
       ``dev-team/<feature>`` branch (never the caller's current branch).
     - ``allow_dirty_baseline``: by default a dirty working tree halts the run
@@ -186,6 +190,13 @@ class EngineConfig:
     resume: bool = True
     require_green_baseline: bool = True
     tolerate_baseline_failures: bool = True
+    #: Refuse to start when the workspace holds no recognised build manifest,
+    #: rather than falling back to a guessed ``pytest`` verify command. Off by
+    #: default (the fallback keeps greenfield Python deliveries working); the
+    #: fallback, when it runs, is now announced loudly so it is never silent.
+    #: Ignored when ``verify_command`` / ``remote_verify_status`` is set (the
+    #: caller already chose the gate). See ``docs/ROADMAP.md``.
+    require_recognised_project: bool = False
     branch: Optional[str] = None
     use_branch: bool = True
     allow_dirty_baseline: bool = False
@@ -445,6 +456,11 @@ def _retrospective(
 # The LLM retrospective is fed a compact digest, never the raw transcript.
 _MAX_EVIDENCE_CHARS = 4000
 _MAX_EVIDENCE_NOTABLE_SPANS = 10
+
+# A rejected attempt's reason is journalled to the event log so a failed
+# delivery is diagnosable in place (not only via --transcript's trace). The
+# reason is length-bounded so one verbose gate dump can't bloat events.jsonl.
+_MAX_REJECTION_DETAIL_CHARS = 400
 
 
 def _run_evidence(
@@ -760,6 +776,30 @@ class DeliveryEngine:
             AgentEvent(role="engine", stage=stage, message=message, detail=detail),
         )
 
+    def _journal_rejection(
+        self, task: Task, span: TraceSpan, stage: str, reason: str
+    ) -> None:
+        """Record *why* an attempt was rejected to the event log.
+
+        The rejection already closes a trace span, but the trace is internal
+        and only surfaces with ``--transcript``. The event log
+        (``events.jsonl``) is what the dashboard and a post-mortem read, so
+        without this a failed delivery reads only as ``T<n> failed`` with no
+        reason. Emitting the stage and a compact reason here is what makes a
+        run's failures diagnosable in place. The reason is whitespace-collapsed
+        and length-bounded so one verbose gate dump cannot bloat the log.
+        """
+
+        detail = " ".join(str(reason).split())
+        if len(detail) > _MAX_REJECTION_DETAIL_CHARS:
+            detail = detail[:_MAX_REJECTION_DETAIL_CHARS].rstrip() + "..."
+        attempt = span.attributes.get("attempt", "?")
+        self._event(
+            "attempt-rejected",
+            f"{task.id} attempt {attempt} rejected at {stage}",
+            detail=detail or None,
+        )
+
     async def deliver(self, request: FeatureRequest) -> DeliveryOutcome:
         """Run the full real delivery lifecycle for ``request``."""
 
@@ -791,7 +831,10 @@ class DeliveryEngine:
                 )
 
         self._profile = detect_project(self.workspace)
-        self._resolve_gates()
+        halt = self._resolve_gates()
+        if halt is not None:
+            self.tracer.end(run_span, "halted")
+            return self._halted(request, halt)
         self._scorecard: Dict[str, int] = {
             "plan_lint_issues": 0,
             "review_rejections": 0,
@@ -1144,11 +1187,16 @@ class DeliveryEngine:
                 f"{added}",
             )
 
-    def _resolve_gates(self) -> None:
-        """Build the Definition of Done from the workspace when not configured."""
+    def _resolve_gates(self) -> Optional[str]:
+        """Build the Definition of Done from the workspace when not configured.
+
+        Returns a halt reason when the project stack could not be recognised
+        and the caller asked to refuse rather than guess a verify command
+        (``require_recognised_project``); ``None`` otherwise.
+        """
 
         if self.definition_of_done is not None:
-            return
+            return None
         profile = self._profile or detect_project(self.workspace)
         self.blackboard.put("project_profile", profile.kind)
         if profile.verify_command is None:
@@ -1181,7 +1229,34 @@ class DeliveryEngine:
                     "review (set remote_verify_status to gate on real CI)"
                 ),
             )
-            return
+            return None
+        if profile.kind == "unknown":
+            # No manifest was recognised, so the verify command is a *guess*
+            # (pytest). Silently guessing is what makes a from-scratch delivery
+            # of, say, a Node or Go project fail every task on a command that
+            # was never theirs. Refuse outright when asked to; otherwise fall
+            # back — but loudly, naming the assumption so it is never silent.
+            if self.config.require_recognised_project:
+                return (
+                    "no build manifest was recognised in the workspace and "
+                    "require_recognised_project is set: refusing to guess a "
+                    "verify command. Set verify_command (or remote_verify_status) "
+                    "to tell the delivery how to test this project."
+                )
+            self.definition_of_done = DefinitionOfDone(
+                [CommandGate("tests", profile.verify_command)]
+            )
+            self._event(
+                "gates",
+                "No build manifest recognised — guessing a Python/pytest project",
+                detail=(
+                    f"assuming verify: {' '.join(profile.verify_command)} "
+                    f"({profile.reason}). If this repo is not Python, set "
+                    "verify_command (or remote_verify_status) — otherwise every "
+                    "task fails on a command that was never yours."
+                ),
+            )
+            return None
         self.definition_of_done = DefinitionOfDone(
             [CommandGate("tests", profile.verify_command)]
         )
@@ -1190,6 +1265,7 @@ class DeliveryEngine:
             f"Auto-detected {profile.kind} project",
             detail=f"verify: {' '.join(profile.verify_command)} ({profile.reason})",
         )
+        return None
 
     def _remote_ci_gate(self) -> RemoteCIGate:
         """The configured external-CI gate (requires remote_verify_status)."""
@@ -1799,6 +1875,7 @@ class DeliveryEngine:
                     self.tracer.end(span, "done")
                     return TaskResult(task, attempts, implementation, review, test_report)
                 feedback = merge_feedback
+                self._journal_rejection(task, span, "merge", merge_feedback.summary)
                 self.tracer.end(span, "merge-gates-failed")
 
             task.status = TaskStatus.FAILED
@@ -1913,6 +1990,7 @@ class DeliveryEngine:
                 )
                 self._rollback(snapshot, repo)
                 task.status = TaskStatus.CHANGES_REQUESTED
+                self._journal_rejection(task, span, "review", review.summary)
                 self.tracer.end(span, "changes-requested")
                 return False, review, None, review
 
@@ -1957,6 +2035,7 @@ class DeliveryEngine:
                     )
                     self._rollback(snapshot, repo)
                     task.status = TaskStatus.CHANGES_REQUESTED
+                    self._journal_rejection(task, span, "gates", dod.summary())
                     self.tracer.end(span, "gates-failed")
                     return False, review, test_report, _review_from_dod(dod)
 
@@ -1973,6 +2052,12 @@ class DeliveryEngine:
                 )
                 self._rollback(snapshot, repo)
                 task.status = TaskStatus.CHANGES_REQUESTED
+                self._journal_rejection(
+                    task,
+                    span,
+                    "verification",
+                    "restoring the shelved implementation failed (stash pop conflict)",
+                )
                 self.tracer.end(span, "stash-restore-failed")
                 feedback = Review(
                     approved=False,
@@ -1999,6 +2084,12 @@ class DeliveryEngine:
                 )
                 self._rollback(snapshot, repo)
                 task.status = TaskStatus.CHANGES_REQUESTED
+                self._journal_rejection(
+                    task,
+                    span,
+                    "vacuous-tests",
+                    "the test suite still passes with the implementation reverted",
+                )
                 self.tracer.end(span, "vacuous-tests")
                 feedback = Review(
                     approved=False,

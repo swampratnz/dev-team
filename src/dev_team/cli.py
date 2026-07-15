@@ -491,6 +491,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start even when the workspace's quality gates already fail "
         "(with --deliver). By default a red baseline halts the run.",
     )
+    delivery.add_argument(
+        "--require-recognised-project",
+        action="store_true",
+        help="Refuse to start when no build manifest is recognised, instead of "
+        "guessing a pytest verify command (with --deliver). By default the "
+        "greenfield pytest fallback runs, but announces itself loudly.",
+    )
     misc.add_argument(
         "--budget-usd",
         type=float,
@@ -812,6 +819,7 @@ def _reject_deliver_only_flags(
         ("--branch", args.branch is not None),
         ("--allow-dirty-baseline", args.allow_dirty_baseline),
         ("--proceed-on-red-baseline", args.proceed_on_red_baseline),
+        ("--require-recognised-project", args.require_recognised_project),
         ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
         ("--no-commit", args.no_commit),
         (
@@ -884,6 +892,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         llm_retrospective=args.llm_retrospective,
         allow_dirty_baseline=args.allow_dirty_baseline,
         require_green_baseline=not args.proceed_on_red_baseline,
+        require_recognised_project=args.require_recognised_project,
         remote_verify_status=(
             tuple(shlex.split(args.remote_verify_status))
             if args.remote_verify_status
