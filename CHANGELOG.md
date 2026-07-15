@@ -134,6 +134,31 @@ sections below are reconstructed from the repository history.
   over-flagging — under-flagging is the accepted direction, never promoted
   to a positive signal. `find_finding` inherits the field for free via its
   existing delegation to `list_findings`.
+- **Interactive dispatch deliver** (`docs/DISPATCH.md`): `POST /jobs` gains
+  opt-in `interactive`/`interactive_timeout_seconds` fields — the missing
+  wiring `docs/ROADMAP.md` item 7 named directly (`Dispatcher.run_job`
+  hardcoded every `deliver` job's `DevTeam(interaction=None)`, so plan
+  review, re-plan supervision, and failure escalation always ran fully
+  autonomous no matter what an operator wanted). A new `_TrackedChannel`
+  (a `QueueChannel` that records its live pending `Question` without
+  draining the queue only the engine's own `ask()` should consume) is
+  wired in when `interactive: true`, surfaced over two new endpoints:
+  `GET /jobs/{id}/question` (peek the live pause, `404` unknown job) and
+  `POST /jobs/{id}/answer` (`choice` validated against the closed set of
+  the *live* question's keys — never free-form — `400` on a mismatch,
+  `409` when nothing is pending, `202` on success). Both reuse the
+  existing bearer-auth gate exactly like every other route.
+  `interactive_timeout_seconds` resolves to `300` when omitted and is
+  clamped to `[30, 1800]` before a `_TrackedChannel` is ever constructed —
+  mirroring #71's poll-timeout clamp, so a misconfigured or malicious huge
+  timeout cannot wedge the single-flight worker on one paused job; nobody
+  answering within the bound falls through to the question's default
+  choice, exactly the existing `QueueChannel` fail-secure behaviour. The
+  deliver approval gate (`PolicyApprovalGate(block_risks=("high",))`) is
+  completely untouched by this feature — answering an interactive question
+  can never approve a push/deploy/rm. Zero marginal cost when `interactive`
+  is omitted (the default): no `_TrackedChannel` is constructed and
+  `interaction=None` is passed exactly as before.
 
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the

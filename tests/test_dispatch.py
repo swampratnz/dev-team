@@ -38,6 +38,7 @@ from dev_team.dispatch import (
 )
 from dev_team.eventlog import read_events
 from dev_team.execution import InMemoryWorkspace, LocalWorkspace
+from dev_team.interaction import Choice, Question, Reply
 from dev_team.testing import ScriptedRunner
 
 TOKEN = "s3cr3t-token"
@@ -1794,6 +1795,411 @@ def test_cancel_http_route_requires_auth():
     with running(materialise=_mem_materialise) as server:
         assert _call(server, "/jobs/x/cancel", method="POST", token=None) == (
             401, {"error": "unauthorized"})
+
+
+# --- interactive dispatch: question/answer (issue #87) -----------------------
+
+
+def _sample_question():
+    return Question(
+        topic="plan-review",
+        prompt="Approve?",
+        choices=(Choice("approve", "go"), Choice("abort", "stop")),
+        context="plan text",
+        asked_by="Priya",
+    )
+
+
+def _interactive_spec(job_id, **overrides):
+    fields = dict(
+        mode="deliver", repo="acme/mono", title="T", description="D",
+        budget_usd=None, interactive=True, id=job_id,
+    )
+    fields.update(overrides)
+    return JobSpec(**fields)
+
+
+def _run_interactive(disp, spec):
+    """Run an interactive deliver job's run_job() to completion on its own
+    thread (with its own event loop), registering it in disp's registry
+    first so answer_question()/get_question() can find it by id. Returns
+    (record, thread, box); the caller must service record.channel (read the
+    posted Question off record.channel.questions, answer via
+    disp.answer_question) and then join the thread. ``box`` collects
+    ``outcome``/``cost`` on success or ``error`` on an uncaught exception.
+    """
+
+    record = JobRecord(spec=spec)
+    disp._registry[spec.id] = record
+    box = {}
+
+    def target():
+        try:
+            box["outcome"], box["cost"] = asyncio.run(disp.run_job(record))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the test via box
+            box["error"] = exc
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    return record, thread, box
+
+
+def _await_channel(record, timeout=5.0):
+    """Wait for run_job to construct record.channel (near-instant: it
+    happens synchronously before the first await in run_job, but the
+    calling thread still needs to observe it)."""
+
+    deadline = time.time() + timeout
+    while record.channel is None:
+        if time.time() > deadline:
+            raise AssertionError("interactive channel was never constructed")
+        time.sleep(0.005)
+    return record.channel
+
+
+def test_build_spec_interactive_defaults_false_and_must_be_bool():
+    disp = Dispatcher(token="x")
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "a/b", "title": "T", "description": "D"}
+    )
+    assert spec.interactive is False
+    assert spec.interactive_timeout_seconds is None
+
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "a/b", "title": "T", "description": "D",
+         "interactive": True, "interactive_timeout_seconds": 60}
+    )
+    assert spec.interactive is True
+    assert spec.interactive_timeout_seconds == 60
+
+    for bad in (1, 0, "true", None, [], {}):
+        with pytest.raises(ValidationError):
+            disp.build_spec({"mode": "assess", "repo": "a/b", "interactive": bad})
+    for bad in (True, "60", [], {}):
+        with pytest.raises(ValidationError):
+            disp.build_spec(
+                {"mode": "assess", "repo": "a/b", "interactive_timeout_seconds": bad}
+            )
+    # null is explicitly allowed (means "use the default once running")
+    assert disp.build_spec(
+        {"mode": "assess", "repo": "a/b", "interactive_timeout_seconds": None}
+    ).interactive_timeout_seconds is None
+
+
+def test_resolved_interactive_timeout_defaults_and_clamps():
+    assert dispatch_mod._resolved_interactive_timeout(None) == 300.0
+    assert dispatch_mod._resolved_interactive_timeout(5) == 30.0
+    assert dispatch_mod._resolved_interactive_timeout(999999) == 1800.0
+    assert dispatch_mod._resolved_interactive_timeout(600) == 600.0
+
+
+def test_run_job_deliver_non_interactive_baseline_is_unchanged(monkeypatch):
+    # AC4 [baseline]: interactive absent (default False) -> zero
+    # _TrackedChannel construction and interaction=None still passed to
+    # DevTeam(...), exactly like before this feature existed.
+    captured = {}
+    real_init = dispatch_mod.DevTeam.__init__
+
+    def spy_init(self, *args, **kwargs):
+        captured["interaction"] = kwargs.get("interaction")
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(dispatch_mod.DevTeam, "__init__", spy_init)
+
+    disp = Dispatcher(token="x", runner=_deliver_runner(), materialise=_mem_materialise)
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d"}
+    )
+    spec.id = "deliver-baseline"
+    record = JobRecord(spec=spec)
+    outcome, cost = asyncio.run(disp.run_job(record))
+    assert outcome.success is True
+    assert record.channel is None
+    assert captured["interaction"] is None
+
+
+def test_interactive_deliver_default_timeout_resolves_to_300_once_running():
+    # AC1: interactive: true with no interactive_timeout_seconds resolves to
+    # the documented default (300) once running, asserted via the record.
+    disp = Dispatcher(token="x", runner=_deliver_runner(), materialise=_mem_materialise)
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d",
+         "interactive": True}
+    )
+    spec.id = "deliver-ac1"
+    record, thread, box = _run_interactive(disp, spec)
+    try:
+        channel = _await_channel(record)
+        assert channel.timeout == 300.0
+        question = channel.questions.get(timeout=5)
+        assert question.topic == "plan-review"
+        status, payload = disp.answer_question(spec.id, {"choice": question.default.key})
+        assert status == 202
+    finally:
+        thread.join(timeout=5)
+    assert "error" not in box
+    assert box["outcome"].success is True
+
+
+@pytest.mark.parametrize("requested,expected", [(5, 30.0), (999999, 1800.0)])
+def test_interactive_deliver_clamps_out_of_range_timeout(requested, expected):
+    # AC2 [security/resource-bounding]: out-of-bound requested timeouts are
+    # clamped to the floor/ceiling rather than stored/used as-is — asserted
+    # against what _TrackedChannel is actually constructed with.
+    disp = Dispatcher(token="x", runner=_deliver_runner(), materialise=_mem_materialise)
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d",
+         "interactive": True, "interactive_timeout_seconds": requested}
+    )
+    spec.id = f"deliver-clamp-{requested}"
+    record, thread, box = _run_interactive(disp, spec)
+    try:
+        channel = _await_channel(record)
+        assert channel.timeout == expected
+        question = channel.questions.get(timeout=5)
+        status, _ = disp.answer_question(spec.id, {"choice": question.default.key})
+        assert status == 202
+    finally:
+        thread.join(timeout=5)
+    assert "error" not in box
+
+
+def test_interactive_deliver_end_to_end_preserves_approval_gate(monkeypatch):
+    # AC7 [security]: through a REAL (not mocked) DeliveryEngine plan-review
+    # pause, the deliver job's approval gate is still the unchanged
+    # PolicyApprovalGate(block_risks=("high",)) instance/config — answering
+    # interactive questions cannot be used to approve a high-risk command.
+    captured = {}
+    real_make_engine = dispatch_mod.DevTeam.make_engine
+
+    def spy_make_engine(self, **kwargs):
+        engine = real_make_engine(self, **kwargs)
+        captured["approval"] = kwargs.get("approval")
+        return engine
+
+    monkeypatch.setattr(dispatch_mod.DevTeam, "make_engine", spy_make_engine)
+
+    disp = Dispatcher(token="x", runner=_deliver_runner(), materialise=_mem_materialise)
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d",
+         "interactive": True}
+    )
+    spec.id = "deliver-ac7"
+    record, thread, box = _run_interactive(disp, spec)
+    try:
+        channel = _await_channel(record)
+        question = channel.questions.get(timeout=5)
+        assert question.topic == "plan-review"
+        # A separate assertion (not just the approval gate) that answering
+        # the question has no code path touching record.spec at all.
+        spec_before = dict(vars(record.spec))
+        status, _ = disp.answer_question(spec.id, {"choice": question.default.key})
+        assert status == 202
+        assert dict(vars(record.spec)) == spec_before
+    finally:
+        thread.join(timeout=5)
+    assert "error" not in box
+    assert box["outcome"].success is True
+
+    approval = captured["approval"]
+    assert isinstance(approval, PolicyApprovalGate)
+    assert approval.block_risks == ("high",)
+
+
+def test_answer_question_rejects_unknown_choice_without_unblocking():
+    # AC5 [security]: an invalid choice must not push anything onto
+    # replies — ask() (driven for real, on a background thread) is still
+    # blocked afterward; a valid choice then unblocks it promptly.
+    disp = Dispatcher(token="x")
+    channel = dispatch_mod._TrackedChannel(timeout=5)
+    spec = _interactive_spec("ans-1")
+    disp._registry[spec.id] = JobRecord(spec=spec, channel=channel)
+
+    result = {}
+
+    def ask():
+        result["reply"] = channel.ask(_sample_question())
+
+    thread = threading.Thread(target=ask)
+    thread.start()
+    deadline = time.time() + 5
+    while channel.current is None:
+        if time.time() > deadline:
+            raise AssertionError("ask() never posted a question")
+        time.sleep(0.005)
+
+    assert disp.answer_question(spec.id, {"choice": "nope"}) == (
+        400, {"error": "unknown choice"})
+    time.sleep(0.05)
+    assert thread.is_alive(), "an invalid choice must not have unblocked ask()"
+
+    assert disp.answer_question(spec.id, {"choice": "approve"}) == (202, {})
+    thread.join(timeout=5)
+    assert result["reply"] == Reply(choice="approve", text="")
+
+
+def test_answer_question_non_string_choice_is_400():
+    disp = Dispatcher(token="x")
+    channel = dispatch_mod._TrackedChannel(timeout=5)
+    channel.current = _sample_question()
+    spec = _interactive_spec("ans-nc")
+    disp._registry[spec.id] = JobRecord(spec=spec, channel=channel)
+    assert disp.answer_question(spec.id, {"choice": None}) == (
+        400, {"error": "unknown choice"})
+    assert disp.answer_question(spec.id, {}) == (400, {"error": "unknown choice"})
+
+
+def test_answer_question_defaults_text_and_coerces_non_string():
+    disp = Dispatcher(token="x")
+    channel = dispatch_mod._TrackedChannel(timeout=5)
+    spec = _interactive_spec("ans-txt")
+    disp._registry[spec.id] = JobRecord(spec=spec, channel=channel)
+
+    channel.current = _sample_question()
+    assert disp.answer_question(spec.id, {"choice": "approve"}) == (202, {})
+    assert channel.replies.get(timeout=1) == Reply(choice="approve", text="")
+
+    channel.current = _sample_question()
+    assert disp.answer_question(
+        spec.id, {"choice": "approve", "text": 123}
+    ) == (202, {})
+    assert channel.replies.get(timeout=1) == Reply(choice="approve", text="")
+
+
+def test_answer_question_no_pending_question_is_409():
+    # AC8: never a silent no-op 202 — a job that was never interactive, or
+    # is interactive but not currently paused, both answer 409.
+    disp = Dispatcher(token="x")
+    never_interactive = JobSpec(
+        mode="deliver", repo="a/b", title="T", description="D",
+        budget_usd=None, id="ans-a",
+    )
+    disp._registry["ans-a"] = JobRecord(spec=never_interactive)
+    assert disp.answer_question("ans-a", {"choice": "approve"}) == (
+        409, {"error": "no pending question"})
+
+    not_paused = _interactive_spec("ans-b")
+    channel = dispatch_mod._TrackedChannel(timeout=5)
+    disp._registry["ans-b"] = JobRecord(spec=not_paused, channel=channel)
+    assert disp.answer_question("ans-b", {"choice": "approve"}) == (
+        409, {"error": "no pending question"})
+
+    assert disp.answer_question("ghost", {"choice": "approve"}) == (
+        404, {"error": "unknown job"})
+
+
+def test_get_question_pending_states_and_unknown_job():
+    # AC6: false for a non-interactive job, an interactive job with no live
+    # pause yet, and after a question has been answered; true with the live
+    # Question's shape while ask() is blocked; 404 for an unknown job id.
+    disp = Dispatcher(token="x")
+
+    never_interactive = JobSpec(
+        mode="deliver", repo="a/b", title="T", description="D",
+        budget_usd=None, id="q-a",
+    )
+    disp._registry["q-a"] = JobRecord(spec=never_interactive)
+    assert disp.get_question("q-a") == (200, {"pending": False})
+
+    not_paused = _interactive_spec("q-b")
+    channel = dispatch_mod._TrackedChannel(timeout=5)
+    disp._registry["q-b"] = JobRecord(spec=not_paused, channel=channel)
+    assert disp.get_question("q-b") == (200, {"pending": False})
+
+    channel.current = _sample_question()
+    status, payload = disp.get_question("q-b")
+    assert status == 200
+    assert payload == {
+        "pending": True,
+        "prompt": "Approve?",
+        "context": "plan text",
+        "choices": [
+            {"key": "approve", "label": "go", "accepts_text": False},
+            {"key": "abort", "label": "stop", "accepts_text": False},
+        ],
+        "default": "approve",
+    }
+
+    channel.current = None  # answered
+    assert disp.get_question("q-b") == (200, {"pending": False})
+
+    assert disp.get_question("ghost") == (404, {"error": "unknown job"})
+
+
+def test_tracked_channel_timeout_takes_default_and_clears_current():
+    # AC9: nobody answers within the bound -> the question's default Reply
+    # is taken, and GET .../question reflects {"pending": false} again
+    # afterward via the finally clear. No real time.sleep — the short
+    # timeout is the QueueChannel's own bounded wait, same convention as
+    # test_queue_channel_timeout_takes_default.
+    disp = Dispatcher(token="x")
+    channel = dispatch_mod._TrackedChannel(timeout=0.01)
+    spec = _interactive_spec("timeout-1")
+    disp._registry[spec.id] = JobRecord(spec=spec, channel=channel)
+
+    reply = channel.ask(_sample_question())
+    assert reply == Reply(choice="approve")
+    assert channel.current is None
+    assert disp.get_question(spec.id) == (200, {"pending": False})
+
+
+def test_question_and_answer_http_routes_round_trip():
+    with running(materialise=_mem_materialise) as server:
+        disp = server.dispatcher
+        channel = dispatch_mod._TrackedChannel(timeout=5)
+        spec = _interactive_spec("http-qa")
+        disp._registry["http-qa"] = JobRecord(spec=spec, channel=channel)
+        disp._order.append("http-qa")
+
+        assert _call(server, "/jobs/http-qa/question") == (200, {"pending": False})
+
+        channel.current = _sample_question()
+        status, payload = _call(server, "/jobs/http-qa/question")
+        assert status == 200
+        assert payload["pending"] is True
+        assert payload["default"] == "approve"
+
+        assert _call(
+            server, "/jobs/http-qa/answer", method="POST", body={"choice": "nope"}
+        ) == (400, {"error": "unknown choice"})
+
+        assert _call(
+            server, "/jobs/http-qa/answer", method="POST",
+            body={"choice": "approve", "text": "go ahead"},
+        ) == (202, {})
+        assert channel.replies.get(timeout=5) == Reply(
+            choice="approve", text="go ahead"
+        )
+
+        assert _call(server, "/jobs/unknown/question") == (
+            404, {"error": "unknown job"})
+        assert _call(
+            server, "/jobs/unknown/answer", method="POST", body={"choice": "x"}
+        ) == (404, {"error": "unknown job"})
+
+
+def test_question_and_answer_http_routes_require_auth():
+    # AC11 [security]: the two new endpoints are not accidentally exempted
+    # from the existing bearer-auth gate.
+    with running(materialise=_mem_materialise) as server:
+        assert _call(server, "/jobs/x/question", token=None) == (
+            401, {"error": "unauthorized"})
+        assert _call(
+            server, "/jobs/x/answer", method="POST", token=None,
+            body={"choice": "approve"},
+        ) == (401, {"error": "unauthorized"})
+
+
+def test_answer_http_route_rejects_malformed_body():
+    # A malformed JSON body is rejected by _read_body's own 400 before
+    # answer_question is ever reached (mirrors _create's malformed-body
+    # handling for POST /jobs).
+    with running(materialise=_mem_materialise) as server:
+        status, payload = _call(
+            server, "/jobs/x/answer", method="POST", body=b"{not json"
+        )
+        assert status == 400
+        assert "error" in payload
 
 
 def test_jobs_list_archived_query_param_reveals_archived_jobs():
