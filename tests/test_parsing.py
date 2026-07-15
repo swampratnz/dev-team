@@ -149,6 +149,44 @@ def test_plan_from_dict_non_dict():
     assert plan.tasks == []
 
 
+def test_replan_from_dict_uses_caller_task_id_and_explicit_action():
+    from dev_team.replan import ReplanAction
+
+    decision = parsing.replan_from_dict(
+        {
+            "action": "split",
+            "rationale": "too big",
+            "replacements": [{"id": "T1a"}, {"id": "T1b", "dependencies": ["T1a"]}],
+        },
+        "T1",  # the caller (engine) names the failed task, not the model
+    )
+    assert decision.action is ReplanAction.SPLIT
+    assert decision.failed_task_id == "T1"
+    assert decision.rationale == "too big"
+    assert [t.id for t in decision.replacements] == ["T1a", "T1b"]
+
+
+def test_replan_from_dict_infers_action_from_replacement_count():
+    from dev_team.replan import ReplanAction
+
+    drop = parsing.replan_from_dict({"replacements": []}, "T1")
+    replace = parsing.replan_from_dict({"replacements": [{"id": "T1b"}]}, "T1")
+    split = parsing.replan_from_dict(
+        {"replacements": [{"id": "T1a"}, {"id": "T1b"}]}, "T1"
+    )
+    assert drop.action is ReplanAction.DROP
+    assert replace.action is ReplanAction.REPLACE
+    assert split.action is ReplanAction.SPLIT
+
+
+def test_replan_from_dict_non_dict_is_a_drop():
+    from dev_team.replan import ReplanAction
+
+    decision = parsing.replan_from_dict("nonsense", "T1")
+    assert decision.action is ReplanAction.DROP
+    assert decision.replacements == []
+
+
 def test_design_from_dict():
     design = parsing.design_from_dict(
         {
