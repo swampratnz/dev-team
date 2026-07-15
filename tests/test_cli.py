@@ -145,6 +145,26 @@ def test_main_max_replan_rounds_rejected_without_deliver(capsys):
     assert "--max-replan-rounds" in err and "--deliver" in err
 
 
+def test_main_reuse_engineer_session_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--reuse-engineer-session"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--reuse-engineer-session" in err and "--deliver" in err
+
+
+def test_engine_config_threads_reuse_engineer_session():
+    # The flag reaches EngineConfig. Tested at the config layer (not via a real
+    # delivery) because the CLI builds a real ClaudeAgentSession with no test
+    # seam — exercising the live SDK is out of scope for a unit test.
+    from dev_team.cli import _engine_config, build_parser
+
+    args = build_parser().parse_args(["T", "D", "--deliver", "--reuse-engineer-session"])
+    assert _engine_config(args).reuse_engineer_session is True
+    off = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(off).reuse_engineer_session is False
+
+
 def test_main_deliver_only_flags_all_reported(capsys):
     argv = [
         "Login", "Add login",

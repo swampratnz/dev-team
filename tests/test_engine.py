@@ -6,7 +6,14 @@ import asyncio
 import os
 
 import pytest
-from helpers import GateCycleRunner, engine_responses, qa_suite_dict, review_dict, run
+from helpers import (
+    GateCycleRunner,
+    engine_responses,
+    impl_dict,
+    qa_suite_dict,
+    review_dict,
+    run,
+)
 
 from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.budget import Budget, BudgetExceededError
@@ -2600,3 +2607,136 @@ def test_propose_replan_stops_on_budget_exhaustion():
     decision = run(eng._propose_replan(_request(), plan, t2, {"T2": r2}))
     assert decision is None
     assert eng._budget_exhausted is True
+
+
+# --- session continuity (--reuse-engineer-session) ----------------------
+
+
+def _rp_task(tid="T1"):
+    return Task(id=tid, title="t", description="d", acceptance_criteria=["ok"])
+
+
+def test_open_engineer_session_is_none_when_off():
+    assert _engine(ScriptedRunner([]))._open_engineer_session() is None
+
+
+def test_open_engineer_session_is_none_when_not_agentic():
+    # InMemoryWorkspace has no real root -> not agentic -> None even when on.
+    eng = _engine(ScriptedRunner([]), config=EngineConfig(reuse_engineer_session=True))
+    assert eng._open_engineer_session() is None
+
+
+def test_open_engineer_session_wraps_the_factory_when_agentic(tmp_path):
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import FakeAgentSession
+
+    fake = FakeAgentSession()
+    eng = _engine(
+        ScriptedRunner([]),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(reuse_engineer_session=True),
+        engineer_session_factory=lambda: fake,
+    )
+    session = eng._open_engineer_session()
+    assert isinstance(session, InstrumentedSession)
+    assert session.inner is fake and session.role == "engineer"
+
+
+def test_open_engineer_session_default_builds_a_claude_session(tmp_path):
+    from dev_team.sdk import ClaudeAgentSession
+
+    eng = _engine(
+        ScriptedRunner([]),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(reuse_engineer_session=True, engineer_tools=["Read"]),
+    )
+    inner = eng._open_engineer_session().inner
+    assert isinstance(inner, ClaudeAgentSession)
+    assert inner.cwd == eng.workdir
+    assert inner.allowed_tools == ["Read"]
+    assert inner.system_prompt == eng.engineer.effective_system_prompt
+
+
+def test_open_engineer_session_uses_default_tools_when_unset(tmp_path):
+    from dev_team.agents.engineer import TOOLS
+
+    eng = _engine(
+        ScriptedRunner([]),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(reuse_engineer_session=True),
+    )
+    assert eng._open_engineer_session().inner.allowed_tools == list(TOOLS)
+
+
+def test_engineer_attempt_over_session_returns_impl_and_keeps_session(tmp_path):
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    eng = _engine(ScriptedRunner([]), workspace=LocalWorkspace(str(tmp_path)))
+    fake = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
+    session = InstrumentedSession(fake, "engineer")
+    impl, out = run(
+        eng._engineer_attempt(_rp_task(), Design(overview="o"), None, session,
+                              continued=False, model=None)
+    )
+    assert isinstance(impl, Implementation)
+    assert out is session and not fake.closed  # healthy: kept for the next attempt
+    assert fake.prompts
+
+
+def test_engineer_attempt_falls_back_to_cold_on_session_error(tmp_path):
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    # The runner serves the cold implement_in_place fallback; the session errors.
+    eng = _engine(
+        ScriptedRunner([json_response(impl_dict())]),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(json_retries=0),
+    )
+    fake = FakeAgentSession(results=[AgentResult(text="", is_error=True)])
+    session = InstrumentedSession(fake, "engineer")
+    impl, out = run(
+        eng._engineer_attempt(_rp_task(), Design(overview="o"), None, session,
+                              continued=False, model=None)
+    )
+    assert isinstance(impl, Implementation)  # came from the cold fallback
+    assert out is None  # the wedged session was discarded
+    assert fake.closed is True
+
+
+def test_engineer_attempt_is_cold_when_no_session(tmp_path):
+    eng = _engine(
+        ScriptedRunner([json_response(impl_dict())]),
+        workspace=LocalWorkspace(str(tmp_path)),
+    )
+    impl, out = run(
+        eng._engineer_attempt(_rp_task(), Design(overview="o"), None, None,
+                              continued=False, model=None)
+    )
+    assert isinstance(impl, Implementation) and out is None
+
+
+def test_attempt_task_opens_and_closes_the_session(tmp_path):
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    sessions = []
+
+    def factory():
+        s = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
+        sessions.append(s)
+        return s
+
+    eng = _engine(
+        ScriptedRunner(by_system_prompt=engine_responses()),
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(
+            reuse_engineer_session=True, max_task_attempts=1,
+            fail_to_pass_check=False, verify_command=["true"],
+        ),
+        engineer_session_factory=factory,
+    )
+    run(eng._attempt_task(_rp_task(), Design(overview="o")))
+    assert sessions and sessions[0].closed is True  # opened per task, closed in finally
+    assert sessions[0].prompts  # the engineer turn went over the session
