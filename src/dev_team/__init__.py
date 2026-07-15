@@ -70,7 +70,7 @@ from .changes import AppliedChange, ApplyResult, ChangeApplier
 from .config import TeamConfig
 from .context import RepoContext, build_repo_context
 from .delivery_target import DeliveryTargetError, publish_pull_request
-from .engine import DeliveryEngine, DeliveryOutcome, EngineConfig
+from .engine import DeliveryEngine, DeliveryOutcome, EngineConfig, RemediationOutcome
 from .errors import (
     AgentResponseError,
     DependencyCycleError,
@@ -212,6 +212,7 @@ __all__ = [
     "DevelopmentWorkflow",
     "DeliveryEngine",
     "DeliveryOutcome",
+    "RemediationOutcome",
     "EngineConfig",
     "TeamConfig",
     "AssessmentEngine",

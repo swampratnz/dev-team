@@ -88,9 +88,21 @@ JSON (`checks_state`/`checks_failed`) and reflected in the exit code (a failed
 or timed-out watch makes the run non-zero even though the PR opened). A read
 error is reported cleanly and never sinks a delivery whose PR did open.
 
-**Remaining:** closing the loop — feeding a CI failure back as gate feedback so
-the team fixes it and re-pushes (force-with-lease) to the PR branch, bounded by
-rounds and budget, human-supervised when an interaction channel is attached.
+**Remediation primitive (shipped):** `DeliveryEngine.remediate_checks(ci_failure)`
+— one agentic pass to make a delivered PR's failing CI go green. The failing-
+checks text is untrusted CI output (a fork workflow's logs can be attacker-
+influenced), so it reaches the engineer as a `fences.defuse`'d, delimited
+`<ci-output>` block (declared off-limits by the engineer's system-prompt note);
+the engineer fixes the workspace in place, the Definition-of-Done gates decide,
+and a fix is committed to the branch only when they pass (a fix that doesn't is
+discarded, leaving the branch untouched; a passing gate with no change reports
+no-fix rather than an empty commit). It never pushes or opens PRs — the caller
+drives that.
+
+**Remaining:** the bounded CLI loop — on a failed `--watch-checks`, call
+`remediate_checks`, force-with-lease push the fix, and re-watch, up to
+`--watch-fix-rounds N` and within budget; autonomous when unattended,
+human-supervised (apply/skip per round) when an interaction channel is attached.
 
 ## 3. Dynamic re-planning
 
