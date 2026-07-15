@@ -25,9 +25,12 @@ from dev_team.interaction import (
     ask_in_thread,
     plan_review_question,
     render_plan,
+    render_replan,
+    replan_review_question,
     task_failure_question,
 )
 from dev_team.models import Plan, Task
+from dev_team.replan import Replan, ReplanAction
 
 
 def _question(**overrides):
@@ -332,6 +335,43 @@ def test_task_failure_question_defaults_to_skip():
 def test_task_failure_question_fails_safe_to_skip():
     question = task_failure_question("T1", "tests: boom", asked_by="Sam")
     assert question.fail_safe.key == "skip"
+
+
+def test_render_replan_shows_replacements_with_deps():
+    decision = Replan(
+        ReplanAction.SPLIT,
+        "T2",
+        [
+            Task(id="T2a", title="part a", description="", acceptance_criteria=["a"]),
+            Task(id="T2b", title="part b", description="", acceptance_criteria=["b"],
+                 dependencies=["T2a"]),
+        ],
+        rationale="too coupled",
+    )
+    text = render_replan(decision)
+    assert "split task T2" in text
+    assert "Why: too coupled" in text
+    assert "T2a: part a" in text
+    assert "T2b: part b (after T2a)" in text
+
+
+def test_render_replan_marks_a_drop_with_no_replacements():
+    text = render_replan(Replan(ReplanAction.DROP, "T2"))
+    assert "drop task T2" in text
+    assert "the failed task is dropped" in text
+
+
+def test_replan_review_question_defaults_to_apply_and_fails_safe_to_reject():
+    question = replan_review_question(
+        Replan(ReplanAction.DROP, "T2"), asked_by="Priya"
+    )
+    # unattended (AutoChannel) applies the manager's autonomous re-plan...
+    assert question.default.key == "apply"
+    # ...but a detached (EOF) run must not silently rewrite its own plan.
+    assert question.fail_safe.key == "reject"
+    assert question.find("revise").accepts_text is True
+    assert question.asked_by == "Priya"
+    assert "T2" in question.prompt
 
 
 def test_queue_channel_is_importable_from_package_root():

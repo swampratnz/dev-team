@@ -29,16 +29,19 @@ from dev_team.execution import (
     SubprocessCommandRunner,
 )
 from dev_team.git import GitRepo
-from dev_team.memory import CheckpointStore
+from dev_team.interaction import Reply, ScriptedChannel
+from dev_team.memory import CheckpointStore, RunCheckpoint
 from dev_team.models import (
     Design,
     FeatureRequest,
     Implementation,
+    Plan,
     SecurityReport,
     Task,
     TaskResult,
     TaskStatus,
 )
+from dev_team.replan import Replan, ReplanAction
 from dev_team.sdk import AgentResult
 from dev_team.testing import ScriptedRunner, json_response
 from dev_team.trace import Tracer
@@ -2286,3 +2289,206 @@ def test_sandbox_boxes_gates_but_delegates_git_to_host(tmp_path):
 
     engine.command_runner.run(["git", "status"], cwd=str(tmp_path))
     assert fake.calls[-1] == ["git", "status"]
+
+
+# --- dynamic re-planning loop (--max-replan-rounds) ---------------------
+
+
+def _rp_engine(**kwargs):
+    """A dry-run engine whose manager.replan is monkeypatched per test."""
+
+    return _engine(ScriptedRunner([]), **kwargs)
+
+
+def _done(tid):
+    task = Task(id=tid, title=tid, description="", acceptance_criteria=["ok"])
+    task.status = TaskStatus.DONE
+    return task, TaskResult(task=task, attempts=1)
+
+
+def _failed(tid, deps=None):
+    task = Task(
+        id=tid, title=tid, description="",
+        acceptance_criteria=["ok"], dependencies=list(deps or []),
+    )
+    task.status = TaskStatus.FAILED
+    return task, TaskResult(task=task, attempts=3)
+
+
+def test_engine_config_rejects_negative_replan_rounds():
+    with pytest.raises(ValueError, match="max_replan_rounds"):
+        EngineConfig(max_replan_rounds=-1)
+
+
+def test_failure_evidence_handles_a_missing_result():
+    # Defensive: no TaskResult on record still yields a usable evidence string.
+    assert _rp_engine()._failure_evidence(None) == "no evidence captured"
+
+
+def test_replan_loop_off_by_default_is_a_noop():
+    eng = _rp_engine()  # max_replan_rounds defaults to 0
+    t2, r2 = _failed("T2")
+    plan = Plan(summary="s", tasks=[t2])
+    results = {"T2": r2}
+    called = []
+
+    async def replan(*a, **k):
+        called.append(1)
+        return Replan(ReplanAction.DROP, "T2", [])
+
+    eng.manager.replan = replan
+
+    async def worker(task):  # pragma: no cover - must never run
+        raise AssertionError("no rescheduling when re-planning is off")
+
+    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    assert new_plan is plan and not called
+
+
+def test_replan_loop_replaces_failed_task_and_reschedules():
+    eng = _rp_engine()
+    eng.config.max_replan_rounds = 1
+    eng._checkpoint = RunCheckpoint(feature_title="Login")  # exercises the refresh
+    t1, r1 = _done("T1")
+    t2, r2 = _failed("T2")
+    plan = Plan(summary="s", tasks=[t1, t2])
+    results = {"T1": r1, "T2": r2}
+
+    async def replan(request, plan, task, evidence, *, revision_feedback=None):
+        return Replan(
+            ReplanAction.REPLACE, task.id,
+            [Task(id="T2b", title="retry", description="", acceptance_criteria=["ok"])],
+        )
+
+    eng.manager.replan = replan
+
+    async def worker(task):
+        task.status = TaskStatus.DONE
+        results[task.id] = TaskResult(task=task, attempts=1)
+        return True
+
+    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    assert [t.id for t in new_plan.tasks] == ["T1", "T2b"]
+    assert results["T2b"].succeeded  # the replacement was scheduled and passed
+    assert eng._checkpoint.plan is not None  # checkpoint refreshed to the new plan
+
+
+def test_replan_loop_stops_when_nothing_failed():
+    eng = _rp_engine()
+    eng.config.max_replan_rounds = 2
+    t1, r1 = _done("T1")
+    plan = Plan(summary="s", tasks=[t1])
+    results = {"T1": r1}
+    called = []
+
+    async def replan(*a, **k):
+        called.append(1)
+        return Replan(ReplanAction.DROP, "T1", [])
+
+    eng.manager.replan = replan
+
+    async def worker(task):  # pragma: no cover - nothing to schedule
+        raise AssertionError("unreachable")
+
+    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    assert new_plan is plan and not called
+
+
+def test_replan_loop_leaves_task_failed_when_supervisor_rejects():
+    eng = _rp_engine()
+    eng.config.max_replan_rounds = 1
+    eng.interaction = ScriptedChannel(script=[Reply(choice="reject")])
+    t1, r1 = _done("T1")
+    t2, r2 = _failed("T2")
+    plan = Plan(summary="s", tasks=[t1, t2])
+    results = {"T1": r1, "T2": r2}
+
+    async def replan(request, plan, task, evidence, *, revision_feedback=None):
+        return Replan(
+            ReplanAction.REPLACE, task.id,
+            [Task(id="T2b", title="x", description="", acceptance_criteria=["ok"])],
+        )
+
+    eng.manager.replan = replan
+
+    async def worker(task):  # pragma: no cover - rejection means no reschedule
+        raise AssertionError("a rejected re-plan must not reschedule")
+
+    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    assert [t.id for t in new_plan.tasks] == ["T1", "T2"]  # unchanged
+
+
+def test_replan_loop_discards_an_invalid_mutation():
+    eng = _rp_engine()
+    eng.config.max_replan_rounds = 1
+    t1, r1 = _failed("T1")  # the only task
+    plan = Plan(summary="s", tasks=[t1])
+    results = {"T1": r1}
+
+    async def replan(request, plan, task, evidence, *, revision_feedback=None):
+        return Replan(ReplanAction.DROP, task.id, [])  # dropping the only task -> empty plan
+
+    eng.manager.replan = replan
+
+    async def worker(task):  # pragma: no cover - the mutation is discarded
+        raise AssertionError("invalid mutation must not reschedule")
+
+    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    assert [t.id for t in new_plan.tasks] == ["T1"]  # discarded, left as-is
+
+
+def test_replan_loop_drops_a_failed_task_with_nothing_left_to_schedule():
+    eng = _rp_engine()
+    eng.config.max_replan_rounds = 1
+    t1, r1 = _done("T1")
+    t2, r2 = _failed("T2")
+    plan = Plan(summary="s", tasks=[t1, t2])
+    results = {"T1": r1, "T2": r2}
+
+    async def replan(request, plan, task, evidence, *, revision_feedback=None):
+        return Replan(ReplanAction.DROP, task.id, [])
+
+    eng.manager.replan = replan
+
+    async def worker(task):  # pragma: no cover - drop leaves nothing pending
+        raise AssertionError("nothing to reschedule after a pure drop")
+
+    new_plan = run(eng._replan_loop(_request(), plan, Design(overview="o"), results, worker))
+    assert [t.id for t in new_plan.tasks] == ["T1"]  # T2 dropped
+
+
+def test_propose_replan_revises_then_applies():
+    eng = _rp_engine()
+    eng.interaction = ScriptedChannel(
+        script=[Reply(choice="revise", text="try smaller"), Reply(choice="apply")]
+    )
+    t2, r2 = _failed("T2")
+    plan = Plan(summary="s", tasks=[t2])
+    results = {"T2": r2}
+    feedbacks = []
+
+    async def replan(request, plan, task, evidence, *, revision_feedback=None):
+        feedbacks.append(revision_feedback)
+        return Replan(
+            ReplanAction.REPLACE, task.id,
+            [Task(id="T2b", title="x", description="", acceptance_criteria=["ok"])],
+        )
+
+    eng.manager.replan = replan
+    decision = run(eng._propose_replan(_request(), plan, t2, results))
+    assert decision is not None and decision.action is ReplanAction.REPLACE
+    assert feedbacks == [None, "try smaller"]  # first proposal, then revised
+
+
+def test_propose_replan_stops_on_budget_exhaustion():
+    eng = _rp_engine()
+    t2, r2 = _failed("T2")
+    plan = Plan(summary="s", tasks=[t2])
+
+    async def replan(*a, **k):
+        raise BudgetExceededError(10.0, 5.0)
+
+    eng.manager.replan = replan
+    decision = run(eng._propose_replan(_request(), plan, t2, {"T2": r2}))
+    assert decision is None
+    assert eng._budget_exhausted is True

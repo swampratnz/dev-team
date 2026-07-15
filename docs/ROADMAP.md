@@ -86,6 +86,17 @@ evidence; allow plan mutation (replace/split tasks) within budget, using the
 same question vocabulary interactive runs use so a human can supervise the
 re-plan when a channel is attached.
 
+**Shipped:** opt-in via `EngineConfig.max_replan_rounds` / `--max-replan-rounds N`
+(default 0 = off). After the schedule leaves tasks failed, a bounded loop asks
+the product manager (`ProductManagerAgent.replan`) for a targeted mutation of
+each still-failed task — split / replace / drop — which `replan.apply_replan`
+splices into the plan (dropping the task, rewiring dependents, re-linting), then
+re-schedules the not-yet-attempted tasks through the same worker. A human
+supervises each proposal (apply / revise / reject, via `replan_review_question`)
+when an interaction channel is attached; otherwise it applies autonomously.
+Bounded by the round count and the budget; the per-task retry-with-guidance
+escalation (`_escalate_failure`) is unchanged and sits underneath it.
+
 ## 4. Retrieval + context budgeting
 
 **Why:** large repos exceed any context window. The v0.5 repo map is a capped
