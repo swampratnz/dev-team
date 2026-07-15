@@ -330,6 +330,54 @@ def _review_from_dod(report: DoDReport) -> Review:
     )
 
 
+# Cross-run hand-off digest bounds. The persisted memory holds every artifact a
+# prior run posted; the planning prompt gets a *summarised* view — enough to see
+# what already exists without dumping the raw log (ROADMAP #4). Caps guard the
+# pathological case; a typical run's handful of artifacts renders in full.
+_MAX_HANDOFF_ARTIFACTS = 12
+_MAX_HANDOFF_PER_KIND = 4
+_HANDOFF_SUMMARY_CHARS = 120
+
+
+def _summarise_artifacts(artifacts: List[dict]) -> List[str]:
+    """A bounded, per-kind digest of what prior runs produced.
+
+    Each artifact already carries a one-line summary (what the engineer built,
+    what the tests cover, the security verdict, ...); this surfaces those grouped
+    by kind, so the planner sees the *work*, not just a count. Bounded per kind
+    (so one noisy kind can't crowd out the rest) and overall; whatever a cap
+    elides is reported as an explicit "... and N more" line, never dropped
+    silently.
+    """
+
+    by_kind: Dict[str, List[dict]] = {}
+    for artifact in artifacts:
+        by_kind.setdefault(str(artifact.get("kind") or "artifact"), []).append(artifact)
+
+    lines: List[str] = []
+    shown = 0
+    dropped = 0  # whole kinds squeezed out by the overall cap
+    for kind, items in by_kind.items():
+        take = min(_MAX_HANDOFF_PER_KIND, _MAX_HANDOFF_ARTIFACTS - shown)
+        if take <= 0:
+            dropped += len(items)
+            continue
+        for artifact in items[:take]:
+            key = str(artifact.get("key") or "").strip()
+            label = f"{kind} {key}" if key and key != kind else kind
+            summary = " ".join(str(artifact.get("summary") or "").split())
+            if len(summary) > _HANDOFF_SUMMARY_CHARS:
+                summary = summary[:_HANDOFF_SUMMARY_CHARS].rstrip() + "..."
+            lines.append(f"- built ({label}): {summary}" if summary else f"- built ({label})")
+            shown += 1
+        over = len(items) - take
+        if over > 0:
+            lines.append(f"- ... and {over} more {kind} artifact(s)")
+    if dropped:
+        lines.append(f"- ... and {dropped} more artifact(s) of other kinds")
+    return lines
+
+
 def _prior_context(snapshot: Optional[dict]) -> Optional[str]:
     """Render a compact planning context from a previous run's memory."""
 
@@ -338,9 +386,7 @@ def _prior_context(snapshot: Optional[dict]) -> Optional[str]:
     lines: List[str] = []
     for decision in snapshot.get("decisions", [])[-5:]:
         lines.append(f"- decision: {decision.get('title')}: {decision.get('decision')}")
-    artifacts = snapshot.get("artifacts", [])
-    if artifacts:
-        lines.append(f"- {len(artifacts)} artifact(s) were produced by earlier runs")
+    lines.extend(_summarise_artifacts(snapshot.get("artifacts", [])))
     # Retrospective notes: what went wrong last time, so the plan avoids it.
     for note in (snapshot.get("entries", {}).get("retrospective") or [])[-5:]:
         lines.append(f"- last run: {note}")

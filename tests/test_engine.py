@@ -18,12 +18,15 @@ from helpers import (
 from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.budget import Budget, BudgetExceededError
 from dev_team.engine import (
+    _MAX_HANDOFF_ARTIFACTS,
+    _MAX_HANDOFF_PER_KIND,
     DeliveryEngine,
     DeliveryOutcome,
     EngineConfig,
     _dod_to_test_report,
     _prior_context,
     _review_from_dod,
+    _summarise_artifacts,
 )
 from dev_team.execution import (
     EXIT_NOT_FOUND,
@@ -813,10 +816,62 @@ def test_prior_context_rendering():
     assert _prior_context({"decisions": [], "artifacts": []}) is None
     snapshot = {
         "decisions": [{"title": "Arch", "decision": "layered"}],
-        "artifacts": [{"kind": "plan"}],
+        "artifacts": [
+            {"kind": "implementation", "key": "T1", "summary": "added /login endpoint"}
+        ],
     }
     text = _prior_context(snapshot)
-    assert "Arch" in text and "1 artifact(s)" in text
+    # the digest surfaces what was built, not just a bare count
+    assert "Arch" in text
+    assert "built (implementation T1): added /login endpoint" in text
+
+
+def test_summarise_artifacts_groups_and_labels():
+    lines = _summarise_artifacts(
+        [
+            {"kind": "plan", "key": "plan", "summary": "layered auth"},
+            {"kind": "implementation", "key": "T1", "summary": "login endpoint"},
+            {"kind": "security", "key": "FEATURE", "summary": "no high findings"},
+        ]
+    )
+    # key == kind collapses to just the kind; distinct key is appended
+    assert "- built (plan): layered auth" in lines
+    assert "- built (implementation T1): login endpoint" in lines
+    assert "- built (security FEATURE): no high findings" in lines
+
+
+def test_summarise_artifacts_truncates_long_summaries():
+    long = "x" * 500
+    (line,) = _summarise_artifacts([{"kind": "impl", "summary": long}])
+    assert line.endswith("...")
+    assert len(line) < 200  # bounded, not the full 500 chars
+
+
+def test_summarise_artifacts_handles_missing_fields():
+    # no key, no summary -> label-only line, no trailing colon
+    assert _summarise_artifacts([{"kind": "tests"}]) == ["- built (tests)"]
+    # missing kind falls back to a generic label
+    assert _summarise_artifacts([{}]) == ["- built (artifact)"]
+
+
+def test_summarise_artifacts_caps_per_kind_with_remainder():
+    items = [
+        {"kind": "implementation", "key": f"T{i}", "summary": "s"} for i in range(7)
+    ]
+    lines = _summarise_artifacts(items)
+    built = [ln for ln in lines if ln.startswith("- built")]
+    assert len(built) == _MAX_HANDOFF_PER_KIND
+    assert f"- ... and {7 - _MAX_HANDOFF_PER_KIND} more implementation artifact(s)" in lines
+
+
+def test_summarise_artifacts_caps_total_across_kinds():
+    # More distinct kinds than the overall budget allows: the squeezed-out
+    # kinds are reported, never silently dropped.
+    items = [{"kind": f"k{i}", "key": str(i), "summary": "s"} for i in range(20)]
+    lines = _summarise_artifacts(items)
+    built = [ln for ln in lines if ln.startswith("- built")]
+    assert len(built) == _MAX_HANDOFF_ARTIFACTS
+    assert any("more artifact(s) of other kinds" in ln for ln in lines)
 
 
 def test_delivery_outcome_property_edges():
