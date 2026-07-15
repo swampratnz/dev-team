@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Mapping, Optional
 
 from .. import parsing
+from ..fences import defuse
 from ..models import Implementation, SecurityReport, Task
 from .base import READ_ONLY_TOOLS, UNTRUSTED_CONTENT_NOTE, BaseAgent
 from .reviewer import render_changed_files
@@ -60,7 +61,8 @@ class SecurityEngineerAgent(BaseAgent):
         files = render_changed_files(implementation, file_contents)
         scan = (
             "\nSecurity scanner output (triage these findings):\n"
-            f"<scanner-output>\n{scanner_output[:6000]}\n</scanner-output>\n"
+            f"<scanner-output>\n{defuse(scanner_output[:6000], 'scanner-output')}\n"
+            "</scanner-output>\n"
             if scanner_output
             else "\n(no scanner output available — rely on the code alone)\n"
         )

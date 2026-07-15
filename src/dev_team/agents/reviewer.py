@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Mapping, Optional
 
 from .. import parsing
+from ..fences import defuse
 from ..models import Implementation, Review, Task
 from .base import READ_ONLY_TOOLS, UNTRUSTED_CONTENT_NOTE, BaseAgent
 
@@ -48,7 +49,7 @@ def render_diff(diff: Optional[str], *, limit: int = DIFF_CHARS) -> str:
         body += "\n... (diff truncated)"
     return (
         "\nGit diff of the change (what actually changed):\n"
-        f"<diff-content>\n{body}\n</diff-content>\n"
+        f"<diff-content>\n{defuse(body, 'diff-content')}\n</diff-content>\n"
     )
 
 
@@ -85,7 +86,8 @@ def render_changed_files(
         if len(snippet) < len(body):
             snippet += "\n... (truncated)"
         lines.append(
-            f'<file-content path="{change.path}">\n{snippet}\n</file-content>'
+            f'<file-content path="{defuse(change.path, "file-content")}">\n'
+            f"{defuse(snippet, 'file-content')}\n</file-content>"
         )
     return "\n".join(lines)
 
@@ -127,7 +129,8 @@ class ReviewerAgent(BaseAgent):
         files = render_changed_files(implementation, file_contents)
         analysis = (
             "\nStatic analysis output (triage: escalate what matters, ignore noise):\n"
-            f"<static-analysis>\n{static_findings[:4000]}\n</static-analysis>\n"
+            f"<static-analysis>\n{defuse(static_findings[:4000], 'static-analysis')}\n"
+            "</static-analysis>\n"
             if static_findings
             else ""
         )

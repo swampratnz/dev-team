@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from .. import parsing
+from ..fences import defuse
 from ..models import Design, FeatureRequest, Plan
 from .base import UNTRUSTED_CONTENT_NOTE, BaseAgent
 
@@ -63,7 +64,7 @@ class ArchitectAgent(BaseAgent):
         ) or "- (no tasks)"
         existing = (
             "\nExisting codebase (design must fit into it):\n"
-            f"<repo-context>\n{repo_context}\n</repo-context>\n"
+            f"<repo-context>\n{defuse(repo_context, 'repo-context')}\n</repo-context>\n"
             if repo_context
             else ""
         )

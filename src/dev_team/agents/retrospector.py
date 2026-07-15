@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import List
 
 from .. import parsing
+from ..fences import defuse
 from ..models import Design, FeatureRequest
 from .base import UNTRUSTED_CONTENT_NOTE, BaseAgent
 
@@ -66,7 +67,7 @@ Feature: {request.title}
 Design overview: {design.overview}
 
 <evidence>
-{run_evidence}
+{defuse(run_evidence, 'evidence')}
 </evidence>
 
 Respond with JSON of the form:

@@ -5,6 +5,20 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Security hardening
+- **Prompt-fence defusing is now systemic.** Untrusted content shown to
+  agents inside delimited `<...>` blocks (file bodies, diffs, tool/scanner
+  output, the cross-run memory digest, the retrospective run digest, audit
+  finding claims) is passed through a single shared helper (`dev_team.fences`
+  `defuse`) that neutralises the block's own closing tag with a zero-width
+  space, so a hostile string can no longer close the block early and have
+  what follows read as trusted instructions. The two prior ad-hoc
+  implementations (`context.py`, `retrieval.py`) now delegate to it, and the
+  previously-unprotected sites (reviewer diff/file/static-analysis, security
+  scanner output, planner prior-context and replan evidence, architect
+  repo-context, retrospector evidence, assessment repo-context and
+  finding-claim) are covered.
+
 ### Self-improvement pipeline
 - **A supervised multi-loop development pipeline now extends this repo
   itself** (`docs/PIPELINE.md`), ported from the community-agent repo's
