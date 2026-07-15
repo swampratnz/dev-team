@@ -77,17 +77,17 @@ def test_checks_outcome_concluded():
 
 
 class _FakeHttp:
-    """Returns canned JSON keyed by which endpoint the URL hits."""
+    """Returns canned JSON keyed by which endpoint the URL hits (single page)."""
 
     def __init__(self, check_runs, combined_state):
-        self._check_runs = check_runs
+        self._check_runs = list(check_runs)
         self._combined_state = combined_state
         self.calls = []
 
     def __call__(self, url, headers):
         self.calls.append((url, headers))
-        if url.endswith("/check-runs"):
-            return {"check_runs": self._check_runs}
+        if "/check-runs" in url:
+            return {"total_count": len(self._check_runs), "check_runs": self._check_runs}
         return {"state": self._combined_state}
 
 
@@ -100,6 +100,39 @@ def test_reader_status_classifies_from_both_endpoints():
     assert any("/commits/abc123/check-runs" in u for u, _ in http.calls)
     assert any("/commits/abc123/status" in u for u, _ in http.calls)
     assert http.calls[0][1]["Authorization"] == "Bearer secret-tok"
+
+
+def test_reader_paginates_and_sees_a_failure_beyond_page_one():
+    # 150 runs over two pages; the failing run is on page 2 and must be seen
+    page1 = [_run(f"t{i}") for i in range(100)]
+    page2 = [_run(f"t{i}") for i in range(100, 149)] + [_run("late", conclusion="failure")]
+    pages = []
+
+    def http(url, headers):
+        if "/check-runs" in url:
+            page = int(url.split("&page=")[1])
+            pages.append(page)
+            return {"total_count": 150, "check_runs": page1 if page == 1 else page2}
+        return {"state": "success"}
+
+    out = GitHubChecksReader(token="t", http=http).status("o", "r", "sha")
+    assert out.state == "failure" and "late" in out.failed
+    assert pages == [1, 2]  # followed pagination exactly to completion
+
+
+def test_reader_stops_paginating_on_empty_page():
+    out = GitHubChecksReader(token="t", http=_FakeHttp([], "pending")).status("o", "r", "s")
+    assert out.state == "pending"  # no runs, nothing failed
+
+
+def test_reader_stops_paginating_when_total_count_absent():
+    def http(url, headers):
+        if "/check-runs" in url:
+            return {"check_runs": [_run("t")]}  # no total_count -> stop after page 1
+        return {"state": "pending"}
+
+    out = GitHubChecksReader(token="t", http=http).status("o", "r", "s")
+    assert out.state == "success"
 
 
 def test_reader_rejects_non_dict_response():
@@ -163,9 +196,9 @@ def test_default_http_get_uses_urllib(monkeypatch):
     def fake_urlopen(request, timeout=None):
         captured["method"] = request.get_method()
         captured["auth"] = request.headers.get("Authorization")
-        if request.full_url.endswith("/check-runs"):
-            return _Response(b'{"check_runs": [{"name": "t", "status": "completed", '
-                             b'"conclusion": "success"}]}')
+        if "/check-runs" in request.full_url:
+            return _Response(b'{"total_count": 1, "check_runs": [{"name": "t", '
+                             b'"status": "completed", "conclusion": "success"}]}')
         return _Response(b'{"state": "success"}')
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)

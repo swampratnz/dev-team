@@ -140,13 +140,31 @@ class GitHubChecksReader:
     http: Optional[Http] = field(default=None, repr=False)  # a bound fake may capture secrets
 
     def status(self, owner: str, name: str, ref: str) -> ChecksOutcome:
-        runs = self._get(f"/repos/{owner}/{name}/commits/{ref}/check-runs")
+        runs = self._all_check_runs(owner, name, ref)
         combined = self._get(f"/repos/{owner}/{name}/commits/{ref}/status")
-        check_runs = runs.get("check_runs")
-        return _classify(
-            check_runs if isinstance(check_runs, list) else [],
-            str(combined.get("state") or ""),
-        )
+        return _classify(runs, str(combined.get("state") or ""))
+
+    def _all_check_runs(self, owner: str, name: str, ref: str) -> List[Dict]:
+        """Every check-run for ``ref``, following pagination.
+
+        The check-runs endpoint returns 30 per page by default; a matrixed
+        workflow can exceed that, and a failing run beyond page one must not be
+        missed. Request the max page size and keep fetching until the collected
+        count reaches the reported ``total_count`` (or a page comes back empty).
+        """
+
+        base = f"/repos/{owner}/{name}/commits/{ref}/check-runs?per_page=100"
+        collected: List[Dict] = []
+        page = 1
+        while True:
+            data = self._get(f"{base}&page={page}")
+            batch = data.get("check_runs")
+            batch = batch if isinstance(batch, list) else []
+            collected.extend(batch)
+            total = data.get("total_count")
+            if not batch or not isinstance(total, int) or len(collected) >= total:
+                return collected
+            page += 1
 
     def _get(self, path: str) -> Dict:
         url = f"{self.api_base}{path}"
