@@ -37,7 +37,12 @@ from .git import GitError, GitRepo
 from .interaction import ChannelApprovalGate, ConsoleChannel
 from .models import FeatureRequest
 from .persona import Roster
-from .pullrequest import GitHubPullRequestPublisher, PullRequestError
+from .pullrequest import (
+    MAX_CHECKS_TIMEOUT_SECONDS,
+    GitHubCheckRunsClient,
+    GitHubPullRequestPublisher,
+    PullRequestError,
+)
 from .report import (
     delivery_to_dict,
     render_delivery_summary,
@@ -527,6 +532,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open the --pull-request as a draft.",
     )
+    delivery.add_argument(
+        "--watch-checks",
+        action="store_true",
+        help="After --pull-request opens the PR, poll GitHub's Checks API on "
+        "the delivered branch until success/failure/timeout, and surface the "
+        "result (requires --pull-request; CLI-only, not reachable via "
+        "--dispatch's POST /jobs).",
+    )
+    delivery.add_argument(
+        "--checks-timeout-seconds",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=f"Max time to poll under --watch-checks before giving up as "
+        f"pending (default 300; hard-clamped to {MAX_CHECKS_TIMEOUT_SECONDS:.0f}).",
+    )
     misc.add_argument(
         "--json",
         action="store_true",
@@ -651,11 +672,14 @@ def _validate_args(
     pr_tuning = [
         ("--pr-base", args.pr_base is not None),
         ("--pr-draft", args.pr_draft),
+        ("--watch-checks", args.watch_checks),
     ]
     if not args.pull_request:
         extra = [name for name, passed in pr_tuning if passed]
         if extra:
             parser.error(f"{', '.join(extra)}: only valid with --pull-request")
+    if args.checks_timeout_seconds is not None and not args.watch_checks:
+        parser.error("--checks-timeout-seconds: only valid with --watch-checks")
     if args.sandbox and not (args.deliver or args.assess):
         parser.error("--sandbox: only valid with --deliver or --assess")
     sandbox_tuning = [
@@ -915,6 +939,19 @@ def _open_pull_request(
         return False
     outcome.pull_request_url = pull_request.url
     print(f"opened pull request: {pull_request.url}", file=sys.stderr)
+    if args.watch_checks:
+        # A failed/timed-out watch is caught inside .watch() itself (never
+        # raises) and must never flip this already-successful PR-open outcome.
+        checks = GitHubCheckRunsClient(token=token or "").watch(
+            ref.owner,
+            ref.name,
+            outcome.branch,
+            timeout_seconds=args.checks_timeout_seconds
+            if args.checks_timeout_seconds is not None
+            else 300.0,
+        )
+        outcome.pull_request_checks = checks.to_dict()
+        print(f"PR checks: {checks.state}", file=sys.stderr)
     return True
 
 

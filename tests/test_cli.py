@@ -1404,13 +1404,145 @@ def test_main_pull_request_incompatible_with_no_commit():
 
 
 def test_main_pr_tuning_requires_pull_request():
-    for extra in (["--pr-base", "develop"], ["--pr-draft"]):
+    for extra in (["--pr-base", "develop"], ["--pr-draft"], ["--watch-checks"]):
         with pytest.raises(SystemExit) as exc:
             main(
                 ["T", "D", "--deliver", "--repo", "acme/mono", *extra],
                 runner=ScriptedRunner([]),
             )
         assert exc.value.code == 2
+
+
+def test_main_checks_timeout_seconds_requires_watch_checks():
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["T", "D", "--deliver", "--repo", "acme/mono", "--pull-request",
+             "--checks-timeout-seconds", "60"],
+            runner=ScriptedRunner([]),
+        )
+    assert exc.value.code == 2
+
+
+# --- --watch-checks (issue #71) ---------------------------------------------------
+
+
+def test_pull_request_without_watch_checks_never_constructs_check_runs_client(
+    tmp_path, monkeypatch
+):
+    # [baseline] existing --pull-request behaviour is provably unchanged: no
+    # GitHubCheckRunsClient is constructed and no check-runs HTTP call happens
+    # unless --watch-checks was explicitly passed.
+    import dev_team.cli as cli_module
+
+    constructed = []
+
+    class _Explosive:
+        def __init__(self, *a, **kw):
+            constructed.append((a, kw))
+
+        def watch(self, *a, **kw):
+            raise AssertionError("GitHubCheckRunsClient.watch must not be called")
+
+    monkeypatch.setattr(cli_module, "GitHubCheckRunsClient", _Explosive)
+    seen = {}
+    code = _pr_deliver(tmp_path, monkeypatch, seen)
+    assert code == 0
+    assert constructed == []
+
+
+def test_watch_checks_reuses_the_pull_request_token_no_new_credential(
+    tmp_path, monkeypatch
+):
+    # [security] the watch path is constructed with only the token already
+    # resolved for --pull-request (GITHUB_TOKEN); no new env var, credential
+    # file, or config key is read to build it.
+    import dev_team.cli as cli_module
+    from dev_team.pullrequest import CheckRunsResult
+
+    seen_tokens = []
+
+    class _FakeCheckRunsClient:
+        def __init__(self, token):
+            seen_tokens.append(token)
+
+        def watch(self, owner, name, ref, *, timeout_seconds):
+            return CheckRunsResult(state="success")
+
+    monkeypatch.setattr(cli_module, "GitHubCheckRunsClient", _FakeCheckRunsClient)
+    seen = {}
+    code = _pr_deliver(tmp_path, monkeypatch, seen, "--watch-checks")
+    assert code == 0
+    assert seen_tokens == ["tok"]  # the exact token _pr_deliver resolved for --pull-request
+
+
+def test_main_deliver_watch_checks_surfaces_state(tmp_path, monkeypatch, capsys):
+    import dev_team.cli as cli_module
+    from dev_team.pullrequest import CheckRunsResult
+
+    class _FakeCheckRunsClient:
+        def __init__(self, token):
+            pass
+
+        def watch(self, owner, name, ref, *, timeout_seconds):
+            assert timeout_seconds == 300.0  # the documented default
+            return CheckRunsResult(
+                state="failure",
+                check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}],
+            )
+
+    monkeypatch.setattr(cli_module, "GitHubCheckRunsClient", _FakeCheckRunsClient)
+    seen = {}
+    code = _pr_deliver(tmp_path, monkeypatch, seen, "--watch-checks", "--json")
+    out = capsys.readouterr()
+    # A failed/red watch never flips the exit code — the PR itself opened fine.
+    assert code == 0
+    assert "PR checks: failure" in out.err
+    data = json.loads(out.out)
+    assert data["pull_request_checks"]["state"] == "failure"
+    assert data["pull_request_checks"]["failing_checks"] == ["ci"]
+
+
+def test_main_deliver_watch_checks_honours_custom_timeout(tmp_path, monkeypatch):
+    import dev_team.cli as cli_module
+    from dev_team.pullrequest import CheckRunsResult
+
+    captured = {}
+
+    class _FakeCheckRunsClient:
+        def __init__(self, token):
+            pass
+
+        def watch(self, owner, name, ref, *, timeout_seconds):
+            captured["timeout_seconds"] = timeout_seconds
+            return CheckRunsResult(state="success")
+
+    monkeypatch.setattr(cli_module, "GitHubCheckRunsClient", _FakeCheckRunsClient)
+    seen = {}
+    code = _pr_deliver(
+        tmp_path, monkeypatch, seen, "--watch-checks", "--checks-timeout-seconds", "42"
+    )
+    assert code == 0
+    assert captured["timeout_seconds"] == 42.0
+
+
+def test_main_deliver_watch_checks_transport_failure_never_affects_exit_code(
+    tmp_path, monkeypatch
+):
+    # [security/fail-secure] end-to-end through the REAL GitHubCheckRunsClient
+    # (CLI constructs it with no injected http, so this exercises the default
+    # transport): a network failure while watching is caught inside .watch()
+    # itself and must never flip an already-successful PR-open's exit code.
+    import urllib.error
+
+    import dev_team.pullrequest as pr_module
+
+    def raising_http_get(url, headers):
+        raise urllib.error.URLError("network down")
+
+    monkeypatch.setattr(pr_module, "_http_get", raising_http_get)
+    seen = {}
+    code = _pr_deliver(tmp_path, monkeypatch, seen, "--watch-checks")
+    assert code == 0
 
 
 def test_main_chat_deliver_pull_request_threads_ref_and_token(

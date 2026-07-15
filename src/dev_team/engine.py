@@ -245,6 +245,11 @@ class DeliveryOutcome:
     #: publish. ``None`` otherwise. Set after ``deliver`` returns, by the
     #: delivery target — the engine itself never opens a PR.
     pull_request_url: Optional[str] = None
+    #: The opened PR's aggregated check-run state (``GitHubCheckRunsClient
+    #: .watch().to_dict()``), when the caller additionally asked to watch it
+    #: (``--watch-checks``, CLI-only — see docs/DISPATCH.md). ``None`` when
+    #: not requested, or when no PR was opened.
+    pull_request_checks: Optional[Dict] = None
 
     @property
     def tasks_complete(self) -> bool:

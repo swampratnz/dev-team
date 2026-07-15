@@ -2048,6 +2048,9 @@ def test_submit_deliver_flows_to_a_result():
         assert status == 200
         assert result["kind"] == "deliver"
         assert result["success"] is True
+        # --pull-request/--watch-checks are CLI-only in v1: POST /jobs calls
+        # team.deliver() directly and never reaches them (docs/DISPATCH.md).
+        assert result["pull_request_checks"] is None
 
 
 def test_submit_validation_errors_are_400():

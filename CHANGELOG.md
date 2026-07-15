@@ -5,6 +5,30 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Delivery: watch the opened PR's checks
+- **`GitHubCheckRunsClient`** (`pullrequest.py`) polls the GitHub Checks API
+  (this repo's own CI reports via Actions check runs, not the legacy
+  combined-status endpoint) for a ref, with injectable `http`/`sleep`/`clock`
+  (mirroring `RemoteCIGate`'s clock-injection pattern) so tests never wait
+  for real time to pass. `aggregate_check_runs` reduces a list of check-run
+  objects to `pending`/`success`/`failure`/`no_checks` against a closed enum
+  — an unrecognised `conclusion` string never resolves to success
+  (fail-secure). `timeout_seconds`/`poll_interval_seconds` are hard-clamped
+  (≤900s / ≥5s) before any polling begins, and a transport/auth failure
+  (403/404/`URLError`) is caught and surfaced as `state="unknown"` rather
+  than raised — the PR is already open and real, so a failed watch never
+  flips the exit code.
+- Wired to the CLI as **`--watch-checks`** (with `--checks-timeout-seconds`),
+  valid only combined with `--pull-request`, reusing the exact token already
+  resolved for it (no new credential surface). The result is surfaced in
+  `DeliveryOutcome.pull_request_checks`, the JSON/text delivery summaries,
+  and the dispatch job-result shape (`docs/DISPATCH.md`) — where it is
+  always `null`, since `POST /jobs` calls `team.deliver()` directly and
+  never reaches `--pull-request`/`--watch-checks` in v1.
+- This is the "watch" half of ROADMAP #2's remaining work; feeding a
+  `failure` verdict back into the delivery task loop as an automatic
+  repair attempt is a separate, still-open follow-up (see `docs/ROADMAP.md`).
+
 ### Self-improvement pipeline
 - **A supervised multi-loop development pipeline now extends this repo
   itself** (`docs/PIPELINE.md`), ported from the community-agent repo's

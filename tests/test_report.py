@@ -305,6 +305,27 @@ def test_delivery_to_dict_carries_pull_request_url():
     )
 
 
+def test_render_delivery_summary_shows_pr_checks_when_watched():
+    text = render_delivery_summary(
+        _outcome(
+            committed=True,
+            pull_request_url="https://github.com/acme/mono/pull/9",
+            pull_request_checks={
+                "state": "success", "failing_checks": [], "timed_out": False, "error": None,
+            },
+        )
+    )
+    assert "PR checks: success" in text
+    # ...and the line is absent when --watch-checks was not used.
+    assert "PR checks:" not in render_delivery_summary(_outcome())
+
+
+def test_delivery_to_dict_carries_pull_request_checks():
+    assert delivery_to_dict(_outcome())["pull_request_checks"] is None
+    checks = {"state": "failure", "failing_checks": ["lint"], "timed_out": False, "error": None}
+    assert delivery_to_dict(_outcome(pull_request_checks=checks))["pull_request_checks"] == checks
+
+
 def test_delivery_to_dict_includes_unverified_claims_when_present():
     from dev_team.models import Documentation
 

@@ -140,7 +140,13 @@ id → `404 {"error":"unknown job"}`.
   `{"kind":"assess","success":bool,"classification":str|null,`
   `"executive_summary":str,"report_path":str|null,"report_markdown":str,`
   `"cost_usd":num}`
-- **succeeded**, deliver: `{"kind":"deliver", …delivery fields…}`.
+- **succeeded**, deliver: `{"kind":"deliver", …delivery fields…}`, including
+  `"pull_request_checks"` (the aggregated GitHub check-run state from
+  `--watch-checks`). This field is **always `null` on a dispatch-originated
+  job**: `POST /jobs` calls `team.deliver()` directly and never reaches
+  `--pull-request`/`--watch-checks`, which are CLI-only in v1 — wiring them
+  into the dispatch job spec is out of scope for this issue and would need
+  its own proposal.
 - **succeeded**, verify:
   `{"kind":"verify","source_job":str,"finding_id":str,`
   `"verdict":"confirmed|refuted|needs-context","rationale":str,`

@@ -74,6 +74,24 @@ summary and JSON (`DeliveryOutcome.pull_request_url`).
 CI failures back into the delivery task loop as gate feedback (closing the loop
 rather than stopping at "PR opened").
 
+**Shipped (watch, v1, CLI-only):** `GitHubCheckRunsClient` (`pullrequest.py`)
+polls the GitHub Checks API (not the legacy combined-status endpoint, since
+this repo's own CI reports via Actions check runs) for a ref, with injectable
+`http`/`sleep`/`clock` mirroring `RemoteCIGate`'s clock-injection pattern, and
+`aggregate_check_runs` reduces the runs to `pending`/`success`/`failure`/
+`no_checks` against a closed enum (fail-secure: an unrecognised conclusion
+never resolves to success). `timeout_seconds`/`poll_interval_seconds` are
+hard-clamped (≤900s / ≥5s) before polling begins, and a transport/auth failure
+is caught and surfaced as `state="unknown"` rather than raised — the PR is
+already open and real, so a failed watch never flips the exit code. Wired to
+the CLI as `--watch-checks` (with `--checks-timeout-seconds`), valid only with
+`--pull-request`, reusing the same already-resolved token (no new credential
+surface); the result is surfaced in `DeliveryOutcome.pull_request_checks`, the
+JSON/text summaries, and (always `None`, since `POST /jobs` never reaches
+`--pull-request`) the dispatch job-result shape — see `docs/DISPATCH.md`.
+Feeding a `failure` verdict back into the delivery task loop for an automatic
+repair attempt remains open — that's the still-`Remaining` half above.
+
 ## 3. Dynamic re-planning
 
 **Why:** interactive runs now escalate a failed task to the *human* (skip, or
