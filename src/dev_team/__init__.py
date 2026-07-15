@@ -143,6 +143,13 @@ from .models import (
 )
 from .policy import GuardedCommandRunner, PolicyVerdict, SideEffectPolicy
 from .profile import ProjectProfile, detect_project
+from .checks import (
+    ChecksError,
+    ChecksOutcome,
+    ChecksReader,
+    GitHubChecksReader,
+    watch_checks,
+)
 from .pullrequest import (
     FakePullRequestPublisher,
     GitHubPullRequestPublisher,
@@ -315,6 +322,11 @@ __all__ = [
     "FakePullRequestPublisher",
     "PullRequestError",
     "publish_pull_request",
+    "ChecksOutcome",
+    "ChecksReader",
+    "GitHubChecksReader",
+    "ChecksError",
+    "watch_checks",
     "DeliveryTargetError",
     # memory
     "Blackboard",

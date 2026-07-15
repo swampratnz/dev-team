@@ -70,9 +70,20 @@ push, never opt-in. Wired to the CLI as `--deliver --repo … --pull-request`
 from the clone rather than re-resolved, and the PR URL is surfaced in the run
 summary and JSON (`DeliveryOutcome.pull_request_url`).
 
-**Remaining:** watching the PR's required checks after opening it, and feeding
-CI failures back into the delivery task loop as gate feedback (closing the loop
-rather than stopping at "PR opened").
+**Watch primitive (shipped):** `dev_team.checks` — a `GitHubChecksReader`
+(injectable GET transport, token only in `Authorization`, scrubbed errors, same
+hygiene as the publisher) and a `watch_checks` poller (bounded like
+`RemoteCIGate`, injectable `sleep`). It reads the PR head's check-runs plus the
+legacy combined status and folds them into a `ChecksOutcome`
+(`success`/`failure`/`pending`/`timeout` + the failing check names and a
+token-free digest), classifying on what a human sees — any failed check-run (or
+a failed combined status) fails the watch, and the combined status's noisy
+"pending" (which never clears on Actions-only repos) is ignored.
+
+**Remaining:** wiring the watcher into the delivery terminus (opt-in
+`--watch-checks`, surfacing the result in the summary/JSON and the exit code),
+then closing the loop — feeding a CI failure back as gate feedback so the team
+fixes it and re-pushes to the PR branch, bounded by rounds and budget.
 
 ## 3. Dynamic re-planning
 
