@@ -121,15 +121,25 @@ def apply_replan(plan: Plan, decision: Replan) -> Plan:
         taken.add(final)
     replacement_ids = [remap[r.id] for r in decision.replacements]
 
-    def _rewire(deps: List[str], *, drop_failed: bool) -> List[str]:
+    def _rewire(deps: List[str], *, is_replacement: bool) -> List[str]:
         rewired: List[str] = []
         for dep in deps:
             if dep == decision.failed_task_id:
-                if not drop_failed:
-                    rewired.extend(replacement_ids)  # depend on all replacements
-                # else: the failed task is gone — drop the dangling edge
-            else:
+                # A replacement can't depend on the task it replaces (drop the
+                # edge); a surviving dependent fans onto all the replacements.
+                if not is_replacement:
+                    rewired.extend(replacement_ids)
+            elif is_replacement:
+                # Only a replacement's *own* deps consult the remap, so a
+                # sibling-replacement reference (e.g. T1b -> T1a) tracks any
+                # rename a collision forced.
                 rewired.append(remap.get(dep, dep))
+            else:
+                # A surviving task's dependency on a pre-existing task is a real
+                # edge that must pass through untouched — never routed through
+                # the replacement remap, or a replacement id that happens to
+                # collide with an unrelated task would hijack it.
+                rewired.append(dep)
         # Preserve order while removing the duplicates a fan-out can introduce.
         return list(dict.fromkeys(rewired))
 
@@ -137,9 +147,7 @@ def apply_replan(plan: Plan, decision: Replan) -> Plan:
         replace(
             repl,
             id=remap[repl.id],
-            # A replacement can't depend on the task it replaces; other deps
-            # (including references to sibling replacements) are remapped.
-            dependencies=_rewire(repl.dependencies, drop_failed=True),
+            dependencies=_rewire(repl.dependencies, is_replacement=True),
         )
         for repl in decision.replacements
     ]
@@ -149,7 +157,9 @@ def apply_replan(plan: Plan, decision: Replan) -> Plan:
         if task.id == decision.failed_task_id:
             tasks.extend(built_replacements)  # splice replacements into its slot
             continue
-        tasks.append(replace(task, dependencies=_rewire(task.dependencies, drop_failed=False)))
+        tasks.append(
+            replace(task, dependencies=_rewire(task.dependencies, is_replacement=False))
+        )
 
     new_plan = Plan(summary=plan.summary, tasks=tasks)
     issues = lint_plan(new_plan)

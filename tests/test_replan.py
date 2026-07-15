@@ -86,6 +86,21 @@ def test_replacement_id_collision_probes_past_the_first_suffix():
     assert [t.id for t in new.tasks] == ["T2-3", "T2", "T2-2"]
 
 
+def test_collision_rename_does_not_hijack_an_unrelated_dependents_edge():
+    # Regression: a replacement id colliding with an unrelated *surviving* task
+    # must not redirect a third party's real dependency. Here T3 depends on the
+    # pre-existing T2, and the split of T1 introduces a replacement also named
+    # T2 (renamed T2-2). T3's edge must stay on the real T2, not follow the
+    # rename — lint can't catch this since T2-2 is a valid id and forms no cycle.
+    plan = _plan(_task("T1"), _task("T2"), _task("T3", deps=["T2"]))
+    new = apply_replan(
+        plan,
+        Replan(ReplanAction.SPLIT, "T1", [_task("T2"), _task("X")]),
+    )
+    assert [t.id for t in new.tasks] == ["T2-2", "X", "T2", "T3"]
+    assert _by_id(new)["T3"].dependencies == ["T2"]  # untouched, not "T2-2"
+
+
 def test_replacement_cannot_depend_on_the_task_it_replaces():
     plan = _plan(_task("T1"))
     # a replacement that (wrongly) lists the failed task as a dependency: the
