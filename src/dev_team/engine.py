@@ -1473,6 +1473,9 @@ class DeliveryEngine:
                 if not f.startswith(_INTERNAL_PREFIX)
             ],
             conventions=self._conventions,
+            relevant_code=self._retrieve_context(
+                "\n".join([task.title, task.description, *task.acceptance_criteria])
+            ),
             model=model,
         )
         async with self._integration_lock:
