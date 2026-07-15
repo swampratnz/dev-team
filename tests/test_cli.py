@@ -200,6 +200,23 @@ def test_engine_config_threads_llm_retrospective():
     assert _engine_config(off).llm_retrospective is False
 
 
+def test_main_require_recognised_project_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--require-recognised-project"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--require-recognised-project" in err and "--deliver" in err
+
+
+def test_engine_config_threads_require_recognised_project():
+    from dev_team.cli import _engine_config, build_parser
+
+    on = build_parser().parse_args(["T", "D", "--deliver", "--require-recognised-project"])
+    assert _engine_config(on).require_recognised_project is True
+    off = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(off).require_recognised_project is False
+
+
 def test_main_deliver_only_flags_all_reported(capsys):
     argv = [
         "Login", "Add login",

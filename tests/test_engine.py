@@ -21,6 +21,7 @@ from dev_team.engine import (
     _MAX_EVIDENCE_CHARS,
     _MAX_HANDOFF_ARTIFACTS,
     _MAX_HANDOFF_PER_KIND,
+    _MAX_REJECTION_DETAIL_CHARS,
     DeliveryEngine,
     DeliveryOutcome,
     EngineConfig,
@@ -2019,6 +2020,81 @@ def test_vacuous_tests_are_rejected():
     assert outcome.blackboard.get("scorecard")["vacuous_test_rejections"] == 1
 
 
+def _rejections(events):
+    """The attempt-rejected events emitted during a run."""
+
+    return [e for e in events if e.stage == "attempt-rejected"]
+
+
+def test_review_rejection_is_journalled_with_reason():
+    # A rejected attempt must land in the event log (events.jsonl), not only in
+    # the trace: a failed delivery has to be diagnosable without --transcript.
+    events = []
+    runner = ScriptedRunner(by_system_prompt=engine_responses(review=False))
+    engine = _engine(
+        runner, config=EngineConfig(max_task_attempts=1), listener=events.append
+    )
+    run(engine.deliver(_request()))
+    rejected = _rejections(events)
+    assert rejected
+    assert "T1 attempt 1 rejected at review" in rejected[0].message
+    assert "needs work" in (rejected[0].detail or "")
+
+
+def test_gate_failure_is_journalled_with_reason():
+    class AlwaysRed:
+        def run(self, command, *, cwd=None, timeout=None):
+            if "pytest" in " ".join(command):
+                return CommandResult(list(command), 1, "FAILED tests/test_x.py::t", "")
+            return CommandResult(list(command), 0, "", "")
+
+    events = []
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        command_runner=AlwaysRed(),
+        config=EngineConfig(max_task_attempts=1),
+        listener=events.append,
+    )
+    run(engine.deliver(_request()))
+    rejected = _rejections(events)
+    assert rejected
+    assert "T1 attempt 1 rejected at gates" in rejected[0].message
+    assert rejected[0].detail  # carries the gate summary
+
+
+def test_vacuous_rejection_is_journalled():
+    class AlwaysGreen:
+        def run(self, command, *, cwd=None, timeout=None):
+            return CommandResult(list(command), 0, "ok", "")
+
+    events = []
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        command_runner=AlwaysGreen(),
+        config=EngineConfig(max_task_attempts=1),
+        listener=events.append,
+    )
+    run(engine.deliver(_request()))
+    assert any("rejected at vacuous-tests" in e.message for e in _rejections(events))
+
+
+def test_journal_rejection_bounds_and_collapses_the_reason():
+    events = []
+    engine = _engine(ScriptedRunner([]), listener=events.append)
+    span = engine.tracer.start("task", "T7", attempt="2")
+    task = Task(id="T7", title="t", description="", acceptance_criteria=["a"])
+    engine._journal_rejection(task, span, "gates", "  first\n\n   second   " + "x" * 999)
+    (ev,) = _rejections(events)
+    assert ev.message == "T7 attempt 2 rejected at gates"
+    assert ev.detail is not None
+    assert ev.detail.startswith("first second")
+    assert "\n" not in ev.detail  # whitespace collapsed to single spaces
+    assert len(ev.detail) <= _MAX_REJECTION_DETAIL_CHARS + len("...")
+    assert ev.detail.endswith("...")
+
+
 def test_vacuous_feedback_reaches_engineer():
     class AlwaysGreen:
         def run(self, command, *, cwd=None, timeout=None):
@@ -2479,6 +2555,55 @@ def test_gates_degrade_when_project_not_locally_runnable():
     assert "evidence-based review" in report.results[0].detail
     assert any("no local verify command" in e.message for e in events)
     assert engine.blackboard.get("project_profile") == "dotnet-framework"
+
+
+def test_unknown_project_fallback_is_announced_loudly():
+    # A greenfield/unrecognised workspace still falls back to pytest, but the
+    # guess must be surfaced (not the silent generic "Auto-detected" line) so a
+    # wrong-stack assumption is visible in the log.
+    events = []
+    engine = _engine(ScriptedRunner([]), listener=events.append)
+    assert engine._resolve_gates() is None
+    (gate,) = engine.definition_of_done.gates
+    assert gate.name == "tests"
+    gates_events = [e for e in events if e.stage == "gates"]
+    assert gates_events
+    assert "No build manifest recognised" in gates_events[0].message
+    assert "pytest" in (gates_events[0].detail or "")
+
+
+def test_require_recognised_project_refuses_to_guess():
+    engine = _engine(
+        ScriptedRunner([]), config=EngineConfig(require_recognised_project=True)
+    )
+    halt = engine._resolve_gates()
+    assert halt is not None
+    assert "refusing to guess" in halt
+    assert engine.definition_of_done is None  # no gate was built
+
+
+def test_require_recognised_project_halts_the_delivery():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, config=EngineConfig(require_recognised_project=True))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is False
+    assert outcome.halted_reason is not None
+    assert "require_recognised_project" in outcome.halted_reason
+    assert not outcome.task_results  # halted before any task work
+
+
+def test_require_recognised_project_allows_a_recognised_stack():
+    # The refusal only fires on truly unrecognised workspaces; a recognised
+    # manifest (here Python) proceeds normally.
+    ws = InMemoryWorkspace({"pyproject.toml": "[project]"})
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        config=EngineConfig(require_recognised_project=True),
+    )
+    assert engine._resolve_gates() is None
+    (gate,) = engine.definition_of_done.gates
+    assert gate.name == "tests"
 
 
 def test_vacuous_check_skipped_without_local_verification():
