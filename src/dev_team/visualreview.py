@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import signal
 import socket
 import subprocess
 import time
@@ -42,6 +44,7 @@ from typing import (
     runtime_checkable,
 )
 
+from .execution import SECRET_ENV_KEYS
 from .models import Severity
 from .policy import SideEffectPolicy
 from .sdk import AgentResult
@@ -206,6 +209,24 @@ def _join_url(base_url: str, route: str) -> str:
     return base_url.rstrip("/") + "/" + route.lstrip("/")
 
 
+def _child_env(
+    environ: Mapping[str, str], overrides: Optional[Mapping[str, str]]
+) -> dict:
+    """Build the served app's environment from a *scrubbed copy* of ``environ``.
+
+    The served app is agent-authored code from an untrusted repo, so it must
+    never inherit the orchestrator's credentials — this strips the same
+    :data:`~dev_team.execution.SECRET_ENV_KEYS` (``ANTHROPIC_API_KEY``,
+    ``GITHUB_TOKEN``, …) that every other engine-run subprocess strips, from a
+    copy so the orchestrator's own ``os.environ`` stays intact. An explicit
+    ``overrides`` value still wins, so a caller can hand one server a
+    deliberately scoped credential.
+    """
+
+    base = {key: value for key, value in environ.items() if key not in SECRET_ENV_KEYS}
+    return base if overrides is None else {**base, **overrides}
+
+
 @dataclass
 class SubprocessAppServer:
     """An :class:`AppServer` that runs the app as a subprocess on a free port.
@@ -219,9 +240,12 @@ class SubprocessAppServer:
     ``{port}`` requirement is enforced there too, so a misconfiguration fails
     fast instead of mid-delivery.
 
-    This is defence-in-depth, not a sandbox: the server runs as a bare
-    subprocess. For untrusted or unattended runs, put the whole workspace inside
-    an isolated container as well (see :mod:`dev_team.policy`).
+    The server runs agent-authored code from an untrusted repo, so its
+    environment is a copy of the parent's with the orchestrator's credentials
+    stripped (see :func:`_child_env`) — the app can never read the Anthropic or
+    GitHub tokens. This is defence-in-depth, not a sandbox: the server is still
+    a bare subprocess. For untrusted or unattended runs, put the whole workspace
+    inside an isolated container as well (see :mod:`dev_team.policy`).
     """
 
     serve_command: Sequence[str]
@@ -250,9 +274,12 @@ class SubprocessAppServer:
         process = subprocess.Popen(
             argv,
             cwd=self.cwd,
-            env=dict(self.env) if self.env is not None else None,
+            env=_child_env(os.environ, self.env),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            # Own session/process group so teardown reaches a dev server spawned
+            # as a grandchild behind a wrapper (e.g. `npm run preview`).
+            start_new_session=True,
         )
         base_url = f"http://{self.host}:{port}"
         try:
@@ -296,16 +323,36 @@ def _await_ready(
 
 
 def _terminate(process: "subprocess.Popen") -> None:  # pragma: no cover - real subprocess, CI-only
-    """Stop the serve process, escalating to kill if it will not exit."""
+    """Stop the serve process *tree*, escalating to kill if it will not exit.
+
+    The child was started in its own process group, so signalling the group
+    also stops a dev server running as a grandchild (the common case behind an
+    ``npm run`` wrapper) rather than orphaning it holding the port.
+    """
 
     if process.poll() is not None:
         return
-    process.terminate()
+    _signal_group(process, signal.SIGTERM)
     try:
         process.wait(timeout=5.0)
     except subprocess.TimeoutExpired:
-        process.kill()
+        _signal_group(process, signal.SIGKILL)
         process.wait(timeout=5.0)
+
+
+def _signal_group(
+    process: "subprocess.Popen", sig: int
+) -> None:  # pragma: no cover - real subprocess/POSIX, CI-only
+    """Signal the child's whole process group, falling back to the child alone."""
+
+    try:
+        os.killpg(os.getpgid(process.pid), sig)
+    except (ProcessLookupError, PermissionError, OSError, AttributeError):
+        # Already gone, or no process-group support (non-POSIX): signal directly.
+        if sig == signal.SIGKILL:
+            process.kill()
+        else:
+            process.terminate()
 
 
 @dataclass

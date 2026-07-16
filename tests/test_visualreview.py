@@ -24,6 +24,7 @@ from dev_team.visualreview import (
     VisualReport,
     VisualReviewer,
     _build_content,
+    _child_env,
     _join_url,
     _parse_json_object,
     _payload_from_response,
@@ -261,6 +262,33 @@ def test_payload_from_response_ignores_blocks_without_text():
 
 
 # --- real adapters: construction guards & protocol conformance --------------
+
+
+def test_child_env_strips_every_orchestrator_secret():
+    from dev_team.execution import SECRET_ENV_KEYS
+
+    environ = {"PATH": "/usr/bin", "HOME": "/home/u"}
+    for key in SECRET_ENV_KEYS:
+        environ[key] = "leak"
+    env = _child_env(environ, None)
+    for key in SECRET_ENV_KEYS:
+        assert key not in env  # the served (untrusted) app never sees a secret
+    assert env["PATH"] == "/usr/bin" and env["HOME"] == "/home/u"
+
+
+def test_child_env_overrides_win_over_scrubbed_base():
+    environ = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "orchestrator-key"}
+    env = _child_env(environ, {"APP_FLAG": "1", "ANTHROPIC_API_KEY": "scoped"})
+    assert env["APP_FLAG"] == "1"
+    # a deliberately-supplied scoped credential still wins over the scrub
+    assert env["ANTHROPIC_API_KEY"] == "scoped"
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_child_env_copies_rather_than_mutating_the_source():
+    environ = {"ANTHROPIC_API_KEY": "secret", "PATH": "/x"}
+    _child_env(environ, None)
+    assert environ["ANTHROPIC_API_KEY"] == "secret"  # os.environ stays intact
 
 
 def test_subprocess_app_server_requires_a_port_placeholder():
