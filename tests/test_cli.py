@@ -306,10 +306,51 @@ def test_engine_config_threads_visual_review():
     assert cfg.visual_review is True
     assert cfg.serve_command == ("serve", "--port", "{port}")
     assert cfg.screenshot_routes == ("/", "/steps")
+    assert cfg.visual_fix_rounds == 0
     off = _engine_config(build_parser().parse_args(["T", "D", "--deliver"]))
     assert off.visual_review is False
     assert off.serve_command is None
     assert off.screenshot_routes == ("/",)
+    assert off.visual_fix_rounds == 0
+
+
+def test_engine_config_threads_visual_fix_rounds():
+    from dev_team.cli import _engine_config, build_parser
+
+    args = build_parser().parse_args(
+        [
+            "T", "D", "--deliver", "--visual-review",
+            "--serve-command", "serve --port {port}",
+            "--visual-fix-rounds", "2",
+        ]
+    )
+    assert _engine_config(args).visual_fix_rounds == 2
+
+
+def test_main_visual_fix_rounds_rejected_without_visual_review(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["Login", "Add login", "--deliver", "--visual-fix-rounds", "1"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--visual-fix-rounds" in err and "--visual-review" in err
+
+
+def test_main_visual_fix_rounds_negative_rejected(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "Login", "Add login", "--deliver", "--visual-review",
+                "--serve-command", "serve --port {port}",
+                "--visual-fix-rounds", "-1",
+            ],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--visual-fix-rounds must be non-negative" in err
 
 
 def test_deliver_visual_review_wires_the_seams(tmp_path, monkeypatch):

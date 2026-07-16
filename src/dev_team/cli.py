@@ -546,6 +546,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Routes to screenshot for --visual-review (default: '/'), "
         "e.g. --screenshot-routes / /steps /about.",
     )
+    delivery.add_argument(
+        "--visual-fix-rounds",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Let the engineer fix the visual review's findings in place, "
+        "re-verifying and re-reviewing each round, up to N rounds (0 = off, the "
+        "default; findings stay advisory either way; requires --visual-review).",
+    )
     misc.add_argument(
         "--budget-usd",
         type=float,
@@ -794,6 +803,7 @@ def _validate_args(
     visual_tuning = [
         ("--serve-command", args.serve_command is not None),
         ("--screenshot-routes", args.screenshot_routes is not None),
+        ("--visual-fix-rounds", args.visual_fix_rounds != 0),
     ]
     if not args.visual_review:
         extra = [name for name, passed in visual_tuning if passed]
@@ -806,6 +816,8 @@ def _validate_args(
         )
     elif "{port}" not in args.serve_command:
         parser.error("--serve-command must contain a '{port}' placeholder")
+    if args.visual_fix_rounds < 0:
+        parser.error("--visual-fix-rounds must be non-negative")
     if not args.assess:
         assess_only = [
             ("--exclude", args.exclude_globs is not None),
@@ -891,6 +903,7 @@ def _reject_deliver_only_flags(
         ("--visual-review", args.visual_review),
         ("--serve-command", args.serve_command is not None),
         ("--screenshot-routes", args.screenshot_routes is not None),
+        ("--visual-fix-rounds", args.visual_fix_rounds != 0),
         ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
         ("--no-commit", args.no_commit),
         (
@@ -973,6 +986,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         screenshot_routes=(
             tuple(args.screenshot_routes) if args.screenshot_routes else ("/",)
         ),
+        visual_fix_rounds=args.visual_fix_rounds,
         remote_verify_status=(
             tuple(shlex.split(args.remote_verify_status))
             if args.remote_verify_status
