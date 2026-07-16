@@ -234,6 +234,23 @@ def test_engine_config_threads_finalization_reserve():
     assert _engine_config(default).finalization_reserve_fraction == 0.10
 
 
+def test_main_no_frontend_craft_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--no-frontend-craft"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--no-frontend-craft" in err and "--deliver" in err
+
+
+def test_engine_config_threads_frontend_craft():
+    from dev_team.cli import _engine_config, build_parser
+
+    off = build_parser().parse_args(["T", "D", "--deliver", "--no-frontend-craft"])
+    assert _engine_config(off).frontend_craft is False
+    on = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(on).frontend_craft is True
+
+
 def test_main_deliver_only_flags_all_reported(capsys):
     argv = [
         "Login", "Add login",
