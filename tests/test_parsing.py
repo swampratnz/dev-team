@@ -247,6 +247,26 @@ def test_review_from_dict():
     assert review.comments[1].path is None
 
 
+def test_rebuttal_from_dict():
+    r = parsing.rebuttal_from_dict({"rebuttal": "it is parameterised", "concedes": False})
+    assert r.text == "it is parameterised"
+    assert r.concedes is False
+
+
+def test_rebuttal_from_dict_accepts_text_key_and_defaults():
+    # "text" is accepted as a fallback key; a missing concedes defaults to False
+    assert parsing.rebuttal_from_dict({"text": "x"}).text == "x"
+    assert parsing.rebuttal_from_dict({}).concedes is False
+
+
+def test_review_judgment_from_dict():
+    j = parsing.review_judgment_from_dict({"overturn": True, "rationale": "verified"})
+    assert j.overturn is True
+    assert j.rationale == "verified"
+    # a missing overturn is conservative (upholds)
+    assert parsing.review_judgment_from_dict({}).overturn is False
+
+
 def test_test_report_from_dict():
     report = parsing.test_report_from_dict(
         {

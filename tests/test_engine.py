@@ -1658,6 +1658,195 @@ def test_engine_config_rejects_negative_visual_fix_rounds():
         EngineConfig(visual_fix_rounds=-1)
 
 
+# -- structured review debate (ROADMAP #8a) ----------------------------------
+
+
+def _debate_review_obj(message="unsafe deserialization of user input"):
+    from dev_team.models import ReviewComment, Severity
+
+    return Review(
+        approved=False,
+        summary="changes requested",
+        comments=[ReviewComment(severity=Severity.MAJOR, message=message, path="x.py")],
+    )
+
+
+def _debate_impl():
+    from dev_team.models import ChangeType, FileChange
+
+    return Implementation(
+        task_id="T1",
+        summary="s",
+        files=[FileChange(path="x.py", change_type=ChangeType.CREATE, summary="s", content="c")],
+    )
+
+
+def _dtask():
+    return Task(id="T1", title="Build", description="d")
+
+
+def _debate_engine(tmp_path, *, rebuttal, judgment, interaction=None):
+    runner = ScriptedRunner(
+        by_system_prompt={
+            "senior software engineer": json_response(rebuttal),
+            "application security engineer": json_response(judgment),
+        }
+    )
+    engine = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(review_debate=True),
+        interaction=interaction,
+    )
+    return engine, runner
+
+
+def _run_debate(engine):
+    return run(
+        engine._debate_review(
+            _dtask(), _debate_impl(), _debate_review_obj(), diff=None, file_contents={}, cwd=None
+        )
+    )
+
+
+def test_debate_overturns_a_block_when_the_judge_agrees(tmp_path):
+    engine, runner = _debate_engine(
+        tmp_path,
+        rebuttal={"concedes": False, "rebuttal": "the input is validated upstream"},
+        judgment={"overturn": True, "rationale": "verified against the code"},
+    )
+    review = _run_debate(engine)
+    assert review.approved is True
+    assert "overturned on debate" in review.summary
+
+
+def test_debate_upholds_a_block_when_the_judge_disagrees(tmp_path):
+    engine, runner = _debate_engine(
+        tmp_path,
+        rebuttal={"concedes": False, "rebuttal": "n/a"},
+        judgment={"overturn": False, "rationale": "the finding stands"},
+    )
+    assert _run_debate(engine).approved is False
+
+
+def test_debate_short_circuits_when_the_engineer_concedes(tmp_path):
+    engine, runner = _debate_engine(
+        tmp_path,
+        rebuttal={"concedes": True, "rebuttal": "fair point"},
+        judgment={"overturn": True, "rationale": "unused"},
+    )
+    assert _run_debate(engine).approved is False
+    # the judge is never consulted once the engineer concedes
+    assert not any(
+        "application security engineer" in (c["system_prompt"] or "") for c in runner.calls
+    )
+
+
+def test_debate_skips_when_there_are_no_blocking_comments(tmp_path):
+    from dev_team.models import ReviewComment, Severity
+
+    engine, runner = _debate_engine(
+        tmp_path, rebuttal={"rebuttal": "x"}, judgment={"overturn": True}
+    )
+    minor = Review(
+        approved=False,
+        summary="nits only",
+        comments=[ReviewComment(severity=Severity.MINOR, message="rename this", path="x.py")],
+    )
+    out = run(
+        engine._debate_review(
+            _dtask(), _debate_impl(), minor, diff=None, file_contents={}, cwd=None
+        )
+    )
+    assert out is minor  # returned unchanged; no agent was consulted
+    assert runner.calls == []
+
+
+def test_debate_skips_when_budget_already_exhausted(tmp_path):
+    engine, runner = _debate_engine(
+        tmp_path, rebuttal={"rebuttal": "x"}, judgment={"overturn": True}
+    )
+    engine._budget_exhausted = True
+    assert _run_debate(engine).approved is False
+    assert runner.calls == []
+
+
+def test_debate_upholds_and_marks_exhaustion_on_budget_error(tmp_path):
+    class _BudgetRunner:
+        async def run(self, prompt, *, system_prompt=None, allowed_tools=None,
+                      model=None, cwd=None):
+            raise BudgetExceededError(9.0, 1.0)
+
+    engine = _engine(
+        _BudgetRunner(),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(review_debate=True),
+    )
+    review = _run_debate(engine)
+    assert review.approved is False  # fails closed: the block stands
+    assert engine._budget_exhausted is True
+
+
+def test_debate_overturn_escalates_to_a_human_who_accepts(tmp_path):
+    channel = ScriptedChannel(script=[Reply(choice="overturn")])
+    engine, runner = _debate_engine(
+        tmp_path,
+        rebuttal={"concedes": False, "rebuttal": "validated"},
+        judgment={"overturn": True, "rationale": "ok"},
+        interaction=channel,
+    )
+    review = _run_debate(engine)
+    assert review.approved is True
+    assert channel.questions[0].topic == "review-dispute"
+
+
+def test_debate_overturn_escalates_to_a_human_who_upholds(tmp_path):
+    channel = ScriptedChannel(script=[Reply(choice="uphold")])
+    engine, runner = _debate_engine(
+        tmp_path,
+        rebuttal={"concedes": False, "rebuttal": "validated"},
+        judgment={"overturn": True, "rationale": "ok"},
+        interaction=channel,
+    )
+    # the human overrides the judge's overturn: the block stands
+    assert _run_debate(engine).approved is False
+
+
+def test_debate_wired_into_delivery_overturns_and_completes(tmp_path):
+    blocking = {
+        "approved": False,
+        "summary": "s",
+        "comments": [{"severity": "major", "path": "a.py", "message": "unsafe eval"}],
+    }
+    mapping = {
+        "product manager": [json_response(__plan())],
+        "software architect": [json_response(__design())],
+        "senior software engineer": [
+            json_response(__impl()),
+            json_response({"concedes": False, "rebuttal": "there is no eval here"}),
+        ],
+        "code reviewer": [json_response(blocking)],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [
+            json_response({"overturn": True, "rationale": "confirmed: no eval in the diff"}),
+            json_response(__security()),
+        ],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    engine = _engine(
+        KeyedQueueRunner(mapping),
+        config=EngineConfig(review_debate=True, max_task_attempts=1),
+    )
+    outcome = run(engine.deliver(_request()))
+    # the reviewer blocked, but the debate overturned it, so the task completes
+    # on its first attempt rather than failing
+    assert outcome.success is True
+    assert outcome.task_results[0].attempts == 1
+    assert outcome.task_results[0].task.status is TaskStatus.DONE
+
+
 def test_delivery_outcome_property_edges():
     # No tasks -> not complete -> not success; budget None -> zero cost.
     outcome = DeliveryOutcome(

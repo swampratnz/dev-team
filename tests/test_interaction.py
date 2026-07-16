@@ -28,6 +28,7 @@ from dev_team.interaction import (
     render_plan,
     render_replan,
     replan_review_question,
+    review_dispute_question,
     task_failure_question,
 )
 from dev_team.models import Plan, Task
@@ -373,6 +374,17 @@ def test_replan_review_question_defaults_to_apply_and_fails_safe_to_reject():
     assert question.find("revise").accepts_text is True
     assert question.asked_by == "Priya"
     assert "T2" in question.prompt
+
+
+def test_review_dispute_question_defaults_to_overturn_and_fails_safe_to_uphold():
+    question = review_dispute_question("T3", context="findings + rationale", asked_by="Sasha")
+    # unattended (AutoChannel) applies the judge's autonomous overturn...
+    assert question.default.key == "overturn"
+    # ...but a detached (EOF) run must not drop a block no human blessed.
+    assert question.fail_safe.key == "uphold"
+    assert question.asked_by == "Sasha"
+    assert "T3" in question.prompt
+    assert question.context == "findings + rationale"
 
 
 def test_queue_channel_is_importable_from_package_root():

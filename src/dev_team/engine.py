@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .agents import (
@@ -63,6 +63,7 @@ from .changes import ChangeApplier
 from .context import build_repo_context
 from .conventions import ConventionsStore
 from .agents.engineer import TOOLS as ENGINEER_TOOLS
+from .agents.reviewer import render_blocking_findings
 from .errors import AgentResponseError, DependencyCycleError, DevTeamError
 from .events import AgentEvent, Listener, emit
 from .failures import new_failures, parse_failed_tests
@@ -83,6 +84,7 @@ from .interaction import (
     ask_in_thread,
     plan_review_question,
     replan_review_question,
+    review_dispute_question,
     task_failure_question,
 )
 from .memory import (
@@ -241,6 +243,14 @@ class EngineConfig:
     #: like all other code. Still advisory: leftover findings never block the
     #: commit. Requires ``visual_review``; see ROADMAP option B.
     visual_fix_rounds: int = 0
+    #: Run a bounded structured debate when the reviewer blocks a task with a
+    #: major/critical finding: the engineer rebuts, and the security engineer
+    #: adjudicates (reviewer vs engineer, security as judge). Off by default. A
+    #: judge that overturns the block lets the change proceed; when an
+    #: interaction channel is attached a human supervises the overturn, and the
+    #: security review at commit still runs regardless, so nothing unvetted
+    #: ships. See ROADMAP #8.
+    review_debate: bool = False
     branch: Optional[str] = None
     use_branch: bool = True
     allow_dirty_baseline: bool = False
@@ -1718,6 +1728,87 @@ class DeliveryEngine:
             self.git.commit("fix(dev-team): address visual review findings")
             return True
 
+    async def _debate_review(
+        self,
+        task: Task,
+        implementation: Implementation,
+        review: Review,
+        *,
+        diff: Optional[str],
+        file_contents: Mapping[str, str],
+        cwd: Optional[str],
+    ) -> Review:
+        """Contest a blocking review: engineer rebuts, security judges.
+
+        Only major/critical findings are contested (minor nits are never worth a
+        debate). The engineer may concede, ending the debate with the block
+        intact. Otherwise the security engineer adjudicates against the actual
+        code; it overturns only a rebuttal it can verify. An overturn is a
+        consequential call, so when an interaction channel is attached a human
+        supervises it (mirroring the re-plan supervision); unattended, the
+        judge's ruling applies. The security review at commit runs regardless,
+        so an overturned change is still vetted before it ships. Budget
+        exhaustion during the debate fails closed — the block is upheld.
+        """
+
+        if not review.blocking_comments or self._budget_exhausted:
+            return review
+        self._event(
+            "debate",
+            f"Contesting review of {task.id}: {len(review.blocking_comments)} blocking finding(s)",
+        )
+        try:
+            rebuttal = await self.engineer.rebut(
+                task,
+                implementation,
+                review,
+                diff=diff,
+                file_contents=file_contents,
+                workspace_root=cwd,
+            )
+            if rebuttal.concedes:
+                self._event("debate", "Engineer concedes; the review stands")
+                return review
+            judgment = await self.security.adjudicate(
+                task,
+                implementation,
+                review,
+                rebuttal,
+                file_contents=file_contents,
+                diff=diff,
+                workspace_root=cwd,
+            )
+        except BudgetExceededError:
+            self._budget_exhausted = True
+            self._event("budget", "Budget exhausted during review debate; upholding the review")
+            return review
+        if not judgment.overturn:
+            self._event("debate", "Judge upholds the review", detail=judgment.rationale)
+            return review
+        if self.interaction is not None:
+            context = (
+                f"Blocking findings:\n{render_blocking_findings(review)}\n\n"
+                f"Judge's rationale for overturning: {judgment.rationale}"
+            )
+            reply = await ask_in_thread(
+                self.interaction,
+                review_dispute_question(
+                    task.id,
+                    context=context,
+                    asked_by=self.roster.display_name("security-engineer"),
+                ),
+            )
+            if reply.choice != "overturn":
+                self._event("debate", "Human upheld the review over the judge's overturn")
+                return review
+        self._event("debate", "Review overturned on debate; the change proceeds",
+                    detail=judgment.rationale)
+        return replace(
+            review,
+            approved=True,
+            summary=f"{review.summary} — overturned on debate: {judgment.rationale}",
+        )
+
     def _on_scheduled(self, result: ScheduledResult) -> None:
         detail = result.error
         self._event("scheduled", f"{result.task_id} {result.status.value}", detail=detail)
@@ -2313,6 +2404,15 @@ class DeliveryEngine:
                 conventions=self._conventions,
                 workspace_root=cwd if cwd is not None else self.workdir,
             )
+            if self.config.review_debate and not review.approved:
+                review = await self._debate_review(
+                    task,
+                    implementation,
+                    review,
+                    diff=diff,
+                    file_contents=contents,
+                    cwd=cwd if cwd is not None else self.workdir,
+                )
             if not review.approved:
                 self._scorecard["review_rejections"] = (
                     self._scorecard.get("review_rejections", 0) + 1

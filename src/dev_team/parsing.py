@@ -19,9 +19,11 @@ from .models import (
     FileChange,
     Implementation,
     Plan,
+    Rebuttal,
     ReliabilityReport,
     Review,
     ReviewComment,
+    ReviewJudgment,
     SecurityFinding,
     SecurityReport,
     Severity,
@@ -279,6 +281,26 @@ def review_from_dict(data: Any) -> Review:
     if review.approved and review.blocking_comments:
         review.approved = False
     return review
+
+
+def rebuttal_from_dict(data: Any) -> Rebuttal:
+    """Build a :class:`Rebuttal` from a JSON dict."""
+
+    data = as_dict(data)
+    return Rebuttal(
+        text=as_str(data, "rebuttal") or as_str(data, "text"),
+        concedes=as_bool(data, "concedes"),
+    )
+
+
+def review_judgment_from_dict(data: Any) -> ReviewJudgment:
+    """Build a :class:`ReviewJudgment` from a JSON dict."""
+
+    data = as_dict(data)
+    return ReviewJudgment(
+        overturn=as_bool(data, "overturn"),
+        rationale=as_str(data, "rationale"),
+    )
 
 
 def test_report_from_dict(data: Any) -> TestReport:

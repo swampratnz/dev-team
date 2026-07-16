@@ -555,6 +555,15 @@ def build_parser() -> argparse.ArgumentParser:
         "re-verifying and re-reviewing each round, up to N rounds (0 = off, the "
         "default; findings stay advisory either way; requires --visual-review).",
     )
+    delivery.add_argument(
+        "--review-debate",
+        action="store_true",
+        help="When the reviewer blocks a task with a major/critical finding, run "
+        "a bounded debate: the engineer rebuts and the security engineer "
+        "adjudicates, and an overturned block lets the change proceed (a human "
+        "supervises the overturn when an interaction channel is attached; the "
+        "security review at commit still runs; off by default; with --deliver).",
+    )
     misc.add_argument(
         "--budget-usd",
         type=float,
@@ -904,6 +913,7 @@ def _reject_deliver_only_flags(
         ("--serve-command", args.serve_command is not None),
         ("--screenshot-routes", args.screenshot_routes is not None),
         ("--visual-fix-rounds", args.visual_fix_rounds != 0),
+        ("--review-debate", args.review_debate),
         ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
         ("--no-commit", args.no_commit),
         (
@@ -987,6 +997,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
             tuple(args.screenshot_routes) if args.screenshot_routes else ("/",)
         ),
         visual_fix_rounds=args.visual_fix_rounds,
+        review_debate=args.review_debate,
         remote_verify_status=(
             tuple(shlex.split(args.remote_verify_status))
             if args.remote_verify_status
