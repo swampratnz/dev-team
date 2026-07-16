@@ -1536,10 +1536,12 @@ class DeliveryEngine:
 
         Off unless ``config.visual_review`` and all three seams (app_server,
         page_capturer, visual_reviewer) are wired, and skipped once the budget
-        is spent. Best-effort: a serve/capture failure degrades to ``None`` and
-        never blocks the delivery. The critique's model errors surface as
-        ``DevTeamError``/``BudgetExceededError`` and are absorbed by the
-        ``_specialist`` wrapper at the call site. Findings never gate the commit.
+        is spent. Best-effort: a serve, capture, or critique failure degrades to
+        ``None`` and never crashes the run — this is enforced here, not left to
+        the ``VisualReviewer`` implementation to translate its errors. A
+        ``BudgetExceededError`` is the one exception re-raised, so the run still
+        records the exhaustion (via ``_specialist``). Findings never gate the
+        commit.
         """
 
         if not self.config.visual_review or self._budget_exhausted:
@@ -1557,7 +1559,13 @@ class DeliveryEngine:
         if not screenshots:
             self._event("visual", "Visual review captured no pages; skipping")
             return None
-        report = await self.visual_reviewer.critique(screenshots, VISUAL_RUBRIC)
+        try:
+            report = await self.visual_reviewer.critique(screenshots, VISUAL_RUBRIC)
+        except BudgetExceededError:
+            raise  # let _specialist record the exhaustion; it never crashes the run
+        except Exception as exc:  # noqa: BLE001 - a model/transport failure degrades, never crashes
+            self._event("visual", "Visual critique failed; skipping", detail=str(exc))
+            return None
         self._event(
             "visual",
             f"Visual review: {len(report.findings)} finding(s)",

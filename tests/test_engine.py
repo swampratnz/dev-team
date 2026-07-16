@@ -715,6 +715,46 @@ def test_visual_review_degrades_when_capture_fails():
     assert any("capture failed" in e.message.lower() for e in events)
 
 
+def test_visual_review_degrades_when_critique_fails():
+    from dev_team.visualreview import FakeAppServer, FakePageCapturer
+
+    class BoomReviewer:
+        async def critique(self, screenshots, rubric):
+            raise RuntimeError("vision model down")
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True),
+        app_server=FakeAppServer(),
+        page_capturer=FakePageCapturer(),
+        visual_reviewer=BoomReviewer(),
+        listener=events.append,
+    )
+    # a non-DevTeamError from the critique degrades to None (never crashes)
+    assert run(engine._visual_review()) is None
+    assert any("critique failed" in e.message.lower() for e in events)
+
+
+def test_visual_review_propagates_budget_exhaustion_from_critique():
+    from dev_team.visualreview import FakeAppServer, FakePageCapturer
+
+    class BrokeReviewer:
+        async def critique(self, screenshots, rubric):
+            raise BudgetExceededError(99.0, 1.0)
+
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True),
+        app_server=FakeAppServer(),
+        page_capturer=FakePageCapturer(),
+        visual_reviewer=BrokeReviewer(),
+    )
+    # budget exhaustion is re-raised (so the run records it), not swallowed
+    with pytest.raises(BudgetExceededError):
+        run(engine._visual_review())
+
+
 def test_visual_review_skips_when_no_pages_captured():
     from dev_team.visualreview import FakeAppServer, FakePageCapturer, FakeVisualReviewer
 
