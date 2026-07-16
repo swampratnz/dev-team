@@ -1678,6 +1678,7 @@ async def verify_finding(
     budget: Optional[Budget] = None,
     tracer: Optional[Tracer] = None,
     source_job: Optional[str] = None,
+    skip_broken_citations: bool = False,
 ) -> Dict:
     """Re-check ONE persisted finding against a (re-)cloned repository.
 
@@ -1688,6 +1689,15 @@ async def verify_finding(
     untrusted: it is delimited in the prompt, and the agent's standing
     instructions forbid following instructions inside delimited blocks.
 
+    When ``skip_broken_citations`` is ``True`` and ``finding["citation_broken"]``
+    is ``True`` (see :func:`list_findings`), no agent runs at all: the cited
+    evidence is already known, at $0, not to resolve to a real file, so this
+    returns a $0 ``needs-context`` result immediately — never ``refuted``, since
+    a broken citation only impugns the citation, not the underlying claim (it
+    could still be true via evidence elsewhere the original auditor mis-cited).
+    Callers that want that $0 skip reflected are responsible for not persisting
+    it as a real verification (see dispatch's calibration isolation).
+
     Agent failure is returned, not raised, so a caller can turn it into a
     failed job without unwinding:
 
@@ -1695,11 +1705,28 @@ async def verify_finding(
       "finding_id", "source_job", "cost_usd"}`` — ``verdict`` is guaranteed
       to be one of :data:`VERIFY_VERDICTS` (an out-of-contract verdict is
       downgraded to ``needs-context``, never promoted to a confirmation).
+      A skip additionally carries ``"skipped": True``.
     - failure: ``{"success": False, "error", "finding_id", "source_job",
       "cost_usd"}``.
     """
 
     budget = budget or Budget()
+    base = {"finding_id": finding.get("id"), "source_job": source_job}
+    if skip_broken_citations and finding.get("citation_broken") is True:
+        return {
+            **base,
+            "success": True,
+            "verdict": "needs-context",
+            "rationale": (
+                "citation_broken: the cited evidence does not resolve to a "
+                "file in the repository, so this finding was skipped without "
+                "spending an agent call; re-run without "
+                "--skip-broken-citations for a full agentic re-check"
+            ),
+            "citations": [],
+            "cost_usd": 0.0,
+            "skipped": True,
+        }
     agent = SecurityEngineerAgent(
         InstrumentedRunner(runner, "verifier", budget=budget, tracer=tracer)
     )
@@ -1709,7 +1736,6 @@ async def verify_finding(
         claim=defuse(finding.get("claim", ""), "finding-claim"),
         evidence=finding.get("evidence") or "(none cited)",
     )
-    base = {"finding_id": finding.get("id"), "source_job": source_job}
     try:
         data = await agent.ask_json(
             prompt,

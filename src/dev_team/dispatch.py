@@ -197,6 +197,10 @@ class JobSpec:
     source_job: Optional[str] = None
     finding_id: Optional[str] = None
     finding: Optional[Dict[str, Any]] = None
+    # verify only: skip the agent call entirely (see
+    # dev_team.assessment.verify_finding) when the finding is already known,
+    # at $0, to cite a broken/fabricated evidence path.
+    skip_broken_citations: bool = False
 
 
 @dataclass
@@ -566,6 +570,9 @@ class Dispatcher:
         finding_id = body.get("finding_id")
         if not isinstance(finding_id, str) or not finding_id.strip():
             raise ValidationError("verify requires a finding_id")
+        skip_broken_citations = body.get("skip_broken_citations", False)
+        if not isinstance(skip_broken_citations, bool):
+            raise ValidationError("skip_broken_citations must be true or false")
         source_job = source_job.strip()
         if self._dashboard_workspace is None:
             raise SubmitRejected(409, "verify needs a dashboard workspace")
@@ -598,6 +605,7 @@ class Dispatcher:
             source_job=source_job,
             finding_id=finding["id"],
             finding=finding,
+            skip_broken_citations=skip_broken_citations,
         )
 
     def submit(self, spec: JobSpec) -> Tuple[str, int]:
@@ -820,20 +828,25 @@ class Dispatcher:
             spec.finding,
             budget=budget,
             source_job=spec.source_job,
+            skip_broken_citations=spec.skip_broken_citations,
         )
         if not result["success"]:
             raise DevTeamError(str(result["error"]))
-        self._mirror_verification(
-            spec.source_job,
-            {
-                "finding_id": result["finding_id"],
-                "verdict": result["verdict"],
-                "rationale": result["rationale"],
-                "citations": result["citations"],
-                "cost_usd": result["cost_usd"],
-                "ts": self._clock(),
-            },
-        )
+        if not result.get("skipped"):
+            # A $0 skip never invoked a model, so it must never be appended
+            # here — GET /calibration's confirm_rate would otherwise be
+            # silently diluted by an entry no model actually adjudicated.
+            self._mirror_verification(
+                spec.source_job,
+                {
+                    "finding_id": result["finding_id"],
+                    "verdict": result["verdict"],
+                    "rationale": result["rationale"],
+                    "citations": result["citations"],
+                    "cost_usd": result["cost_usd"],
+                    "ts": self._clock(),
+                },
+            )
         return result, float(result["cost_usd"])
 
     def _mirror_report(self, job_id: str, outcome: Any) -> None:
@@ -1610,7 +1623,7 @@ class Dispatcher:
             }
         outcome = record.outcome
         if record.spec.mode == "verify":
-            return 200, {
+            payload = {
                 "kind": "verify",
                 "source_job": record.spec.source_job,
                 "finding_id": outcome["finding_id"],
@@ -1619,6 +1632,12 @@ class Dispatcher:
                 "citations": outcome["citations"],
                 "cost_usd": outcome["cost_usd"],
             }
+            if outcome.get("skipped"):
+                # Distinguishes a $0 deterministic skip from a real agent
+                # verdict — see verify_finding's skip_broken_citations.
+                payload["success"] = True
+                payload["skipped"] = True
+            return 200, payload
         if record.spec.mode == "assess":
             return 200, {
                 "kind": "assess",

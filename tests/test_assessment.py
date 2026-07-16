@@ -2398,6 +2398,67 @@ def test_verify_finding_unusable_response_is_a_structured_failure():
     assert result["cost_usd"] == 0.0
 
 
+def test_verify_finding_skip_broken_citations_short_circuits_with_no_agent_call():
+    from dev_team.assessment import verify_finding
+
+    runner = ScriptedRunner()  # raises if .run() is ever invoked
+    finding = _finding_fixture(citation_broken=True)
+    result = run(
+        verify_finding(
+            runner,
+            InMemoryWorkspace(),
+            finding,
+            source_job="assess-1",
+            skip_broken_citations=True,
+        )
+    )
+    assert runner.calls == []
+    assert result == {
+        "finding_id": "risk.secrets[0]",
+        "source_job": "assess-1",
+        "success": True,
+        "verdict": "needs-context",
+        "rationale": result["rationale"],
+        "citations": [],
+        "cost_usd": 0.0,
+        "skipped": True,
+    }
+    assert result["rationale"]  # non-empty
+
+
+def test_verify_finding_skip_broken_citations_false_finding_runs_normally():
+    from dev_team.assessment import verify_finding
+
+    runner = _security_verdict(
+        {"verdict": "confirmed", "rationale": "checked", "citations": []}
+    )
+    finding = _finding_fixture(citation_broken=False)
+    result = run(
+        verify_finding(
+            runner, InMemoryWorkspace(), finding, skip_broken_citations=True
+        )
+    )
+    assert result["success"] is True
+    assert result.get("skipped") is None
+    assert len(runner.calls) == 1
+
+
+def test_verify_finding_skip_broken_citations_missing_key_runs_normally():
+    from dev_team.assessment import verify_finding
+
+    runner = _security_verdict(
+        {"verdict": "confirmed", "rationale": "checked", "citations": []}
+    )
+    finding = _finding_fixture()  # no citation_broken key at all
+    result = run(
+        verify_finding(
+            runner, InMemoryWorkspace(), finding, skip_broken_citations=True
+        )
+    )
+    assert result["success"] is True
+    assert len(runner.calls) == 1
+
+
 def test_verify_finding_records_a_trace_span():
     from dev_team.assessment import verify_finding
     from dev_team.trace import Tracer

@@ -148,6 +148,21 @@ sections below are reconstructed from the repository history.
   over-flagging — under-flagging is the accepted direction, never promoted
   to a positive signal. `find_finding` inherits the field for free via its
   existing delegation to `list_findings`.
+- **Opt-in `--skip-broken-citations` / `skip_broken_citations` acts on
+  `citation_broken`** (`docs/ASSESSMENT.md`, `docs/DISPATCH.md`): the named
+  follow-up above finally spends — `verify_finding` now short-circuits to a
+  $0 `needs-context` result, with no agent/runner call at all, when the
+  flag is set and the finding is already known to cite a broken path.
+  Default off (byte-for-byte identical behaviour for every existing
+  caller); a broken citation only impugns the citation, so the verdict is
+  deliberately `needs-context`, never `refuted`. Threaded through the CLI
+  (`--verify --skip-broken-citations`) and dispatch (`POST /jobs`
+  `mode: "verify"`, `skip_broken_citations: bool`, rejected with `400` if
+  not a bool). A skipped verification is never appended to
+  `verifications.jsonl` and never counted by `GET /calibration` — no model
+  ever adjudicated it — and `GET /jobs/{id}/result` marks a skip with
+  `"success":true,"skipped":true` so a caller can tell it apart from a
+  real agent verdict.
 - **Interactive dispatch deliver** (`docs/DISPATCH.md`): `POST /jobs` gains
   opt-in `interactive`/`interactive_timeout_seconds` fields — the missing
   wiring `docs/ROADMAP.md` item 7 named directly (`Dispatcher.run_job`

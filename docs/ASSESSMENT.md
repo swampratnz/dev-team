@@ -293,6 +293,20 @@ produced (`refuted` is a *successful* verification), `1` the verifier
 itself failed (budget, unusable response), `2` no persisted assessment or
 no matching finding.
 
+**`--skip-broken-citations`** short-circuits the agent call entirely — $0,
+no clone read — when the finding's cited evidence is already known, at $0,
+to not resolve to a real file in the repo (the `citation_broken` flag
+`GET /jobs/{id}/findings` and the finding enumeration already surface, see
+above). The verdict in that case is always `needs-context`, never
+`refuted`: a broken citation only impugns the citation, not the underlying
+claim, which could still be true via evidence elsewhere the original
+auditor mis-cited. It has no effect on a finding whose citation is not
+already known broken — that still runs the full agentic re-check. The
+result carries `"skipped": true` so a caller can tell a deterministic skip
+apart from a real agent verdict; it is never persisted to
+`verifications.jsonl` (dispatch) or counted by `GET /calibration`, since no
+model ever adjudicated it.
+
 The dispatch service exposes the same model remotely as a `verify` job mode
 plus `GET /jobs/{id}/findings` and `GET /jobs/{id}/verifications`; there the
 repository identity for the re-clone comes from `audit/<job-id>/meta.json`,
