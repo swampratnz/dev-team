@@ -631,6 +631,170 @@ def test_frontend_craft_preserves_learned_conventions():
     assert "Frontend design baseline" in engine._conventions
 
 
+# --- visual review (advisory) -------------------------------------------------
+
+
+def _visual_seams(**kwargs):
+    from dev_team.visualreview import FakeAppServer, FakePageCapturer, FakeVisualReviewer
+
+    kwargs.setdefault("app_server", FakeAppServer())
+    kwargs.setdefault("page_capturer", FakePageCapturer())
+    kwargs.setdefault("visual_reviewer", FakeVisualReviewer())
+    return kwargs
+
+
+def test_visual_review_off_by_default_returns_none():
+    engine = _engine(ScriptedRunner([]))
+    assert run(engine._visual_review()) is None
+
+
+def test_visual_review_produces_a_report_from_the_seams():
+    from dev_team.models import Severity
+    from dev_team.visualreview import (
+        FakeAppServer,
+        FakePageCapturer,
+        FakeVisualReviewer,
+        VisualFinding,
+        VisualReport,
+    )
+
+    events = []
+    reviewer = FakeVisualReviewer(
+        report=VisualReport(
+            findings=[VisualFinding(route="/", issue="unstyled", severity=Severity.MINOR)],
+            summary="one issue",
+            routes=["/"],
+        )
+    )
+    capturer = FakePageCapturer()
+    server = FakeAppServer(base_url="http://x")
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True, screenshot_routes=("/", "/steps")),
+        app_server=server,
+        page_capturer=capturer,
+        visual_reviewer=reviewer,
+        listener=events.append,
+    )
+    report = run(engine._visual_review())
+    assert report is reviewer.report
+    assert server.starts == 1
+    assert capturer.calls == [("http://x", ("/", "/steps"))]
+    assert [s.route for s in reviewer.seen] == ["/", "/steps"]
+    assert any(e.stage == "visual" for e in events)
+
+
+def test_visual_review_without_seams_skips_with_an_event():
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True),
+        listener=events.append,
+    )
+    assert run(engine._visual_review()) is None
+    assert any("no reviewer is wired" in e.message for e in events)
+
+
+def test_visual_review_degrades_when_capture_fails():
+    from dev_team.visualreview import FakeAppServer, FakeVisualReviewer
+
+    class BoomCapturer:
+        def capture(self, base_url, routes):
+            raise RuntimeError("no browser here")
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True),
+        app_server=FakeAppServer(),
+        page_capturer=BoomCapturer(),
+        visual_reviewer=FakeVisualReviewer(),
+        listener=events.append,
+    )
+    assert run(engine._visual_review()) is None
+    assert any("capture failed" in e.message.lower() for e in events)
+
+
+def test_visual_review_degrades_when_critique_fails():
+    from dev_team.visualreview import FakeAppServer, FakePageCapturer
+
+    class BoomReviewer:
+        async def critique(self, screenshots, rubric):
+            raise RuntimeError("vision model down")
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True),
+        app_server=FakeAppServer(),
+        page_capturer=FakePageCapturer(),
+        visual_reviewer=BoomReviewer(),
+        listener=events.append,
+    )
+    # a non-DevTeamError from the critique degrades to None (never crashes)
+    assert run(engine._visual_review()) is None
+    assert any("critique failed" in e.message.lower() for e in events)
+
+
+def test_visual_review_propagates_budget_exhaustion_from_critique():
+    from dev_team.visualreview import FakeAppServer, FakePageCapturer
+
+    class BrokeReviewer:
+        async def critique(self, screenshots, rubric):
+            raise BudgetExceededError(99.0, 1.0)
+
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True),
+        app_server=FakeAppServer(),
+        page_capturer=FakePageCapturer(),
+        visual_reviewer=BrokeReviewer(),
+    )
+    # budget exhaustion is re-raised (so the run records it), not swallowed
+    with pytest.raises(BudgetExceededError):
+        run(engine._visual_review())
+
+
+def test_visual_review_skips_when_no_pages_captured():
+    from dev_team.visualreview import FakeAppServer, FakePageCapturer, FakeVisualReviewer
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True),
+        app_server=FakeAppServer(),
+        page_capturer=FakePageCapturer(screenshots=[]),
+        visual_reviewer=FakeVisualReviewer(),
+        listener=events.append,
+    )
+    assert run(engine._visual_review()) is None
+    assert any("no pages" in e.message.lower() for e in events)
+
+
+def test_visual_review_wired_into_delivery_is_advisory():
+    from dev_team.models import Severity
+    from dev_team.visualreview import FakeVisualReviewer, VisualFinding, VisualReport
+
+    reviewer = FakeVisualReviewer(
+        report=VisualReport(
+            findings=[VisualFinding(route="/", issue="cramped", severity=Severity.MAJOR)],
+            summary="spacing",
+            routes=["/"],
+        )
+    )
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        **_visual_seams(
+            config=EngineConfig(visual_review=True), visual_reviewer=reviewer
+        ),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.visual is reviewer.report
+    # advisory: a major visual finding does not sink an otherwise-successful run
+    assert outcome.success is True
+
+
 def test_without_a_reserve_task_work_starves_the_security_review():
     # Same costs, no reserve: T2 also runs, spending past the ceiling, so the
     # security review is starved and the build cannot be banked.
