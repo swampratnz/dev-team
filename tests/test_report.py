@@ -257,6 +257,42 @@ def test_render_delivery_summary_branches():
     assert "[SCANNER DID NOT RUN]" not in good
 
 
+def test_delivery_report_surfaces_visual_findings():
+    from dev_team.models import Severity
+    from dev_team.visualreview import VisualFinding, VisualReport
+
+    report = VisualReport(
+        findings=[
+            VisualFinding(route="/", issue="unstyled body text", severity=Severity.MAJOR)
+        ],
+        summary="one issue on /",
+        routes=["/"],
+    )
+    outcome = _outcome(visual=report)
+    data = delivery_to_dict(outcome)
+    assert data["visual_summary"] == "one issue on /"
+    assert data["visual_findings"] == [
+        {"route": "/", "issue": "unstyled body text", "severity": "major"}
+    ]
+    text = render_delivery_summary(outcome)
+    assert "Visual (advisory): 1 finding(s) — one issue on /" in text
+    assert "[major] /: unstyled body text" in text
+
+
+def test_delivery_report_visual_clean_and_absent():
+    from dev_team.visualreview import VisualReport
+
+    clean = render_delivery_summary(_outcome(visual=VisualReport(summary="", routes=["/"])))
+    assert "Visual (advisory): clean" in clean
+
+    # absent by default: no visual line, and the JSON fields are null
+    default = _outcome()
+    assert "Visual" not in render_delivery_summary(default)
+    data = delivery_to_dict(default)
+    assert data["visual_summary"] is None
+    assert data["visual_findings"] is None
+
+
 def test_render_delivery_summary_marks_scanner_failure():
     from dev_team.models import SecurityReport, Task, TaskResult, TaskStatus
 

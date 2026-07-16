@@ -51,6 +51,14 @@ from .budget import Budget, BudgetExceededError
 from .checks import ChecksOutcome
 from .fences import defuse
 from .frontend import FRONTEND_GUIDANCE, looks_like_frontend, merge_conventions
+from .visualreview import (
+    VISUAL_RUBRIC,
+    AppServer,
+    PageCapturer,
+    Screenshot,
+    VisualReport,
+    VisualReviewer,
+)
 from .changes import ChangeApplier
 from .context import build_repo_context
 from .conventions import ConventionsStore
@@ -212,6 +220,17 @@ class EngineConfig:
     #: a nudge, never a gate. Engages only when the delivery looks like a
     #: frontend (see ``dev_team.frontend``). On by default.
     frontend_craft: bool = True
+    #: Run an advisory visual review after delivery: serve the app, screenshot
+    #: its routes, and critique them with a vision model. Off by default and
+    #: never blocks the commit (findings are advisory). Requires the app_server,
+    #: page_capturer, and visual_reviewer seams to be wired; see
+    #: ``dev_team.visualreview`` / ROADMAP option B.
+    visual_review: bool = False
+    #: How to start the delivered app for the visual review (a ``{port}``
+    #: placeholder is filled in by the server). Consumed by the real AppServer.
+    serve_command: Optional[Sequence[str]] = None
+    #: Routes to screenshot for the visual review.
+    screenshot_routes: Sequence[str] = ("/",)
     branch: Optional[str] = None
     use_branch: bool = True
     allow_dirty_baseline: bool = False
@@ -319,6 +338,10 @@ class DeliveryOutcome:
     #: or ``None`` when not watched. Set after ``deliver`` returns, alongside
     #: ``pull_request_url`` — the engine itself never reaches the network.
     checks: Optional[ChecksOutcome] = None
+    #: The advisory visual review of the rendered UI (``visual_review``), or
+    #: ``None`` when not run. Never affects ``success`` — findings inform, they
+    #: do not gate.
+    visual: Optional[VisualReport] = None
 
     @property
     def tasks_complete(self) -> bool:
@@ -690,8 +713,17 @@ class DeliveryEngine:
         interaction: Optional[InteractionChannel] = None,
         transcript_recorder: Optional[TranscriptRecorder] = None,
         engineer_session_factory: Optional[Callable[[], AgentSession]] = None,
+        app_server: Optional[AppServer] = None,
+        page_capturer: Optional[PageCapturer] = None,
+        visual_reviewer: Optional[VisualReviewer] = None,
     ) -> None:
         self.config = config or EngineConfig()
+        # Visual-review seams (ROADMAP option B). Injected; None until the real
+        # Playwright/vision implementations are wired. The advisory stage runs
+        # only when all three are present, so the core stays browser-free.
+        self.app_server = app_server
+        self.page_capturer = page_capturer
+        self.visual_reviewer = visual_reviewer
         # Test seam: builds the raw engineer session (a ClaudeAgentSession in
         # production). The engine wraps whatever this returns in an
         # InstrumentedSession, so metering is identical either way.
@@ -1129,6 +1161,7 @@ class DeliveryEngine:
         documentation = await self._specialist(
             self._write_documentation(request, design, task_results)
         )
+        visual = await self._specialist(self._visual_review())
 
         committed = self._commit_if_approved(request, task_results, security)
         self._finalise_backlog(backlog, stories, task_results)
@@ -1161,6 +1194,7 @@ class DeliveryEngine:
                 f for f in self.workspace.list_files() if not f.startswith(_INTERNAL_PREFIX)
             ],
             committed=committed,
+            visual=visual,
             budget_exhausted=self._budget_exhausted,
             resumed_task_ids=resumed,
             branch=self._branch,
@@ -1496,6 +1530,46 @@ class DeliveryEngine:
                 f"Retrospective mined {len(lessons)} root-cause lesson(s)",
             )
         return lessons
+
+    async def _visual_review(self) -> Optional[VisualReport]:
+        """Serve the app, screenshot its routes, and critique them (advisory).
+
+        Off unless ``config.visual_review`` and all three seams (app_server,
+        page_capturer, visual_reviewer) are wired, and skipped once the budget
+        is spent. Best-effort: a serve/capture failure degrades to ``None`` and
+        never blocks the delivery. The critique's model errors surface as
+        ``DevTeamError``/``BudgetExceededError`` and are absorbed by the
+        ``_specialist`` wrapper at the call site. Findings never gate the commit.
+        """
+
+        if not self.config.visual_review or self._budget_exhausted:
+            return None
+        if not (self.app_server and self.page_capturer and self.visual_reviewer):
+            self._event("visual", "Visual review enabled but no reviewer is wired; skipping")
+            return None
+        routes = list(self.config.screenshot_routes)
+        self._event("visual", f"Visual review: serving the app and capturing {len(routes)} route(s)")
+        try:
+            screenshots = await asyncio.to_thread(self._capture_pages, routes)
+        except Exception as exc:  # noqa: BLE001 - serve/browser failures degrade, never crash
+            self._event("visual", "Visual capture failed; skipping", detail=str(exc))
+            return None
+        if not screenshots:
+            self._event("visual", "Visual review captured no pages; skipping")
+            return None
+        report = await self.visual_reviewer.critique(screenshots, VISUAL_RUBRIC)
+        self._event(
+            "visual",
+            f"Visual review: {len(report.findings)} finding(s)",
+            detail=report.summary or None,
+        )
+        return report
+
+    def _capture_pages(self, routes: List[str]) -> List[Screenshot]:
+        """Serve the app and screenshot ``routes`` (blocking; runs off-loop)."""
+
+        with self.app_server.serve() as base_url:
+            return self.page_capturer.capture(base_url, routes)
 
     def _on_scheduled(self, result: ScheduledResult) -> None:
         detail = result.error

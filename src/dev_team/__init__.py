@@ -167,6 +167,18 @@ from .retrieval import (
     retrieve,
 )
 from .sandbox import ContainerCommandRunner, SandboxConfig, SandboxError
+from .visualreview import (
+    VISUAL_RUBRIC,
+    AppServer,
+    FakeAppServer,
+    FakePageCapturer,
+    FakeVisualReviewer,
+    PageCapturer,
+    Screenshot,
+    VisualFinding,
+    VisualReport,
+    VisualReviewer,
+)
 from .scheduler import ScheduledResult, ScheduleStatus, schedule
 from .sdk import (
     AgentResult,
@@ -307,6 +319,16 @@ __all__ = [
     "ContainerCommandRunner",
     "SandboxConfig",
     "SandboxError",
+    "Screenshot",
+    "VisualFinding",
+    "VisualReport",
+    "AppServer",
+    "PageCapturer",
+    "VisualReviewer",
+    "FakeAppServer",
+    "FakePageCapturer",
+    "FakeVisualReviewer",
+    "VISUAL_RUBRIC",
     "Replan",
     "ReplanAction",
     "ReplanError",

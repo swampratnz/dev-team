@@ -111,6 +111,15 @@ def delivery_to_dict(outcome: "DeliveryOutcome") -> Dict[str, Any]:
             outcome.reliability.production_ready if outcome.reliability else None
         ),
         "committed": outcome.committed,
+        "visual_summary": outcome.visual.summary if outcome.visual else None,
+        "visual_findings": (
+            [
+                {"route": f.route, "issue": f.issue, "severity": f.severity.value}
+                for f in outcome.visual.findings
+            ]
+            if outcome.visual
+            else None
+        ),
         "pull_request_url": outcome.pull_request_url,
         "checks_state": outcome.checks.state if outcome.checks else None,
         "checks_failed": list(outcome.checks.failed) if outcome.checks else [],
@@ -164,6 +173,13 @@ def render_delivery_summary(outcome: "DeliveryOutcome") -> str:
     if outcome.reliability is not None:
         state = "ready" if outcome.reliability.production_ready else "NOT READY"
         lines.append(f"Reliability: {state}")
+    if outcome.visual is not None:
+        count = len(outcome.visual.findings)
+        state = "clean" if count == 0 else f"{count} finding(s)"
+        summary = f" — {outcome.visual.summary}" if outcome.visual.summary else ""
+        lines.append(f"Visual (advisory): {state}{summary}")
+        for finding in outcome.visual.findings:
+            lines.append(f"  [{finding.severity.value}] {finding.route}: {finding.issue}")
     lines.append(f"Committed: {'yes' if outcome.committed else 'no'}")
     if outcome.pull_request_url:
         lines.append(f"Pull request: {outcome.pull_request_url}")
