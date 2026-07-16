@@ -792,6 +792,164 @@ def test_visual_review_skips_when_no_pages_captured():
     assert any("no pages" in e.message.lower() for e in events)
 
 
+def test_visual_review_warns_once_when_sandboxed(tmp_path):
+    # AC1: sandbox set + a successful capture/critique -> exactly one "visual"
+    # event carrying the fixed marker, emitted before the serve/capture event.
+    from dev_team.sandbox import SandboxConfig
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        **_visual_seams(
+            config=EngineConfig(
+                visual_review=True, sandbox=SandboxConfig(image="toolchain:1")
+            ),
+        ),
+        listener=events.append,
+    )
+    report = run(engine._visual_review())
+    assert report is not None
+    visual_events = [e for e in events if e.stage == "visual"]
+    warnings = [e for e in visual_events if "unsandboxed" in e.message]
+    assert len(warnings) == 1
+    assert visual_events.index(warnings[0]) < next(
+        i for i, e in enumerate(visual_events) if "serving the app and capturing" in e.message
+    )
+
+
+def test_visual_review_no_sandbox_warning_when_sandbox_unset():
+    # AC2: sandbox=None (default) -> no such warning event appears anywhere.
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        **_visual_seams(config=EngineConfig(visual_review=True)),
+        listener=events.append,
+    )
+    run(engine._visual_review())
+    assert not any("unsandboxed" in e.message for e in events)
+
+
+def test_visual_review_off_by_default_emits_no_visual_events():
+    # AC3: visual_review=False -> no visual events fire at all, including the
+    # new sandbox warning (even with sandbox configured).
+    from dev_team.sandbox import SandboxConfig
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(sandbox=SandboxConfig(image="toolchain:1")),
+        listener=events.append,
+    )
+    assert run(engine._visual_review()) is None
+    assert not any(e.stage == "visual" for e in events)
+
+
+def test_visual_review_no_sandbox_warning_when_nothing_delivered():
+    # AC4 (guard: delivered=False) - the early-return fires before the
+    # sandbox check, so the warning must not appear even with sandbox set.
+    from dev_team.sandbox import SandboxConfig
+    from dev_team.visualreview import FakeAppServer, FakePageCapturer, FakeVisualReviewer
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(
+            visual_review=True, sandbox=SandboxConfig(image="toolchain:1")
+        ),
+        app_server=FakeAppServer(),
+        page_capturer=FakePageCapturer(),
+        visual_reviewer=FakeVisualReviewer(),
+        listener=events.append,
+    )
+    assert run(engine._visual_review(delivered=False)) is None
+    assert not any("unsandboxed" in e.message for e in events)
+
+
+def test_visual_review_no_sandbox_warning_when_budget_exhausted():
+    # AC4 (guard: budget exhausted).
+    from dev_team.sandbox import SandboxConfig
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        **_visual_seams(
+            config=EngineConfig(
+                visual_review=True, sandbox=SandboxConfig(image="toolchain:1")
+            ),
+        ),
+        listener=events.append,
+    )
+    engine._budget_exhausted = True
+    assert run(engine._visual_review()) is None
+    assert not any("unsandboxed" in e.message for e in events)
+
+
+def test_visual_review_no_sandbox_warning_when_seams_unwired():
+    # AC4 (guard: seams not wired).
+    from dev_team.sandbox import SandboxConfig
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(
+            visual_review=True, sandbox=SandboxConfig(image="toolchain:1")
+        ),
+        listener=events.append,
+    )
+    assert run(engine._visual_review()) is None
+    assert not any("unsandboxed" in e.message for e in events)
+
+
+def test_visual_review_sandbox_warning_fires_exactly_once_across_rounds(tmp_path):
+    # AC5: two _visual_review() calls in the same run (via visual_fix_rounds)
+    # -> the warning appears exactly once, not once per call.
+    from dev_team.sandbox import SandboxConfig
+
+    engine, runner, cmd, reviewer = _visual_fix_engine(
+        tmp_path, reports=[_major(), _clean()]
+    )
+    engine.config.sandbox = SandboxConfig(image="toolchain:1")
+    events = []
+    engine.listener = events.append
+    report = run(engine._visual_stage(_visual_design(), delivered=True))
+    assert reviewer.calls == 2  # initial review + one re-review
+    assert report.clean is True
+    warnings = [e for e in events if e.stage == "visual" and "unsandboxed" in e.message]
+    assert len(warnings) == 1
+
+
+def test_visual_review_sandbox_warning_is_advisory_only():
+    # AC6 [security]: the warning path never raises, never sinks
+    # DeliveryOutcome.success on its own, and the review still returns a
+    # normally-populated VisualReport in the same run.
+    from dev_team.models import Severity
+    from dev_team.sandbox import SandboxConfig
+    from dev_team.visualreview import FakeVisualReviewer, VisualFinding, VisualReport
+
+    reviewer = FakeVisualReviewer(
+        report=VisualReport(
+            findings=[VisualFinding(route="/", issue="cramped", severity=Severity.MAJOR)],
+            summary="spacing",
+            routes=["/"],
+        )
+    )
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        **_visual_seams(
+            config=EngineConfig(
+                visual_review=True, sandbox=SandboxConfig(image="toolchain:1")
+            ),
+            visual_reviewer=reviewer,
+        ),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.visual is reviewer.report
+    assert outcome.visual.findings  # a normally-populated report, not swallowed
+    # advisory: the sandbox warning never sinks an otherwise-successful run
+    assert outcome.success is True
+
+
 def test_visual_review_wired_into_delivery_is_advisory():
     from dev_team.models import Severity
     from dev_team.visualreview import FakeVisualReviewer, VisualFinding, VisualReport

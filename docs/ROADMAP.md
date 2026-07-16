@@ -48,7 +48,13 @@ running the whole process in a container/VM ([`DEPLOYMENT.md` §5d](../DEPLOYMEN
 has a hardened recipe and the layered model), with matching hardening on the
 standing systemd units. The remaining open edge is a per-job isolation boundary
 (review S4) — one dispatched job's container can still see another's workspace on
-a shared host; a per-job rootless container/namespace is the follow-up.
+a shared host; a per-job rootless container/namespace is the follow-up. A second
+known-uncovered surface: visual review's served app (`SubprocessAppServer`) runs
+as a bare host subprocess even under `--sandbox` — the engine now logs an
+advisory warning rather than leaving the gap silently assumed-covered (see
+[`docs/SANDBOX.md`](SANDBOX.md)); real containment is future work (needs
+inbound-from-host connectivity with denied outbound, a shape this repo's
+network-isolation primitives don't yet support).
 
 ## 2. PR / CI integration
 
