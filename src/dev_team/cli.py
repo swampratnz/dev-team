@@ -671,7 +671,7 @@ def build_parser() -> argparse.ArgumentParser:
         "posted as a PR comment and an allow-listed login answers by "
         "commenting 'apply' or 'skip'. This posts the CI failure summary as "
         "a plain, repo-visible PR comment — a broader audience than the "
-        "terminal (see docs/DEPLOYMENT.md before enabling on a repo where "
+        "terminal (see docs/INTERACTION.md before enabling on a repo where "
         "CI diagnostics shouldn't be public). Requires --interactive, "
         "--pull-request, --watch-fix-rounds > 0, and at least one "
         "--interactive-pr-comment-author (no default allow-list).",

@@ -22,7 +22,7 @@ Enabling this channel changes the **audience** of the posted content: today
 ``ci_fix_question``'s context (CI failure output, Restricted-classified) is
 seen only on a private terminal or through dispatch's bearer-token-gated
 endpoint. Posting it as a plain PR comment makes it world-readable on a
-public repo — see ``docs/DEPLOYMENT.md`` for the operator-facing warning.
+public repo — see ``docs/INTERACTION.md`` for the operator-facing warning.
 """
 
 from __future__ import annotations

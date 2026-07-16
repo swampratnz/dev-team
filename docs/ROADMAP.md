@@ -254,7 +254,7 @@ that loop's channel — `team.interaction` (plan review, approvals) is
 untouched. **Exposure change to weigh before enabling:** this posts the CI
 failure summary as a plain, repo-visible PR comment, a broader audience than
 the terminal or dispatch's bearer-token-gated question endpoint (#87) — see
-`docs/DEPLOYMENT.md`. The dashboard and Slack adapters remain future work.
+`docs/INTERACTION.md`. The dashboard and Slack adapters remain future work.
 
 ## 8. MCP tool provider & group review
 
