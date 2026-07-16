@@ -158,11 +158,14 @@ sections below are reconstructed from the repository history.
   deliberately `needs-context`, never `refuted`. Threaded through the CLI
   (`--verify --skip-broken-citations`) and dispatch (`POST /jobs`
   `mode: "verify"`, `skip_broken_citations: bool`, rejected with `400` if
-  not a bool). A skipped verification is never appended to
-  `verifications.jsonl` and never counted by `GET /calibration` — no model
-  ever adjudicated it — and `GET /jobs/{id}/result` marks a skip with
-  `"success":true,"skipped":true` so a caller can tell it apart from a
-  real agent verdict.
+  not a bool). `Dispatcher.run_job` also skips the repo clone itself
+  whenever the eligible skip fires — a genuine $0, no-clone-read result,
+  not just a saved agent call — instead of paying `clone_or_update`'s
+  network/disk cost for a repo the skip path never reads. A skipped
+  verification is never appended to `verifications.jsonl` and never
+  counted by `GET /calibration` — no model ever adjudicated it — and
+  `GET /jobs/{id}/result` marks a skip with `"success":true,"skipped":true`
+  so a caller can tell it apart from a real agent verdict.
 - **Interactive dispatch deliver** (`docs/DISPATCH.md`): `POST /jobs` gains
   opt-in `interactive`/`interactive_timeout_seconds` fields — the missing
   wiring `docs/ROADMAP.md` item 7 named directly (`Dispatcher.run_job`

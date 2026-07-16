@@ -712,6 +712,21 @@ class Dispatcher:
         """
 
         spec = record.spec
+        if (
+            spec.mode == "verify"
+            and spec.skip_broken_citations
+            and (spec.finding or {}).get("citation_broken") is True
+        ):
+            # verify_finding's skip_broken_citations branch never touches
+            # `workspace` — it short-circuits on the finding's already-known
+            # citation_broken flag before any repo access. Skip the clone
+            # itself here too, so the "$0, no clone read" promise in
+            # docs/ASSESSMENT.md and docs/DISPATCH.md is actually true: no
+            # network egress, disk I/O, or clone latency for this (untrusted,
+            # third-party) repo. record.workspace stays None, which
+            # _progress() already treats as "no events" for a job that never
+            # ran anything with an EventLog (true of every verify job).
+            return await self._run_verify(record, spec, None)
         dest = str(Path(self._jobs_root) / spec.id)
         workspace = self._materialise(spec, dest)
         record.workspace = workspace
@@ -797,7 +812,7 @@ class Dispatcher:
         return outcome, outcome.cost_usd
 
     async def _run_verify(
-        self, record: JobRecord, spec: JobSpec, workspace: Workspace
+        self, record: JobRecord, spec: JobSpec, workspace: Optional[Workspace]
     ) -> Tuple[Any, float]:
         """Re-check the resolved finding against the fresh clone of its repo.
 
@@ -808,6 +823,11 @@ class Dispatcher:
         the mirrored assessment JSON. An agent failure is raised so the
         worker records a failed job (and ``result()`` answers
         ``{"kind":"verify","success":false,…}``).
+
+        ``workspace`` is ``None`` exactly when ``run_job`` skipped the clone
+        entirely (``spec.skip_broken_citations`` and the finding's citation
+        already known broken) — safe because :func:`verify_finding` never
+        dereferences ``workspace`` on that same short-circuit path.
         """
 
         # verify_finding drives the agent DIRECTLY, not through DevTeam, so it

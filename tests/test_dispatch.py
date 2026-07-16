@@ -3519,6 +3519,47 @@ def test_verify_job_skip_broken_citations_has_no_effect_when_not_broken():
         assert len(verifs["verifications"]) == 1
 
 
+def test_verify_job_skip_broken_citations_never_clones_the_real_repo(
+    tmp_path, monkeypatch
+):
+    """Regression for the review on #111/#112: an eligible skip must skip
+    the clone itself, not just the agent call — every other test here
+    injects `_mem_materialise`, an in-memory fake, so none of them would
+    catch `run_job` calling the real `clone_or_update` before branching
+    into the skip. This one leaves `materialise` unset (the Dispatcher
+    default, `_default_materialise`) and fails loudly if it is ever
+    reached."""
+
+    def clone_should_not_run(*args, **kwargs):
+        raise AssertionError(
+            "clone_or_update must not run for an eligible skip_broken_citations job"
+        )
+
+    monkeypatch.setattr(dispatch_mod, "clone_or_update", clone_should_not_run)
+    dash = _seeded_dash_with_broken_citation()
+    raising_runner = ScriptedRunner()  # raises if .run() is ever invoked
+    with running(
+        runner=raising_runner,
+        dashboard_workspace=dash,
+        jobs_root=str(tmp_path / "jobs"),
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-cb2",
+                  "finding_id": "risk.secrets[0]",
+                  "skip_broken_citations": True},
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["cost_usd"] == 0.0
+        assert raising_runner.calls == []
+
+
 def test_submit_verify_http_error_contract():
     with running(
         materialise=_mem_materialise, dashboard_workspace=_seeded_dash()
