@@ -664,8 +664,11 @@ def _render_visual_findings(report: VisualReport) -> str:
     if report.summary:
         lines.append(f"Summary: {defuse(report.summary, 'visual-findings')}")
     for finding in report.findings:
+        # route and issue both come from the untrusted model JSON; severity is a
+        # fixed enum value, so only the two free-text fields need defusing.
+        route = defuse(finding.route, "visual-findings")
         issue = defuse(finding.issue, "visual-findings")
-        lines.append(f"- [{finding.severity.value}] {finding.route}: {issue}")
+        lines.append(f"- [{finding.severity.value}] {route}: {issue}")
     return "\n".join(lines)
 
 
@@ -1633,7 +1636,16 @@ class DeliveryEngine:
         """
 
         report = await self._visual_review(delivered)
-        if report is None or self.config.visual_fix_rounds <= 0 or self.definition_of_done is None:
+        # Fixing needs quality gates to verify each fix and a git baseline so a
+        # kept round can be WIP-committed (see _apply_visual_fix); without a
+        # baseline the fixes cannot be isolated per round, so the review stays
+        # purely advisory.
+        if (
+            report is None
+            or self.config.visual_fix_rounds <= 0
+            or self.definition_of_done is None
+            or self._baseline_sha is None
+        ):
             return report
         for _ in range(self.config.visual_fix_rounds):
             if report.clean:
@@ -1654,10 +1666,13 @@ class DeliveryEngine:
         The findings are model output derived from reading a screenshot, so they
         are shown to the engineer as a defused, delimited ``<visual-findings>``
         block — the same untrusted-content discipline as the CI remediation
-        path. A fix is kept in the working tree (folded into the feature commit
-        later, and security-reviewed first) only when the gates pass and it
-        actually changed something; otherwise it is discarded. Returns whether a
-        kept change was made.
+        path. A fix is kept only when the gates pass and it actually changed
+        something; otherwise it is discarded. A kept fix is WIP-committed on the
+        delivery branch (like an accepted task), so a *later* round that fails
+        its gates rolls back only to this round rather than discarding it too —
+        and ``_commit_if_approved`` later collapses these WIP commits into the
+        one feature commit, after the security review has vetted them. Returns
+        whether a kept change was made.
         """
 
         task = Task(
@@ -1697,6 +1712,10 @@ class DeliveryEngine:
             if not changed:
                 self._event("visual", "Visual fix changed nothing")
                 return False
+            # WIP-commit the kept fix so a later failed round's discard cannot
+            # reach past it (the feature commit later squashes these together).
+            self.git.add_paths(changed)
+            self.git.commit("fix(dev-team): address visual review findings")
             return True
 
     def _on_scheduled(self, result: ScheduledResult) -> None:

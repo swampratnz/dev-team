@@ -1479,17 +1479,23 @@ def _visual_fix_engine(tmp_path, *, reports, gate_passes=True, changed="src/app.
         cmd.add_rule(
             "status --porcelain", CommandResult(["git", "status"], 0, f"?? {changed}\x00", "")
         )
+    if isinstance(gate_passes, (list, tuple)):
+        results = iter(gate_passes)
+        gate = PredicateGate("g", lambda ctx: next(results, True))
+    else:
+        gate = PredicateGate("g", lambda ctx: gate_passes)
     reviewer = _SequencedReviewer(reports)
     engine = _engine(
         runner,
         workspace=LocalWorkspace(str(tmp_path)),
         command_runner=cmd,
-        definition_of_done=DefinitionOfDone([PredicateGate("g", lambda ctx: gate_passes)]),
+        definition_of_done=DefinitionOfDone([gate]),
         config=EngineConfig(visual_review=True, visual_fix_rounds=fix_rounds),
         app_server=FakeAppServer(),
         page_capturer=FakePageCapturer(),
         visual_reviewer=reviewer,
     )
+    engine._baseline_sha = "base"  # activate the WIP-commit fix loop (branch mode)
     return engine, runner, cmd, reviewer
 
 
@@ -1509,8 +1515,8 @@ def test_visual_stage_fixes_findings_and_reconverges_to_clean(tmp_path):
     # the engineer saw the findings as a fenced, untrusted block
     prompt = _engineer_prompt(runner)
     assert "<visual-findings>" in prompt and "unstyled body text" in prompt
-    # the kept fix is staged (folded into the feature commit later), not committed here
-    assert not any(c[:2] == ["git", "commit"] for c in cmd.calls)
+    # the kept fix is WIP-committed (later squashed into the feature commit)
+    assert any(c[:2] == ["git", "commit"] for c in cmd.calls)
 
 
 def test_visual_stage_discards_a_fix_that_breaks_the_gates(tmp_path):
@@ -1521,6 +1527,30 @@ def test_visual_stage_discards_a_fix_that_breaks_the_gates(tmp_path):
     assert report.clean is False  # the pre-fix report is preserved
     assert reviewer.calls == 1  # no re-review after a discarded fix
     assert ["git", "reset", "--hard"] in cmd.calls and ["git", "clean", "-fd"] in cmd.calls
+
+
+def test_visual_stage_preserves_earlier_kept_rounds_when_a_later_round_fails(tmp_path):
+    # round 1 passes its gates (kept, WIP-committed), round 2 fails them.
+    engine, runner, cmd, reviewer = _visual_fix_engine(
+        tmp_path, reports=[_major(), _major()], gate_passes=[True, False], fix_rounds=2
+    )
+    report = run(engine._visual_stage(_visual_design(), delivered=True))
+    assert report.clean is False  # round 2 failed; page still not clean
+    assert reviewer.calls == 2  # initial review + the re-review after round 1
+    # round 1 was committed *before* round 2's discard, so the reset --hard
+    # rolls back only round 2 rather than wiping the round-1 fix as well.
+    commit_idx = next(i for i, c in enumerate(cmd.calls) if c[:2] == ["git", "commit"])
+    reset_idx = next(i for i, c in enumerate(cmd.calls) if c == ["git", "reset", "--hard"])
+    assert commit_idx < reset_idx
+
+
+def test_visual_stage_skips_fixing_without_a_git_baseline(tmp_path):
+    engine, runner, cmd, reviewer = _visual_fix_engine(tmp_path, reports=[_major()])
+    engine._baseline_sha = None  # no WIP-commit anchor -> review stays advisory
+    report = run(engine._visual_stage(_visual_design(), delivered=True))
+    assert report.clean is False
+    assert reviewer.calls == 1
+    assert not any("current working directory" in c["prompt"] for c in runner.calls)
 
 
 def test_visual_stage_stops_when_the_fix_changes_nothing(tmp_path):
