@@ -327,6 +327,23 @@ def test_engine_config_threads_visual_fix_rounds():
     assert _engine_config(args).visual_fix_rounds == 2
 
 
+def test_engine_config_threads_review_debate():
+    from dev_team.cli import _engine_config, build_parser
+
+    on = build_parser().parse_args(["T", "D", "--deliver", "--review-debate"])
+    assert _engine_config(on).review_debate is True
+    off = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(off).review_debate is False
+
+
+def test_main_review_debate_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--review-debate"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--review-debate" in err and "--deliver" in err
+
+
 def test_main_visual_fix_rounds_rejected_without_visual_review(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(

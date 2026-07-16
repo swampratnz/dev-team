@@ -13,6 +13,24 @@ from ..fences import defuse
 from ..models import Implementation, Review, Task
 from .base import READ_ONLY_TOOLS, UNTRUSTED_CONTENT_NOTE, BaseAgent
 
+
+def render_blocking_findings(review: Review) -> str:
+    """Render a review's blocking comments as defused text for a debate prompt.
+
+    The comment text is model output (the reviewer read untrusted code), so it
+    is defused against the ``<review-findings>`` fence the caller wraps it in
+    before it re-enters another agent's prompt.
+    """
+
+    lines = []
+    for comment in review.blocking_comments:
+        where = f"{comment.path}: " if comment.path else ""
+        lines.append(
+            f"- [{comment.severity.value}] {where}"
+            f"{defuse(comment.message, 'review-findings')}"
+        )
+    return "\n".join(lines) or "- (no specific blocking comments)"
+
 _SYSTEM = """\
 You are a meticulous code reviewer. You judge whether an implementation meets
 the task's acceptance criteria and follows good engineering practice, based on

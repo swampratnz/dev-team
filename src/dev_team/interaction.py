@@ -370,6 +370,28 @@ def ci_fix_question(
     )
 
 
+def review_dispute_question(task_id: str, *, context: str, asked_by: str) -> Question:
+    """Supervise a debate whose judge would overturn a blocking review.
+
+    Default (unattended :class:`AutoChannel`) answer: overturn — matching the
+    autonomous path, where the judge's ruling is applied when no human is
+    watching. With no input available (EOF) the fail-safe is ``uphold``: a
+    detached run must not drop a reviewer's block that no human blessed.
+    """
+
+    return Question(
+        topic="review-dispute",
+        prompt=f"The review debate would overturn the block on {task_id}. Accept it?",
+        choices=(
+            Choice("overturn", "accept the overturn and let the change proceed"),
+            Choice("uphold", "keep the changes-requested verdict"),
+        ),
+        context=context,
+        asked_by=asked_by,
+        fail_safe_key="uphold",
+    )
+
+
 def replan_review_question(decision: Replan, *, asked_by: str) -> Question:
     """Supervise a manager-proposed re-plan: apply, revise, or reject.
 

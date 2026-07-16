@@ -147,6 +147,32 @@ class Review:
 
 
 @dataclass
+class Rebuttal:
+    """The engineer's response when a review blocks their change.
+
+    ``concedes`` short-circuits the debate: the engineer agrees the blocking
+    findings are valid, so there is nothing to adjudicate and the
+    changes-requested verdict stands.
+    """
+
+    text: str
+    concedes: bool = False
+
+
+@dataclass
+class ReviewJudgment:
+    """A judge's ruling on a contested review (reviewer vs engineer).
+
+    ``overturn`` is true only when the engineer's rebuttal has shown the
+    blocking findings to be wrong or already addressed; the bar is high, so the
+    default is to uphold.
+    """
+
+    overturn: bool
+    rationale: str = ""
+
+
+@dataclass
 class TestCase:
     """A single automated test authored by QA."""
 
