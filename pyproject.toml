@@ -35,6 +35,15 @@ test = [
     "coverage>=7",
     "ruff>=0.4",
 ]
+# The advisory visual review (--visual-review): a headless browser to
+# screenshot the delivered UI and the Anthropic API SDK to critique it with a
+# vision model. Optional and lazily imported — the core package never needs
+# them. After installing, fetch the browser once with `playwright install
+# chromium` (skipped where Chromium is already provisioned).
+visual = [
+    "anthropic>=0.40",
+    "playwright>=1.40",
+]
 
 [project.scripts]
 dev-team = "dev_team.cli:main"

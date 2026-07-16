@@ -251,6 +251,110 @@ def test_engine_config_threads_frontend_craft():
     assert _engine_config(on).frontend_craft is True
 
 
+def test_main_visual_review_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["Login", "Add login", "--visual-review", "--serve-command", "s --port {port}"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--visual-review" in err and "--deliver" in err
+
+
+def test_main_serve_command_rejected_without_visual_review(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["Login", "Add login", "--deliver", "--serve-command", "s --port {port}"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--serve-command" in err and "--visual-review" in err
+
+
+def test_main_visual_review_requires_serve_command(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--deliver", "--visual-review"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--serve-command" in err
+
+
+def test_main_serve_command_requires_port_placeholder(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["Login", "Add login", "--deliver", "--visual-review", "--serve-command", "npm start"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "{port}" in err
+
+
+def test_engine_config_threads_visual_review():
+    from dev_team.cli import _engine_config, build_parser
+
+    on = build_parser().parse_args(
+        [
+            "T", "D", "--deliver", "--visual-review",
+            "--serve-command", "serve --port {port}",
+            "--screenshot-routes", "/", "/steps",
+        ]
+    )
+    cfg = _engine_config(on)
+    assert cfg.visual_review is True
+    assert cfg.serve_command == ("serve", "--port", "{port}")
+    assert cfg.screenshot_routes == ("/", "/steps")
+    off = _engine_config(build_parser().parse_args(["T", "D", "--deliver"]))
+    assert off.visual_review is False
+    assert off.serve_command is None
+    assert off.screenshot_routes == ("/",)
+
+
+def test_deliver_visual_review_wires_the_seams(tmp_path, monkeypatch):
+    import dev_team.cli as cli_module
+    from dev_team.visualreview import (
+        AnthropicVisualReviewer,
+        PlaywrightPageCapturer,
+        SubprocessAppServer,
+    )
+
+    captured = {}
+
+    class _FakeEngine:
+        async def deliver(self, request):
+            raise SystemExit(0)
+
+    class _FakeTeam:
+        def __init__(self, *a, **k):
+            self.interaction = None
+            self.roster = None
+
+        def make_engine(self, **kwargs):
+            captured.update(kwargs)
+            return _FakeEngine()
+
+    monkeypatch.setattr(cli_module, "DevTeam", _FakeTeam)
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "Fix", "Fix it", "--deliver",
+                "--workspace", str(tmp_path),
+                "--visual-review",
+                "--serve-command", "serve --port {port}",
+                "--screenshot-routes", "/", "/steps",
+            ],
+            runner=ScriptedRunner([]),
+        )
+    assert isinstance(captured["app_server"], SubprocessAppServer)
+    assert captured["app_server"].serve_command == ("serve", "--port", "{port}")
+    assert captured["app_server"].cwd == str(tmp_path)
+    assert isinstance(captured["page_capturer"], PlaywrightPageCapturer)
+    assert isinstance(captured["visual_reviewer"], AnthropicVisualReviewer)
+    assert captured["config"].visual_review is True
+
+
 def test_main_deliver_only_flags_all_reported(capsys):
     argv = [
         "Login", "Add login",

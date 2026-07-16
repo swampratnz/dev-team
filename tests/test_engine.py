@@ -684,6 +684,27 @@ def test_visual_review_produces_a_report_from_the_seams():
     assert any(e.stage == "visual" for e in events)
 
 
+def test_visual_review_skips_when_nothing_was_delivered():
+    from dev_team.visualreview import FakeAppServer, FakePageCapturer, FakeVisualReviewer
+
+    events = []
+    server = FakeAppServer()
+    reviewer = FakeVisualReviewer()
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True),
+        app_server=server,
+        page_capturer=FakePageCapturer(),
+        visual_reviewer=reviewer,
+        listener=events.append,
+    )
+    # A run that produced no successful change never serves or spends on vision.
+    assert run(engine._visual_review(delivered=False)) is None
+    assert server.starts == 0
+    assert reviewer.seen == []
+    assert any("no change" in e.message.lower() for e in events)
+
+
 def test_visual_review_without_seams_skips_with_an_event():
     events = []
     engine = _engine(

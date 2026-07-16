@@ -56,6 +56,11 @@ from .sources import (
 )
 from .team import DevTeam
 from .transcripts import TRANSCRIPTS_DIR, TranscriptRecorder
+from .visualreview import (
+    AnthropicVisualReviewer,
+    PlaywrightPageCapturer,
+    SubprocessAppServer,
+)
 
 # Any one of these satisfies the credential preflight. The Claude CLI (which
 # the Agent SDK spawns) resolves them itself; dev-team only checks presence so
@@ -517,6 +522,30 @@ def build_parser() -> argparse.ArgumentParser:
         "reviewer's guidance so a from-scratch frontend is not visually bare "
         "(with --deliver).",
     )
+    delivery.add_argument(
+        "--visual-review",
+        action="store_true",
+        help="After delivery, serve the app, screenshot its routes, and critique "
+        "the rendered UI with a vision model (advisory — findings are reported "
+        "but never block the commit). Requires --serve-command and the "
+        "'dev-team[visual]' extra (with --deliver).",
+    )
+    delivery.add_argument(
+        "--serve-command",
+        default=None,
+        metavar="CMD",
+        help="How to serve the delivered app for --visual-review; must contain a "
+        "'{port}' placeholder, substituted with a free port, e.g. "
+        "'npm run preview -- --port {port}' (with --visual-review).",
+    )
+    delivery.add_argument(
+        "--screenshot-routes",
+        nargs="+",
+        default=None,
+        metavar="ROUTE",
+        help="Routes to screenshot for --visual-review (default: '/'), "
+        "e.g. --screenshot-routes / /steps /about.",
+    )
     misc.add_argument(
         "--budget-usd",
         type=float,
@@ -762,6 +791,21 @@ def _validate_args(
         extra = [name for name, passed in sandbox_tuning if passed]
         if extra:
             parser.error(f"{', '.join(extra)}: only valid with --sandbox")
+    visual_tuning = [
+        ("--serve-command", args.serve_command is not None),
+        ("--screenshot-routes", args.screenshot_routes is not None),
+    ]
+    if not args.visual_review:
+        extra = [name for name, passed in visual_tuning if passed]
+        if extra:
+            parser.error(f"{', '.join(extra)}: only valid with --visual-review")
+    elif args.serve_command is None:
+        parser.error(
+            "--visual-review needs --serve-command to know how to start the app "
+            "(e.g. --serve-command 'npm run preview -- --port {port}')"
+        )
+    elif "{port}" not in args.serve_command:
+        parser.error("--serve-command must contain a '{port}' placeholder")
     if not args.assess:
         assess_only = [
             ("--exclude", args.exclude_globs is not None),
@@ -844,6 +888,9 @@ def _reject_deliver_only_flags(
             args.finalization_reserve != parser.get_default("finalization_reserve"),
         ),
         ("--no-frontend-craft", args.no_frontend_craft),
+        ("--visual-review", args.visual_review),
+        ("--serve-command", args.serve_command is not None),
+        ("--screenshot-routes", args.screenshot_routes is not None),
         ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
         ("--no-commit", args.no_commit),
         (
@@ -919,6 +966,13 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         require_recognised_project=args.require_recognised_project,
         finalization_reserve_fraction=args.finalization_reserve,
         frontend_craft=not args.no_frontend_craft,
+        visual_review=args.visual_review,
+        serve_command=(
+            tuple(shlex.split(args.serve_command)) if args.serve_command else None
+        ),
+        screenshot_routes=(
+            tuple(args.screenshot_routes) if args.screenshot_routes else ("/",)
+        ),
         remote_verify_status=(
             tuple(shlex.split(args.remote_verify_status))
             if args.remote_verify_status
@@ -984,6 +1038,18 @@ async def _deliver(
     recorder = _transcript_recorder(args, run)
     if recorder is not None:
         kwargs["transcript_recorder"] = recorder
+    if args.visual_review:
+        # The advisory visual-review seams. Validation has already ensured
+        # --serve-command is present and carries a {port} placeholder; the
+        # engine only runs these when config.visual_review is also set.
+        kwargs["app_server"] = SubprocessAppServer(
+            serve_command=tuple(shlex.split(args.serve_command)),
+            cwd=args.workspace,
+        )
+        kwargs["page_capturer"] = PlaywrightPageCapturer()
+        kwargs["visual_reviewer"] = AnthropicVisualReviewer(
+            model=args.model or "claude-opus-4-8", budget=budget
+        )
     # Hold the engine (rather than team.deliver) so the CI-fix loop can reuse it
     # to remediate on the same workspace/gates/git after the PR's checks fail.
     engine = team.make_engine(
