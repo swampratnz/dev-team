@@ -1161,7 +1161,8 @@ class DeliveryEngine:
         documentation = await self._specialist(
             self._write_documentation(request, design, task_results)
         )
-        visual = await self._specialist(self._visual_review())
+        delivered = any(tr.task.status is TaskStatus.DONE for tr in task_results)
+        visual = await self._specialist(self._visual_review(delivered))
 
         committed = self._commit_if_approved(request, task_results, security)
         self._finalise_backlog(backlog, stories, task_results)
@@ -1531,20 +1532,26 @@ class DeliveryEngine:
             )
         return lessons
 
-    async def _visual_review(self) -> Optional[VisualReport]:
+    async def _visual_review(self, delivered: bool = True) -> Optional[VisualReport]:
         """Serve the app, screenshot its routes, and critique them (advisory).
 
         Off unless ``config.visual_review`` and all three seams (app_server,
         page_capturer, visual_reviewer) are wired, and skipped once the budget
-        is spent. Best-effort: a serve, capture, or critique failure degrades to
-        ``None`` and never crashes the run — this is enforced here, not left to
-        the ``VisualReviewer`` implementation to translate its errors. A
+        is spent. Also skipped when ``delivered`` is false — a run that produced
+        no successful change has nothing to serve or look at, so the serve,
+        browser, and (metered) vision spend would be wasted. Best-effort: a
+        serve, capture, or critique failure degrades to ``None`` and never
+        crashes the run — this is enforced here, not left to the
+        ``VisualReviewer`` implementation to translate its errors. A
         ``BudgetExceededError`` is the one exception re-raised, so the run still
         records the exhaustion (via ``_specialist``). Findings never gate the
         commit.
         """
 
         if not self.config.visual_review or self._budget_exhausted:
+            return None
+        if not delivered:
+            self._event("visual", "Delivery produced no change; skipping visual review")
             return None
         if not (self.app_server and self.page_capturer and self.visual_reviewer):
             self._event("visual", "Visual review enabled but no reviewer is wired; skipping")
