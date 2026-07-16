@@ -121,6 +121,7 @@ def delivery_to_dict(outcome: "DeliveryOutcome") -> Dict[str, Any]:
             else None
         ),
         "pull_request_url": outcome.pull_request_url,
+        "pull_request_number": outcome.pull_request_number,
         "checks_state": outcome.checks.state if outcome.checks else None,
         "checks_failed": list(outcome.checks.failed) if outcome.checks else [],
         "budget_exhausted": outcome.budget_exhausted,

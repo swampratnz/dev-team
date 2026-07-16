@@ -1858,7 +1858,10 @@ def _run_fix_loop(monkeypatch, engine, outcome, *, team=None, rounds=2, rewatch=
             o.checks = ChecksOutcome(states.pop(0), summary="rewatch")
 
     monkeypatch.setattr(cli_module, "_watch_pr_checks", fake_rewatch)
-    args = types.SimpleNamespace(watch_fix_rounds=rounds, workspace="/ws", watch_timeout=600.0)
+    args = types.SimpleNamespace(
+        watch_fix_rounds=rounds, workspace="/ws", watch_timeout=600.0,
+        interactive_pr_comments=False, interactive_pr_comment_author=None,
+    )
     run(
         cli_module._run_ci_fix_loop(
             engine, team or _fix_team(), outcome, args, RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), "tok"
@@ -1951,7 +1954,10 @@ def test_watch_fix_loop_stops_on_push_failure(monkeypatch):
 
     engine = _FakeEngine([RemediationOutcome(True, "fixed")])
     outcome = _fix_outcome("failure")
-    args = types.SimpleNamespace(watch_fix_rounds=2, workspace="/ws", watch_timeout=600.0)
+    args = types.SimpleNamespace(
+        watch_fix_rounds=2, workspace="/ws", watch_timeout=600.0,
+        interactive_pr_comments=False, interactive_pr_comment_author=None,
+    )
     run(
         cli_module._run_ci_fix_loop(
             engine, _fix_team(), outcome, args, RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), "tok"
@@ -1959,6 +1965,205 @@ def test_watch_fix_loop_stops_on_push_failure(monkeypatch):
     )
     assert engine.calls == ["boom"]  # fixed once, but the push failed -> stopped
     assert outcome.checks.state == "failure"  # never re-watched
+
+
+# --- --interactive-pr-comments (ROADMAP #7: PR-comment CI-fix supervision) --
+
+
+def test_main_interactive_pr_comments_requires_interactive():
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["T", "D", "--deliver", "--repo", "acme/mono", "--pull-request",
+             "--watch-checks", "--watch-fix-rounds", "1",
+             "--interactive-pr-comments", "--interactive-pr-comment-author", "ada"],
+            runner=ScriptedRunner([]),
+        )
+    assert exc.value.code == 2
+
+
+def test_main_interactive_pr_comments_requires_pull_request():
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["T", "D", "--deliver", "--interactive",
+             "--interactive-pr-comments", "--interactive-pr-comment-author", "ada"],
+            runner=ScriptedRunner([]),
+        )
+    assert exc.value.code == 2
+
+
+def test_main_interactive_pr_comments_requires_watch_fix_rounds():
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["T", "D", "--deliver", "--repo", "acme/mono", "--interactive",
+             "--pull-request", "--watch-checks",
+             "--interactive-pr-comments", "--interactive-pr-comment-author", "ada"],
+            runner=ScriptedRunner([]),
+        )
+    assert exc.value.code == 2
+
+
+def test_main_interactive_pr_comments_requires_an_author():
+    # The load-bearing security control: no implicit "defaults to PR author".
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["T", "D", "--deliver", "--repo", "acme/mono", "--interactive",
+             "--pull-request", "--watch-checks", "--watch-fix-rounds", "1",
+             "--interactive-pr-comments"],
+            runner=ScriptedRunner([]),
+        )
+    assert exc.value.code == 2
+
+
+def test_main_interactive_pr_comment_author_requires_the_flag():
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["T", "D", "--deliver", "--repo", "acme/mono", "--interactive",
+             "--pull-request", "--watch-checks", "--watch-fix-rounds", "1",
+             "--interactive-pr-comment-author", "ada"],
+            runner=ScriptedRunner([]),
+        )
+    assert exc.value.code == 2
+
+
+def test_pr_comment_channel_is_none_when_not_opted_in():
+    import types
+
+    import dev_team.cli as cli_module
+    from dev_team.sources import RepoRef
+
+    outcome = _fix_outcome()
+    outcome.pull_request_number = 7
+    args = types.SimpleNamespace(interactive_pr_comments=False, interactive_pr_comment_author=None)
+    ref = RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git")
+    assert cli_module._pr_comment_channel(outcome, args, ref, "tok") is None
+
+
+def test_pr_comment_channel_builds_scoped_channel_when_opted_in():
+    import types
+
+    import dev_team.cli as cli_module
+    from dev_team.pr_comment_channel import GitHubPRCommentChannel
+    from dev_team.sources import RepoRef
+
+    outcome = _fix_outcome()
+    outcome.pull_request_number = 7
+    args = types.SimpleNamespace(
+        interactive_pr_comments=True, interactive_pr_comment_author=["ada", "grace"],
+    )
+    ref = RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git")
+    channel = cli_module._pr_comment_channel(outcome, args, ref, "tok")
+    assert isinstance(channel, GitHubPRCommentChannel)
+    assert channel.owner == "acme" and channel.name == "mono"
+    assert channel.pr_number == 7
+    assert channel.allowed_logins == ("ada", "grace")
+    assert channel.token == "tok"
+
+
+def test_run_ci_fix_loop_baseline_constructs_no_pr_comment_channel(monkeypatch):
+    # AC8: the flag omitted means zero GitHubPRCommentChannel construction and
+    # team.interaction answers exactly as before.
+    import dev_team.cli as cli_module
+    from dev_team.engine import RemediationOutcome
+    from dev_team.interaction import Reply, ScriptedChannel
+
+    def boom(*a, **k):
+        raise AssertionError("GitHubPRCommentChannel must not be constructed by default")
+
+    monkeypatch.setattr(cli_module, "GitHubPRCommentChannel", boom)
+    engine = _FakeEngine([RemediationOutcome(True, "fixed")])
+    outcome = _fix_outcome("failure")
+    team = _fix_team(interaction=ScriptedChannel(script=[Reply("apply")]))
+    pushes = _run_fix_loop(monkeypatch, engine, outcome, team=team, rewatch=["success"])
+    assert pushes == [True]  # team.interaction answered, unchanged from before
+
+
+def test_run_ci_fix_loop_uses_pr_comment_channel_when_opted_in(monkeypatch):
+    import types
+
+    import dev_team.cli as cli_module
+    from dev_team.checks import ChecksOutcome
+    from dev_team.engine import RemediationOutcome
+    from dev_team.interaction import Reply, ScriptedChannel
+    from dev_team.sources import RepoRef
+    from helpers import run
+
+    pr_channel = ScriptedChannel(script=[Reply("apply")])
+    monkeypatch.setattr(cli_module, "GitHubPRCommentChannel", lambda **kw: pr_channel)
+    monkeypatch.setattr(cli_module, "push_branch", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli_module, "_watch_pr_checks",
+        lambda o, a, ref, token: setattr(o, "checks", ChecksOutcome("success", summary="ok")),
+    )
+    engine = _FakeEngine([RemediationOutcome(True, "fixed")])
+    outcome = _fix_outcome("failure")
+    outcome.pull_request_number = 7
+
+    def poison_ask(question):
+        raise AssertionError("team.interaction must not be asked when --interactive-pr-comments is set")
+
+    team = types.SimpleNamespace(
+        interaction=types.SimpleNamespace(ask=poison_ask), roster=_fix_team().roster,
+    )
+    args = types.SimpleNamespace(
+        watch_fix_rounds=1, workspace="/ws", watch_timeout=600.0,
+        interactive_pr_comments=True, interactive_pr_comment_author=["ada"],
+    )
+    run(
+        cli_module._run_ci_fix_loop(
+            engine, team, outcome, args,
+            RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), "tok",
+        )
+    )
+    assert pr_channel.questions and pr_channel.questions[0].topic == "ci-fix"
+    assert engine.calls == ["boom"]  # the PR-comment reply drove the same loop
+
+
+def test_run_ci_fix_loop_pr_comment_error_stops_gracefully(monkeypatch, capsys):
+    import types
+
+    import dev_team.cli as cli_module
+    from dev_team.pr_comment_channel import GitHubPRCommentChannelError
+    from dev_team.sources import RepoRef
+    from helpers import run
+
+    class _BoomChannel:
+        def ask(self, question):
+            raise GitHubPRCommentChannelError("GitHub returned 500 posting the CI-fix question")
+
+    monkeypatch.setattr(cli_module, "GitHubPRCommentChannel", lambda **kw: _BoomChannel())
+    engine = _FakeEngine([])
+    outcome = _fix_outcome("failure")
+    outcome.pull_request_number = 7
+    args = types.SimpleNamespace(
+        watch_fix_rounds=1, workspace="/ws", watch_timeout=600.0,
+        interactive_pr_comments=True, interactive_pr_comment_author=["ada"],
+    )
+    run(
+        cli_module._run_ci_fix_loop(
+            engine, _fix_team(), outcome, args,
+            RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), "tok",
+        )
+    )
+    assert engine.calls == []  # never reached remediation
+    assert "could not reach the PR comments" in capsys.readouterr().err
+
+
+def test_main_deliver_pull_request_sets_pull_request_number(tmp_path, monkeypatch, capsys):
+    seen = {}
+    code = _pr_deliver(tmp_path, monkeypatch, seen, "--json")
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["pull_request_number"] == 3
+
+
+def test_main_deliver_without_pull_request_leaves_number_unset(tmp_path, capsys):
+    from helpers import engine_responses
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(_deliver_args(tmp_path, "--json"), runner=runner)
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["pull_request_number"] is None
 
 
 def test_main_chat_deliver_pull_request_threads_ref_and_token(

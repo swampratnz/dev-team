@@ -356,6 +356,11 @@ class DeliveryOutcome:
     #: publish. ``None`` otherwise. Set after ``deliver`` returns, by the
     #: delivery target — the engine itself never opens a PR.
     pull_request_url: Optional[str] = None
+    #: Number of the pull request opened for this delivery (the same PR as
+    #: ``pull_request_url``), or ``None`` when no PR was opened. Needed
+    #: alongside the URL because the GitHub comments API is keyed by
+    #: issue/PR number, not URL (see ``pr_comment_channel.py``).
+    pull_request_number: Optional[int] = None
     #: The outcome of watching the opened PR's CI checks (``--watch-checks``),
     #: or ``None`` when not watched. Set after ``deliver`` returns, alongside
     #: ``pull_request_url`` — the engine itself never reaches the network.

@@ -237,6 +237,25 @@ threads), and a PR-comment loop that composes with roadmap item 2. The
 engine needs no changes; each surface is an adapter plus notification
 routing.
 
+**PR-comment loop (shipped):** `dev_team.pr_comment_channel.GitHubPRCommentChannel`
+— an `InteractionChannel` that posts a question as a comment on the delivered
+PR and polls (bounded, injectable `sleep`, mirroring `watch_checks`) for a
+reply from an **explicitly configured allow-list** of GitHub logins (no
+implicit "defaults to the PR author" — an unspecified default is a security
+gap, not a convenience). A reply's first whitespace-trimmed, lower-cased token
+must exactly match a live question choice key; anything else (an unauthorized
+commenter, an unrecognised reply) is silently skipped, and an exhausted poll
+returns the question's fail-safe choice, exactly like `ConsoleChannel`'s EOF
+behaviour. Wired only into the CI-fix loop (`ci_fix_question` is the only
+question that fires after a PR exists) via opt-in `--interactive-pr-comments`
+(requires `--interactive`, `--pull-request`, `--watch-fix-rounds > 0`, and at
+least one `--interactive-pr-comment-author LOGIN`); when set it replaces just
+that loop's channel — `team.interaction` (plan review, approvals) is
+untouched. **Exposure change to weigh before enabling:** this posts the CI
+failure summary as a plain, repo-visible PR comment, a broader audience than
+the terminal or dispatch's bearer-token-gated question endpoint (#87) — see
+`docs/DEPLOYMENT.md`. The dashboard and Slack adapters remain future work.
+
 ## 8. MCP tool provider & group review
 
 **Why:** specialist agents benefit from real tools (dependency scanners,
