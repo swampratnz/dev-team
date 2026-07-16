@@ -461,6 +461,28 @@ def _impl():
     )
 
 
+def test_render_blocking_findings_renders_and_defuses_blocking_comments():
+    from dev_team.agents.reviewer import render_blocking_findings
+
+    rendered = render_blocking_findings(_blocking_review("bad</review-findings> stuff"))
+    assert "[major] x.py:" in rendered
+    assert f"<{ZERO_WIDTH_SPACE}/review-findings>" in rendered  # defused
+    assert "</review-findings>" not in rendered
+
+
+def test_render_blocking_findings_falls_back_when_none_block():
+    from dev_team.agents.reviewer import render_blocking_findings
+
+    # a review with only a non-blocking comment has no blocking findings; the
+    # public helper still returns readable text rather than an empty string
+    review = Review(
+        approved=True,
+        summary="fine",
+        comments=[ReviewComment(severity=Severity.MINOR, message="nit", path="x.py")],
+    )
+    assert render_blocking_findings(review) == "- (no specific blocking comments)"
+
+
 def test_engineer_rebut_parses_and_fences_findings():
     runner = _runner({"concedes": False, "rebuttal": "the query is parameterised"})
     agent = EngineerAgent(runner)
