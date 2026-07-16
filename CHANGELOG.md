@@ -5,6 +5,20 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Benchmarks
+- **The benchmark suite's aggregate result now persists across CI runs**
+  (ROADMAP #6 follow-up): a new `dev_team.benchmark_history.BenchmarkHistory`
+  mirrors `dev_team.scores.ScoreHistory`'s bounded-JSON-trail, fail-secure-load
+  shape over a plain local file (the benchmark harness has no durable
+  workspace to attach to). `dev-team-benchmark` gains an opt-in
+  `--history-file PATH` flag (unset by default — zero new disk I/O, today's
+  behaviour unchanged); when set, it appends the run's pass/cost totals and
+  prints the signed pass-rate/cost delta against the prior run. A history
+  write failure is caught and never changes the reported exit code.
+  `.github/workflows/benchmark.yml` restores/saves `.benchmark/history.json`
+  via `actions/cache` around the run — no repo write, `permissions:
+  contents: read` unchanged.
+
 ### Security hardening
 - **Prompt-fence defusing is now systemic.** Untrusted content shown to
   agents inside delimited `<...>` blocks (file bodies, diffs, tool/scanner

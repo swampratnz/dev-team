@@ -219,10 +219,18 @@ workflow (`.github/workflows/benchmark.yml`). That workflow is **disabled by
 default** — its one enable switch is the `RUN_BENCHMARKS` repository variable, so
 both the nightly run and manual dispatch stay completely inert (no spend, no
 credential use) until an admin sets it to `true` and provides a Claude
-credential secret — the governance guard for scheduled real spend. Remaining:
-persisting the benchmark's aggregate result into a durable cross-run trail
-(the per-delivery score mechanism above is in place; committing/retaining the
-benchmark aggregate across CI runs is the follow-up).
+credential secret — the governance guard for scheduled real spend.
+
+**Done:** the benchmark's own cross-run trend trail has landed
+(`dev_team.benchmark_history`): an opt-in `--history-file PATH` flag on
+`dev-team-benchmark` (unset by default — zero disk I/O, today's behaviour
+unchanged) appends a bounded `BenchmarkRun` (cases total/passed, cost,
+timestamp) to a local JSON trail and prints the signed pass-rate/cost delta
+against the prior run. `.github/workflows/benchmark.yml` restores and saves
+that file via `actions/cache` (no repo write, `permissions: contents: read`
+unchanged) so the trail persists across nightly CI runs without committing
+anything to git — mirroring `ScoreHistory`'s bounded-trail, fail-secure-load
+shape one level up, from a single delivery to the whole suite.
 
 ## 7. Richer interaction surfaces
 

@@ -17,8 +17,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import tempfile
+from datetime import datetime, timezone
 from typing import List, Optional, Sequence
 
+from .benchmark_history import BenchmarkHistory, BenchmarkRun
 from .budget import Budget
 from .engine import DeliveryEngine, EngineConfig
 from .evals import EngineFactory, EvalCase, EvalReport, evaluate
@@ -69,6 +71,29 @@ def _exit_code(report: EvalReport) -> int:
     """Zero only when every case passed — the CI signal for a regression."""
 
     return 0 if report.passed == len(report.results) else 1
+
+
+def _record_history(history_file: str, report: EvalReport) -> Optional[str]:
+    """Append this run to ``history_file`` and return the trend line, if any.
+
+    Fail-secure: a write failure (e.g. an unwritable path) is caught and
+    swallowed rather than propagated — history persistence never blocks or
+    changes the benchmark's pass/fail signalling.
+    """
+
+    history = BenchmarkHistory(history_file)
+    run = BenchmarkRun(
+        cases_total=len(report.results),
+        cases_passed=report.passed,
+        cost_usd=report.total_cost_usd,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+    try:
+        history.record(run)
+    except OSError:
+        return None
+    delta = history.latest_delta()
+    return f"Trend: {delta}" if delta is not None else None
 
 
 def default_engine_factory(
@@ -127,10 +152,23 @@ def main(argv: Optional[List[str]] = None, runner: Optional[AgentRunner] = None)
     parser.add_argument(
         "--model", default=None, help="Model override for the benchmark engines."
     )
+    parser.add_argument(
+        "--history-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Append this run's aggregate result to a durable JSON trend file "
+            "(default: unset, no disk I/O)."
+        ),
+    )
     args = parser.parse_args(argv)
     factory = _engine_factory(runner, args.model, args.budget_usd)
     report = asyncio.run(run_benchmark(factory))
     print(report.render())
+    if args.history_file is not None:
+        trend = _record_history(args.history_file, report)
+        if trend is not None:
+            print(trend)
     return _exit_code(report)
 
 

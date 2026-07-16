@@ -2,7 +2,11 @@ name: Benchmark
 
 # Standing benchmark suite (ROADMAP #6). Runs the real team over a fixed set of
 # feature requests and scores the deliveries, so a prompt or orchestration
-# change shows up as a movement in the pass rate rather than a vibe.
+# change shows up as a movement in the pass rate rather than a vibe. The
+# aggregate result is appended to a durable cross-run trend trail
+# (.benchmark/history.json, persisted via actions/cache — no repo write, no
+# permission change) so a regression is visible as a movement over time, not
+# just a single run's console output.
 #
 # DISABLED BY DEFAULT. It spends real budget against the shared Max pool and
 # needs Claude credentials, so nothing runs until an admin deliberately opts in:
@@ -48,6 +52,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
+      # Restores the last saved trail (if any) so this run's aggregate can be
+      # appended to a durable cross-run trend rather than starting cold each
+      # time. actions/cache is a first-party Actions primitive — no new
+      # credential, no permission change (still contents: read below).
+      - name: Restore benchmark history
+        uses: actions/cache/restore@v4
+        with:
+          path: .benchmark/history.json
+          key: benchmark-history-${{ github.run_id }}
+          restore-keys: |
+            benchmark-history-
+
       - name: Run benchmark suite
         env:
           # Reference both; whichever secret is set is used by the runner.
@@ -59,4 +75,15 @@ jobs:
           # shell applies the 2.0 default, and dev-team-benchmark's argparse
           # rejects any non-numeric value before anything else runs.
           BUDGET_USD: ${{ github.event.inputs.budget_usd }}
-        run: dev-team-benchmark --budget-usd "${BUDGET_USD:-2.0}"
+        run: >
+          dev-team-benchmark --budget-usd "${BUDGET_USD:-2.0}"
+          --history-file .benchmark/history.json
+
+      # Always save, even on a failing (regressed) run — a regression is
+      # exactly the data point the trend trail exists to capture.
+      - name: Save benchmark history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .benchmark/history.json
+          key: benchmark-history-${{ github.run_id }}
