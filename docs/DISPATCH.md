@@ -80,7 +80,8 @@ Body (assess/deliver):
 
 ```json
 {"mode":"assess|deliver","repo":"owner/name or url",
- "title":"...","description":"...","budget_usd":10,"backlog":false}
+ "title":"...","description":"...","budget_usd":10,"backlog":false,
+ "interactive":false,"interactive_timeout_seconds":300}
 ```
 
 Body (verify — see *Finding re-verification* below):
@@ -100,6 +101,18 @@ Body (verify — see *Finding re-verification* below):
   merged into that workspace's shared backlog (deduplicated by title).
   Ignored for `deliver`. Leaving it `false` costs nothing later: backlog
   generation can always be run after the fact via `POST /jobs/{id}/backlog`.
+- `interactive` (optional, default `false`, must be a boolean): with `true`
+  on a `deliver` job, the run pauses for plan review, re-plan supervision,
+  and failure escalation exactly like the CLI's `--interactive`, answerable
+  over `GET`/`POST /jobs/{id}/question`/`answer` below — see *Interactive
+  deliver*. Accepted but ignored on `assess`/`verify` (mirrors `backlog`
+  above).
+- `interactive_timeout_seconds` (optional, must be a number or `null`):
+  meaningful only alongside `interactive: true`. Resolves to `300` when
+  omitted, and is **clamped to `[30, 1800]`** before use — a request outside
+  that range is silently bounded, never rejected or stored as-is, so a
+  misconfigured or malicious huge timeout cannot wedge the single-flight
+  worker on one paused job.
 - `deliver` requires a non-empty `title` and `description`.
 - `assess` defaults `title` to the repo slug and `description` to `""`.
 - `verify` requires a non-empty `source_job` and `finding_id`; it is
@@ -107,8 +120,9 @@ Body (verify — see *Finding re-verification* below):
   assessment/finding → immediate `404`, no queue slot wasted).
 
 → `202 {"id":"assess-…","state":"queued","position":0}`. Errors:
-`400 {"error":…}` (bad mode/repo/budget, non-boolean backlog, missing title
-or description for deliver, missing source_job/finding_id for verify,
+`400 {"error":…}` (bad mode/repo/budget, non-boolean backlog, non-boolean
+`interactive`, non-numeric `interactive_timeout_seconds`, missing title or
+description for deliver, missing source_job/finding_id for verify,
 malformed JSON), `401`, `404` / `409` (verify — see below),
 `503 {"error":"queue full"}`.
 
@@ -227,6 +241,72 @@ something cancel changes.
 `queued → running` transition, so the two are mutually exclusive —
 whichever call wins a race decides the outcome deterministically. A job can
 never end up both running and marked cancelled.
+
+## Interactive deliver
+
+By default a dispatched `deliver` job runs fully autonomously: plan review,
+re-plan supervision, and failed-task escalation all take their default
+(non-interactive) answer with no human in the loop, exactly as if the CLI's
+`--interactive` flag had never been passed. Submitting `interactive: true`
+(see `POST /jobs` above) wires the run to a `QueueChannel`-backed
+`InteractionChannel` instead, so those three touchpoints pause and wait for
+an answer over the two endpoints below — the same primitive
+`docs/INTERACTION.md` names as the integration point for a non-terminal UI.
+
+This only unlocks plan review / re-plan / failure-escalation questions. The
+feature-commit and guarded-command approval gate stays exactly
+`PolicyApprovalGate(block_risks=("high",))` regardless of `interactive` — a
+push/deploy/rm still cannot be approved through this (or any) dispatch
+surface.
+
+### `GET /jobs/{id}/question` (auth) — peek the pending question
+
+Non-destructive: reads the channel's live question without consuming from
+its internal queue, so polling never steals the answer from the run itself.
+
+No pending question — the job was never interactive, isn't paused right
+now, or its question was already answered:
+
+```json
+{"pending": false}
+```
+
+A question is live (`ask()` is blocked on it):
+
+```json
+{"pending": true, "prompt": "Approve this plan (3 task(s))?",
+ "context": "Plan: …", "default": "approve",
+ "choices": [{"key": "approve", "label": "start the work", "accepts_text": false},
+             {"key": "revise", "label": "request changes", "accepts_text": true},
+             {"key": "abort", "label": "stop the run", "accepts_text": false}]}
+```
+
+`404 {"error":"unknown job"}` — no such job id. `401` — as everywhere.
+
+### `POST /jobs/{id}/answer` (auth) — answer the pending question
+
+Body: `{"choice": "approve", "text": ""}` (`text` optional, default `""`,
+carries revision/retry guidance into the *next* agent prompt — only
+meaningful for a `revise`/`retry`-style choice).
+
+→ `202 {}` on success — the waiting `ask()` call unblocks and the run
+proceeds. Errors:
+
+- `404 {"error":"unknown job"}` — no such job id.
+- `409 {"error":"no pending question"}` — the job was never interactive, or
+  is interactive but has no live pause right now. Never a silent no-op
+  `202`.
+- `400 {"error":"unknown choice"}` — `choice` is not one of the *live*
+  question's choice keys, validated against a closed set and never treated
+  as free-form or forwarded anywhere. Nothing is pushed to the run in this
+  case, so a mistyped choice leaves the run still waiting, retryable.
+- `401` — as everywhere.
+
+**Fail-secure on abandonment**: if nobody answers within
+`interactive_timeout_seconds` (clamped/defaulted per `POST /jobs` above),
+the question's default choice is taken automatically and the run proceeds
+exactly as a non-interactive job would have — a dead dashboard or absent
+operator degrades to autonomous, never hangs.
 
 ## Archive / unarchive
 

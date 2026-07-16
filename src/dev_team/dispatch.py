@@ -47,7 +47,7 @@ import queue
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -83,6 +83,7 @@ from .execution import (
     Workspace,
     WorkspaceError,
 )
+from .interaction import QueueChannel, Question, Reply
 from .models import FeatureRequest
 from .report import delivery_to_dict
 from .sdk import AgentRunner
@@ -123,6 +124,16 @@ _PROGRESS_LIMIT = 12
 #: returns) would wedge the queue forever; the worker aborts it past this bound
 #: and moves on. Injectable via the ``job_timeout`` constructor param for tests.
 _JOB_TIMEOUT_SECONDS = 3600.0
+
+#: Default :class:`~dev_team.interaction.QueueChannel` timeout (seconds) an
+#: interactive deliver job's ``interactive_timeout_seconds`` resolves to when
+#: omitted, and the floor/ceiling every requested value is clamped to before
+#: use — mirrors #71's poll-timeout clamp, for the same reason: a
+#: misconfigured or malicious huge timeout must not wedge the single-flight
+#: worker on one paused job.
+_INTERACTIVE_TIMEOUT_DEFAULT = 300.0
+_INTERACTIVE_TIMEOUT_FLOOR = 30.0
+_INTERACTIVE_TIMEOUT_CEILING = 1800.0
 
 #: The run modes the service accepts. ``verify`` re-checks one finding from
 #: a previously mirrored assessment against a fresh clone of its repository.
@@ -172,6 +183,13 @@ class JobSpec:
     description: str
     budget_usd: Optional[float]
     backlog: bool = False
+    # Meaningful only for mode: "deliver" (accepted but ignored on assess /
+    # verify, mirroring how backlog is validated for both modes but only
+    # applied to assess). interactive_timeout_seconds is the RAW requested
+    # value (or None); _resolved_interactive_timeout clamps/defaults it at
+    # the point a _TrackedChannel is actually constructed.
+    interactive: bool = False
+    interactive_timeout_seconds: Optional[float] = None
     id: str = ""
     # verify only: the source assess job, the resolved finding id, and the
     # RESOLVED finding itself (resolved synchronously at submit time so the
@@ -198,6 +216,94 @@ class JobRecord:
     # report the partial spend it already banked, rather than a hard 0.0. Stays
     # ``None`` for a failure before the budget exists (e.g. a clone that raised).
     budget: Optional[Budget] = None
+    # Set by run_job only for an interactive deliver job (mode == "deliver"
+    # and spec.interactive); stays None otherwise, which is exactly what
+    # GET .../question / POST .../answer treat as "never interactive".
+    channel: Optional["_TrackedChannel"] = None
+
+
+def _resolved_interactive_timeout(requested: Optional[float]) -> float:
+    """The clamped timeout an interactive deliver job's channel actually uses.
+
+    ``requested`` is the raw ``JobSpec.interactive_timeout_seconds`` (already
+    type-validated at submit time in :meth:`Dispatcher.build_spec`); ``None``
+    resolves to :data:`_INTERACTIVE_TIMEOUT_DEFAULT` before clamping to
+    ``[_INTERACTIVE_TIMEOUT_FLOOR, _INTERACTIVE_TIMEOUT_CEILING]`` so an
+    out-of-range request (too small to be useful, or large enough to wedge
+    the single-flight worker) is silently bounded rather than stored/used
+    as-is.
+    """
+
+    value = _INTERACTIVE_TIMEOUT_DEFAULT if requested is None else float(requested)
+    return max(_INTERACTIVE_TIMEOUT_FLOOR, min(_INTERACTIVE_TIMEOUT_CEILING, value))
+
+
+@dataclass
+class _TrackedChannel(QueueChannel):
+    """A :class:`~dev_team.interaction.QueueChannel` that exposes its pending
+    question and answers it race-free.
+
+    :attr:`QueueChannel.replies` is one queue shared for the channel's whole
+    lifetime — reusing it here would let a reply meant for one ``ask()`` call
+    be validated against that question but actually delivered (a moment
+    later, after the validating lock is released) to a *different* question
+    the engine has since moved on to, e.g. once ``ask()`` has already timed
+    out and taken the default. Instead, :meth:`ask` mints a fresh
+    single-slot queue for each question and publishes ``(question, slot)``
+    together with :attr:`current` under :attr:`_answer_lock`; :meth:`submit_reply`
+    validates a choice against — and delivers it to — that exact ``(question,
+    slot)`` pair atomically under the same lock, so a choice can never be
+    handed to a question other than the live one it was validated against.
+
+    :attr:`current` remains for ``GET /jobs/{id}/question``'s non-destructive
+    peek; it is set alongside the pending slot and cleared in a ``finally``
+    once answered or timed out.
+    """
+
+    current: Optional[Question] = None
+    _pending: Optional[Tuple[Question, "queue.Queue[Reply]"]] = field(
+        default=None, repr=False, compare=False
+    )
+    _answer_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
+    def ask(self, question: Question) -> Reply:
+        reply_slot: "queue.Queue[Reply]" = queue.Queue(maxsize=1)
+        with self._answer_lock:
+            self.current = question
+            self._pending = (question, reply_slot)
+        self.questions.put(question)
+        try:
+            return reply_slot.get(timeout=self.timeout)
+        except queue.Empty:
+            return Reply(choice=question.default.key)
+        finally:
+            with self._answer_lock:
+                self.current = None
+                self._pending = None
+
+    def submit_reply(self, choice: str, text: str) -> Optional[bool]:
+        """Atomically validate and deliver a reply to the live ``ask()`` call.
+
+        Returns ``None`` if there is no live question right now, ``False``
+        if ``choice`` isn't among the live question's keys, ``True`` once the
+        reply has been handed to the exact ``ask()`` call that posted that
+        question. The validate-then-deliver happens under :attr:`_answer_lock`
+        — the same lock :meth:`ask` uses to publish/clear the pending
+        ``(question, slot)`` pair — so a question can never time out and be
+        replaced by a different one between validation and delivery.
+        """
+
+        with self._answer_lock:
+            pending = self._pending
+            if pending is None:
+                return None
+            question, reply_slot = pending
+            if question.find(choice) is None:
+                return False
+            reply_slot.put(Reply(choice=choice, text=text))
+            return True
 
 
 def _failed_cost(record: JobRecord) -> float:
@@ -389,6 +495,17 @@ class Dispatcher:
         backlog = body.get("backlog", False)
         if not isinstance(backlog, bool):
             raise ValidationError("backlog must be true or false")
+        interactive = body.get("interactive", False)
+        if not isinstance(interactive, bool):
+            raise ValidationError("interactive must be true or false")
+        interactive_timeout = body.get("interactive_timeout_seconds")
+        if interactive_timeout is not None:
+            if isinstance(interactive_timeout, bool) or not isinstance(
+                interactive_timeout, (int, float)
+            ):
+                raise ValidationError(
+                    "interactive_timeout_seconds must be a number or null"
+                )
         title = body.get("title")
         description = body.get("description")
         if mode == "deliver":
@@ -408,6 +525,8 @@ class Dispatcher:
             description=description,
             budget_usd=budget,
             backlog=backlog,
+            interactive=interactive,
+            interactive_timeout_seconds=interactive_timeout,
         )
 
     def _exists(self, path: str) -> bool:
@@ -601,11 +720,21 @@ class Dispatcher:
                 listener,
                 EventLog(self._dashboard_workspace, run=spec.id, clock=self._clock),
             )
+        # Interactive plan review / re-plan supervision / failure escalation
+        # is opt-in and deliver-only: a queued/non-interactive job (the
+        # default) still gets interaction=None exactly as before, so no
+        # _TrackedChannel is ever constructed and behaviour is unchanged.
+        interaction = None
+        if spec.mode == "deliver" and spec.interactive:
+            record.channel = _TrackedChannel(
+                timeout=_resolved_interactive_timeout(spec.interactive_timeout_seconds)
+            )
+            interaction = record.channel
         team = DevTeam(
             self._runner,
             config=TeamConfig(),
             listener=listener,
-            interaction=None,
+            interaction=interaction,
         )
         budget = Budget(limit_usd=spec.budget_usd)
         # Attach the budget to the record immediately, so a failure (or a
@@ -807,6 +936,75 @@ class Dispatcher:
             record.ended = self._clock()
         self._events[job_id].set()
         return 200, {"id": job_id, "state": "cancelled"}
+
+    # -- interactive question/answer (opt-in deliver pause) --------------------
+
+    def get_question(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The ``GET /jobs/{id}/question`` core: peek the live pending question.
+
+        Non-destructive — reads :attr:`_TrackedChannel.current` under
+        ``self._lock`` (the same lock every other job-state read/write
+        already uses) without touching :attr:`QueueChannel.questions`, which
+        only the engine's own blocking ``ask()`` may ever drain. ``pending``
+        is ``False`` for a job that was never interactive, one with no live
+        pause right now, or one whose question was already answered.
+        """
+
+        with self._lock:
+            record = self._registry.get(job_id)
+            if record is None:
+                return 404, {"error": "unknown job"}
+            channel = record.channel
+            question = channel.current if channel is not None else None
+        if question is None:
+            return 200, {"pending": False}
+        return 200, {
+            "pending": True,
+            "prompt": question.prompt,
+            "context": question.context,
+            "choices": [
+                {"key": c.key, "label": c.label, "accepts_text": c.accepts_text}
+                for c in question.choices
+            ],
+            "default": question.default.key,
+        }
+
+    def answer_question(
+        self, job_id: str, body: Dict[str, Any]
+    ) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /jobs/{id}/answer`` core: unblock a paused ``ask()``.
+
+        ``choice`` is validated against — and delivered to — the LIVE
+        question atomically inside :meth:`_TrackedChannel.submit_reply`,
+        never trusted as free-form and never split across a
+        validate-then-deliver gap: an invalid choice can never unblock the
+        wrong (or any) answer, and a choice that *was* live when checked
+        can never end up delivered to a different question the engine has
+        since moved on to (e.g. after a timeout took the default). Touches
+        nothing on ``record.spec``: this cannot be used to approve a
+        push/deploy/rm, which stays gated by the unchanged
+        ``PolicyApprovalGate`` wired in :meth:`run_job`.
+        """
+
+        with self._lock:
+            record = self._registry.get(job_id)
+            if record is None:
+                return 404, {"error": "unknown job"}
+            channel = record.channel
+        if channel is None:
+            return 409, {"error": "no pending question"}
+        choice = body.get("choice")
+        if not isinstance(choice, str):
+            return 400, {"error": "unknown choice"}
+        text = body.get("text", "")
+        if not isinstance(text, str):
+            text = ""
+        result = channel.submit_reply(choice, text)
+        if result is None:
+            return 409, {"error": "no pending question"}
+        if result is False:
+            return 400, {"error": "unknown choice"}
+        return 202, {}
 
     # -- archive / unarchive (job lifecycle) ----------------------------------
 
@@ -1597,6 +1795,10 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 status, payload = dispatcher.verifications(parts[1])
                 self._json(status, payload)
                 return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "question":
+                status, payload = dispatcher.get_question(parts[1])
+                self._json(status, payload)
+                return
             self._json(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802 (http.server API)
@@ -1618,6 +1820,13 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 # Same shape as .../backlog above: a pure in-memory
                 # transition, synchronous, no queue slot.
                 status, payload = dispatcher.cancel_job(parts[1])
+                self._json(status, payload)
+                return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "answer":
+                body = self._read_body()
+                if body is None:
+                    return
+                status, payload = dispatcher.answer_question(parts[1], body)
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] in (
