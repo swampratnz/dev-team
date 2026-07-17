@@ -949,6 +949,42 @@ def test_assess_report_footer_states_live_mode_for_both_scans():
     assert "EOL/support-status check" in report
 
 
+_RUBY_WORKSPACE = {
+    "MyApp.sln": "Microsoft Visual Studio Solution File",
+    "src/Api/Api.csproj": "<Project><TargetFramework>net47</TargetFramework></Project>",
+    ".ruby-version": "3.2.0",
+    "README.md": "# MyApp",
+}
+
+
+def _ruby_eol_fetch(product):
+    assert product == "ruby"
+    return [{"cycle": "3.2", "eol": "2000-01-01"}]
+
+
+def test_assess_integrates_eol_scan_for_ruby():
+    events = []
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(
+        runner,
+        workspace=InMemoryWorkspace(dict(_RUBY_WORKSPACE)),
+        listener=events.append,
+        eol_fetch=_ruby_eol_fetch,
+    )
+    outcome = run(engine.assess())
+    assert outcome.success is True
+    assert outcome.eol_scan.queried is True
+    assert outcome.eol_scan.statuses[0].end_of_life is True
+    report = outcome.report_markdown
+    assert "Ruby 3.2.0" in report
+    assert "END OF LIFE" in report
+    assert "endoflife.date" in report
+    stages = [e.stage for e in events]
+    assert "eol" in stages
+    data = outcome_to_dict(outcome)
+    assert data["eol_scan"]["statuses"][0]["runtime"]["product"] == "ruby"
+
+
 # --- component fan-out -----------------------------------------------------------
 
 

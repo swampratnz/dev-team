@@ -111,15 +111,16 @@ machinery understands them now:
   range-specified project still gets its *resolved* versions scanned;
   only dependencies with no lockfile and no exact pin fall back to
   training data.
-- **Detected Node.js/Python/.NET runtime versions get a live
+- **Detected Node.js/Python/.NET/Ruby/Go runtime versions get a live
   endoflife.date EOL/support-status check; every other EOL/support-status
   judgment (other runtimes, frameworks, libraries) is model knowledge** —
   the same report footer states which mode produced the claim. The
   runtime version is parsed from `package.json` (`engines.node`),
-  `.nvmrc`, `runtime.txt`, `.python-version`, or `global.json`
-  (`sdk.version`); an unresolved release cycle reports `unknown` rather
-  than guessing. Treat EOL findings outside those three runtimes as a
-  triage list, not a compliance scan.
+  `.nvmrc`, `runtime.txt`, `.python-version`, `global.json`
+  (`sdk.version`), `.ruby-version`, or `go.mod` (the `go` directive); an
+  unresolved release cycle reports `unknown` rather than guessing. Treat
+  EOL findings outside those five runtimes as a triage list, not a
+  compliance scan.
 - Phase evidence is as good as what the auditors read: on very large repos
   the deterministic inventory is exact, but agents sample files. The report
   appendix names the **audit blind spots** — top-level directories no
@@ -163,12 +164,13 @@ involved, so their findings are exact and citable:
   NuGet `packages.lock.json`) queried against OSV.dev in one batch
   (`--no-osv-scan` opts out; offline degrades to a labelled
   model-knowledge fallback).
-- **Live EOL/support-status scan** — Node.js/Python/.NET runtime versions
-  detected from `package.json`/`.nvmrc`/`runtime.txt`/`.python-version`/
-  `global.json` are checked against endoflife.date, one request per
-  distinct detected product (`--no-eol-scan` opts out; offline or an
-  unresolved release cycle degrades to a labelled model-knowledge/`unknown`
-  fallback rather than guessing).
+- **Live EOL/support-status scan** — Node.js/Python/.NET/Ruby/Go runtime
+  versions detected from `package.json`/`.nvmrc`/`runtime.txt`/
+  `.python-version`/`global.json`/`.ruby-version`/`go.mod` are checked
+  against endoflife.date, one request per distinct detected product
+  (`--no-eol-scan` opts out; offline or an unresolved release cycle
+  degrades to a labelled model-knowledge/`unknown` fallback rather than
+  guessing).
 - **Audit blind spots** — the exact set of top-level directories no phase
   finding (nor dead-code probe) cited, listed in the report appendix so
   sampling gaps are named instead of implied clean.
