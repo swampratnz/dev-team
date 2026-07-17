@@ -205,6 +205,19 @@ sections below are reconstructed from the repository history.
   cap. A log-write failure (disk full, unwritable jobs root) is swallowed
   at the handler level and never affects a response already sent to the
   caller.
+- **`GET /access-log`** (`docs/DISPATCH.md`): the "natural growth" the
+  access-log write path (above) explicitly deferred — a newest-first,
+  `?limit=`-bounded (default 100, clamped to `[1, 1000]`) page of the same
+  journal, so an operator can glance at recent requests from the dashboard
+  instead of SSHing into the tailnet-only deployment to `cat
+  access.jsonl`. Reuses the existing bearer auth (no new credential),
+  reads straight off `jobs_root/access.jsonl` (no dashboard-workspace
+  guard needed, exactly like `GET /costs`), and inherits
+  `read_access_log`'s tolerant-read contract (missing file → `200
+  {"entries":[]}`, a corrupt line skipped rather than fatal). Every
+  returned entry carries exactly the four fields the write path persists —
+  never an `Authorization` header or a request/response body, since #54
+  never wrote those in the first place.
 - **`citation_broken` on every enumerated finding** (`docs/DISPATCH.md`):
   the follow-up the $0 `broken_citations` check (above) named and deferred
   on purpose — `list_findings` now joins its own already-persisted
@@ -306,6 +319,15 @@ sections below are reconstructed from the repository history.
   `501` and the panel shows a muted "not configured" state. Scope is
   strictly `/api/costs` (exact match, no path parameter) — the same
   narrow-proxy discipline as the existing backlog/job-lifecycle proxies.
+- **Access log panel** (`docs/DASHBOARD.md`): a new `GET /api/access-log`
+  route proxies the dispatch service's new `GET /access-log` (above) — same
+  narrow-proxy shape as Spend (`?limit=` forwarded unchanged, `501
+  {"error":"access log not configured"}` without a dispatch token wired).
+  Renders a compact, status-colour-coded table of recent requests next to
+  Spend, fetched once on page load and on manual refresh only — kept out of
+  the 2.5s `/api/state` poll for the same load-multiplication reason Spend
+  is. A logged `path` is arbitrary caller-supplied input, so every field
+  renders through `esc()` before `innerHTML`, never raw.
 - **Pending-question panel** (`docs/DASHBOARD.md`): the dashboard's answer
   to `docs/ROADMAP.md` item 7's "questions as buttons" — a live "pending
   question" panel on each running job's card, backed by two new narrow

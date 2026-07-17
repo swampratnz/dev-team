@@ -1521,6 +1521,167 @@ def test_dashboard_html_spend_panel():
     assert "\nloadSpend();" in DASHBOARD_HTML
 
 
+# --- the access log proxy (GET /api/access-log → dispatch GET /access-log) ---
+
+
+def test_access_log_proxy_forwards_and_relays_verbatim(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch,
+        status=200,
+        body=b'{"entries": [{"ts": 1.0, "method": "GET", "path": "/jobs", "status": 200}]}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/access-log", headers=AUTH
+    )
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {
+        "entries": [{"ts": 1.0, "method": "GET", "path": "/jobs", "status": 200}],
+    }
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/access-log"
+    assert request.get_method() == "GET"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.data is None
+
+
+def test_access_log_proxy_unconfigured_is_501(token_server, monkeypatch):
+    # token_server has no dispatch_url/dispatch_token wired
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "GET", "/api/access-log", headers=AUTH
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "access log not configured"}
+    assert seen == []
+
+
+def test_access_log_proxy_url_without_token_stays_unconfigured(monkeypatch):
+    # A dispatch URL alone (no dispatch token) must not forward: still 501,
+    # matching every other proxy's own behaviour.
+    seen = _capture_urlopen(monkeypatch)
+    srv = DashboardServer(
+        InMemoryWorkspace(), port=0, token=TOKEN, dispatch_url=DISPATCH_URL
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, body = _request(srv, "GET", "/api/access-log", headers=AUTH)
+        assert status == 501
+        assert json.loads(body) == {"error": "access log not configured"}
+        assert seen == []
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
+
+
+def test_access_log_proxy_forwards_limit_unchanged(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch, body=b'{"entries": []}')
+    status, _, _ = _request(
+        proxy_server, "GET", "/api/access-log?limit=25", headers=AUTH
+    )
+    assert status == 200
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/access-log?limit=25"
+
+
+def test_access_log_proxy_without_limit_forwards_no_query_string(
+    proxy_server, monkeypatch
+):
+    seen = _capture_urlopen(monkeypatch, body=b'{"entries": []}')
+    status, _, _ = _request(proxy_server, "GET", "/api/access-log", headers=AUTH)
+    assert status == 200
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/access-log"
+
+
+def test_access_log_proxy_unreachable_dispatch_is_502(proxy_server, monkeypatch):
+    _capture_urlopen(monkeypatch, error=urllib.error.URLError("refused"))
+    status, _, body = _request(proxy_server, "GET", "/api/access-log", headers=AUTH)
+    assert status == 502
+    assert json.loads(body) == {"error": "dispatch service unreachable"}
+    assert "refused" not in body  # no internals leak
+
+
+def test_access_log_proxy_relays_a_dispatch_rejection_verbatim(
+    proxy_server, monkeypatch
+):
+    # e.g. a stale dispatch token: the dispatch service's own 401, never
+    # swallowed or translated by the dashboard.
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/access-log", 401, "Unauthorized", None,
+        io.BytesIO(b'{"error": "unauthorized"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(proxy_server, "GET", "/api/access-log", headers=AUTH)
+    assert status == 401
+    assert json.loads(body) == {"error": "unauthorized"}
+
+
+def test_access_log_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    # SECURITY (AC8): unauthenticated GET /api/access-log answers 401, and
+    # nothing is ever forwarded to the dispatch service.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(proxy_server, "GET", "/api/access-log")
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []  # nothing was ever forwarded
+
+
+def test_access_log_proxy_never_echoes_the_dispatch_token(proxy_server, monkeypatch):
+    # SECURITY: the dispatch bearer token must never reach the browser, in
+    # the response body or in any header.
+    _capture_urlopen(
+        monkeypatch,
+        body=b'{"entries": [{"ts": 1.0, "method": "GET", "path": "/x", "status": 200}]}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/access-log", headers=AUTH
+    )
+    assert status == 200
+    assert DISPATCH_TOKEN not in body
+    assert DISPATCH_TOKEN not in str(headers)
+
+
+def test_access_log_route_scope_is_exact_match_only(proxy_server, monkeypatch):
+    # SECURITY/scope: only exactly /api/access-log is the route — a path
+    # that merely starts with it falls through to the ordinary 404, never
+    # forwarded to the dispatch service (no general dispatch passthrough).
+    seen = _capture_urlopen(monkeypatch)
+    for path in ("/api/access-log/", "/api/access-log/extra", "/api/access-log2"):
+        status, _, _ = _request(proxy_server, "GET", path, headers=AUTH)
+        assert status == 404
+    assert seen == []
+
+
+def test_dashboard_html_access_log_panel():
+    # AC9 + AC10: fetched once on load plus manual refresh only — never
+    # inside the setInterval-driven refresh() poll (same load-multiplication
+    # reason as Spend) — and every rendered field flows through esc() before
+    # innerHTML: a logged `path` is arbitrary caller-supplied input (an
+    # external caller can hit "/whatever<script>" and have it logged
+    # verbatim, by design), so it must always render as inert text.
+    assert 'id="access-log-refresh"' in DASHBOARD_HTML
+    assert '<div class="panel" id="access-log">' in DASHBOARD_HTML
+    assert 'fetch("/api/access-log")' in DASHBOARD_HTML
+    assert "access log not configured" in DASHBOARD_HTML
+    assert (
+        '$("access-log-refresh").addEventListener("click", loadAccessLog)'
+        in DASHBOARD_HTML
+    )
+    assert "${esc(e.method)}" in DASHBOARD_HTML
+    assert "${esc(e.path)}" in DASHBOARD_HTML
+    assert "${esc(e.status)}" in DASHBOARD_HTML
+
+    refresh_start = DASHBOARD_HTML.index("async function refresh()")
+    refresh_end = DASHBOARD_HTML.index("refresh();", refresh_start)
+    assert "/api/access-log" not in DASHBOARD_HTML[refresh_start:refresh_end]
+    assert "setInterval(loadAccessLog" not in DASHBOARD_HTML
+    assert "\nloadAccessLog();" in DASHBOARD_HTML
+
+
 # --- the pending-question proxy (GET /api/jobs/{id}/question → dispatch) -----
 
 

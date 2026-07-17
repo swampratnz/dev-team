@@ -28,6 +28,7 @@ workspace on every request.
 | **House conventions** — the captured style summary | `.dev_team/conventions.json` |
 | **Verdict calibration** — per-phase and overall confirmed/refuted/needs-context counts and confirm rate | `audit/<id>/verifications.jsonl` (same aggregate as `GET /calibration`) |
 | **Spend** — total spend and a per-mode breakdown, fetched on demand | the dispatch service's `GET /costs` (proxied, see *Spend* below) |
+| **Access log** — recent dispatch HTTP requests (method/path/status), fetched on demand | the dispatch service's `GET /access-log` (proxied, see *Access log* below) |
 | **Reports** — every `audit/*.md`, viewable in place | the workspace tree |
 
 Runs, Reports, and the Kanban board all exclude **archived** jobs by
@@ -158,6 +159,27 @@ number that only changes when a job finishes. Without a dispatch URL/token
 configured, `GET /api/costs` answers `501` and the panel renders a muted
 "not configured" state, never a raw error.
 
+### Access log
+
+The **Access log** panel (next to Spend) shows the dispatch service's most
+recent HTTP requests — method, path, and status, status colour-coded so a
+run of `401`s is visually obvious — the same page `GET /access-log` returns
+(see [`docs/DISPATCH.md`](DISPATCH.md)). The dispatch service is deployed
+tailnet-only behind a hardened systemd unit, so this panel is what lets an
+operator notice a misconfigured caller or a credential-stuffing burst from
+the dashboard they already have open, instead of SSHing in to `cat
+access.jsonl`.
+
+Same proxy shape and the same on-demand-only discipline as Spend: fetched
+**once on page load plus a manual refresh button**, never part of the 2.5s
+poll (a proxied dispatch hop must not multiply by open tabs × poll cadence
+for data that only changes on a new request). Without a dispatch URL/token
+configured, `GET /api/access-log` answers `501` and the panel renders a
+muted "not configured" state. Every rendered field goes through `esc()`
+before `innerHTML` — a logged `path` is arbitrary caller-supplied input (an
+external caller can hit `/whatever<script>` and have it logged verbatim, by
+design), so it must always render as inert text.
+
 ### Pending questions
 
 An `interactive: true` deliver job (see [`docs/DISPATCH.md`](DISPATCH.md))
@@ -281,7 +303,14 @@ the same shape:
 browser ──(dashboard token)──▶ dashboard GET /api/costs ──(dispatch token)──▶ dispatch GET /costs
 ```
 
-The pending-question panel's two routes (above) are a fourth pair, one
+The Access log panel's `GET /api/access-log` (above) is a fourth, read-only
+proxy of the same shape:
+
+```
+browser ──(dashboard token)──▶ dashboard GET /api/access-log ──(dispatch token)──▶ dispatch GET /access-log
+```
+
+The pending-question panel's two routes (above) are a fifth pair, one
 read-only and one body-forwarding:
 
 ```
@@ -312,6 +341,12 @@ browser ──(dashboard token)──▶ dashboard POST /api/jobs/{id}/answer �
   excludes archived jobs, matching `GET /jobs`), and without a token it
   answers `501 {"error": "spend rollup not configured"}`. Scope is
   **exactly `/api/costs`** — no path parameter, no other dispatch route
+  reachable through it.
+- Same again for `GET /api/access-log`: forwarded to `<dispatch-url>
+  /access-log`, with `?limit=` passed through unchanged (the dispatch
+  service itself clamps/defaults it), and without a token it answers
+  `501 {"error": "access log not configured"}`. Scope is **exactly
+  `/api/access-log`** — no path parameter, no other dispatch route
   reachable through it.
 - Last, `GET /api/jobs/{id}/question` and `POST /api/jobs/{id}/answer`:
   forwarded verbatim to `<dispatch-url>/jobs/{id}/question|answer`
@@ -370,6 +405,9 @@ the bearer header when a token is set):
   `POST /api/jobs/{id}/purge` — the archive/unarchive/purge proxy described
   above (same auth and `501` gating).
 - `GET /api/costs` — the spend rollup proxy described above (`?archived=1`
+  passed through unchanged; same auth and `501` gating; requires dashboard
+  auth).
+- `GET /api/access-log` — the access-log proxy described above (`?limit=`
   passed through unchanged; same auth and `501` gating; requires dashboard
   auth).
 - `GET /api/jobs/{id}/question` / `POST /api/jobs/{id}/answer` — the
