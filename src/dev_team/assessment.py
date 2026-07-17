@@ -1670,6 +1670,78 @@ Respond with a single JSON object exactly of this shape and nothing else:
 """
 
 
+#: Hard ceiling on ``verify_finding``'s ``votes`` fan-out, shared by the CLI
+#: (``--verify-votes``) and dispatch (``POST /jobs`` ``votes`` field) so the
+#: two surfaces can never drift. All ``votes`` passes run *concurrently*
+#: (``asyncio.gather``), so an uncapped value would let a single untrusted
+#: dispatch request fan out an unbounded burst of concurrent agentic passes
+#: against the shared Max pool — a resource/availability concern the
+#: per-call ``budget`` ceiling does not address, since it only caps spend
+#: once it accrues, not the concurrency burst of kicking many calls off at
+#: once (adversarial review, issue #129).
+MAX_VERIFY_VOTES = 5
+
+
+async def _verify_pass(
+    runner: AgentRunner,
+    workspace: Workspace,
+    finding: Dict,
+    budget: Budget,
+    tracer: Optional[Tracer],
+) -> Dict:
+    """Run ONE independent verifier pass.
+
+    Identical construction to what ``verify_finding`` has always done for its
+    single call — a fresh :class:`SecurityEngineerAgent` with only the
+    read-only tools, no agent sees another's answer. Shared by the ``votes=1``
+    and ``votes>1`` paths so every pass, at any ``votes``, is the same call.
+
+    Never raises :class:`~dev_team.budget.BudgetExceededError` or
+    :class:`~dev_team.errors.AgentResponseError` — both come back as
+    ``{"error": message}`` instead of ``{"verdict", "rationale",
+    "citations"}``, so a multi-vote fan-out via ``asyncio.gather`` lets one
+    vote's expected failure sit alongside the others' results rather than
+    aborting the whole gather; only a genuinely unexpected exception still
+    propagates.
+    """
+
+    agent = SecurityEngineerAgent(
+        InstrumentedRunner(runner, "verifier", budget=budget, tracer=tracer)
+    )
+    root = getattr(workspace, "root", None)
+    prompt = VERIFY_PROMPT.format(
+        phase=finding.get("phase", "unknown"),
+        claim=defuse(finding.get("claim", ""), "finding-claim"),
+        evidence=finding.get("evidence") or "(none cited)",
+    )
+    try:
+        data = await agent.ask_json(
+            prompt,
+            allowed_tools=READ_ONLY_TOOLS,
+            cwd=str(root) if root is not None else None,
+        )
+    except BudgetExceededError:
+        return {"error": "budget exhausted"}
+    except AgentResponseError as exc:
+        return {"error": str(exc)}
+    verdict = data.get("verdict")
+    rationale = str(data.get("rationale", ""))
+    if verdict not in VERIFY_VERDICTS:
+        # Fail securely: an out-of-contract verdict must never read as a
+        # confirmation (or a refutation) downstream.
+        rationale = (
+            f"verifier returned unrecognised verdict {verdict!r}; "
+            f"treated as needs-context. {rationale}"
+        ).strip()
+        verdict = "needs-context"
+    citations = [
+        {"path": str(item.get("path", "")), "note": str(item.get("note", ""))}
+        for item in data.get("citations", [])
+        if isinstance(item, dict)
+    ]
+    return {"verdict": verdict, "rationale": rationale, "citations": citations}
+
+
 async def verify_finding(
     runner: AgentRunner,
     workspace: Workspace,
@@ -1679,6 +1751,7 @@ async def verify_finding(
     tracer: Optional[Tracer] = None,
     source_job: Optional[str] = None,
     skip_broken_citations: bool = False,
+    votes: int = 1,
 ) -> Dict:
     """Re-check ONE persisted finding against a (re-)cloned repository.
 
@@ -1696,7 +1769,21 @@ async def verify_finding(
     a broken citation only impugns the citation, not the underlying claim (it
     could still be true via evidence elsewhere the original auditor mis-cited).
     Callers that want that $0 skip reflected are responsible for not persisting
-    it as a real verification (see dispatch's calibration isolation).
+    it as a real verification (see dispatch's calibration isolation). This
+    short-circuit takes precedence over ``votes`` — no vote is spent either.
+
+    ``votes`` (default ``1``, unchanged behaviour) opts into N-way adversarial
+    voting: ``votes`` independent :func:`_verify_pass` calls run concurrently
+    (no agent sees another's answer), and the verdict with the most votes
+    wins (a tie — e.g. 1-1 at ``votes=2`` — resolves to ``needs-context``,
+    the same fail-secure posture applied to an out-of-contract verdict).
+    ``budget`` is shared and enforced exactly as for a single call: if some
+    passes raise :class:`~dev_team.budget.BudgetExceededError` partway
+    through, the votes that did complete still decide the result (never
+    fewer than 1 succeeding); only if *every* pass fails does this return the
+    same ``{"success": False, ...}`` shape a single failed call returns
+    today. Callers are responsible for keeping ``votes`` at or below
+    :data:`MAX_VERIFY_VOTES` (the CLI and dispatch surfaces enforce this).
 
     Agent failure is returned, not raised, so a caller can turn it into a
     failed job without unwinding:
@@ -1705,7 +1792,12 @@ async def verify_finding(
       "finding_id", "source_job", "cost_usd"}`` — ``verdict`` is guaranteed
       to be one of :data:`VERIFY_VERDICTS` (an out-of-contract verdict is
       downgraded to ``needs-context``, never promoted to a confirmation).
-      A skip additionally carries ``"skipped": True``.
+      A skip additionally carries ``"skipped": True``. When ``votes > 1``,
+      the result additionally carries ``"votes"`` (a list of every
+      individual pass's ``{"verdict", "rationale", "citations"}``) and
+      ``"vote_count"`` (how many passes actually succeeded) — additive only,
+      so a ``votes=1`` caller (and ``GET /calibration``, which only ever
+      reads the top-level ``verdict``) sees no schema change.
     - failure: ``{"success": False, "error", "finding_id", "source_job",
       "cost_usd"}``.
     """
@@ -1727,45 +1819,60 @@ async def verify_finding(
             "cost_usd": 0.0,
             "skipped": True,
         }
-    agent = SecurityEngineerAgent(
-        InstrumentedRunner(runner, "verifier", budget=budget, tracer=tracer)
-    )
-    root = getattr(workspace, "root", None)
-    prompt = VERIFY_PROMPT.format(
-        phase=finding.get("phase", "unknown"),
-        claim=defuse(finding.get("claim", ""), "finding-claim"),
-        evidence=finding.get("evidence") or "(none cited)",
-    )
-    try:
-        data = await agent.ask_json(
-            prompt,
-            allowed_tools=READ_ONLY_TOOLS,
-            cwd=str(root) if root is not None else None,
+    if votes <= 1:
+        # Kept as its own path (not just `votes=1` through the fan-out
+        # machinery below) so this stays byte-for-byte the call every
+        # existing caller already makes.
+        single = await _verify_pass(runner, workspace, finding, budget, tracer)
+        if "error" in single:
+            return {
+                **base,
+                "success": False,
+                "error": single["error"],
+                "cost_usd": budget.spent,
+            }
+        return {
+            **base,
+            "success": True,
+            "verdict": single["verdict"],
+            "rationale": single["rationale"],
+            "citations": single["citations"],
+            "cost_usd": budget.spent,
+        }
+
+    outcomes = await asyncio.gather(
+        *(
+            _verify_pass(runner, workspace, finding, budget, tracer)
+            for _ in range(votes)
         )
-    except BudgetExceededError:
+    )
+    passes = [outcome for outcome in outcomes if "error" not in outcome]
+    if not passes:
         return {
             **base,
             "success": False,
-            "error": "budget exhausted",
+            "error": outcomes[-1]["error"],
             "cost_usd": budget.spent,
         }
-    except AgentResponseError as exc:
-        return {**base, "success": False, "error": str(exc), "cost_usd": budget.spent}
-    verdict = data.get("verdict")
-    rationale = str(data.get("rationale", ""))
-    if verdict not in VERIFY_VERDICTS:
-        # Fail securely: an out-of-contract verdict must never read as a
-        # confirmation (or a refutation) downstream.
-        rationale = (
-            f"verifier returned unrecognised verdict {verdict!r}; "
-            f"treated as needs-context. {rationale}"
-        ).strip()
+    tally: Dict[str, int] = {}
+    for one_pass in passes:
+        tally[one_pass["verdict"]] = tally.get(one_pass["verdict"], 0) + 1
+    top_count = max(tally.values())
+    winners = sorted(v for v, count in tally.items() if count == top_count)
+    if len(winners) > 1:
         verdict = "needs-context"
-    citations = [
-        {"path": str(item.get("path", "")), "note": str(item.get("note", ""))}
-        for item in data.get("citations", [])
-        if isinstance(item, dict)
-    ]
+        rationale = (
+            f"{len(passes)} independent votes split with no plurality "
+            f"({', '.join(winners)} tied at {top_count} each); resolved to "
+            "needs-context rather than promoted to a confirmation or "
+            "refutation."
+        )
+        citations: List[Dict] = []
+    else:
+        verdict = winners[0]
+        winning_pass = next(p for p in passes if p["verdict"] == verdict)
+        rationale = winning_pass["rationale"]
+        citations = winning_pass["citations"]
     return {
         **base,
         "success": True,
@@ -1773,6 +1880,8 @@ async def verify_finding(
         "rationale": rationale,
         "citations": citations,
         "cost_usd": budget.spent,
+        "votes": passes,
+        "vote_count": len(passes),
     }
 
 

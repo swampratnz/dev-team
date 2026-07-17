@@ -245,6 +245,29 @@ sections below are reconstructed from the repository history.
   pair atomically under the channel's own lock (`submit_reply`), so a reply
   can never be misdelivered to a later, unrelated question if the original
   one has since timed out and moved on.
+- **Opt-in N-way adversarial voting for `--verify`** (`docs/ASSESSMENT.md`,
+  `docs/DISPATCH.md`): a single `verify_finding` call is itself one
+  stochastic LLM sample standing in for the system's confidence. A new
+  `votes` parameter (default `1`, byte-for-byte unchanged behaviour) runs
+  `votes` independent `SecurityEngineerAgent` passes concurrently — no
+  agent sees another's answer — and takes the plurality verdict; a tie
+  (e.g. 1-1 at `votes=2`) resolves to `needs-context`, the same fail-secure
+  posture already applied to an out-of-contract verdict. `budget` is shared
+  and enforced across every pass exactly as for today's single call: if
+  some passes exhaust it, the passes that did complete still decide the
+  result, and only an all-fail run returns the existing failure shape. The
+  result gains `votes`/`vote_count` only when `votes > 1` — additive-only,
+  so `GET /calibration` (reading only the top-level `verdict`) needs no
+  change. Threaded through the CLI (`--verify-votes N`) and dispatch
+  (`POST /jobs` `mode: "verify"`, `votes: int`). Both surfaces cap `votes`
+  at **5** via one shared `MAX_VERIFY_VOTES` constant — added at adversarial
+  review to close a concurrency-burst gap: uncapped, a dispatch caller
+  could fan out an unbounded burst of concurrent agentic passes against the
+  shared Max pool in one request, which the per-call `budget` ceiling does
+  not itself bound (it caps eventual spend, not the concurrency burst of
+  starting many calls at once). Dispatch validation rejects a non-integer
+  (including a bool, since `bool` is an `int` subtype in Python) or
+  out-of-range `votes` with `400`, never coerced.
 
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the

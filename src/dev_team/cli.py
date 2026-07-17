@@ -15,6 +15,7 @@ from typing import List, Mapping, Optional, Tuple
 from . import __version__
 from .assessment import (
     ASSESSMENT_JSON_PATH,
+    MAX_VERIFY_VOTES,
     AssessConfig,
     dict_to_backlog,
     find_finding,
@@ -385,6 +386,17 @@ def build_parser() -> argparse.ArgumentParser:
         "agent call entirely and return a $0 'needs-context' result instead "
         "of spending a real verification pass. Has no effect on findings "
         "whose citation is not already known broken.",
+    )
+    assessment.add_argument(
+        "--verify-votes",
+        type=int,
+        default=1,
+        metavar="N",
+        help="With --verify: run N independent skeptical agent passes "
+        "concurrently instead of one, and take the plurality verdict (a tie "
+        "resolves to needs-context) — reduces single-verifier variance at "
+        f"~Nx the cost. Default 1 (unchanged behaviour); capped at "
+        f"{MAX_VERIFY_VOTES}.",
     )
     assessment.add_argument(
         "--no-conventions",
@@ -769,6 +781,12 @@ def _validate_args(
         parser.error("--finding: only valid with --verify")
     if args.skip_broken_citations and args.verify is None:
         parser.error("--skip-broken-citations: only valid with --verify")
+    if args.verify_votes != 1 and args.verify is None:
+        parser.error("--verify-votes: only valid with --verify")
+    if args.verify_votes < 1:
+        parser.error("--verify-votes: must be at least 1")
+    if args.verify_votes > MAX_VERIFY_VOTES:
+        parser.error(f"--verify-votes: must be at most {MAX_VERIFY_VOTES}")
     if args.port is not None and not (args.dashboard or args.dispatch):
         parser.error("--port: only valid with --dashboard or --dispatch")
     if args.host is not None and not (args.dashboard or args.dispatch):
@@ -1591,6 +1609,7 @@ async def _verify_one(args, runner: AgentRunner) -> int:
         finding,
         budget=Budget(limit_usd=args.budget_usd),
         skip_broken_citations=args.skip_broken_citations,
+        votes=args.verify_votes,
     )
     if args.json:
         print(json.dumps(result, indent=2))

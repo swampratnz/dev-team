@@ -56,6 +56,7 @@ from urllib.parse import parse_qs, urlsplit
 from .accesslog import AccessLog
 from .approval import PolicyApprovalGate
 from .assessment import (
+    MAX_VERIFY_VOTES,
     AssessConfig,
     calibration_summary,
     dict_to_backlog,
@@ -201,6 +202,10 @@ class JobSpec:
     # dev_team.assessment.verify_finding) when the finding is already known,
     # at $0, to cite a broken/fabricated evidence path.
     skip_broken_citations: bool = False
+    # verify only: how many independent verifier passes to run and take the
+    # plurality of (see dev_team.assessment.verify_finding); validated at
+    # submit time against MAX_VERIFY_VOTES (see _verify_spec).
+    votes: int = 1
 
 
 @dataclass
@@ -573,6 +578,14 @@ class Dispatcher:
         skip_broken_citations = body.get("skip_broken_citations", False)
         if not isinstance(skip_broken_citations, bool):
             raise ValidationError("skip_broken_citations must be true or false")
+        votes = body.get("votes", 1)
+        # bool is a subtype of int in Python (isinstance(True, int) is True),
+        # so the bool check must come first or True/False would silently
+        # pass as 1/0 votes instead of being rejected.
+        if isinstance(votes, bool) or not isinstance(votes, int):
+            raise ValidationError("votes must be an integer")
+        if votes < 1 or votes > MAX_VERIFY_VOTES:
+            raise ValidationError(f"votes must be between 1 and {MAX_VERIFY_VOTES}")
         source_job = source_job.strip()
         if self._dashboard_workspace is None:
             raise SubmitRejected(409, "verify needs a dashboard workspace")
@@ -606,6 +619,7 @@ class Dispatcher:
             finding_id=finding["id"],
             finding=finding,
             skip_broken_citations=skip_broken_citations,
+            votes=votes,
         )
 
     def submit(self, spec: JobSpec) -> Tuple[str, int]:
@@ -849,6 +863,7 @@ class Dispatcher:
             budget=budget,
             source_job=spec.source_job,
             skip_broken_citations=spec.skip_broken_citations,
+            votes=spec.votes,
         )
         if not result["success"]:
             raise DevTeamError(str(result["error"]))
@@ -1657,6 +1672,12 @@ class Dispatcher:
                 # verdict — see verify_finding's skip_broken_citations.
                 payload["success"] = True
                 payload["skipped"] = True
+            if "vote_count" in outcome:
+                # Present only when the request opted into votes > 1 (see
+                # verify_finding) — additive, so a votes=1 caller (the
+                # default) sees no schema change here either.
+                payload["votes"] = outcome["votes"]
+                payload["vote_count"] = outcome["vote_count"]
             return 200, payload
         if record.spec.mode == "assess":
             return 200, {

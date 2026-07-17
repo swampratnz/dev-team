@@ -467,12 +467,14 @@ malformed data (including assessments persisted before this field existed).
 
 `{"mode":"verify","source_job":<assess job id>,"finding_id":<finding id or
 case-insensitive claim substring>,"budget_usd":number|null,
-"skip_broken_citations":bool|omitted}` →
+"skip_broken_citations":bool|omitted,"votes":int|omitted}` →
 `202 {"id":"verify-…","state":"queued","position":n}`. The finding is
 resolved synchronously at submit time; unless `skip_broken_citations`
 short-circuits the job (below), it re-clones the repo named by the source
 job's `meta.json`. Errors: `400` (missing/blank `source_job`/`finding_id`,
-or `skip_broken_citations` present and not a bool),
+`skip_broken_citations` present and not a bool, or `votes` present and not
+an integer in `[1, 5]` — a bool, string, float, or out-of-range value is
+rejected, never coerced),
 `404 {"error":"no assessment for that job"}`,
 `404 {"error":"finding not found"}`,
 `409 {"error":"verify needs a dashboard workspace"}`.
@@ -489,6 +491,20 @@ deterministic skip apart from a real agent verdict. A skipped result is
 **not** appended to `GET /jobs/{source-id}/verifications` or counted by
 `GET /calibration` — no model ever adjudicated it, so persisting it would
 silently dilute `confirm_rate`.
+
+`votes` (default `1`, unchanged behaviour) mirrors `dev-team --verify
+--verify-votes`: runs `votes` independent skeptical agent passes
+concurrently and takes the plurality verdict (a tie resolves to
+`needs-context`, never promoted to a confirmation or refutation), capped at
+**5** on both the CLI and this dispatch surface via one shared constant —
+an uncapped value would let a single request fan out an unbounded burst of
+concurrent agent calls against the shared pool. The result additionally
+carries `"votes":[{"verdict","rationale","citations"}]` (one entry per
+completed pass) and `"vote_count":int` when `votes > 1`; the top-level
+`verdict`/`rationale`/`citations` fields are unchanged, so
+`GET /jobs/{source-id}/verifications` and `GET /calibration` (which only
+ever read the top-level `verdict`) need no change and never double-count a
+multi-vote result as more than one entry.
 
 The job then flows through the normal machinery: single-flight queue,
 `GET /jobs/{id}` status, and `GET /jobs/{id}/result` (shapes above — a

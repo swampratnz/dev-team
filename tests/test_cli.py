@@ -1268,6 +1268,104 @@ def test_main_help_documents_skip_broken_citations(capsys):
     assert "--skip-broken-citations" in out
 
 
+def test_main_verify_votes_wires_through_end_to_end(tmp_path):
+    # Acceptance criterion 7.
+    from dev_team.testing import json_response
+
+    ws = _persisted_assessment(tmp_path)
+    runner = ScriptedRunner(
+        responses=[
+            json_response(
+                {"verdict": "confirmed", "rationale": "r1", "citations": []}
+            ),
+            json_response(
+                {"verdict": "confirmed", "rationale": "r2", "citations": []}
+            ),
+            json_response(
+                {"verdict": "refuted", "rationale": "r3", "citations": []}
+            ),
+        ]
+    )
+    code = main(
+        [
+            "--verify", str(ws), "--finding", "pin build",
+            "--verify-votes", "3",
+        ],
+        runner=runner,
+    )
+    assert code == 0
+    assert len(runner.calls) == 3
+
+
+def test_main_verify_votes_omitted_runs_a_single_call(tmp_path, capsys):
+    # Acceptance criterion 7: omitting the flag behaves exactly as today —
+    # a single agent call, no votes/vote_count in the result.
+    ws = _persisted_assessment(tmp_path)
+    code = main(
+        ["--verify", str(ws), "--finding", "pin build", "--json"],
+        runner=_verify_runner(),
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert "votes" not in payload
+    assert "vote_count" not in payload
+
+
+def test_main_verify_votes_zero_and_negative_rejected():
+    for value in ("0", "-1"):
+        with pytest.raises(SystemExit) as excinfo:
+            main(
+                ["--verify", ".", "--finding", "x", "--verify-votes", value],
+                runner=ScriptedRunner([]),
+            )
+        assert excinfo.value.code == 2
+
+
+def test_main_verify_votes_above_cap_rejected():
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--verify", ".", "--finding", "x", "--verify-votes", "6"],
+            runner=ScriptedRunner([]),
+        )
+    assert excinfo.value.code == 2
+
+
+def test_main_verify_votes_at_cap_succeeds(tmp_path):
+    from dev_team.testing import json_response
+
+    ws = _persisted_assessment(tmp_path)
+    runner = ScriptedRunner(
+        responses=[
+            json_response(
+                {"verdict": "confirmed", "rationale": "r", "citations": []}
+            )
+            for _ in range(5)
+        ]
+    )
+    code = main(
+        [
+            "--verify", str(ws), "--finding", "pin build",
+            "--verify-votes", "5",
+        ],
+        runner=runner,
+    )
+    assert code == 0
+    assert len(runner.calls) == 5
+
+
+def test_main_verify_votes_flag_requires_verify():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--verify-votes", "3"], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+
+
+def test_main_help_documents_verify_votes(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "--verify-votes" in out
+
+
 def test_main_make_backlog_generates_stories_without_credentials(
     monkeypatch, tmp_path, capsys
 ):
