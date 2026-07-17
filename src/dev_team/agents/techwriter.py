@@ -98,6 +98,18 @@ _TOKEN_SPLIT_RE = re.compile(r"""[\s,;'"`*|{}()\[\]<>]+""")
 #: fails to match, so malformed input is skipped rather than raising.
 _FENCE_RE = re.compile(r"^```([\w+-]*)[ \t]*\r?\n(.*?)^```[ \t]*$", re.DOTALL | re.MULTILINE)
 
+#: Shell-ish fence language tags whose lines get scanned for CLI invocations.
+_SHELL_FENCE_LANGS = frozenset({"bash", "sh", "shell", "console", "zsh"})
+
+#: How a documented shell line must start (as a whole leading token) to be
+#: treated as invoking this project's own CLI.
+_CLI_INVOCATION_PREFIXES = ("dev-team", "python -m dev_team", "python3 -m dev_team")
+
+#: Long-flag tokens only — a bare ``--`` followed by word/hyphen characters.
+#: For ``--flag=value`` this naturally matches just ``--flag``, since ``=``
+#: is not in the character class.
+_LONG_FLAG_RE = re.compile(r"--[\w-]+")
+
 
 def _looks_like_bare_path(s: str) -> bool:
     """True only for strings that read as an unambiguous bare relative path.
@@ -134,17 +146,79 @@ def _candidate_path_tokens(content: str) -> Iterable[str]:
     return (token for token in _TOKEN_SPLIT_RE.split(content) if token)
 
 
+def _cli_invocation_command(line: str) -> Optional[str]:
+    """The line's command text if it invokes this project's CLI, else ``None``.
+
+    Strips one leading ``$ `` prompt marker and surrounding whitespace first,
+    then matches ``dev-team``/``python -m dev_team``/``python3 -m dev_team``
+    as a whole leading token (not a substring match).
+    """
+
+    text = line.strip()
+    if text.startswith("$ "):
+        text = text[2:].strip()
+    for prefix in _CLI_INVOCATION_PREFIXES:
+        if text == prefix or text.startswith(prefix + " "):
+            return text
+    return None
+
+
+def _truncate_before_unquoted_delimiter(text: str) -> str:
+    """Cut ``text`` before the first unquoted ``|``, ``&&``, ``;``, or ``#``.
+
+    Tracks single/double-quote state left-to-right: a quote character toggles
+    state, and a delimiter inside an open quote does not truncate.
+    """
+
+    quote: Optional[str] = None
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch in ("|", ";", "#"):
+            return text[:i]
+        if ch == "&" and text[i : i + 2] == "&&":
+            return text[:i]
+        i += 1
+    return text
+
+
+def _cli_flags_cited(block: str) -> Iterable[str]:
+    """Long-flag tokens (``--foo``) cited on CLI-invocation lines in ``block``."""
+
+    for line in block.splitlines():
+        command = _cli_invocation_command(line)
+        if command is None:
+            continue
+        truncated = _truncate_before_unquoted_delimiter(command)
+        for flag in _LONG_FLAG_RE.findall(truncated):
+            yield flag
+
+
 def doc_claim_issues(
     doc_files: Sequence[FileChange], known_files: Iterable[str]
 ) -> List[str]:
     """Advisory findings where a shipped doc's claims don't check out.
 
     Deterministic and $0: no LLM call, no subprocess, no network, no I/O.
-    Two checks, mirroring ``assessment.broken_citations``' precedent:
+    Three checks, mirroring ``assessment.broken_citations``' precedent:
 
     - a bare-path-shaped citation absent from ``known_files``;
     - a ```python``` fenced block that fails ``ast.parse`` (parse-only —
-      doc content is untrusted model output, never executed).
+      doc content is untrusted model output, never executed);
+    - a line in a ``bash``/``sh``/``shell``/``console``/``zsh`` fence that
+      invokes this project's own CLI and cites a ``--flag`` not recognised
+      by ``dev_team.cli.build_parser()`` (regex-scanned only — never passed
+      to ``subprocess``, ``os.system``, ``eval``, or ``exec``).
 
     Fences in any other language (or unlabelled) are left unchecked; a
     malformed, unterminated fence is silently skipped, not raised.
@@ -152,6 +226,7 @@ def doc_claim_issues(
 
     known = set(known_files)
     issues: List[str] = []
+    known_flags: Optional[set] = None
     for doc in doc_files:
         # Path citations are a prose claim ("see src/x.py") — scan outside
         # fenced code, so identifiers that merely happen to contain a dot
@@ -162,12 +237,26 @@ def doc_claim_issues(
             if _looks_like_bare_path(candidate) and candidate not in known:
                 issues.append(f"{doc.path}: cites {token!r}, not found in workspace")
         for lang, block in _FENCE_RE.findall(doc.content):
-            if lang != "python":
-                continue
-            try:
-                ast.parse(block)
-            except SyntaxError as exc:
-                issues.append(
-                    f"{doc.path}: python fence has a syntax error at line {exc.lineno}"
-                )
+            if lang == "python":
+                try:
+                    ast.parse(block)
+                except SyntaxError as exc:
+                    issues.append(
+                        f"{doc.path}: python fence has a syntax error at line {exc.lineno}"
+                    )
+            elif lang in _SHELL_FENCE_LANGS:
+                for flag in _cli_flags_cited(block):
+                    if known_flags is None:
+                        from ..cli import build_parser  # deferred: avoid cli -> engine -> techwriter cycle
+
+                        known_flags = {
+                            option
+                            for action in build_parser()._actions
+                            for option in action.option_strings
+                            if option.startswith("--")
+                        }
+                    if flag not in known_flags:
+                        issues.append(
+                            f"{doc.path}: cites CLI flag {flag!r}, not a recognised dev-team option"
+                        )
     return issues
