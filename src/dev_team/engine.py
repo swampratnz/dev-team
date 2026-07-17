@@ -2175,7 +2175,7 @@ class DeliveryEngine:
                 self._commit_wip(task)
         return implementation, done, review, test_report, feedback
 
-    def _open_engineer_session(self) -> Optional[AgentSession]:
+    def _open_engineer_session(self, cwd: Optional[str] = None) -> Optional[AgentSession]:
         """Open an instrumented engineer session for a task, or ``None``.
 
         ``None`` unless ``reuse_engineer_session`` is set and the run is agentic
@@ -2183,7 +2183,9 @@ class DeliveryEngine:
         The raw session comes from the injected factory (tests) or a
         :class:`ClaudeAgentSession` fixed to the engineer's system prompt,
         tools, cwd, and model; it is wrapped in an :class:`InstrumentedSession`
-        so every turn meters and traces exactly like a runner call.
+        so every turn meters and traces exactly like a runner call. ``cwd``
+        defaults to the engine's own workdir; worktree-mode callers pass the
+        task's own worktree path so the session runs inside its own arena.
         """
 
         if not (self.config.reuse_engineer_session and self.agentic):
@@ -2200,7 +2202,7 @@ class DeliveryEngine:
                 system_prompt=self.engineer.effective_system_prompt,
                 allowed_tools=tools,
                 model=self.engineer.model,
-                cwd=str(self.workdir),
+                cwd=cwd if cwd is not None else str(self.workdir),
             )
         return InstrumentedSession(
             inner,
@@ -2211,7 +2213,9 @@ class DeliveryEngine:
             system_prompt=self.engineer.effective_system_prompt,
         )
 
-    async def _engineer_attempt(self, task, design, feedback, session, *, continued, model):
+    async def _engineer_attempt(
+        self, task, design, feedback, session, *, continued, model, cwd: Optional[str] = None
+    ):
         """Run one engineer attempt, over the session when there is one.
 
         Returns ``(implementation, session)``. A session turn that fails
@@ -2219,7 +2223,9 @@ class DeliveryEngine:
         fatal: the session is discarded and the attempt retried once on the
         proven cold :meth:`implement_in_place` path — so ``session`` comes back
         ``None`` and every later attempt stays cold. Per-attempt model
-        escalation applies only to that cold path; the session's model is fixed.
+        escalation applies only to that cold path; the session's model is
+        fixed. ``cwd`` defaults to the engine's own workdir; worktree-mode
+        callers pass the task's own worktree path for the cold fallback too.
         """
 
         if session is not None:
@@ -2240,7 +2246,7 @@ class DeliveryEngine:
             task,
             design,
             feedback,
-            cwd=str(self.workdir),
+            cwd=cwd if cwd is not None else str(self.workdir),
             conventions=self._conventions,
             model=model,
             tools=self.config.engineer_tools,
@@ -2277,20 +2283,21 @@ class DeliveryEngine:
         review: Optional[Review] = None
         test_report: Optional[TestReport] = None
         attempts = 0
+        # One persistent session per task (opt-in), rooted in this task's own
+        # worktree, mirroring _attempt_task's non-worktree session lifecycle.
+        # None when off or not agentic; closed in the finally, before the
+        # worktree it's rooted in is removed.
+        session = self._open_engineer_session(cwd=wt_path)
         try:
             while attempts < self.config.max_task_attempts:
                 attempts += 1
                 task.status = TaskStatus.IN_PROGRESS
                 span = self.tracer.start("task", task.id, attempt=str(attempts))
 
-                implementation = await self.engineer.implement_in_place(
-                    task,
-                    design,
-                    feedback,
+                implementation, session = await self._engineer_attempt(
+                    task, design, feedback, session,
+                    continued=attempts > 1, model=self._attempt_model(attempts),
                     cwd=wt_path,
-                    conventions=self._conventions,
-                    model=self._attempt_model(attempts),
-                    tools=self.config.engineer_tools,
                 )
                 done, review, test_report, feedback = await self._integrate(
                     task,
@@ -2316,6 +2323,8 @@ class DeliveryEngine:
             task.status = TaskStatus.FAILED
             return TaskResult(task, attempts, implementation, review, test_report)
         finally:
+            if session is not None:
+                await session.aclose()
             async with self._integration_lock:
                 self.git.worktree_remove(wt_path)
                 self.git.delete_branch(task_branch)

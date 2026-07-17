@@ -5,6 +5,18 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Delivery
+- **Session reuse (`--reuse-engineer-session`) now composes with worktree
+  mode (`--worktrees`)** instead of silently no-oping. `_develop_task_in_worktree`
+  opens one persistent engineer session per task, rooted in that task's own
+  worktree, via the same `_open_engineer_session`/`_engineer_attempt`
+  machinery `--reuse-engineer-session` already uses outside worktree mode —
+  each retry continues the session instead of re-exploring the repo cold. A
+  session turn that errors falls back to the proven cold `implement_in_place`
+  path for that attempt and every later attempt of the same task; the session
+  is always closed before its worktree is removed. Off by default; only
+  activates when an operator has opted into both flags.
+
 ### Benchmarks
 - **The benchmark suite's aggregate result now persists across CI runs**
   (ROADMAP #6 follow-up): a new `dev_team.benchmark_history.BenchmarkHistory`
