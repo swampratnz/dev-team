@@ -3,7 +3,8 @@
 The risk phase's CVE claims otherwise come from model knowledge — plausible,
 stale, and unverifiable. This module is the deterministic counterpart: exact
 pins are parsed straight out of the manifests (NuGet ``packages.config``,
-``package.json``, ``requirements.txt``, ``Cargo.toml``) *and* the lockfiles
+``package.json``, ``requirements.txt``, PEP 621 ``pyproject.toml``,
+``Cargo.toml``) *and* the lockfiles
 (``package-lock.json``, ``poetry.lock``, ``Cargo.lock``, NuGet
 ``packages.lock.json``) and checked against
 the OSV.dev batch API, which covers every major
@@ -253,6 +254,61 @@ def parse_cargo_toml(text: str, manifest: str) -> List[Dependency]:
     return deps
 
 
+def _pep508_pin(spec: str) -> Optional[tuple]:
+    """Exact ``(name, version)`` pin from a PEP 508 dependency string.
+
+    The environment marker (after ``;``) and any extras (``[...]``) are
+    stripped from the name first; anything but a single ``==`` (a range, a
+    comma-separated constraint, no version at all) is not a pin and yields
+    ``None`` — mirrors :func:`parse_requirements_txt`'s ``==``-only pip
+    behaviour rather than a full PEP 440 comparator.
+    """
+
+    without_marker = spec.split(";", 1)[0].strip()
+    if without_marker.count("==") != 1:
+        return None
+    name_part, _, version = without_marker.partition("==")
+    name = name_part.split("[", 1)[0].strip()
+    version = version.strip()
+    if name and version:
+        return name, version
+    return None
+
+
+def parse_pyproject_toml(text: str, manifest: str) -> List[Dependency]:
+    """PEP 621 ``pyproject.toml``: ``==`` pins from ``[project.dependencies]``
+    and ``[project.optional-dependencies]``.
+
+    Ranges, unpinned entries, and PEP 735 ``[dependency-groups]`` are out of
+    scope for v1 (see the module docstring's honest-limitations note) — only
+    exact pins are live-scanned, everything else stays model knowledge.
+    """
+
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return []
+    project = data.get("project")
+    if not isinstance(project, dict):
+        return []
+    specs: List[str] = []
+    direct = project.get("dependencies")
+    if isinstance(direct, list):
+        specs.extend(spec for spec in direct if isinstance(spec, str))
+    optional = project.get("optional-dependencies")
+    if isinstance(optional, dict):
+        for group in optional.values():
+            if isinstance(group, list):
+                specs.extend(spec for spec in group if isinstance(spec, str))
+    deps = []
+    for spec in specs:
+        pin = _pep508_pin(spec)
+        if pin is not None:
+            name, version = pin
+            deps.append(Dependency(name, version, "PyPI", manifest))
+    return deps
+
+
 def parse_package_lock(text: str, manifest: str) -> List[Dependency]:
     """npm ``package-lock.json``: exact resolved versions (v1, v2, and v3).
 
@@ -378,6 +434,7 @@ _PARSERS = {
     "packages.config": parse_packages_config,
     "package.json": parse_package_json,
     "requirements.txt": parse_requirements_txt,
+    "pyproject.toml": parse_pyproject_toml,
     "Cargo.toml": parse_cargo_toml,
     "package-lock.json": parse_package_lock,
     "poetry.lock": parse_poetry_lock,

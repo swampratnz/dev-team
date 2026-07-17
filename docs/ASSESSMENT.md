@@ -110,7 +110,10 @@ machinery understands them now:
   NuGet `packages.lock.json`) are parsed alongside the manifests, so a
   range-specified project still gets its *resolved* versions scanned;
   only dependencies with no lockfile and no exact pin fall back to
-  training data.
+  training data. PEP 621 `pyproject.toml` `[project.dependencies]` and
+  `[project.optional-dependencies]` `==` pins are live-scanned too, even
+  with no lockfile present; PEP 735 `[dependency-groups]` and any
+  non-`==` range in `pyproject.toml` still fall back to model knowledge.
 - **Detected Node.js/Python/.NET/Ruby/Go runtime versions get a live
   endoflife.date EOL/support-status check; every other EOL/support-status
   judgment (other runtimes, frameworks, libraries) is model knowledge** —
