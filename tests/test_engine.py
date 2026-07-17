@@ -3953,6 +3953,271 @@ def test_attempt_task_opens_and_closes_the_session(tmp_path):
     assert sessions[0].prompts  # the engineer turn went over the session
 
 
+# --- session continuity in worktree mode (#121) --------------------------
+
+
+def test_open_engineer_session_cwd_override_used_over_workdir(tmp_path):
+    from dev_team.sdk import ClaudeAgentSession
+
+    eng = _engine(
+        ScriptedRunner([]),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(reuse_engineer_session=True),
+    )
+    wt_path = str(tmp_path / ".dev_team" / "worktrees" / "t1")
+    inner = eng._open_engineer_session(cwd=wt_path).inner
+    assert isinstance(inner, ClaudeAgentSession)
+    assert inner.cwd == wt_path
+    assert inner.cwd != str(eng.workdir)
+
+
+def test_engineer_attempt_cold_path_uses_cwd_override(tmp_path):
+    runner = ScriptedRunner([json_response(impl_dict())])
+    eng = _engine(runner, workspace=LocalWorkspace(str(tmp_path)))
+    wt_path = str(tmp_path / ".dev_team" / "worktrees" / "t1")
+    run(
+        eng._engineer_attempt(_rp_task(), Design(overview="o"), None, None,
+                              continued=False, model=None, cwd=wt_path)
+    )
+    assert runner.calls[-1]["cwd"] == wt_path
+
+
+def test_worktree_session_reuse_opens_one_session_per_task_and_threads_it(tmp_path):
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    sessions = []
+
+    def factory():
+        s = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
+        sessions.append(s)
+        return s
+
+    mapping = {
+        "product manager": [json_response(__plan())],
+        "software architect": [json_response(__design())],
+        "code reviewer": [json_response(__review(False)), json_response(__review(True))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    cmd = DispatchCommandRunner(rev_shas=["BASE", "TIP"])
+    engine = _engine(
+        KeyedQueueRunner(mapping),
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=cmd,
+        config=EngineConfig(
+            worktrees=True, reuse_engineer_session=True, max_task_attempts=2,
+        ),
+        engineer_session_factory=factory,
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert outcome.task_results[0].attempts == 2
+    assert len(sessions) == 1  # one session opened for the whole task
+    assert len(sessions[0].prompts) == 2  # both attempts reused the same session
+    assert sessions[0].closed is True
+
+
+def test_worktree_session_error_falls_back_to_cold_and_stays_cold(tmp_path):
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    sessions = []
+
+    def factory():
+        s = FakeAgentSession(results=[AgentResult(text="", is_error=True)])
+        sessions.append(s)
+        return s
+
+    mapping = {
+        "product manager": [json_response(__plan())],
+        "software architect": [json_response(__design())],
+        "senior software engineer": [json_response(impl_dict())],
+        "code reviewer": [json_response(__review(False)), json_response(__review(True))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    runner = KeyedQueueRunner(mapping)
+    cmd = DispatchCommandRunner(rev_shas=["BASE", "TIP"])
+    engine = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=cmd,
+        config=EngineConfig(
+            worktrees=True, reuse_engineer_session=True, max_task_attempts=2,
+            json_retries=0,
+        ),
+        engineer_session_factory=factory,
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert outcome.task_results[0].attempts == 2
+    assert len(sessions) == 1  # the wedged session was never reopened mid-task
+    assert sessions[0].closed is True
+    wt_path = f"{engine.workdir}/.dev_team/worktrees/t1"
+    cold_calls = [
+        c for c in runner.calls
+        if c["cwd"] == wt_path and "in the current working directory" in c["prompt"]
+    ]
+    assert len(cold_calls) == 2  # every attempt, including the retry, ran cold
+
+
+def test_worktree_session_closed_before_worktree_removed_on_success(tmp_path):
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    order = []
+
+    class SpySession(FakeAgentSession):
+        async def aclose(self):
+            order.append("session_closed")
+            await super().aclose()
+
+    def factory():
+        return SpySession(results=[AgentResult(text=json_response(impl_dict()))])
+
+    class SpyCommandRunner(DispatchCommandRunner):
+        def run(self, command, *, cwd=None, timeout=None):
+            if list(command)[:3] == ["git", "worktree", "remove"]:
+                order.append("worktree_removed")
+            return super().run(command, cwd=cwd, timeout=timeout)
+
+    cmd = SpyCommandRunner(rev_shas=["BASE", "TIP"])
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=cmd,
+        config=EngineConfig(worktrees=True, reuse_engineer_session=True),
+        engineer_session_factory=factory,
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    # an initial crash-cleanup remove precedes the task even starting; what
+    # matters is the FINAL teardown remove, which must follow the close.
+    assert order[-2:] == ["session_closed", "worktree_removed"]
+
+
+def test_worktree_session_closed_before_worktree_removed_on_failure(tmp_path):
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    order = []
+
+    class SpySession(FakeAgentSession):
+        async def aclose(self):
+            order.append("session_closed")
+            await super().aclose()
+
+    def factory():
+        return SpySession(results=[AgentResult(text=json_response(impl_dict()))])
+
+    class SpyCommandRunner(DispatchCommandRunner):
+        def run(self, command, *, cwd=None, timeout=None):
+            if list(command)[:3] == ["git", "worktree", "remove"]:
+                order.append("worktree_removed")
+            return super().run(command, cwd=cwd, timeout=timeout)
+
+    cmd = SpyCommandRunner(rev_shas=["BASE"])
+    runner = ScriptedRunner(by_system_prompt=engine_responses(review=False))
+    engine = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=cmd,
+        config=EngineConfig(
+            worktrees=True, reuse_engineer_session=True, max_task_attempts=1,
+        ),
+        engineer_session_factory=factory,
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is False
+    assert order[-2:] == ["session_closed", "worktree_removed"]
+
+
+def test_worktree_without_reuse_never_touches_session_machinery(tmp_path):
+    def factory():
+        raise AssertionError("session factory must not be called when reuse is off")
+
+    cmd = DispatchCommandRunner(rev_shas=["BASE", "TIP"])
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=cmd,
+        config=EngineConfig(worktrees=True),  # reuse_engineer_session defaults False
+        engineer_session_factory=factory,
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    wt_path = f"{engine.workdir}/.dev_team/worktrees/t1"
+    eng_call = next(
+        c for c in runner.calls if "in the current working directory" in c["prompt"]
+    )
+    assert eng_call["cwd"] == wt_path  # unchanged: cold implement_in_place, as before
+
+
+def test_worktree_concurrent_tasks_get_distinct_sessions(tmp_path, monkeypatch):
+    from dev_team import engine as engine_mod
+    from dev_team.sdk import AgentResult
+
+    instances = []
+
+    class SpyClaudeSession:
+        def __init__(self, *, system_prompt=None, allowed_tools=None, model=None,
+                     cwd=None, **kwargs):
+            self.cwd = cwd
+            self.prompts = []
+            self.closed = False
+            instances.append(self)
+
+        async def send(self, prompt):
+            self.prompts.append(prompt)
+            return AgentResult(text=json_response(impl_dict()), num_turns=1)
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr(engine_mod, "ClaudeAgentSession", SpyClaudeSession)
+
+    plan = {
+        "summary": "s",
+        "tasks": [
+            {"id": "T1", "title": "a", "description": "d",
+             "acceptance_criteria": ["ok"], "dependencies": []},
+            {"id": "T2", "title": "b", "description": "d",
+             "acceptance_criteria": ["ok"], "dependencies": []},
+        ],
+    }
+    mapping = {
+        "product manager": [json_response(plan)],
+        "software architect": [json_response(__design())],
+        "code reviewer": [json_response(__review(True))],
+        "quality assurance engineer": [json_response(qa_suite_dict())],
+        "application security engineer": [json_response(__security())],
+        "technical writer": [json_response(__docs())],
+        "site reliability engineer": [json_response(__rel())],
+        "DevOps engineer": [json_response(__deploy())],
+    }
+    cmd = DispatchCommandRunner(rev_shas=["BASE", "TIP"])
+    engine = _engine(
+        KeyedQueueRunner(mapping),
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=cmd,
+        config=EngineConfig(worktrees=True, reuse_engineer_session=True),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert len(instances) == 2
+    assert instances[0] is not instances[1]  # no shared session across tasks
+    cwds = {inst.cwd for inst in instances}
+    assert cwds == {
+        f"{engine.workdir}/.dev_team/worktrees/t1",
+        f"{engine.workdir}/.dev_team/worktrees/t2",
+    }
+
+
 # --- retrieval into the architect prompt (--retrieval) ------------------
 
 
