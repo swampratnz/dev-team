@@ -120,6 +120,11 @@ QA, security, docs, reliability, and deployment.
   `.dev_team/events.jsonl`, so the dashboard is a separate read-only process
   you leave open (see [`docs/DASHBOARD.md`](docs/DASHBOARD.md)).
 - ✅ **Ubuntu-ready** — packaged for deployment as a container or systemd unit.
+- ✅ **Security posture, mapped** — every threat area (prompt injection,
+  credential hygiene, execution/workspace containment, HTTP surface auth,
+  pipeline guardrails, and what's explicitly *not* covered yet) is indexed to
+  the exact module/function that implements it in one reference (see
+  [docs/SECURITY.md](docs/SECURITY.md)).
 
 The capability set was chosen from a structured research pass across seven
 dimensions (roles, orchestration, execution, quality gates, memory, governance,

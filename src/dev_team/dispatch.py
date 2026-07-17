@@ -199,6 +199,10 @@ class JobSpec:
     source_job: Optional[str] = None
     finding_id: Optional[str] = None
     finding: Optional[Dict[str, Any]] = None
+    # verify only: skip the agent call entirely (see
+    # dev_team.assessment.verify_finding) when the finding is already known,
+    # at $0, to cite a broken/fabricated evidence path.
+    skip_broken_citations: bool = False
 
 
 @dataclass
@@ -568,6 +572,9 @@ class Dispatcher:
         finding_id = body.get("finding_id")
         if not isinstance(finding_id, str) or not finding_id.strip():
             raise ValidationError("verify requires a finding_id")
+        skip_broken_citations = body.get("skip_broken_citations", False)
+        if not isinstance(skip_broken_citations, bool):
+            raise ValidationError("skip_broken_citations must be true or false")
         source_job = source_job.strip()
         if self._dashboard_workspace is None:
             raise SubmitRejected(409, "verify needs a dashboard workspace")
@@ -600,6 +607,7 @@ class Dispatcher:
             source_job=source_job,
             finding_id=finding["id"],
             finding=finding,
+            skip_broken_citations=skip_broken_citations,
         )
 
     def submit(self, spec: JobSpec) -> Tuple[str, int]:
@@ -706,6 +714,21 @@ class Dispatcher:
         """
 
         spec = record.spec
+        if (
+            spec.mode == "verify"
+            and spec.skip_broken_citations
+            and (spec.finding or {}).get("citation_broken") is True
+        ):
+            # verify_finding's skip_broken_citations branch never touches
+            # `workspace` — it short-circuits on the finding's already-known
+            # citation_broken flag before any repo access. Skip the clone
+            # itself here too, so the "$0, no clone read" promise in
+            # docs/ASSESSMENT.md and docs/DISPATCH.md is actually true: no
+            # network egress, disk I/O, or clone latency for this (untrusted,
+            # third-party) repo. record.workspace stays None, which
+            # _progress() already treats as "no events" for a job that never
+            # ran anything with an EventLog (true of every verify job).
+            return await self._run_verify(record, spec, None)
         dest = str(Path(self._jobs_root) / spec.id)
         workspace = self._materialise(spec, dest)
         record.workspace = workspace
@@ -797,7 +820,7 @@ class Dispatcher:
         return outcome, outcome.cost_usd
 
     async def _run_verify(
-        self, record: JobRecord, spec: JobSpec, workspace: Workspace
+        self, record: JobRecord, spec: JobSpec, workspace: Optional[Workspace]
     ) -> Tuple[Any, float]:
         """Re-check the resolved finding against the fresh clone of its repo.
 
@@ -808,6 +831,11 @@ class Dispatcher:
         the mirrored assessment JSON. An agent failure is raised so the
         worker records a failed job (and ``result()`` answers
         ``{"kind":"verify","success":false,…}``).
+
+        ``workspace`` is ``None`` exactly when ``run_job`` skipped the clone
+        entirely (``spec.skip_broken_citations`` and the finding's citation
+        already known broken) — safe because :func:`verify_finding` never
+        dereferences ``workspace`` on that same short-circuit path.
         """
 
         # verify_finding drives the agent DIRECTLY, not through DevTeam, so it
@@ -828,20 +856,25 @@ class Dispatcher:
             spec.finding,
             budget=budget,
             source_job=spec.source_job,
+            skip_broken_citations=spec.skip_broken_citations,
         )
         if not result["success"]:
             raise DevTeamError(str(result["error"]))
-        self._mirror_verification(
-            spec.source_job,
-            {
-                "finding_id": result["finding_id"],
-                "verdict": result["verdict"],
-                "rationale": result["rationale"],
-                "citations": result["citations"],
-                "cost_usd": result["cost_usd"],
-                "ts": self._clock(),
-            },
-        )
+        if not result.get("skipped"):
+            # A $0 skip never invoked a model, so it must never be appended
+            # here — GET /calibration's confirm_rate would otherwise be
+            # silently diluted by an entry no model actually adjudicated.
+            self._mirror_verification(
+                spec.source_job,
+                {
+                    "finding_id": result["finding_id"],
+                    "verdict": result["verdict"],
+                    "rationale": result["rationale"],
+                    "citations": result["citations"],
+                    "cost_usd": result["cost_usd"],
+                    "ts": self._clock(),
+                },
+            )
         return result, float(result["cost_usd"])
 
     def _mirror_report(self, job_id: str, outcome: Any) -> None:
@@ -1618,7 +1651,7 @@ class Dispatcher:
             }
         outcome = record.outcome
         if record.spec.mode == "verify":
-            return 200, {
+            payload = {
                 "kind": "verify",
                 "source_job": record.spec.source_job,
                 "finding_id": outcome["finding_id"],
@@ -1627,6 +1660,12 @@ class Dispatcher:
                 "citations": outcome["citations"],
                 "cost_usd": outcome["cost_usd"],
             }
+            if outcome.get("skipped"):
+                # Distinguishes a $0 deterministic skip from a real agent
+                # verdict — see verify_finding's skip_broken_citations.
+                payload["success"] = True
+                payload["skipped"] = True
+            return 200, payload
         if record.spec.mode == "assess":
             return 200, {
                 "kind": "assess",

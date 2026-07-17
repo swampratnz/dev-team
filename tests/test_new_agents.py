@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from helpers import run
 
 from dev_team.agents import SecurityEngineerAgent, SREAgent, TechnicalWriterAgent
@@ -219,6 +221,151 @@ def test_doc_claim_issues_traversal_and_absolute_paths_are_unresolved_by_set_mem
 def test_doc_claim_issues_handles_unterminated_fence_without_raising():
     doc = _doc("```python\ndef broken(:\nno closing fence here")
     assert doc_claim_issues([doc], []) == []
+
+
+# --- doc_claim_issues: CLI-flag checking in shell fences ------------------
+
+
+def test_doc_claim_issues_flags_hallucinated_cli_flag():
+    doc = _doc("```bash\ndev-team --made-up-flag\n```\n")
+    issues = doc_claim_issues([doc], [])
+    assert len(issues) == 1
+    assert "docs/feature.md" in issues[0]
+    assert "--made-up-flag" in issues[0]
+
+
+def test_doc_claim_issues_no_finding_for_real_cli_flags():
+    doc = _doc("```bash\ndev-team --deliver --workspace .\n```\n")
+    assert doc_claim_issues([doc], []) == []
+
+
+@pytest.mark.parametrize("lang", ["bash", "sh", "shell", "console", "zsh"])
+def test_doc_claim_issues_checks_all_shell_fence_languages(lang):
+    doc = _doc(f"```{lang}\ndev-team --made-up-flag\n```\n")
+    issues = doc_claim_issues([doc], [])
+    assert len(issues) == 1
+
+
+@pytest.mark.parametrize("lang", ["bash", "sh", "shell", "console", "zsh"])
+def test_doc_claim_issues_checks_shell_fence_with_prompt_marker(lang):
+    doc = _doc(f"```{lang}\n$ dev-team --made-up-flag\n```\n")
+    issues = doc_claim_issues([doc], [])
+    assert len(issues) == 1
+
+
+def test_doc_claim_issues_recognises_python_module_invocation():
+    doc = _doc("```bash\npython -m dev_team --made-up-flag\n```\n")
+    issues = doc_claim_issues([doc], [])
+    assert len(issues) == 1
+
+
+def test_doc_claim_issues_recognises_python3_module_invocation():
+    doc = _doc("```bash\npython3 -m dev_team --made-up-flag\n```\n")
+    issues = doc_claim_issues([doc], [])
+    assert len(issues) == 1
+
+
+def test_doc_claim_issues_ignores_non_cli_invocation_shell_lines():
+    doc = _doc("```bash\ncurl -X POST https://example.com --data '{}'\n```\n")
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_doc_claim_issues_truncates_at_unquoted_pipe():
+    # Without truncation, "--raw-output" (a jq flag, not a dev-team one)
+    # would be misread as a cited dev-team flag.
+    doc = _doc("```bash\ndev-team --deliver | jq --raw-output .x\n```\n")
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_doc_claim_issues_truncates_at_unquoted_double_ampersand():
+    # Without truncation, "--raw-output" (an unrelated flag) would be
+    # misread as a cited dev-team flag.
+    doc = _doc("```bash\ndev-team --deliver && jq --raw-output .x\n```\n")
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_doc_claim_issues_does_not_truncate_at_quoted_delimiter():
+    # The ';' is inside a quoted value, so it must not truncate the line
+    # before the real, unrecognised flag that follows it.
+    doc = _doc('```bash\ndev-team --deliver "a; b" --typo-flag\n```\n')
+    issues = doc_claim_issues([doc], [])
+    assert len(issues) == 1
+    assert "--typo-flag" in issues[0]
+
+
+def test_doc_claim_issues_ignores_short_flags():
+    doc = _doc("```bash\ndev-team -x\n```\n")
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_doc_claim_issues_equals_form_real_flag_has_no_finding():
+    doc = _doc("```bash\ndev-team --budget-usd=5\n```\n")
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_doc_claim_issues_equals_form_misspelled_flag_flags():
+    doc = _doc("```bash\ndev-team --budget-us=5\n```\n")
+    issues = doc_claim_issues([doc], [])
+    assert len(issues) == 1
+    assert "--budget-us" in issues[0]
+
+
+def test_doc_claim_issues_shell_fence_never_shells_out_or_executes():
+    import os
+    import subprocess
+    from unittest.mock import patch
+
+    doc = _doc("```bash\ndev-team --bogus-flag; rm -rf /\n```\n")
+    with patch.object(
+        subprocess, "run", side_effect=AssertionError("must not run")
+    ) as mock_run, patch.object(
+        os, "system", side_effect=AssertionError("must not run")
+    ) as mock_system, patch.object(
+        os, "popen", side_effect=AssertionError("must not run")
+    ) as mock_popen:
+        issues = doc_claim_issues([doc], [])
+    mock_run.assert_not_called()
+    mock_system.assert_not_called()
+    mock_popen.assert_not_called()
+    assert len(issues) == 1
+    assert "--bogus-flag" in issues[0]
+
+
+def test_doc_claim_issues_reads_known_flags_from_the_live_parser(monkeypatch):
+    import dev_team.cli as cli_module
+
+    real_build_parser = cli_module.build_parser
+
+    def build_parser_with_temp_flag():
+        parser = real_build_parser()
+        parser.add_argument("--totally-new-flag", action="store_true")
+        return parser
+
+    monkeypatch.setattr(cli_module, "build_parser", build_parser_with_temp_flag)
+    doc = _doc("```bash\ndev-team --totally-new-flag\n```\n")
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_doc_claim_issues_other_fence_languages_unaffected_by_cli_check():
+    doc = _doc("```json\n{\"--not-a-flag\": true}\n```\n")
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_techwriter_import_does_not_trigger_cli_import():
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import dev_team.agents.techwriter; "
+            "assert 'dev_team.cli' not in sys.modules",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_sre_agent_with_stack():

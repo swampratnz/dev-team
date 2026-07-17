@@ -108,3 +108,11 @@ pipeline, so it can measure what they can't: the run **scorecard**
 failures, and vacuous-test rejections per delivery, and retrospectives feed
 those lessons into the next run. Trend these numbers across the eval suite
 and agent changes become measurable, not vibes.
+
+The eval suite's own aggregate trends across CI runs too: `dev-team-benchmark
+--history-file PATH` (opt-in; unset by default) appends each run's pass rate
+and cost to a bounded local JSON trail (`dev_team.benchmark_history`) and
+prints the signed delta against the prior run. The nightly `benchmark.yml`
+workflow persists that file across runs via `actions/cache` — a regression in
+"best in field" now shows up as a movement in the trend, not just a single
+run's console output.

@@ -466,13 +466,29 @@ malformed data (including assessments persisted before this field existed).
 ### `POST /jobs` with `{"mode":"verify",…}` — submit a re-check
 
 `{"mode":"verify","source_job":<assess job id>,"finding_id":<finding id or
-case-insensitive claim substring>,"budget_usd":number|null}` →
+case-insensitive claim substring>,"budget_usd":number|null,
+"skip_broken_citations":bool|omitted}` →
 `202 {"id":"verify-…","state":"queued","position":n}`. The finding is
-resolved synchronously at submit time and the job re-clones the repo named
-by the source job's `meta.json`. Errors: `400` (missing/blank
-`source_job`/`finding_id`), `404 {"error":"no assessment for that job"}`,
+resolved synchronously at submit time; unless `skip_broken_citations`
+short-circuits the job (below), it re-clones the repo named by the source
+job's `meta.json`. Errors: `400` (missing/blank `source_job`/`finding_id`,
+or `skip_broken_citations` present and not a bool),
+`404 {"error":"no assessment for that job"}`,
 `404 {"error":"finding not found"}`,
 `409 {"error":"verify needs a dashboard workspace"}`.
+
+`skip_broken_citations` (default `false`) mirrors `dev-team --verify
+--skip-broken-citations`: when `true` and the resolved finding's
+`citation_broken` is `true`, the job completes at **$0** with **no clone
+and no agent call** — the repo named by `meta.json` is never touched, so
+there is no network egress, disk I/O, or clone latency for it either —
+`verdict` is always `needs-context` (a broken citation impugns the
+citation, never proves the claim false) and the result additionally
+carries `"success":true,"skipped":true` so a caller can tell a $0
+deterministic skip apart from a real agent verdict. A skipped result is
+**not** appended to `GET /jobs/{source-id}/verifications` or counted by
+`GET /calibration` — no model ever adjudicated it, so persisting it would
+silently dilute `confirm_rate`.
 
 The job then flows through the normal machinery: single-flight queue,
 `GET /jobs/{id}` status, and `GET /jobs/{id}/result` (shapes above — a

