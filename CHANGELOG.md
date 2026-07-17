@@ -301,6 +301,16 @@ sections below are reconstructed from the repository history.
   loops, and a dashboard/dispatch HTTP status quick-reference.
   `DEPLOYMENT.md`'s two env-file gotcha callouts now cross-link it. Docs
   only — no `src/` change, no new credential surface.
+- **`docs/SECURITY.md`**: a consolidated security & threat-model reference
+  mapping each threat area — prompt-injection handling, credential/token
+  hygiene, execution containment, workspace/path containment, HTTP surface
+  auth, and pipeline/CI guardrails — to the exact module/function that
+  implements it, plus an explicit "what this does NOT protect against"
+  section (the ROADMAP per-job isolation gap, the dashboard's
+  unauthenticated-by-default localhost stance). Linked from `README.md`.
+  A reference-checker test resolves every cited `dev_team.x.y` symbol
+  against the installed package so the doc can't silently drift from the
+  code. Docs only — no `src/` change, no new credential surface.
 
 ## [0.7.0] — Legacy-repo analysis: dead code, live CVEs, conventions, remote CI
 
