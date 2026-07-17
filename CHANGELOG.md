@@ -17,7 +17,31 @@ sections below are reconstructed from the repository history.
   is always closed before its worktree is removed. Off by default; only
   activates when an operator has opted into both flags.
 
+### Benchmarks
+- **The benchmark suite's aggregate result now persists across CI runs**
+  (ROADMAP #6 follow-up): a new `dev_team.benchmark_history.BenchmarkHistory`
+  mirrors `dev_team.scores.ScoreHistory`'s bounded-JSON-trail, fail-secure-load
+  shape over a plain local file (the benchmark harness has no durable
+  workspace to attach to). `dev-team-benchmark` gains an opt-in
+  `--history-file PATH` flag (unset by default — zero new disk I/O, today's
+  behaviour unchanged); when set, it appends the run's pass/cost totals and
+  prints the signed pass-rate/cost delta against the prior run. A history
+  write failure is caught and never changes the reported exit code.
+  `.github/workflows/benchmark.yml` restores/saves `.benchmark/history.json`
+  via `actions/cache` around the run — no repo write, `permissions:
+  contents: read` unchanged.
+
 ### Security hardening
+- **Visual review now flags its unsandboxed served app.** `--sandbox` only
+  boxes gate/build-probe commands via `ContainerCommandRunner` — the app
+  `SubprocessAppServer` serves for visual review (`--visual-review`) is a
+  bare host subprocess either way. `DeliveryEngine._visual_review` now emits
+  a once-per-run advisory event when `EngineConfig.sandbox` is set, so an
+  operator combining `--visual-review --sandbox` sees the gap instead of
+  silently assuming full coverage. Purely informational: never raises, never
+  affects `DeliveryOutcome.success`, and never gates or skips the review
+  itself. `docs/SANDBOX.md`'s trust-boundary table and `docs/ROADMAP.md` item
+  1 gain matching notes.
 - **Prompt-fence defusing is now systemic.** Untrusted content shown to
   agents inside delimited `<...>` blocks (file bodies, diffs, tool/scanner
   output, the cross-run memory digest, the retrospective run digest, audit
@@ -63,6 +87,29 @@ sections below are reconstructed from the repository history.
   do-not-propose list (no merge autonomy, no credential-handling changes,
   no weakening the coverage gate). All agent workflows are inert until the
   `CLAUDE_CODE_OAUTH_TOKEN` secret and Claude GitHub App exist.
+
+### Interactivity
+- **The CI-fix loop can now be supervised from the pull request itself**
+  (`--interactive-pr-comments`, ROADMAP #7): a new `InteractionChannel`,
+  `GitHubPRCommentChannel` (`dev_team.pr_comment_channel`), posts the
+  `ci_fix_question` as a PR comment and polls (bounded, injectable `sleep`,
+  mirroring `watch_checks`) for a reply from an **explicitly configured**
+  allow-list of GitHub logins (`--interactive-pr-comment-author`,
+  repeatable) — no implicit "defaults to the PR author". A reply's first
+  whitespace-trimmed, lower-cased token must exactly match a live choice
+  key (`apply`/`skip`); an unauthorized commenter or an unrecognised reply
+  is silently skipped, and an exhausted poll fails safe to `skip`, exactly
+  like `ConsoleChannel`'s EOF behaviour. `--interactive-pr-comments`
+  requires `--interactive`, `--pull-request`, `--watch-fix-rounds > 0`, and
+  at least one `--interactive-pr-comment-author`; it replaces only the
+  CI-fix loop's channel — `team.interaction` (plan review, approvals) is
+  untouched, and omitting the flag leaves `_run_ci_fix_loop` exactly as
+  before. `DeliveryOutcome.pull_request_number` (alongside the existing
+  `pull_request_url`) is set from the opened PR so the channel can address
+  the comments API, which is keyed by PR number, not URL. Enabling this
+  posts the CI failure summary as a plain, repo-visible PR comment — see
+  `docs/INTERACTION.md` for the exposure-audience tradeoff before turning
+  it on.
 
 ### Finding re-verification
 - **A fresh skeptical agent can re-check any ONE persisted assessment
@@ -160,6 +207,24 @@ sections below are reconstructed from the repository history.
   over-flagging — under-flagging is the accepted direction, never promoted
   to a positive signal. `find_finding` inherits the field for free via its
   existing delegation to `list_findings`.
+- **Opt-in `--skip-broken-citations` / `skip_broken_citations` acts on
+  `citation_broken`** (`docs/ASSESSMENT.md`, `docs/DISPATCH.md`): the named
+  follow-up above finally spends — `verify_finding` now short-circuits to a
+  $0 `needs-context` result, with no agent/runner call at all, when the
+  flag is set and the finding is already known to cite a broken path.
+  Default off (byte-for-byte identical behaviour for every existing
+  caller); a broken citation only impugns the citation, so the verdict is
+  deliberately `needs-context`, never `refuted`. Threaded through the CLI
+  (`--verify --skip-broken-citations`) and dispatch (`POST /jobs`
+  `mode: "verify"`, `skip_broken_citations: bool`, rejected with `400` if
+  not a bool). `Dispatcher.run_job` also skips the repo clone itself
+  whenever the eligible skip fires — a genuine $0, no-clone-read result,
+  not just a saved agent call — instead of paying `clone_or_update`'s
+  network/disk cost for a repo the skip path never reads. A skipped
+  verification is never appended to `verifications.jsonl` and never
+  counted by `GET /calibration` — no model ever adjudicated it — and
+  `GET /jobs/{id}/result` marks a skip with `"success":true,"skipped":true`
+  so a caller can tell it apart from a real agent verdict.
 - **Interactive dispatch deliver** (`docs/DISPATCH.md`): `POST /jobs` gains
   opt-in `interactive`/`interactive_timeout_seconds` fields — the missing
   wiring `docs/ROADMAP.md` item 7 named directly (`Dispatcher.run_job`
@@ -229,6 +294,25 @@ sections below are reconstructed from the repository history.
   `501` and the panel shows a muted "not configured" state. Scope is
   strictly `/api/costs` (exact match, no path parameter) — the same
   narrow-proxy discipline as the existing backlog/job-lifecycle proxies.
+- **Pending-question panel** (`docs/DASHBOARD.md`): the dashboard's answer
+  to `docs/ROADMAP.md` item 7's "questions as buttons" — a live "pending
+  question" panel on each running job's card, backed by two new narrow
+  proxies alongside the spend rollup: `GET /api/jobs/{id}/question` (reads)
+  and `POST /api/jobs/{id}/answer` (a body-forwarding write, kept separate
+  from the no-body archive/unarchive/purge action set). An operator running
+  an `interactive: true` deliver job can now see the paused prompt/context
+  and click a choice (or type free text for an `accepts_text` choice)
+  straight from the dashboard, instead of `curl`ing the dispatch API by
+  hand. Polling is scoped and visibility-gated — only currently-running,
+  non-archived jobs are polled, only while the tab is visible, on their own
+  5s interval kept out of the 2.5s `/api/state` poll (same reasoning as the
+  Spend panel) — so the common case (no interactive job running) costs zero
+  extra dispatch calls. Both routes reuse the dashboard's existing
+  `_authorised()` gate and the server-side-only dispatch token injection;
+  neither is reachable without dashboard auth, and the dispatch token never
+  reaches the browser. Without `--dispatch-url`/`DEV_TEAM_DISPATCH_TOKEN`
+  configured both answer `501` and the panel renders nothing, matching
+  Spend/Calibration's degrade-gracefully contract.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /
@@ -258,6 +342,16 @@ sections below are reconstructed from the repository history.
   when set, so pre-existing custom runners keep working.
 
 ### Assessment
+- **Live EOL/support-status scan extended to Ruby and Go runtimes**
+  (`eolscan.py`): `.ruby-version` (pyenv/rbenv convention) and `go.mod`'s
+  `go` directive (e.g. `go 1.21.3`) are now parsed alongside the existing
+  Node.js/Python/.NET manifests and checked against endoflife.date the
+  same way — one request per distinct detected product, degrading to
+  `unknown`/model-knowledge on a malformed manifest or a failed query,
+  never guessed. No change to the scan orchestration, HTTP fetch, cycle-
+  matching, or verdict logic — just two new parser functions registered
+  in the existing `_PARSERS` table (issue #117, follow-on to the original
+  three-runtime scan above).
 - **Live EOL/support-status scanning via endoflife.date** (`eolscan.py`,
   mirroring `depscan.py`'s shape): Node.js/Python/.NET runtime versions
   parsed deterministically from `package.json` (`engines.node`),
@@ -304,6 +398,16 @@ sections below are reconstructed from the repository history.
   keep the heuristic false-positive-free.
 
 ### Documentation
+- **Hallucinated CLI-flag detection in shipped docs** (`doc_claim_issues`,
+  `techwriter.py`): fenced `bash`/`sh`/`shell`/`console`/`zsh` blocks are
+  now scanned line-by-line for `dev-team`/`python -m dev_team` invocations,
+  and any `--flag` they cite is checked against the live
+  `cli.build_parser()` option strings (deferred import, avoiding the
+  `cli` → `engine` → `techwriter` cycle) — the bash-fence CLI-flag check
+  named as the next increment in #48's own "Grows into" section. Advisory
+  only, same `Documentation.unverified_claims` surface #48 already wired
+  up; the shell text is regex-scanned only, never passed to `subprocess`,
+  `os.system`, `os.popen`, `eval`, or `exec`.
 - **`docs/TROUBLESHOOTING.md`**: a symptom-first operator runbook
   consolidating operational knowledge previously scattered across
   `DEPLOYMENT.md`, `docs/DISPATCH.md`, `docs/DASHBOARD.md`, and
@@ -313,6 +417,16 @@ sections below are reconstructed from the repository history.
   loops, and a dashboard/dispatch HTTP status quick-reference.
   `DEPLOYMENT.md`'s two env-file gotcha callouts now cross-link it. Docs
   only — no `src/` change, no new credential surface.
+- **`docs/SECURITY.md`**: a consolidated security & threat-model reference
+  mapping each threat area — prompt-injection handling, credential/token
+  hygiene, execution containment, workspace/path containment, HTTP surface
+  auth, and pipeline/CI guardrails — to the exact module/function that
+  implements it, plus an explicit "what this does NOT protect against"
+  section (the ROADMAP per-job isolation gap, the dashboard's
+  unauthenticated-by-default localhost stance). Linked from `README.md`.
+  A reference-checker test resolves every cited `dev_team.x.y` symbol
+  against the installed package so the doc can't silently drift from the
+  code. Docs only — no `src/` change, no new credential surface.
 
 ## [0.7.0] — Legacy-repo analysis: dead code, live CVEs, conventions, remote CI
 

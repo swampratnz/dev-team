@@ -158,6 +158,56 @@ number that only changes when a job finishes. Without a dispatch URL/token
 configured, `GET /api/costs` answers `501` and the panel renders a muted
 "not configured" state, never a raw error.
 
+### Pending questions
+
+An `interactive: true` deliver job (see [`docs/DISPATCH.md`](DISPATCH.md))
+pauses mid-run waiting for an operator's answer. Each run card for a
+currently-**running**, non-archived job carries a **pending question**
+panel: when the job is paused, it shows the live prompt/context and one
+button per choice (a choice with `accepts_text` gets a small text input
+alongside its button); clicking a button submits that choice (and any
+typed text) and clears the panel.
+
+This is the dashboard-side "questions as buttons" surface `docs/ROADMAP.md`
+item 7 names, built on the interactive primitive
+[#87](https://github.com/swampratnz/dev-team/issues/87) added to the
+dispatch service. Two new proxies back it, the same narrow shape as the
+Spend proxy above:
+
+```
+browser ──(dashboard token)──▶ dashboard GET /api/jobs/{id}/question ──(dispatch token)──▶ dispatch GET /jobs/{id}/question
+browser ──(dashboard token)──▶ dashboard POST /api/jobs/{id}/answer ──(dispatch token)──▶ dispatch POST /jobs/{id}/answer
+```
+
+- `GET /api/jobs/{id}/question` is read-only, forwarded verbatim to
+  `<dispatch-url>/jobs/{id}/question` (including an unknown job id's
+  `404`); without a token it answers `501 {"error": "pending question not
+  configured"}`.
+- `POST /api/jobs/{id}/answer` forwards its JSON body (`{"choice": ...,
+  "text": ...}`) byte-for-byte to `<dispatch-url>/jobs/{id}/answer` and
+  relays the response verbatim (`400`/`409`/`202`); without a token it
+  answers `501 {"error": "job actions not configured"}` — the same message
+  the archive/unarchive/purge proxy uses, since this is still a job action,
+  just a body-forwarding one kept out of that no-body action set (see
+  *The board write model* below). Untrusted `choice`/`text` are never
+  validated dashboard-side — the dispatch service already validates
+  `choice` against the *live* question's closed key set, so this proxy adds
+  no new trust boundary.
+- **Scope is exact**: only `.../question` and `.../answer` match — a path
+  that merely starts with the jobs prefix (e.g. `.../question/extra`,
+  `.../answered`) falls through to the ordinary `404`, never into either
+  proxy.
+
+**Polling is scoped and visibility-gated**, not part of the 2.5s
+`/api/state` poll: the dashboard polls `GET .../question` only for jobs
+currently shown as running (excluding archived ones) and only while
+`document.visibilityState` is `"visible"`, on its own 5s interval —
+mirroring the Spend panel's reasoning above, since most running jobs are
+never actually interactive and this keeps that common case at zero extra
+dispatch calls. Without a dispatch URL/token configured, `GET
+.../question` answers `501` and the panel renders nothing, the same
+degrade-gracefully contract as Spend/Calibration.
+
 ## The event journal
 
 Runs journal automatically — every `--deliver` or `--assess` invocation
@@ -231,6 +281,14 @@ the same shape:
 browser ──(dashboard token)──▶ dashboard GET /api/costs ──(dispatch token)──▶ dispatch GET /costs
 ```
 
+The pending-question panel's two routes (above) are a fourth pair, one
+read-only and one body-forwarding:
+
+```
+browser ──(dashboard token)──▶ dashboard GET /api/jobs/{id}/question ──(dispatch token)──▶ dispatch GET /jobs/{id}/question
+browser ──(dashboard token)──▶ dashboard POST /api/jobs/{id}/answer ──(dispatch token)──▶ dispatch POST /jobs/{id}/answer
+```
+
 - **The proxy** (`--dashboard` with `--dispatch-url`, default
   `http://127.0.0.1:8738`): authorised `POST`/`PATCH`/`DELETE` requests
   under `/api/backlog/` are forwarded — same method, same JSON body — to
@@ -255,6 +313,15 @@ browser ──(dashboard token)──▶ dashboard GET /api/costs ──(dispatc
   answers `501 {"error": "spend rollup not configured"}`. Scope is
   **exactly `/api/costs`** — no path parameter, no other dispatch route
   reachable through it.
+- Last, `GET /api/jobs/{id}/question` and `POST /api/jobs/{id}/answer`:
+  forwarded verbatim to `<dispatch-url>/jobs/{id}/question|answer`
+  (including the dispatch service's own `404`/`400`/`409` cases); without a
+  token both answer `501` (`{"error": "pending question not configured"}`
+  for the GET, `{"error": "job actions not configured"}` for the POST,
+  matching the archive/unarchive/purge proxy's message since it is still a
+  job action). Scope is **exactly `.../question` and `.../answer`** — a
+  path that merely starts with the jobs prefix but doesn't match either
+  suffix exactly is the ordinary `404`, never forwarded.
 - **Auth is layered**: the browser authenticates to the dashboard
   (dashboard token / cookie, checked first); the dashboard process — not
   the browser — holds the dispatch bearer token. Both comparisons are
@@ -305,3 +372,6 @@ the bearer header when a token is set):
 - `GET /api/costs` — the spend rollup proxy described above (`?archived=1`
   passed through unchanged; same auth and `501` gating; requires dashboard
   auth).
+- `GET /api/jobs/{id}/question` / `POST /api/jobs/{id}/answer` — the
+  pending-question proxy described above (same auth and `501` gating;
+  requires dashboard auth).

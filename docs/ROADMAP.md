@@ -48,7 +48,13 @@ running the whole process in a container/VM ([`DEPLOYMENT.md` §5d](../DEPLOYMEN
 has a hardened recipe and the layered model), with matching hardening on the
 standing systemd units. The remaining open edge is a per-job isolation boundary
 (review S4) — one dispatched job's container can still see another's workspace on
-a shared host; a per-job rootless container/namespace is the follow-up.
+a shared host; a per-job rootless container/namespace is the follow-up. A second
+known-uncovered surface: visual review's served app (`SubprocessAppServer`) runs
+as a bare host subprocess even under `--sandbox` — the engine now logs an
+advisory warning rather than leaving the gap silently assumed-covered (see
+[`docs/SANDBOX.md`](SANDBOX.md)); real containment is future work (needs
+inbound-from-host connectivity with denied outbound, a shape this repo's
+network-isolation primitives don't yet support).
 
 ## 2. PR / CI integration
 
@@ -223,10 +229,18 @@ workflow (`.github/workflows/benchmark.yml`). That workflow is **disabled by
 default** — its one enable switch is the `RUN_BENCHMARKS` repository variable, so
 both the nightly run and manual dispatch stay completely inert (no spend, no
 credential use) until an admin sets it to `true` and provides a Claude
-credential secret — the governance guard for scheduled real spend. Remaining:
-persisting the benchmark's aggregate result into a durable cross-run trail
-(the per-delivery score mechanism above is in place; committing/retaining the
-benchmark aggregate across CI runs is the follow-up).
+credential secret — the governance guard for scheduled real spend.
+
+**Done:** the benchmark's own cross-run trend trail has landed
+(`dev_team.benchmark_history`): an opt-in `--history-file PATH` flag on
+`dev-team-benchmark` (unset by default — zero disk I/O, today's behaviour
+unchanged) appends a bounded `BenchmarkRun` (cases total/passed, cost,
+timestamp) to a local JSON trail and prints the signed pass-rate/cost delta
+against the prior run. `.github/workflows/benchmark.yml` restores and saves
+that file via `actions/cache` (no repo write, `permissions: contents: read`
+unchanged) so the trail persists across nightly CI runs without committing
+anything to git — mirroring `ScoreHistory`'s bounded-trail, fail-secure-load
+shape one level up, from a single delivery to the whole suite.
 
 ## 7. Richer interaction surfaces
 
@@ -240,6 +254,25 @@ dashboard, Slack, or the pull request itself.
 threads), and a PR-comment loop that composes with roadmap item 2. The
 engine needs no changes; each surface is an adapter plus notification
 routing.
+
+**PR-comment loop (shipped):** `dev_team.pr_comment_channel.GitHubPRCommentChannel`
+— an `InteractionChannel` that posts a question as a comment on the delivered
+PR and polls (bounded, injectable `sleep`, mirroring `watch_checks`) for a
+reply from an **explicitly configured allow-list** of GitHub logins (no
+implicit "defaults to the PR author" — an unspecified default is a security
+gap, not a convenience). A reply's first whitespace-trimmed, lower-cased token
+must exactly match a live question choice key; anything else (an unauthorized
+commenter, an unrecognised reply) is silently skipped, and an exhausted poll
+returns the question's fail-safe choice, exactly like `ConsoleChannel`'s EOF
+behaviour. Wired only into the CI-fix loop (`ci_fix_question` is the only
+question that fires after a PR exists) via opt-in `--interactive-pr-comments`
+(requires `--interactive`, `--pull-request`, `--watch-fix-rounds > 0`, and at
+least one `--interactive-pr-comment-author LOGIN`); when set it replaces just
+that loop's channel — `team.interaction` (plan review, approvals) is
+untouched. **Exposure change to weigh before enabling:** this posts the CI
+failure summary as a plain, repo-visible PR comment, a broader audience than
+the terminal or dispatch's bearer-token-gated question endpoint (#87) — see
+`docs/INTERACTION.md`. The dashboard and Slack adapters remain future work.
 
 ## 8. MCP tool provider & group review
 

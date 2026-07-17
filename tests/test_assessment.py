@@ -949,6 +949,42 @@ def test_assess_report_footer_states_live_mode_for_both_scans():
     assert "EOL/support-status check" in report
 
 
+_RUBY_WORKSPACE = {
+    "MyApp.sln": "Microsoft Visual Studio Solution File",
+    "src/Api/Api.csproj": "<Project><TargetFramework>net47</TargetFramework></Project>",
+    ".ruby-version": "3.2.0",
+    "README.md": "# MyApp",
+}
+
+
+def _ruby_eol_fetch(product):
+    assert product == "ruby"
+    return [{"cycle": "3.2", "eol": "2000-01-01"}]
+
+
+def test_assess_integrates_eol_scan_for_ruby():
+    events = []
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    engine = _engine(
+        runner,
+        workspace=InMemoryWorkspace(dict(_RUBY_WORKSPACE)),
+        listener=events.append,
+        eol_fetch=_ruby_eol_fetch,
+    )
+    outcome = run(engine.assess())
+    assert outcome.success is True
+    assert outcome.eol_scan.queried is True
+    assert outcome.eol_scan.statuses[0].end_of_life is True
+    report = outcome.report_markdown
+    assert "Ruby 3.2.0" in report
+    assert "END OF LIFE" in report
+    assert "endoflife.date" in report
+    stages = [e.stage for e in events]
+    assert "eol" in stages
+    data = outcome_to_dict(outcome)
+    assert data["eol_scan"]["statuses"][0]["runtime"]["product"] == "ruby"
+
+
 # --- component fan-out -----------------------------------------------------------
 
 
@@ -2396,6 +2432,67 @@ def test_verify_finding_unusable_response_is_a_structured_failure():
     assert result["success"] is False
     assert "unusable response" in result["error"]
     assert result["cost_usd"] == 0.0
+
+
+def test_verify_finding_skip_broken_citations_short_circuits_with_no_agent_call():
+    from dev_team.assessment import verify_finding
+
+    runner = ScriptedRunner()  # raises if .run() is ever invoked
+    finding = _finding_fixture(citation_broken=True)
+    result = run(
+        verify_finding(
+            runner,
+            InMemoryWorkspace(),
+            finding,
+            source_job="assess-1",
+            skip_broken_citations=True,
+        )
+    )
+    assert runner.calls == []
+    assert result == {
+        "finding_id": "risk.secrets[0]",
+        "source_job": "assess-1",
+        "success": True,
+        "verdict": "needs-context",
+        "rationale": result["rationale"],
+        "citations": [],
+        "cost_usd": 0.0,
+        "skipped": True,
+    }
+    assert result["rationale"]  # non-empty
+
+
+def test_verify_finding_skip_broken_citations_false_finding_runs_normally():
+    from dev_team.assessment import verify_finding
+
+    runner = _security_verdict(
+        {"verdict": "confirmed", "rationale": "checked", "citations": []}
+    )
+    finding = _finding_fixture(citation_broken=False)
+    result = run(
+        verify_finding(
+            runner, InMemoryWorkspace(), finding, skip_broken_citations=True
+        )
+    )
+    assert result["success"] is True
+    assert result.get("skipped") is None
+    assert len(runner.calls) == 1
+
+
+def test_verify_finding_skip_broken_citations_missing_key_runs_normally():
+    from dev_team.assessment import verify_finding
+
+    runner = _security_verdict(
+        {"verdict": "confirmed", "rationale": "checked", "citations": []}
+    )
+    finding = _finding_fixture()  # no citation_broken key at all
+    result = run(
+        verify_finding(
+            runner, InMemoryWorkspace(), finding, skip_broken_citations=True
+        )
+    )
+    assert result["success"] is True
+    assert len(runner.calls) == 1
 
 
 def test_verify_finding_records_a_trace_span():
