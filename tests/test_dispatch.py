@@ -3577,6 +3577,141 @@ def test_verify_job_skip_broken_citations_never_clones_the_real_repo(
         assert raising_runner.calls == []
 
 
+def test_build_spec_verify_votes_defaults_to_one():
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    spec = disp.build_spec(
+        {"mode": "verify", "source_job": "assess-old",
+         "finding_id": "recommendation.plan[0]"}
+    )
+    assert spec.votes == 1
+
+
+def test_build_spec_verify_votes_must_be_int_in_range():
+    # Acceptance criterion 9 (tightened): non-integer (including bool, since
+    # bool is an int subtype in Python) or out-of-range values are rejected.
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    base = {
+        "mode": "verify", "source_job": "assess-old",
+        "finding_id": "recommendation.plan[0]",
+    }
+    for value in ("3", 0, -1, 1.5, None, True, False):
+        with pytest.raises(ValidationError):
+            disp.build_spec({**base, "votes": value})
+
+
+def test_build_spec_verify_votes_cap_matches_cli_constant():
+    # Acceptance criterion 12: one shared constant enforces the identical
+    # cap on both the CLI and dispatch surfaces.
+    from dev_team.assessment import MAX_VERIFY_VOTES
+
+    assert MAX_VERIFY_VOTES == 5
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    base = {
+        "mode": "verify", "source_job": "assess-old",
+        "finding_id": "recommendation.plan[0]",
+    }
+    with pytest.raises(ValidationError):
+        disp.build_spec({**base, "votes": MAX_VERIFY_VOTES + 1})
+    spec = disp.build_spec({**base, "votes": MAX_VERIFY_VOTES})
+    assert spec.votes == MAX_VERIFY_VOTES
+
+
+def test_submit_verify_votes_invalid_is_400_http():
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=_seeded_dash()
+    ) as server:
+        for value in ("3", 0, -1, 1.5, None, True, False, 6):
+            status, payload = _call(
+                server, "/jobs", method="POST",
+                body={"mode": "verify", "source_job": "assess-old",
+                      "finding_id": "recommendation.plan[0]", "votes": value},
+            )
+            assert status == 400, value
+            assert "votes" in payload["error"]
+
+
+def test_verify_job_votes_wires_through_and_counts_as_one_calibration_entry():
+    # Acceptance criteria 2/8/10: votes wires end-to-end over dispatch, and
+    # a multi-vote result is still exactly ONE entry in verifications.jsonl
+    # and GET /calibration — never double-counted from the votes array.
+    from dev_team.testing import json_response
+
+    dash = _seeded_dash()
+    verifier = ScriptedRunner(
+        responses=[
+            json_response(
+                {"verdict": "confirmed", "rationale": "r1", "citations": []}
+            ),
+            json_response(
+                {"verdict": "confirmed", "rationale": "r2", "citations": []}
+            ),
+            json_response(
+                {"verdict": "refuted", "rationale": "r3", "citations": []}
+            ),
+        ]
+    )
+    with running(
+        runner=verifier, materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        before = _call(server, "/calibration")
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]", "votes": 3},
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["verdict"] == "confirmed"
+        assert result["vote_count"] == 3
+        assert len(result["votes"]) == 3
+        assert len(verifier.calls) == 3
+
+        _, verifs = _call(server, "/jobs/assess-old/verifications")
+        assert len(verifs["verifications"]) == 1
+        (entry,) = verifs["verifications"]
+        assert entry["verdict"] == "confirmed"
+        assert "votes" not in entry
+        assert "vote_count" not in entry
+
+        _, after = _call(server, "/calibration")
+        assert after["overall"]["total"] == before[1]["overall"]["total"] + 1
+        assert after["overall"]["confirmed"] == before[1]["overall"]["confirmed"] + 1
+
+
+def test_verify_job_votes_at_cap_succeeds_http():
+    from dev_team.assessment import MAX_VERIFY_VOTES
+    from dev_team.testing import json_response
+
+    verifier = ScriptedRunner(
+        responses=[
+            json_response(
+                {"verdict": "confirmed", "rationale": "r", "citations": []}
+            )
+            for _ in range(MAX_VERIFY_VOTES)
+        ]
+    )
+    with running(
+        runner=verifier, materialise=_mem_materialise,
+        dashboard_workspace=_seeded_dash(),
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]",
+                  "votes": MAX_VERIFY_VOTES},
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["vote_count"] == MAX_VERIFY_VOTES
+
+
 def test_submit_verify_http_error_contract():
     with running(
         materialise=_mem_materialise, dashboard_workspace=_seeded_dash()

@@ -2509,6 +2509,210 @@ def test_verify_finding_records_a_trace_span():
     assert [s.name for s in tracer.by_kind("agent")] == ["verifier"]
 
 
+def test_verify_finding_votes_default_carries_no_vote_fields():
+    # Acceptance criterion 1: votes=1 (the default) carries no votes/
+    # vote_count keys — pinning the "only present when votes > 1" choice.
+    from dev_team.assessment import verify_finding
+
+    runner = _security_verdict(
+        {"verdict": "confirmed", "rationale": "ok", "citations": []}
+    )
+    result = run(verify_finding(runner, InMemoryWorkspace(), _finding_fixture()))
+    assert "votes" not in result
+    assert "vote_count" not in result
+
+
+def test_verify_finding_votes_three_unanimous_confirmed():
+    # Acceptance criterion 2.
+    from dev_team.assessment import verify_finding
+
+    runner = ScriptedRunner(
+        responses=[
+            json_response(
+                {"verdict": "confirmed", "rationale": "r1", "citations": []}
+            ),
+            json_response(
+                {"verdict": "confirmed", "rationale": "r2", "citations": []}
+            ),
+            json_response(
+                {"verdict": "confirmed", "rationale": "r3", "citations": []}
+            ),
+        ]
+    )
+    result = run(
+        verify_finding(
+            runner, InMemoryWorkspace(), _finding_fixture(), votes=3
+        )
+    )
+    assert result["success"] is True
+    assert result["verdict"] == "confirmed"
+    assert result["vote_count"] == 3
+    assert len(result["votes"]) == 3
+    assert len(runner.calls) == 3
+
+
+def test_verify_finding_votes_three_plurality_wins():
+    # Acceptance criterion 3: 2 confirmed / 1 refuted -> confirmed wins.
+    from dev_team.assessment import verify_finding
+
+    runner = ScriptedRunner(
+        responses=[
+            json_response(
+                {"verdict": "confirmed", "rationale": "same", "citations": []}
+            ),
+            json_response({"verdict": "refuted", "rationale": "no", "citations": []}),
+            json_response(
+                {"verdict": "confirmed", "rationale": "same", "citations": []}
+            ),
+        ]
+    )
+    result = run(
+        verify_finding(
+            runner, InMemoryWorkspace(), _finding_fixture(), votes=3
+        )
+    )
+    assert result["verdict"] == "confirmed"
+    assert result["rationale"] == "same"
+    assert result["vote_count"] == 3
+
+
+def test_verify_finding_votes_two_tie_resolves_to_needs_context():
+    # Acceptance criterion 4.
+    from dev_team.assessment import verify_finding
+
+    runner = ScriptedRunner(
+        responses=[
+            json_response(
+                {"verdict": "confirmed", "rationale": "c", "citations": []}
+            ),
+            json_response({"verdict": "refuted", "rationale": "r", "citations": []}),
+        ]
+    )
+    result = run(
+        verify_finding(
+            runner, InMemoryWorkspace(), _finding_fixture(), votes=2
+        )
+    )
+    assert result["success"] is True
+    assert result["verdict"] == "needs-context"
+    assert result["vote_count"] == 2
+    assert result["citations"] == []
+
+
+def test_verify_finding_votes_three_partial_budget_exhaustion_still_decides():
+    # Acceptance criterion 5: the 1 vote that completed before the budget
+    # tipped over decides the result — not reported as a hard failure.
+    from dev_team.assessment import verify_finding
+    from dev_team.sdk import AgentResult
+
+    runner = ScriptedRunner(
+        responses=[
+            AgentResult(
+                text=json_response(
+                    {"verdict": "confirmed", "rationale": "ok", "citations": []}
+                ),
+                cost_usd=0.05,
+            ),
+        ]
+    )
+    result = run(
+        verify_finding(
+            runner,
+            InMemoryWorkspace(),
+            _finding_fixture(),
+            budget=Budget(limit_usd=0.05),
+            votes=3,
+        )
+    )
+    assert result["success"] is True
+    assert result["verdict"] == "confirmed"
+    assert result["vote_count"] == 1
+    assert len(result["votes"]) == 1
+    assert result["cost_usd"] == 0.05
+    assert len(runner.calls) == 1  # the other 2 votes never called the agent
+
+
+def test_verify_finding_votes_two_full_budget_exhaustion_is_a_structured_failure():
+    # Acceptance criterion 6: both passes exhaust budget -> unchanged shape.
+    from dev_team.assessment import verify_finding
+
+    runner = ScriptedRunner()  # would raise if .run() is ever invoked
+    result = run(
+        verify_finding(
+            runner,
+            InMemoryWorkspace(),
+            _finding_fixture(),
+            budget=Budget(limit_usd=0.0),
+            votes=2,
+        )
+    )
+    assert result["success"] is False
+    assert result["error"] == "budget exhausted"
+    assert result["cost_usd"] == 0.0
+    assert runner.calls == []
+
+
+def test_verify_finding_votes_mixes_unusable_response_with_a_success():
+    # A vote whose response is unparseable JSON (AgentResponseError) is
+    # dropped from the tally, not treated as a hard failure, as long as at
+    # least one other vote succeeds.
+    from dev_team.assessment import verify_finding
+
+    # ask_json's default json_retries=1 means the unparseable-response vote
+    # consumes 2 queue entries (initial attempt + 1 retry) before giving up
+    # and returning its own {"error": ...} — each vote runs to completion
+    # before the next starts (no internal suspension in ScriptedRunner), so
+    # the queue order below lines up with vote 0 then vote 1.
+    runner = ScriptedRunner(
+        responses=[
+            "not json at all",
+            "not json at all",
+            json_response(
+                {"verdict": "confirmed", "rationale": "ok", "citations": []}
+            ),
+        ]
+    )
+    result = run(
+        verify_finding(
+            runner, InMemoryWorkspace(), _finding_fixture(), votes=2
+        )
+    )
+    assert result["success"] is True
+    assert result["verdict"] == "confirmed"
+    assert result["vote_count"] == 1
+
+
+def test_verify_finding_votes_all_unusable_responses_is_a_structured_failure():
+    from dev_team.assessment import verify_finding
+
+    runner = ScriptedRunner(
+        responses=["not json at all"] * 4  # 2 attempts (json_retries=1) x 2 votes
+    )
+    result = run(
+        verify_finding(
+            runner, InMemoryWorkspace(), _finding_fixture(), votes=2
+        )
+    )
+    assert result["success"] is False
+    assert "unusable response" in result["error"]
+
+
+def test_max_verify_votes_constant_is_five():
+    from dev_team.assessment import MAX_VERIFY_VOTES
+
+    assert MAX_VERIFY_VOTES == 5
+
+
+def test_verify_finding_votes_regression_omitted_everywhere_unchanged():
+    # Acceptance criterion 11: the existing single-call suite (above) already
+    # exercises every --verify path with votes omitted; this just pins that
+    # the keyword defaults to 1 and behaves identically to no argument.
+    from dev_team.assessment import verify_finding
+    import inspect
+
+    assert inspect.signature(verify_finding).parameters["votes"].default == 1
+
+
 def test_assess_sandbox_wraps_runner_boxing_probe_not_git(tmp_path):
     # AssessConfig.sandbox boxes the build-probe's untrusted commands; the
     # dead-code dormancy `git log` queries self-delegate to the host.

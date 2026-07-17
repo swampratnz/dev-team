@@ -27,6 +27,7 @@ from .approval import (
 from .assessment import (
     ASSESSMENT_JSON_PATH,
     DEFAULT_EXCLUDE_GLOBS,
+    MAX_VERIFY_VOTES,
     VERIFY_VERDICTS,
     AssessConfig,
     AssessmentEngine,
@@ -246,6 +247,7 @@ __all__ = [
     "find_finding",
     "verify_finding",
     "VERIFY_VERDICTS",
+    "MAX_VERIFY_VOTES",
     "render_report",
     "Component",
     "detect_components",

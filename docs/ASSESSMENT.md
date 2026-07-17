@@ -314,13 +314,33 @@ so a caller can tell a deterministic skip apart from a real agent verdict;
 it is never persisted to `verifications.jsonl` (dispatch) or counted by
 `GET /calibration`, since no model ever adjudicated it.
 
+**`--verify-votes N`** (default `1`, unchanged behaviour) is an opt-in
+N-way adversarial vote: instead of one verifier pass, `N` independent
+skeptical agents each re-check the finding concurrently (no agent sees
+another's answer), and the verdict with the most votes wins — a tie (e.g.
+1-1 at `N=2`) resolves to `needs-context`, the same fail-secure posture
+applied to an out-of-contract verdict. This exists because the verifier
+itself is a single stochastic LLM call; running several independent passes
+and taking the plurality reduces that single-sample variance for a finding
+whose verdict is about to gate a real decision. `budget` is shared and
+enforced across all `N` passes exactly as it is across today's single
+call: if some passes exhaust the budget partway through, the passes that
+did complete still decide the result (never fewer than 1 succeeding); only
+if every pass fails does this return the same failure shape a single
+failed call returns today. The result additionally carries `"votes"` (each
+pass's `verdict`/`rationale`/`citations`) and `"vote_count"` when `N > 1` —
+additive only, so `GET /calibration` (which only ever reads the top-level
+`verdict`) needs no change and a `votes=1` caller sees no schema change.
+`N` is capped at **5** (`--verify-votes 6` is rejected); the dispatch
+`votes` field enforces the identical cap (see below).
+
 The dispatch service exposes the same model remotely as a `verify` job mode
 plus `GET /jobs/{id}/findings` and `GET /jobs/{id}/verifications`; there the
 repository identity for the re-clone comes from `audit/<job-id>/meta.json`,
 written beside every mirrored assessment (see
 [`docs/DISPATCH.md`](DISPATCH.md)). In code:
 `list_findings(data)` / `find_finding(data, id_or_substring)` /
-`await verify_finding(runner, workspace, finding, budget=…)`.
+`await verify_finding(runner, workspace, finding, budget=…, votes=…)`.
 
 ## Library use
 
