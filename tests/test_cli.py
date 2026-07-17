@@ -1173,6 +1173,101 @@ def _persisted_assessment(tmp_path):
     return ws
 
 
+def _persisted_assessment_with_broken_citation(tmp_path):
+    """A persisted assessment whose one finding's evidence is already known
+    broken — the fixture for --skip-broken-citations thread-through tests."""
+
+    ws = tmp_path / "repo"
+    (ws / ".dev_team").mkdir(parents=True)
+    payload = {
+        "classification": "dependency-surgery",
+        "phases": {
+            "recommendation": {
+                "role": "product-manager",
+                "ok": True,
+                "error": None,
+                "data": {
+                    "plan": [
+                        {
+                            "step": "Pin build chain",
+                            "effort": "2 days",
+                            "detail": "CI",
+                            "evidence": "fake/path.cs",
+                        }
+                    ]
+                },
+            }
+        },
+        "dead_code": {"findings": []},
+        "dependency_scan": {"vulnerabilities": []},
+        "broken_citations": {"recommendation": ["fake/path.cs"]},
+    }
+    (ws / ".dev_team" / "assessment.json").write_text(json.dumps(payload))
+    return ws
+
+
+def test_main_verify_skip_broken_citations_text_output(tmp_path, capsys):
+    ws = _persisted_assessment_with_broken_citation(tmp_path)
+    runner = ScriptedRunner()  # raises if .run() is ever invoked
+    code = main(
+        [
+            "--verify", str(ws), "--finding", "recommendation.plan[0]",
+            "--skip-broken-citations",
+        ],
+        runner=runner,
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert runner.calls == []
+    assert "recommendation.plan[0] — needs-context (skipped)" in out
+    assert "cost: $0.0000" in out
+
+
+def test_main_verify_skip_broken_citations_json_output(tmp_path, capsys):
+    ws = _persisted_assessment_with_broken_citation(tmp_path)
+    runner = ScriptedRunner()  # raises if .run() is ever invoked
+    code = main(
+        [
+            "--verify", str(ws), "--finding", "recommendation.plan[0]",
+            "--skip-broken-citations", "--json",
+        ],
+        runner=runner,
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert runner.calls == []
+    assert payload["success"] is True
+    assert payload["verdict"] == "needs-context"
+    assert payload["skipped"] is True
+    assert payload["cost_usd"] == 0.0
+
+
+def test_main_verify_skip_broken_citations_omitted_runs_normally(tmp_path):
+    # Same citation_broken=True finding, but the flag is not passed: the
+    # existing agentic path must run unchanged.
+    ws = _persisted_assessment_with_broken_citation(tmp_path)
+    runner = _verify_runner()
+    code = main(
+        ["--verify", str(ws), "--finding", "recommendation.plan[0]"],
+        runner=runner,
+    )
+    assert code == 0
+    assert len(runner.calls) == 1
+
+
+def test_main_verify_skip_broken_citations_flag_requires_verify():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--skip-broken-citations"], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+
+
+def test_main_help_documents_skip_broken_citations(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "--skip-broken-citations" in out
+
+
 def test_main_make_backlog_generates_stories_without_credentials(
     monkeypatch, tmp_path, capsys
 ):

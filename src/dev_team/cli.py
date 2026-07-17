@@ -376,6 +376,16 @@ def build_parser() -> argparse.ArgumentParser:
         "substring of its claim text (first match wins).",
     )
     assessment.add_argument(
+        "--skip-broken-citations",
+        action="store_true",
+        help="With --verify: if the finding's cited evidence is already "
+        "known, at $0, to be a citation that doesn't resolve to a real file "
+        "in the repo (see --assess's broken-citation detection), skip the "
+        "agent call entirely and return a $0 'needs-context' result instead "
+        "of spending a real verification pass. Has no effect on findings "
+        "whose citation is not already known broken.",
+    )
+    assessment.add_argument(
         "--no-conventions",
         action="store_true",
         help="Do not persist the captured house-conventions profile "
@@ -733,6 +743,8 @@ def _validate_args(
         parser.error("--verify requires --finding (a finding id or claim substring)")
     if args.finding is not None and args.verify is None:
         parser.error("--finding: only valid with --verify")
+    if args.skip_broken_citations and args.verify is None:
+        parser.error("--skip-broken-citations: only valid with --verify")
     if args.port is not None and not (args.dashboard or args.dispatch):
         parser.error("--port: only valid with --dashboard or --dispatch")
     if args.host is not None and not (args.dashboard or args.dispatch):
@@ -1505,7 +1517,11 @@ async def _verify_one(args, runner: AgentRunner) -> int:
             "'risk.secrets[0]' or a substring of the claim text"
         )
     result = await verify_finding(
-        runner, workspace, finding, budget=Budget(limit_usd=args.budget_usd)
+        runner,
+        workspace,
+        finding,
+        budget=Budget(limit_usd=args.budget_usd),
+        skip_broken_citations=args.skip_broken_citations,
     )
     if args.json:
         print(json.dumps(result, indent=2))
@@ -1513,7 +1529,8 @@ async def _verify_one(args, runner: AgentRunner) -> int:
     if not result["success"]:
         print(f"verification failed: {result['error']}")
         return 1
-    print(f"{finding['id']} — {result['verdict']}")
+    skipped_suffix = " (skipped)" if result.get("skipped") else ""
+    print(f"{finding['id']} — {result['verdict']}{skipped_suffix}")
     print(f"claim: {finding['claim']}")
     if result["rationale"]:
         print(f"rationale: {result['rationale']}")
