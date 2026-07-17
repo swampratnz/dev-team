@@ -55,6 +55,48 @@ it falls back to `skip`, leaving the task failed rather than retrying blind.)
 On resume from a checkpoint the plan is *not* re-reviewed: it was approved by
 the run that created it, and the banked work matches it.
 
+## Supervising CI fixes from the pull request (`--interactive-pr-comments`)
+
+Every question above fires on this terminal, because it happens *before* a
+PR exists. Once `--deliver --pull-request --watch-checks --watch-fix-rounds N
+--interactive` is running unattended on a server, the one question that fires
+*after* the PR is open — "CI is failing, fix it and re-push?" (each
+`--watch-fix-rounds` round) — has nowhere to go: nobody is attached to that
+terminal. `--interactive-pr-comments` moves just that question onto the PR
+itself:
+
+```bash
+dev-team "Feature" "..." --deliver --repo acme/mono -i \
+  --pull-request --watch-checks --watch-fix-rounds 3 \
+  --interactive-pr-comments \
+  --interactive-pr-comment-author ada --interactive-pr-comment-author grace
+```
+
+The question, its CI-failure context, and the reply menu are posted as a PR
+comment; the run polls for a comment from an **explicitly allow-listed**
+GitHub login (`--interactive-pr-comment-author`, repeatable — there is no
+implicit default, e.g. "the PR author") whose first word is `apply` or
+`skip`. Every other comment — an unauthorized login, an unrecognised reply —
+is silently ignored. If nothing authorized arrives before the poll bound is
+exhausted, the round fails safe to `skip`, exactly like a detached terminal's
+EOF behaviour: the fix is never force-pushed without a blessed reply. This
+touches only the CI-fix loop's channel — plan review, task-failure
+escalation, and approvals still go through `team.interaction` (this
+terminal) unchanged, because those questions fire before any PR exists.
+
+**Before enabling this, weigh the exposure change:** the CI-failure summary
+that this posts is the same Restricted-classified content `ci_fix_question`
+always carried, but today it is seen only on this private terminal (or,
+through dispatch's `--interactive` job API, behind a bearer token). Posting
+it as a plain PR comment makes it **world-readable on a public repo** — CI
+logs can leak more than a red/green status (file paths, partial stack
+traces, sometimes fragments of test data). Only enable
+`--interactive-pr-comments` on a repository where that diagnostic detail is
+fine to be public, or where the repo itself is private.
+
+Requires `--interactive`, `--pull-request`, and `--watch-fix-rounds > 0` (the
+flags that already need to be true for a CI-fix round to exist at all).
+
 ## Chat (`--chat`)
 
 ```bash

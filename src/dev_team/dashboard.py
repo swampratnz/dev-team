@@ -354,7 +354,11 @@ _JOBS_PROXY_PREFIX = "/api/jobs/"
 #: The only actions the jobs proxy will forward. ``purge`` is archive-gated
 #: server-side (the dispatch service's own ``purge_job`` refuses a
 #: non-archived job with 409) — the proxy's job here is only to keep the
-#: forwarding surface narrow, not to re-enforce that gate.
+#: forwarding surface narrow, not to re-enforce that gate. ``question``/
+#: ``answer`` are a separate pair of routes (see :meth:`Handler._question`/
+#: :meth:`Handler._proxy_answer`) — not folded into this set because they
+#: are a GET and a body-forwarding POST, a different shape than these
+#: no-body actions.
 _JOBS_PROXY_ACTIONS = frozenset({"archive", "unarchive", "purge"})
 
 #: How long a proxied board write may take end to end. The dispatch cores are
@@ -419,9 +423,11 @@ def _make_handler(
     ``/jobs/{id}/...`` lifecycle route; ``GET /api/costs`` is forwarded to
     the dispatch service's ``GET /costs`` spend rollup; ``GET
     /api/access-log`` is forwarded to the dispatch service's ``GET
-    /access-log`` recent-requests page; with either unset all four stay
-    unavailable and answer ``501``. The dispatch token is only ever sent to
-    ``dispatch_url`` — never logged or reflected.
+    /access-log`` recent-requests page; ``GET /api/jobs/{id}/question`` and
+    ``POST /api/jobs/{id}/answer`` are forwarded to the matching
+    ``/jobs/{id}/question|answer`` interactive deliver routes; with either
+    unset all six stay unavailable and answer ``501``. The dispatch token is
+    only ever sent to ``dispatch_url`` — never logged or reflected.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -605,6 +611,11 @@ def _make_handler(
         # /jobs passthrough (see _JOBS_PROXY_PREFIX).
 
         def _proxy_jobs(self, path: str) -> None:
+            rest = path[len(_JOBS_PROXY_PREFIX):]
+            parts = rest.split("/")
+            if len(parts) == 2 and parts[1] == "answer":
+                self._proxy_answer(rest)
+                return
             if not (dispatch_url and dispatch_token):
                 self._send(
                     501,
@@ -612,12 +623,30 @@ def _make_handler(
                     json.dumps({"error": "job actions not configured"}),
                 )
                 return
-            rest = path[len(_JOBS_PROXY_PREFIX):]
-            parts = rest.split("/")
             if len(parts) != 2 or parts[1] not in _JOBS_PROXY_ACTIONS:
                 self._send(404, "application/json", json.dumps({"error": "not found"}))
                 return
             self._proxy("POST", f"/jobs/{rest}", b"")
+
+        # -- interactive answer: a body-forwarding sibling of the no-body
+        # actions above. Kept separate from _JOBS_PROXY_ACTIONS (see its
+        # comment) because the browser's choice/text body must reach
+        # dispatch verbatim, not be dropped like archive/unarchive/purge's.
+
+        def _proxy_answer(self, rest: str) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "job actions not configured"}),
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length) if length > 0 else None
+            self._proxy("POST", f"/jobs/{rest}", body)
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             parts = urlsplit(self.path)
@@ -651,6 +680,8 @@ def _make_handler(
                 self._costs(parts.query)
             elif parts.path == "/api/access-log":
                 self._access_log(parts.query)
+            elif parts.path.startswith(_JOBS_PROXY_PREFIX):
+                self._question(parts.path)
             else:
                 self._send(404, "text/plain", "not found")
 
@@ -713,6 +744,27 @@ def _make_handler(
             limit = parse_qs(query).get("limit", [""])[0]
             suffix = f"/access-log?limit={quote(limit, safe='')}" if limit else "/access-log"
             self._proxy("GET", suffix, None)
+
+        # -- pending question: a narrow read-only proxy, same shape as the
+        # spend rollup above. Scope is exactly /api/jobs/{id}/question — any
+        # other suffix under the jobs prefix (including a bare job id, or a
+        # path merely starting with "question") falls through to 404, never
+        # into this proxy (see :meth:`_proxy_answer` for the write sibling).
+
+        def _question(self, path: str) -> None:
+            rest = path[len(_JOBS_PROXY_PREFIX):]
+            parts = rest.split("/")
+            if len(parts) != 2 or parts[1] != "question":
+                self._send(404, "text/plain", "not found")
+                return
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "pending question not configured"}),
+                )
+                return
+            self._proxy("GET", f"/jobs/{rest}", None)
 
         # -- transcripts: a SENSITIVE surface -------------------------------
         # These two routes serve the raw system-prompt/prompt/response of each
@@ -970,6 +1022,18 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
 .run .msg { margin-top: 6px; color: var(--ink-2); font-size: 12px;
             display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
             overflow: hidden; }
+.question:not(:empty) { margin-top: 8px; padding: 8px 10px; background: var(--accent-soft);
+            border: 1px solid var(--accent); border-radius: 8px; }
+.question .qprompt { font-weight: 600; font-size: 12px; }
+.question .qcontext { margin-top: 4px; color: var(--ink-2); font-size: 12px;
+            white-space: pre-wrap; overflow-wrap: anywhere; }
+.question .qchoices { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+.qchoice-row { display: inline-flex; gap: 4px; align-items: center; }
+.qchoice { background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+           color: var(--ink); font-size: 12px; padding: 3px 8px; cursor: pointer; }
+.qchoice:hover { border-color: var(--accent); color: var(--accent); }
+.qtext { width: 120px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px;
+         background: var(--inset); color: var(--ink); font: inherit; font-size: 12px; }
 
 .epic { padding: 10px 0; border-top: 1px solid var(--line-soft); }
 .epic:first-child { border-top: 0; padding-top: 0; }
@@ -1489,9 +1553,21 @@ function purgeButton(id, archived) {
   return `<button class="purgebtn" data-purgejob="${esc(id)}" title="permanently delete this job">delete permanently</button>`;
 }
 
+// The run ids currently shown as running (not yet good/bad per STAGE_GOOD/
+// STAGE_BAD, and not archived) — the same set the pending-question poll
+// below scopes itself to, so a finished or archived job is never polled.
+function runningJobIds(s) {
+  const archivedSet = new Set(s.archived_jobs || []);
+  return s.runs.filter(r => {
+    const stage = String(r.last_stage || "").toLowerCase();
+    return !STAGE_BAD.has(stage) && !STAGE_GOOD.has(stage) && !archivedSet.has(r.id);
+  }).map(r => r.id);
+}
+
 function runsPanel(s) {
   if (!s.runs.length) { put($("runs"), '<div class="panel muted">no runs recorded</div>'); return; }
   const archivedSet = new Set(s.archived_jobs || []);
+  const runningSet = new Set(runningJobIds(s));
   put($("runs"), s.runs.map(r => {
     const cost = parseCost(r.last_message);
     const dur = (r.started != null && r.ended != null) ? fmtDur(r.ended - r.started) : "";
@@ -1506,8 +1582,63 @@ function runsPanel(s) {
       <div class="top"><code>${esc(r.id)}</code>${runChip(r.last_stage)}${isArchived ? chip("archived", "archived") : ""}</div>
       <div class="meta">${meta}${archiveButton(r.id, isArchived)}${purgeButton(r.id, isArchived)}</div>
       ${r.last_message ? `<div class="msg" title="${esc(r.last_message)}">${esc(r.last_message)}</div>` : ""}
+      ${runningSet.has(r.id) ? `<div class="question" id="q-${esc(r.id)}"></div>` : ""}
     </div>`;
   }).join(""));
+}
+
+// ---- pending question panel (interactive deliver jobs) --------------------
+// Scoped and visibility-gated: pollQuestions only fetches for ids in
+// runningJobIds(state), and only while the tab is visible — a non-running
+// or archived job is never polled, and a background tab pays nothing.
+// Deliberately its own 5s interval, not folded into the 2.5s /api/state
+// poll (same reasoning as the Spend panel — see loadSpend above): most
+// running jobs are never interactive, so this keeps the common case at
+// zero extra dispatch calls per state tick.
+
+function questionChoice(id, c) {
+  const input = c.accepts_text
+    ? '<input type="text" class="qtext" placeholder="optional detail">' : "";
+  return `<span class="qchoice-row"><button class="qchoice" data-answer="${esc(id)}" data-choice="${esc(c.key)}">${esc(c.label)}</button>${input}</span>`;
+}
+
+// SECURITY: prompt/context/choice labels are repository-derived plan text
+// (the same class of content the feed/report panels already render) — esc()
+// before innerHTML, same discipline as every other panel.
+function questionPanel(id, data) {
+  if (!data || !data.pending) return "";
+  const choices = (data.choices || []).map(c => questionChoice(id, c)).join("");
+  return `<div class="qprompt">${esc(data.prompt)}</div>`
+    + (data.context ? `<div class="qcontext">${esc(data.context)}</div>` : "")
+    + `<div class="qchoices">${choices}</div>`;
+}
+
+async function loadQuestion(id) {
+  const el = $("q-" + id);
+  if (!el) return;
+  try {
+    const res = await fetch("/api/jobs/" + encodeURIComponent(id) + "/question");
+    if (!res.ok) { put(el, ""); return; }
+    put(el, questionPanel(id, await res.json()));
+  } catch (err) {
+    put(el, "");
+  }
+}
+
+async function pollQuestions() {
+  if (!state || document.visibilityState !== "visible") return;
+  await Promise.all(runningJobIds(state).map(loadQuestion));
+}
+
+async function answerQuestion(id, choice, text) {
+  try {
+    const res = await fetch("/api/jobs/" + encodeURIComponent(id) + "/answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ choice, text }),
+    });
+    if (res.ok) { const el = $("q-" + id); if (el) put(el, ""); }
+  } catch (err) {}
 }
 
 // Story detail lookup for the modal, rebuilt from every /api/state payload:
@@ -2115,6 +2246,12 @@ async function purgeJob(id) {
 
 // ---- wiring ----
 $("runs").addEventListener("click", e => {
+  const answer = e.target.closest("[data-answer]");
+  if (answer) {
+    const input = answer.parentElement.querySelector(".qtext");
+    answerQuestion(answer.dataset.answer, answer.dataset.choice, input ? input.value : "");
+    return;
+  }
   const purge = e.target.closest("[data-purgejob]");
   if (purge) {
     // two-step confirm: the first click arms the button, the second purges
@@ -2257,6 +2394,9 @@ refresh();
 setInterval(refresh, 2500);
 loadSpend();
 loadAccessLog();
+pollQuestions();
+setInterval(pollQuestions, 5000);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") pollQuestions(); });
 </script>
 </body>
 </html>

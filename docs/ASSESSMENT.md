@@ -111,15 +111,16 @@ machinery understands them now:
   range-specified project still gets its *resolved* versions scanned;
   only dependencies with no lockfile and no exact pin fall back to
   training data.
-- **Detected Node.js/Python/.NET runtime versions get a live
+- **Detected Node.js/Python/.NET/Ruby/Go runtime versions get a live
   endoflife.date EOL/support-status check; every other EOL/support-status
   judgment (other runtimes, frameworks, libraries) is model knowledge** —
   the same report footer states which mode produced the claim. The
   runtime version is parsed from `package.json` (`engines.node`),
-  `.nvmrc`, `runtime.txt`, `.python-version`, or `global.json`
-  (`sdk.version`); an unresolved release cycle reports `unknown` rather
-  than guessing. Treat EOL findings outside those three runtimes as a
-  triage list, not a compliance scan.
+  `.nvmrc`, `runtime.txt`, `.python-version`, `global.json`
+  (`sdk.version`), `.ruby-version`, or `go.mod` (the `go` directive); an
+  unresolved release cycle reports `unknown` rather than guessing. Treat
+  EOL findings outside those five runtimes as a triage list, not a
+  compliance scan.
 - Phase evidence is as good as what the auditors read: on very large repos
   the deterministic inventory is exact, but agents sample files. The report
   appendix names the **audit blind spots** — top-level directories no
@@ -163,12 +164,13 @@ involved, so their findings are exact and citable:
   NuGet `packages.lock.json`) queried against OSV.dev in one batch
   (`--no-osv-scan` opts out; offline degrades to a labelled
   model-knowledge fallback).
-- **Live EOL/support-status scan** — Node.js/Python/.NET runtime versions
-  detected from `package.json`/`.nvmrc`/`runtime.txt`/`.python-version`/
-  `global.json` are checked against endoflife.date, one request per
-  distinct detected product (`--no-eol-scan` opts out; offline or an
-  unresolved release cycle degrades to a labelled model-knowledge/`unknown`
-  fallback rather than guessing).
+- **Live EOL/support-status scan** — Node.js/Python/.NET/Ruby/Go runtime
+  versions detected from `package.json`/`.nvmrc`/`runtime.txt`/
+  `.python-version`/`global.json`/`.ruby-version`/`go.mod` are checked
+  against endoflife.date, one request per distinct detected product
+  (`--no-eol-scan` opts out; offline or an unresolved release cycle
+  degrades to a labelled model-knowledge/`unknown` fallback rather than
+  guessing).
 - **Audit blind spots** — the exact set of top-level directories no phase
   finding (nor dead-code probe) cited, listed in the report appendix so
   sampling gaps are named instead of implied clean.
@@ -292,6 +294,22 @@ other modes) and requires `--finding`. Exit codes: `0` a verdict was
 produced (`refuted` is a *successful* verification), `1` the verifier
 itself failed (budget, unusable response), `2` no persisted assessment or
 no matching finding.
+
+**`--skip-broken-citations`** short-circuits the agent call entirely — $0 —
+when the finding's cited evidence is already known, at $0, to not resolve
+to a real file in the repo (the `citation_broken` flag `GET
+/jobs/{id}/findings` and the finding enumeration already surface, see
+above). Over dispatch this also skips the repo clone itself: `$0, no clone
+read` — the job never touches the repo named by the source job's
+`meta.json` at all (see [`docs/DISPATCH.md`](DISPATCH.md)). The verdict in
+that case is always `needs-context`, never `refuted`: a broken citation
+only impugns the citation, not the underlying claim, which could still be
+true via evidence elsewhere the original auditor mis-cited. It has no
+effect on a finding whose citation is not already known broken — that
+still runs the full agentic re-check. The result carries `"skipped": true`
+so a caller can tell a deterministic skip apart from a real agent verdict;
+it is never persisted to `verifications.jsonl` (dispatch) or counted by
+`GET /calibration`, since no model ever adjudicated it.
 
 The dispatch service exposes the same model remotely as a `verify` job mode
 plus `GET /jobs/{id}/findings` and `GET /jobs/{id}/verifications`; there the

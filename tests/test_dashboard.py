@@ -1682,6 +1682,243 @@ def test_dashboard_html_access_log_panel():
     assert "\nloadAccessLog();" in DASHBOARD_HTML
 
 
+# --- the pending-question proxy (GET /api/jobs/{id}/question → dispatch) -----
+
+
+def test_question_proxy_forwards_and_relays_verbatim(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch,
+        body=b'{"pending": true, "prompt": "merge now?", "context": "plan review",'
+        b' "choices": [{"key": "yes", "label": "Yes", "accepts_text": false}],'
+        b' "default": "yes"}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/jobs/deliver-1/question", headers=AUTH
+    )
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {
+        "pending": True,
+        "prompt": "merge now?",
+        "context": "plan review",
+        "choices": [{"key": "yes", "label": "Yes", "accepts_text": False}],
+        "default": "yes",
+    }
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/jobs/deliver-1/question"
+    assert request.get_method() == "GET"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.data is None
+
+
+def test_question_proxy_relays_no_pending_question(proxy_server, monkeypatch):
+    _capture_urlopen(monkeypatch, body=b'{"pending": false}')
+    status, _, body = _request(
+        proxy_server, "GET", "/api/jobs/deliver-1/question", headers=AUTH
+    )
+    assert status == 200
+    assert json.loads(body) == {"pending": False}
+
+
+def test_question_proxy_relays_unknown_job_404_verbatim(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/jobs/nope/question", 404, "Not Found", None,
+        io.BytesIO(b'{"error": "unknown job"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(
+        proxy_server, "GET", "/api/jobs/nope/question", headers=AUTH
+    )
+    assert status == 404
+    assert json.loads(body) == {"error": "unknown job"}
+
+
+def test_question_proxy_unconfigured_is_501(token_server, monkeypatch):
+    # token_server has no dispatch_url/dispatch_token wired
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "GET", "/api/jobs/deliver-1/question", headers=AUTH
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "pending question not configured"}
+    assert seen == []
+
+
+def test_question_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/jobs/deliver-1/question"
+    )
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+def test_question_proxy_never_echoes_the_dispatch_token(proxy_server, monkeypatch):
+    # SECURITY: matches the costs/backlog proxies' own non-leak assertion —
+    # the dispatch bearer token must never reach the browser.
+    _capture_urlopen(
+        monkeypatch, body=b'{"pending": true, "prompt": "p", "context": "",'
+        b' "choices": [], "default": "yes"}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/jobs/deliver-1/question", headers=AUTH
+    )
+    assert status == 200
+    assert DISPATCH_TOKEN not in body
+    assert DISPATCH_TOKEN not in str(headers)
+
+
+def test_question_route_scope_is_exact_match_only(proxy_server, monkeypatch):
+    # SECURITY/scope: a path that merely starts with the jobs prefix but
+    # doesn't exactly match .../question falls through to the ordinary 404,
+    # never forwarded — proving the suffix match is exact, not a loose
+    # startswith/in check.
+    seen = _capture_urlopen(monkeypatch)
+    for path in (
+        "/api/jobs/deliver-1",
+        "/api/jobs/deliver-1/question/extra",
+        "/api/jobs/deliver-1/answered",
+    ):
+        status, _, body = _request(proxy_server, "GET", path, headers=AUTH)
+        assert status == 404
+    assert seen == []
+
+
+# --- the interactive answer proxy (POST /api/jobs/{id}/answer → dispatch) ----
+
+
+def test_answer_proxy_forwards_body_and_relays_verbatim(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch, status=202, body=b"{}")
+    payload = json.dumps({"choice": "yes", "text": ""})
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/deliver-1/answer",
+        headers={**AUTH, "Content-Type": "application/json"}, body=payload,
+    )
+    assert status == 202
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {}
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/jobs/deliver-1/answer"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.data == payload.encode()
+
+
+def test_answer_proxy_tolerates_no_body(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch, status=400, body=b'{"error": "unknown choice"}')
+    status, _, body = _request(
+        proxy_server, "POST", "/api/jobs/deliver-1/answer", headers=AUTH
+    )
+    assert status == 400
+    assert json.loads(body) == {"error": "unknown choice"}
+    (request,) = seen
+    assert request.data is None  # no body sent → none forwarded
+
+
+def test_answer_proxy_tolerates_a_malformed_content_length(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch, status=202, body=b"{}")
+    status, _, _ = _request(
+        proxy_server, "POST", "/api/jobs/deliver-1/answer",
+        headers={**AUTH, "Content-Length": "xyz"},
+    )
+    assert status == 202
+    (request,) = seen
+    assert request.data is None  # unreadable length → treated as no body
+
+
+def test_answer_proxy_relays_a_dispatch_rejection(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/jobs/deliver-1/answer", 409, "Conflict", None,
+        io.BytesIO(b'{"error": "no pending question"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(
+        proxy_server, "POST", "/api/jobs/deliver-1/answer",
+        headers=AUTH, body=json.dumps({"choice": "yes"}),
+    )
+    assert status == 409
+    assert json.loads(body) == {"error": "no pending question"}
+
+
+def test_answer_proxy_unconfigured_is_501(token_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "POST", "/api/jobs/deliver-1/answer",
+        headers=AUTH, body=json.dumps({"choice": "yes"}),
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "job actions not configured"}
+    assert seen == []
+
+
+def test_answer_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/deliver-1/answer"
+    )
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+def test_answer_proxy_never_echoes_the_dispatch_token(proxy_server, monkeypatch):
+    # SECURITY: matches the question/costs/backlog proxies' own non-leak
+    # assertion — the dispatch bearer token must never reach the browser.
+    _capture_urlopen(monkeypatch, status=202, body=b"{}")
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/deliver-1/answer",
+        headers=AUTH, body=json.dumps({"choice": "yes"}),
+    )
+    assert status == 202
+    assert DISPATCH_TOKEN not in body
+    assert DISPATCH_TOKEN not in str(headers)
+
+
+def test_answer_route_is_kept_out_of_the_no_body_jobs_actions(proxy_server, monkeypatch):
+    # SECURITY/scope: "answer" is not in _JOBS_PROXY_ACTIONS, so a path that
+    # merely resembles it (wrong exact suffix) still falls through to the
+    # ordinary 404, never forwarded — same exact-match discipline as the
+    # question route above.
+    seen = _capture_urlopen(monkeypatch)
+    for path in (
+        "/api/jobs/deliver-1/answered",
+        "/api/jobs/deliver-1/answer/extra",
+    ):
+        status, _, body = _request(proxy_server, "POST", path, headers=AUTH)
+        assert status == 404
+        assert json.loads(body) == {"error": "not found"}
+    assert seen == []
+
+
+def test_dashboard_html_question_panel():
+    # Static desk-check of the pending-question panel JS (CI has no
+    # browser), mirroring test_dashboard_html_spend_panel's approach:
+    # only running, non-archived jobs get a placeholder to poll, the panel
+    # renders nothing on an absent/unconfigured question and the prompt
+    # plus one button per choice when one is pending, and polling is scoped
+    # (running jobs only) and visibility-gated, on its own interval kept
+    # out of the 2.5s /api/state poll.
+    assert 'function runningJobIds(s)' in DASHBOARD_HTML
+    assert 'id="q-${esc(r.id)}"' in DASHBOARD_HTML
+    assert 'if (!data || !data.pending) return ""' in DASHBOARD_HTML
+    assert 'data-answer="${esc(id)}"' in DASHBOARD_HTML
+    assert 'data-choice="${esc(c.key)}"' in DASHBOARD_HTML
+    assert "c.accepts_text" in DASHBOARD_HTML
+    assert 'fetch("/api/jobs/" + encodeURIComponent(id) + "/question")' in DASHBOARD_HTML
+    assert 'fetch("/api/jobs/" + encodeURIComponent(id) + "/answer"' in DASHBOARD_HTML
+    assert 'document.visibilityState !== "visible"' in DASHBOARD_HTML
+    assert "setInterval(pollQuestions, 5000)" in DASHBOARD_HTML
+
+    refresh_start = DASHBOARD_HTML.index("async function refresh()")
+    refresh_end = DASHBOARD_HTML.index("refresh();", refresh_start)
+    assert "/api/jobs/" not in DASHBOARD_HTML[refresh_start:refresh_end]
+
+
 # --- /api/state?archived=1 ----------------------------------------------------
 
 
