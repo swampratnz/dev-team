@@ -77,3 +77,23 @@ Transcript text is raw repository-derived content, so the dashboard
 verbatim text (a `<script>` or `</pre>` in a prompt cannot break out). The read
 routes (`/api/transcripts`, `/api/transcript`) sanitise every query parameter
 and gate on workspace membership as a traversal guard, mirroring `/api/report`.
+
+## Related: the always-on trace log
+
+Transcripts are the raw, sensitive, **opt-in** complement to a separate,
+always-on, **metadata-only** journal: `.dev_team/trace.jsonl`, written by
+`dev_team.tracelog.TraceLog` (a sink wired into every `Tracer`, see
+`dev_team.trace`). Every agent call — success, error result, or exception —
+appends one JSON line with `ts`, `run`, `seq`, `kind`, `name`, `status`,
+`duration`, and `attributes` (which carries `cost_usd` on the two result
+paths). It never contains a `system_prompt`, `prompt`, or `response` key —
+`TraceSpan` has never carried raw call content, so this is a type-level
+guarantee, not a redaction filter.
+
+Unlike `--record-transcripts`, nothing gates this: it satisfies CLAUDE.md
+section 7's baseline ("every agent authentication and call must produce a
+retained, reviewable log") by default, for both `--deliver`/`--assess` and
+dispatched jobs, under the same run id as `events.jsonl` and any transcripts.
+It is bounded the same way (`MAX_TRACE_SPANS`, newest half kept past the
+cap), and a write failure is swallowed rather than breaking the run it is
+auditing.

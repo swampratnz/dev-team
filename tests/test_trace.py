@@ -53,3 +53,30 @@ def test_default_clock_used_when_none():
     # Real clock returns a float; duration should be a non-negative number.
     assert span.duration is not None
     assert span.duration >= 0.0
+
+
+def test_sink_called_once_per_start_end_pair_with_span_finalised():
+    seen = []
+    tracer = Tracer(clock=FakeClock(), sink=seen.append)
+    span = tracer.start("agent", "engineer")
+    assert seen == []  # never called on an open span
+    tracer.end(span, "ok")
+    assert seen == [span]
+    assert seen[0].ended_at is not None
+    assert seen[0].status == "ok"
+
+
+def test_sink_called_once_for_a_zero_duration_event():
+    seen = []
+    tracer = Tracer(clock=FakeClock(), sink=seen.append)
+    span = tracer.event("tool", "pytest")
+    assert seen == [span]
+
+
+def test_no_sink_behaves_exactly_as_before():
+    # Regression: constructing a Tracer with no sink (every existing caller)
+    # must never attempt to call anything.
+    tracer = Tracer(clock=FakeClock())
+    span = tracer.start("agent", "engineer")
+    tracer.end(span)
+    assert span.status == "ok"

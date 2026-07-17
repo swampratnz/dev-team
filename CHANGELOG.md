@@ -6,6 +6,18 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Security hardening
+- **Every agent call now produces a retained, reviewable log, closing a
+  CLAUDE.md section 7 gap.** `Tracer` (`dev_team.trace`) gains an optional
+  `sink` invoked once per finalised span; the new `dev_team.tracelog.TraceLog`
+  wires it to an always-on, bounded `.dev_team/trace.jsonl` journal — one JSON
+  line per agent call with `ts`/`run`/`seq`/`kind`/`name`/`status`/`duration`/
+  `attributes` (the latter carrying `cost_usd` on the two result paths). A
+  `TraceSpan` has never carried prompt/response text, so this is metadata-only
+  by construction, not by a redaction filter — safe to leave on by default,
+  unlike the raw-content `--record-transcripts` (see `docs/TRANSCRIPTS.md`).
+  Wired in `cli.py`'s `--deliver`/`--assess` and in `dispatch.py`'s per-job
+  run, under the same run id as `events.jsonl`; a write failure is swallowed
+  rather than breaking the run it is auditing.
 - **Prompt-fence defusing is now systemic.** Untrusted content shown to
   agents inside delimited `<...>` blocks (file bodies, diffs, tool/scanner
   output, the cross-run memory digest, the retrospective run digest, audit

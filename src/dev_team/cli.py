@@ -55,6 +55,8 @@ from .sources import (
     resolve_github_token,
 )
 from .team import DevTeam
+from .trace import Tracer
+from .tracelog import TraceLog
 from .transcripts import TRANSCRIPTS_DIR, TranscriptRecorder
 from .visualreview import (
     AnthropicVisualReviewer,
@@ -1023,6 +1025,22 @@ def _transcript_recorder(args, run: Optional[str]) -> Optional[TranscriptRecorde
     return TranscriptRecorder(LocalWorkspace(args.workspace), run=run)
 
 
+def _tracer(args, run: Optional[str]) -> Optional[Tracer]:
+    """A tracer journalling to the workspace under ``run``, or ``None``.
+
+    Unlike :func:`_transcript_recorder`, this is always-on (no flag): the
+    persisted trace is metadata only (role, status, duration, cost — never
+    prompt/response text), so gating it behind an opt-in would leave the
+    default posture non-compliant with CLAUDE.md section 7 ("a log gap is a
+    control failure"). ``None`` only when there is no run id to correlate
+    against (matching the modes that keep no event log either).
+    """
+
+    if run is None:
+        return None
+    return Tracer(sink=TraceLog(LocalWorkspace(args.workspace), run=run))
+
+
 def _progress_printer(budget: Budget) -> Listener:
     """A concise one-line-per-event progress display for stderr.
 
@@ -1063,6 +1081,11 @@ async def _deliver(
     recorder = _transcript_recorder(args, run)
     if recorder is not None:
         kwargs["transcript_recorder"] = recorder
+    # Unlike the recorder above, always assigned: DeliveryEngine's tracer
+    # parameter defaults to None (building its own in-memory-only Tracer), so
+    # a None here is behaviourally identical to omitting the kwarg — no
+    # branch needed.
+    kwargs["tracer"] = _tracer(args, run)
     if args.visual_review:
         # The advisory visual-review seams. Validation has already ensured
         # --serve-command is present and carries a {port} placeholder; the
@@ -1247,6 +1270,7 @@ async def _assess(
     recorder = _transcript_recorder(args, run)
     if recorder is not None:
         kwargs["transcript_recorder"] = recorder
+    kwargs["tracer"] = _tracer(args, run)
     outcome = await team.assess(
         workspace=LocalWorkspace(args.workspace),
         budget=budget,

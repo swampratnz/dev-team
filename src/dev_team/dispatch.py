@@ -77,6 +77,8 @@ from .config import TeamConfig
 from .engine import EngineConfig
 from .errors import DependencyCycleError, DevTeamError
 from .eventlog import EventLog, compose, read_events
+from .trace import Tracer
+from .tracelog import TraceLog
 from .execution import (
     LocalWorkspace,
     SubprocessCommandRunner,
@@ -748,6 +750,12 @@ class Dispatcher:
         if self._record_transcripts:
             target = self._dashboard_workspace or workspace
             kwargs["transcript_recorder"] = TranscriptRecorder(target, run=spec.id)
+        # Always-on, unlike the transcript recorder above: the persisted trace
+        # is metadata only (role/status/duration/cost — never prompt/response
+        # text), so gating it behind --record-transcripts would leave the
+        # default posture non-compliant with CLAUDE.md section 7. Journalled
+        # into the job's own workspace under the same run id as the events.
+        kwargs["tracer"] = Tracer(sink=TraceLog(workspace, run=spec.id, clock=self._clock))
         if spec.mode == "assess":
             outcome = await team.assess(
                 workspace=workspace,

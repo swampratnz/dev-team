@@ -69,6 +69,7 @@ class InstrumentedRunner:
                 self.tracer.end(span, "exception")
             raise
         if self.tracer is not None:
+            span.attributes["cost_usd"] = str(result.cost_usd)
             self.tracer.end(span, "error" if result.is_error else "ok")
         # Capture the raw I/O on both the success and the error-result paths
         # (the raising path returned above, so it has no result to record).
@@ -130,6 +131,7 @@ class InstrumentedSession:
                 self.tracer.end(span, "exception")
             raise
         if self.tracer is not None:
+            span.attributes["cost_usd"] = str(result.cost_usd)
             self.tracer.end(span, "error" if result.is_error else "ok")
         # Record before enforcing the budget: the call that tips the ceiling has
         # still been paid for, so its transcript must be audited, not lost.

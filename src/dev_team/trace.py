@@ -4,6 +4,10 @@ Distinct from ephemeral progress :mod:`~dev_team.events`, the tracer keeps a
 durable, ordered record of everything that happened — agent calls, tool runs,
 decisions, approvals — so a run can be inspected, audited, or replayed after the
 fact. Timestamps are injected (via a clock) to keep it deterministic in tests.
+
+In-process spans alone do not survive process exit; an optional ``sink`` (see
+:class:`~dev_team.tracelog.TraceLog`) is how a caller makes the trace durable
+on disk, the same seam :mod:`~dev_team.eventlog` uses for progress events.
 """
 
 from __future__ import annotations
@@ -13,6 +17,9 @@ from typing import Callable, Dict, List, Optional
 
 # A clock returns a monotonic-ish float timestamp; injected for determinism.
 Clock = Callable[[], float]
+
+# Invoked with a finalised (ended) span; never called for a still-open span.
+Sink = Callable[["TraceSpan"], None]
 
 
 @dataclass
@@ -37,10 +44,16 @@ class TraceSpan:
 
 
 class Tracer:
-    """Records an ordered sequence of spans using an injected clock."""
+    """Records an ordered sequence of spans using an injected clock.
 
-    def __init__(self, clock: Optional[Clock] = None) -> None:
+    An optional ``sink`` is called with each span exactly once, when it is
+    finalised by :meth:`end` — never for a still-open span. ``None`` (the
+    default) keeps every existing caller's in-memory-only behaviour unchanged.
+    """
+
+    def __init__(self, clock: Optional[Clock] = None, sink: Optional[Sink] = None) -> None:
         self._clock: Clock = clock if clock is not None else _default_clock
+        self._sink = sink
         self.spans: List[TraceSpan] = []
         self._seq = 0
 
@@ -62,10 +75,12 @@ class Tracer:
         return span
 
     def end(self, span: TraceSpan, status: str = "ok") -> TraceSpan:
-        """Close ``span`` with a final ``status``."""
+        """Close ``span`` with a final ``status``, then notify the sink."""
 
         span.ended_at = self._now()
         span.status = status
+        if self._sink is not None:
+            self._sink(span)
         return span
 
     def event(self, kind: str, name: str, **attributes: str) -> TraceSpan:

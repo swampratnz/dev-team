@@ -43,6 +43,39 @@ def test_error_result_marks_span_error():
     assert tracer.spans[0].status == "error"
 
 
+def test_success_result_attaches_cost_usd_to_the_span():
+    inner = ScriptedRunner([AgentResult(text="hi", cost_usd=0.5)])
+    tracer = Tracer(clock=_Clock())
+    runner = InstrumentedRunner(inner, "engineer", tracer=tracer)
+    run(runner.run("p"))
+    assert tracer.spans[0].attributes["cost_usd"] == "0.5"
+
+
+def test_error_result_attaches_cost_usd_to_the_span():
+    inner = ScriptedRunner([AgentResult(text="boom", is_error=True, cost_usd=0.1)])
+    tracer = Tracer(clock=_Clock())
+    runner = InstrumentedRunner(inner, "qa", tracer=tracer)
+    run(runner.run("p"))
+    assert tracer.spans[0].attributes["cost_usd"] == "0.1"
+
+
+def test_exception_path_omits_cost_usd_from_the_span():
+    class BoomRunner:
+        async def run(self, prompt, **kwargs):
+            raise RuntimeError("boom")
+
+    tracer = Tracer(clock=_Clock())
+    runner = InstrumentedRunner(BoomRunner(), "engineer", tracer=tracer)
+    try:
+        run(runner.run("p"))
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the raise is the point
+        raise AssertionError("expected RuntimeError")
+    # cost is unknowable on the raising path, matching the existing comment
+    assert "cost_usd" not in tracer.spans[0].attributes
+
+
 def test_works_without_budget_or_tracer():
     inner = ScriptedRunner([AgentResult(text="ok")])
     runner = InstrumentedRunner(inner, "pm")
@@ -192,6 +225,37 @@ def test_session_error_result_marks_span_error():
     assert tracer.spans[0].status == "error"
 
 
+def test_session_success_result_attaches_cost_usd_to_the_span():
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import FakeAgentSession
+
+    inner = FakeAgentSession(results=[AgentResult(text="hi", cost_usd=0.5)])
+    tracer = Tracer(clock=_Clock())
+    run(InstrumentedSession(inner, "engineer", tracer=tracer).send("p"))
+    assert tracer.spans[0].attributes["cost_usd"] == "0.5"
+
+
+def test_session_exception_path_omits_cost_usd_from_the_span():
+    from dev_team.instrument import InstrumentedSession
+
+    class BoomSession:
+        async def send(self, prompt):
+            raise RuntimeError("boom")
+
+        async def aclose(self):  # pragma: no cover - not reached
+            pass
+
+    tracer = Tracer(clock=_Clock())
+    session = InstrumentedSession(BoomSession(), "engineer", tracer=tracer)
+    try:
+        run(session.send("p"))
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the raise is the point
+        raise AssertionError("expected RuntimeError")
+    assert "cost_usd" not in tracer.spans[0].attributes
+
+
 def test_session_works_without_budget_or_tracer_and_closes():
     from dev_team.instrument import InstrumentedSession
     from dev_team.sdk import FakeAgentSession
@@ -278,3 +342,19 @@ def test_session_exception_without_tracer_still_propagates():
         pass
     else:  # pragma: no cover - the raise is the point
         raise AssertionError("expected RuntimeError")
+
+
+# --- security: the persisted trace never carries prompt/response content ----
+
+
+def test_persisted_trace_never_contains_the_prompt_or_response_text():
+    from dev_team.tracelog import TRACE_PATH, TraceLog
+    from dev_team.trace import Tracer
+
+    marker = "super-secret-repo-content-marker-9e21"
+    inner = ScriptedRunner([AgentResult(text=f"leaked: {marker}", cost_usd=0.2)])
+    ws = InMemoryWorkspace()
+    tracer = Tracer(clock=_Clock(), sink=TraceLog(ws, run="deliver-1", clock=lambda: 1.0))
+    runner = InstrumentedRunner(inner, "engineer", tracer=tracer)
+    run(runner.run(f"do this: {marker}", system_prompt=f"sys: {marker}"))
+    assert marker not in ws.read_text(TRACE_PATH)
