@@ -241,6 +241,25 @@ sections below are reconstructed from the repository history.
   `501` and the panel shows a muted "not configured" state. Scope is
   strictly `/api/costs` (exact match, no path parameter) — the same
   narrow-proxy discipline as the existing backlog/job-lifecycle proxies.
+- **Pending-question panel** (`docs/DASHBOARD.md`): the dashboard's answer
+  to `docs/ROADMAP.md` item 7's "questions as buttons" — a live "pending
+  question" panel on each running job's card, backed by two new narrow
+  proxies alongside the spend rollup: `GET /api/jobs/{id}/question` (reads)
+  and `POST /api/jobs/{id}/answer` (a body-forwarding write, kept separate
+  from the no-body archive/unarchive/purge action set). An operator running
+  an `interactive: true` deliver job can now see the paused prompt/context
+  and click a choice (or type free text for an `accepts_text` choice)
+  straight from the dashboard, instead of `curl`ing the dispatch API by
+  hand. Polling is scoped and visibility-gated — only currently-running,
+  non-archived jobs are polled, only while the tab is visible, on their own
+  5s interval kept out of the 2.5s `/api/state` poll (same reasoning as the
+  Spend panel) — so the common case (no interactive job running) costs zero
+  extra dispatch calls. Both routes reuse the dashboard's existing
+  `_authorised()` gate and the server-side-only dispatch token injection;
+  neither is reachable without dashboard auth, and the dispatch token never
+  reaches the browser. Without `--dispatch-url`/`DEV_TEAM_DISPATCH_TOKEN`
+  configured both answer `501` and the panel renders nothing, matching
+  Spend/Calibration's degrade-gracefully contract.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /
