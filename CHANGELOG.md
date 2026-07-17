@@ -6,6 +6,16 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Security hardening
+- **Visual review now flags its unsandboxed served app.** `--sandbox` only
+  boxes gate/build-probe commands via `ContainerCommandRunner` — the app
+  `SubprocessAppServer` serves for visual review (`--visual-review`) is a
+  bare host subprocess either way. `DeliveryEngine._visual_review` now emits
+  a once-per-run advisory event when `EngineConfig.sandbox` is set, so an
+  operator combining `--visual-review --sandbox` sees the gap instead of
+  silently assuming full coverage. Purely informational: never raises, never
+  affects `DeliveryOutcome.success`, and never gates or skips the review
+  itself. `docs/SANDBOX.md`'s trust-boundary table and `docs/ROADMAP.md` item
+  1 gain matching notes.
 - **Prompt-fence defusing is now systemic.** Untrusted content shown to
   agents inside delimited `<...>` blocks (file bodies, diffs, tool/scanner
   output, the cross-run memory digest, the retrospective run digest, audit

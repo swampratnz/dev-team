@@ -861,6 +861,9 @@ class DeliveryEngine:
         self._stash_lock = asyncio.Lock()
         self._checkpoint: Optional[RunCheckpoint] = None
         self._budget_exhausted = False
+        # Fires at most once per delivery run (see _visual_review), not once
+        # per visual_fix_rounds re-review round.
+        self._visual_sandbox_warned = False
         self._branch: Optional[str] = None
         self._baseline_failures = None
         self._baseline_sha: Optional[str] = None
@@ -1602,6 +1605,13 @@ class DeliveryEngine:
         if not (self.app_server and self.page_capturer and self.visual_reviewer):
             self._event("visual", "Visual review enabled but no reviewer is wired; skipping")
             return None
+        if self.config.sandbox is not None and not self._visual_sandbox_warned:
+            self._visual_sandbox_warned = True
+            self._event(
+                "visual",
+                "the served app runs as a bare, unsandboxed host subprocess "
+                "-- --sandbox only boxes gates/build-probe commands, not this",
+            )
         routes = list(self.config.screenshot_routes)
         self._event("visual", f"Visual review: serving the app and capturing {len(routes)} route(s)")
         try:
