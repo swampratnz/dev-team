@@ -38,6 +38,7 @@ from .git import GitError, GitRepo
 from .interaction import ChannelApprovalGate, ConsoleChannel, ask_in_thread, ci_fix_question
 from .models import FeatureRequest
 from .persona import Roster
+from .pr_comment_channel import GitHubPRCommentChannel, GitHubPRCommentChannelError
 from .pullrequest import GitHubPullRequestPublisher, PullRequestError
 from .report import (
     delivery_to_dict,
@@ -672,6 +673,29 @@ def build_parser() -> argparse.ArgumentParser:
         "force-push to the PR branch, re-watching after each fix, up to N "
         "rounds (0 = off, the default; requires --watch-checks).",
     )
+    delivery.add_argument(
+        "--interactive-pr-comments",
+        action="store_true",
+        help="Supervise --watch-fix-rounds CI-fix rounds through comments on "
+        "the opened pull request instead of this terminal: the question is "
+        "posted as a PR comment and an allow-listed login answers by "
+        "commenting 'apply' or 'skip'. This posts the CI failure summary as "
+        "a plain, repo-visible PR comment — a broader audience than the "
+        "terminal (see docs/INTERACTION.md before enabling on a repo where "
+        "CI diagnostics shouldn't be public). Requires --interactive, "
+        "--pull-request, --watch-fix-rounds > 0, and at least one "
+        "--interactive-pr-comment-author (no default allow-list).",
+    )
+    delivery.add_argument(
+        "--interactive-pr-comment-author",
+        action="append",
+        default=None,
+        metavar="LOGIN",
+        help="A GitHub login authorized to answer --interactive-pr-comments "
+        "questions (repeatable). Any comment from a login not in this list "
+        "is ignored. Required at least once when --interactive-pr-comments "
+        "is set — there is no implicit default.",
+    )
     misc.add_argument(
         "--json",
         action="store_true",
@@ -810,6 +834,25 @@ def _validate_args(
         parser.error("--watch-fix-rounds must be non-negative")
     if args.watch_fix_rounds and not args.watch_checks:
         parser.error("--watch-fix-rounds requires --watch-checks (there is no watch to fix)")
+    if args.interactive_pr_comments and not args.interactive:
+        parser.error("--interactive-pr-comments requires --interactive")
+    if args.interactive_pr_comments and not args.pull_request:
+        parser.error("--interactive-pr-comments requires --pull-request")
+    if args.interactive_pr_comments and not args.watch_fix_rounds:
+        parser.error(
+            "--interactive-pr-comments requires --watch-fix-rounds > 0 "
+            "(there is no CI-fix loop to supervise)"
+        )
+    if args.interactive_pr_comments and not args.interactive_pr_comment_author:
+        parser.error(
+            "--interactive-pr-comments requires at least one "
+            "--interactive-pr-comment-author (there is no default allow-list)"
+        )
+    if args.interactive_pr_comment_author and not args.interactive_pr_comments:
+        parser.error(
+            "--interactive-pr-comment-author: only valid with "
+            "--interactive-pr-comments"
+        )
     if args.sandbox and not (args.deliver or args.assess):
         parser.error("--sandbox: only valid with --deliver or --assess")
     sandbox_tuning = [
@@ -1141,6 +1184,7 @@ def _open_pull_request(
         print(f"pull request not opened: {exc}", file=sys.stderr)
         return False
     outcome.pull_request_url = pull_request.url
+    outcome.pull_request_number = pull_request.number
     print(f"opened pull request: {pull_request.url}", file=sys.stderr)
     if args.watch_checks:
         _watch_pr_checks(outcome, args, ref, token or "")
@@ -1179,6 +1223,25 @@ def _watch_pr_checks(outcome, args, ref: "RepoRef", token: str) -> None:
     print(f"checks: {result.state} — {result.summary}", file=sys.stderr)
 
 
+def _pr_comment_channel(outcome, args, ref: "RepoRef", token: str) -> Optional[GitHubPRCommentChannel]:
+    """Build the CI-fix loop's PR-comment channel, or ``None`` when not opted in.
+
+    Scoped to this loop only: ``team.interaction`` (whatever governs plan
+    review, e.g. ``ConsoleChannel``) is untouched — ``--interactive-pr-comments``
+    replaces just the ``ci_fix_question`` channel for this delivery's PR.
+    """
+
+    if not args.interactive_pr_comments:
+        return None
+    return GitHubPRCommentChannel(
+        token=token,
+        owner=ref.owner,
+        name=ref.name,
+        pr_number=outcome.pull_request_number or 0,
+        allowed_logins=tuple(args.interactive_pr_comment_author or ()),
+    )
+
+
 async def _run_ci_fix_loop(engine, team, outcome, args, ref, token) -> None:
     """Close the loop: fix a failed PR watch, re-push, and re-watch, bounded.
 
@@ -1188,19 +1251,25 @@ async def _run_ci_fix_loop(engine, team, outcome, args, ref, token) -> None:
     autonomously otherwise; a fix that lands is force-pushed to the PR branch
     and the checks are re-watched. The loop stops on success, on a round that
     produces no committed fix, when the rounds or the budget run out, or when a
-    human skips.
+    human skips. ``--interactive-pr-comments`` swaps the channel used for this
+    loop's questions to the PR's own comments instead of ``team.interaction``.
     """
 
     asked_by = team.roster.display_name("engineer")
+    pr_channel = _pr_comment_channel(outcome, args, ref, token or "")
+    channel = pr_channel if pr_channel is not None else team.interaction
     for round_num in range(1, args.watch_fix_rounds + 1):
         checks = outcome.checks
         if checks is None or checks.state != "failure":
             return
-        if team.interaction is not None:
-            reply = await ask_in_thread(
-                team.interaction,
-                ci_fix_question(round_num, checks.failed, checks.summary, asked_by=asked_by),
-            )
+        if channel is not None:
+            question = ci_fix_question(round_num, checks.failed, checks.summary, asked_by=asked_by)
+            try:
+                reply = await ask_in_thread(channel, question)
+            except GitHubPRCommentChannelError as exc:
+                print(f"CI fix round {round_num}: could not reach the PR comments: {exc}",
+                      file=sys.stderr)
+                return
             if reply.choice != "apply":
                 print(f"CI fix skipped by human at round {round_num}", file=sys.stderr)
                 return

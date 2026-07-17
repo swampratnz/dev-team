@@ -76,6 +76,29 @@ sections below are reconstructed from the repository history.
   no weakening the coverage gate). All agent workflows are inert until the
   `CLAUDE_CODE_OAUTH_TOKEN` secret and Claude GitHub App exist.
 
+### Interactivity
+- **The CI-fix loop can now be supervised from the pull request itself**
+  (`--interactive-pr-comments`, ROADMAP #7): a new `InteractionChannel`,
+  `GitHubPRCommentChannel` (`dev_team.pr_comment_channel`), posts the
+  `ci_fix_question` as a PR comment and polls (bounded, injectable `sleep`,
+  mirroring `watch_checks`) for a reply from an **explicitly configured**
+  allow-list of GitHub logins (`--interactive-pr-comment-author`,
+  repeatable) — no implicit "defaults to the PR author". A reply's first
+  whitespace-trimmed, lower-cased token must exactly match a live choice
+  key (`apply`/`skip`); an unauthorized commenter or an unrecognised reply
+  is silently skipped, and an exhausted poll fails safe to `skip`, exactly
+  like `ConsoleChannel`'s EOF behaviour. `--interactive-pr-comments`
+  requires `--interactive`, `--pull-request`, `--watch-fix-rounds > 0`, and
+  at least one `--interactive-pr-comment-author`; it replaces only the
+  CI-fix loop's channel — `team.interaction` (plan review, approvals) is
+  untouched, and omitting the flag leaves `_run_ci_fix_loop` exactly as
+  before. `DeliveryOutcome.pull_request_number` (alongside the existing
+  `pull_request_url`) is set from the opened PR so the channel can address
+  the comments API, which is keyed by PR number, not URL. Enabling this
+  posts the CI failure summary as a plain, repo-visible PR comment — see
+  `docs/INTERACTION.md` for the exposure-audience tradeoff before turning
+  it on.
+
 ### Finding re-verification
 - **A fresh skeptical agent can re-check any ONE persisted assessment
   finding** against the code (`docs/ASSESSMENT.md`): `list_findings`
