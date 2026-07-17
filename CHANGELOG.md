@@ -292,6 +292,16 @@ sections below are reconstructed from the repository history.
   keep the heuristic false-positive-free.
 
 ### Documentation
+- **Hallucinated CLI-flag detection in shipped docs** (`doc_claim_issues`,
+  `techwriter.py`): fenced `bash`/`sh`/`shell`/`console`/`zsh` blocks are
+  now scanned line-by-line for `dev-team`/`python -m dev_team` invocations,
+  and any `--flag` they cite is checked against the live
+  `cli.build_parser()` option strings (deferred import, avoiding the
+  `cli` → `engine` → `techwriter` cycle) — the bash-fence CLI-flag check
+  named as the next increment in #48's own "Grows into" section. Advisory
+  only, same `Documentation.unverified_claims` surface #48 already wired
+  up; the shell text is regex-scanned only, never passed to `subprocess`,
+  `os.system`, `os.popen`, `eval`, or `exec`.
 - **`docs/TROUBLESHOOTING.md`**: a symptom-first operator runbook
   consolidating operational knowledge previously scattered across
   `DEPLOYMENT.md`, `docs/DISPATCH.md`, `docs/DASHBOARD.md`, and
