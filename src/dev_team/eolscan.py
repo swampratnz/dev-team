@@ -6,11 +6,11 @@ audited long after the model's training cutoff. This module is the
 deterministic counterpart, mirroring :mod:`depscan`'s exact shape: runtime
 versions are parsed straight out of a small, fixed set of manifest files
 (``package.json`` ``engines.node``, ``.nvmrc``, ``runtime.txt``,
-``.python-version``, ``global.json`` ``sdk.version``) and checked against
-endoflife.date's public, unauthenticated API — one request per *distinct*
-detected product. No network (or a failed/malformed query) degrades
-gracefully: the detected runtimes still feed the report, annotated that the
-live check was unavailable.
+``.python-version``, ``global.json`` ``sdk.version``, ``.ruby-version``,
+``go.mod``) and checked against endoflife.date's public, unauthenticated
+API — one request per *distinct* detected product. No network (or a
+failed/malformed query) degrades gracefully: the detected runtimes still
+feed the report, annotated that the live check was unavailable.
 """
 
 from __future__ import annotations
@@ -31,10 +31,17 @@ _HTTP_TIMEOUT_SECONDS = 30.0
 #: that product's list of release-cycle records (the raw JSON response).
 Fetch = Callable[[str], List[Dict]]
 
-_DISPLAY_NAMES = {"nodejs": "Node.js", "python": "Python", "dotnet": ".NET"}
+_DISPLAY_NAMES = {
+    "nodejs": "Node.js",
+    "python": "Python",
+    "dotnet": ".NET",
+    "ruby": "Ruby",
+    "go": "Go",
+}
 
-#: The only products v1 understands — the smallest slice that closes the
-#: documented gap (every audited repo has exactly one primary runtime).
+#: The only products this module understands (every audited repo has
+#: exactly one primary runtime per product). Grown one manifest at a time
+#: as new bare-version-file conventions are added.
 _SUPPORTED_PRODUCTS = frozenset(_DISPLAY_NAMES)
 
 _VERSION_RE = re.compile(r"\d+(?:\.\d+){0,2}")
@@ -199,12 +206,37 @@ def parse_global_json_sdk(text: str) -> Optional[Tuple[str, str]]:
     return ("dotnet", version) if version else None
 
 
+def parse_ruby_version(text: str) -> Optional[Tuple[str, str]]:
+    """``.ruby-version``: the first line's version (pyenv/rbenv convention)."""
+
+    stripped = text.strip()
+    if not stripped:
+        return None
+    first_line = stripped.splitlines()[0]
+    version = _leading_version(first_line)
+    return ("ruby", version) if version else None
+
+
+def parse_go_mod(text: str) -> Optional[Tuple[str, str]]:
+    """``go.mod``: the ``go`` directive line (e.g. ``go 1.21`` or ``go 1.21.3``)."""
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("go "):
+            continue
+        version = _leading_version(stripped[len("go ") :])
+        return ("go", version) if version else None
+    return None
+
+
 _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "package.json": parse_package_json_engines,
     ".nvmrc": parse_nvmrc,
     "runtime.txt": parse_runtime_txt,
     ".python-version": parse_python_version,
     "global.json": parse_global_json_sdk,
+    ".ruby-version": parse_ruby_version,
+    "go.mod": parse_go_mod,
 }
 
 

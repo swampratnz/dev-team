@@ -3392,6 +3392,174 @@ def test_verify_job_agent_failure_becomes_a_failed_job():
         assert verifs["verifications"] == []
 
 
+def _seeded_dash_with_broken_citation(source="assess-cb2"):
+    """A dashboard workspace whose one finding's evidence is already known
+    broken — the fixture for skip_broken_citations end-to-end tests."""
+
+    payload = {
+        "classification": "dependency-surgery",
+        "phases": {
+            "risk": {
+                "role": "security-engineer",
+                "ok": True,
+                "error": None,
+                "data": {
+                    "secrets": [
+                        {"claim": "connection string committed",
+                         "evidence": "does/not/exist.py"},
+                    ],
+                },
+            }
+        },
+        "broken_citations": {"risk": ["does/not/exist.py"]},
+        "dead_code": {"findings": []},
+        "dependency_scan": {"vulnerabilities": []},
+    }
+    dash = InMemoryWorkspace()
+    dash.write_text(f"audit/{source}/assessment.json", json.dumps(payload))
+    dash.write_text(
+        f"audit/{source}/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": source}),
+    )
+    return dash
+
+
+def test_build_spec_verify_skip_broken_citations_must_be_bool():
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    for value in ("true", 1, None):
+        body = {
+            "mode": "verify", "source_job": "assess-old",
+            "finding_id": "recommendation.plan[0]",
+            "skip_broken_citations": value,
+        }
+        with pytest.raises(ValidationError):
+            disp.build_spec(body)
+
+
+def test_submit_verify_skip_broken_citations_non_bool_is_400_http():
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=_seeded_dash()
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]",
+                  "skip_broken_citations": "true"},
+        )
+        assert status == 400
+        assert "skip_broken_citations" in payload["error"]
+
+
+def test_verify_job_skip_broken_citations_is_a_0_cost_no_agent_skip():
+    dash = _seeded_dash_with_broken_citation()
+    raising_runner = ScriptedRunner()  # raises if .run() is ever invoked
+    with running(
+        runner=raising_runner, materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        # calibration counts before the skip
+        before = _call(server, "/calibration")
+
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-cb2",
+                  "finding_id": "risk.secrets[0]",
+                  "skip_broken_citations": True},
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result == {
+            "kind": "verify",
+            "source_job": "assess-cb2",
+            "finding_id": "risk.secrets[0]",
+            "verdict": "needs-context",
+            "rationale": result["rationale"],
+            "citations": [],
+            "cost_usd": 0.0,
+            "success": True,
+            "skipped": True,
+        }
+        assert result["rationale"]  # non-empty
+        assert raising_runner.calls == []  # no agent call at all
+
+        # calibration isolation: a skip never adjudicated anything, so the
+        # source job's verification history and the global rollup are
+        # byte-identical before and after
+        _, verifs = _call(server, "/jobs/assess-cb2/verifications")
+        assert verifs["verifications"] == []
+        after = _call(server, "/calibration")
+        assert after == before
+
+
+def test_verify_job_skip_broken_citations_has_no_effect_when_not_broken():
+    dash = _seeded_dash()  # recommendation.plan[0] has no evidence -> not broken
+    verifier = _verifier_runner()
+    with running(
+        runner=verifier, materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]",
+                  "skip_broken_citations": True},
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["verdict"] == "confirmed"
+        assert "skipped" not in result
+        assert len(verifier.calls) == 1
+        # a real verdict IS mirrored into verification history
+        _, verifs = _call(server, "/jobs/assess-old/verifications")
+        assert len(verifs["verifications"]) == 1
+
+
+def test_verify_job_skip_broken_citations_never_clones_the_real_repo(
+    tmp_path, monkeypatch
+):
+    """Regression for the review on #111/#112: an eligible skip must skip
+    the clone itself, not just the agent call — every other test here
+    injects `_mem_materialise`, an in-memory fake, so none of them would
+    catch `run_job` calling the real `clone_or_update` before branching
+    into the skip. This one leaves `materialise` unset (the Dispatcher
+    default, `_default_materialise`) and fails loudly if it is ever
+    reached."""
+
+    def clone_should_not_run(*args, **kwargs):
+        raise AssertionError(
+            "clone_or_update must not run for an eligible skip_broken_citations job"
+        )
+
+    monkeypatch.setattr(dispatch_mod, "clone_or_update", clone_should_not_run)
+    dash = _seeded_dash_with_broken_citation()
+    raising_runner = ScriptedRunner()  # raises if .run() is ever invoked
+    with running(
+        runner=raising_runner,
+        dashboard_workspace=dash,
+        jobs_root=str(tmp_path / "jobs"),
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-cb2",
+                  "finding_id": "risk.secrets[0]",
+                  "skip_broken_citations": True},
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["cost_usd"] == 0.0
+        assert raising_runner.calls == []
+
+
 def test_submit_verify_http_error_contract():
     with running(
         materialise=_mem_materialise, dashboard_workspace=_seeded_dash()
