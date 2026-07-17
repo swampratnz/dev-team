@@ -14,6 +14,7 @@ from dev_team.depscan import (
     parse_cargo_toml,
     parse_package_json,
     parse_packages_config,
+    parse_pyproject_toml,
     parse_requirements_txt,
     scan_dependencies,
 )
@@ -96,6 +97,109 @@ insta = "1.34.0"
     ]
     assert parse_cargo_toml("not = toml =", "Cargo.toml") == []
     assert parse_cargo_toml("[dependencies]\nbroken = 5\n", "Cargo.toml") == []
+
+
+def test_parse_pyproject_toml_exact_pins():
+    text = """
+[project]
+dependencies = ["requests==2.31.0"]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version, d.ecosystem) for d in deps] == [
+        ("requests", "2.31.0", "PyPI"),
+    ]
+
+
+def test_parse_pyproject_toml_strips_extras_and_markers():
+    text = """
+[project]
+dependencies = ["httpx[http2]==0.27.0; python_version >= \\"3.8\\""]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version) for d in deps] == [("httpx", "0.27.0")]
+
+
+def test_parse_pyproject_toml_optional_dependencies():
+    text = """
+[project]
+dependencies = ["requests==2.31.0"]
+
+[project.optional-dependencies]
+dev = ["pytest==8.0.0"]
+docs = ["sphinx>=7.0"]
+malformed = "not-a-list"
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version) for d in deps] == [
+        ("requests", "2.31.0"),
+        ("pytest", "8.0.0"),
+    ]
+
+
+def test_parse_pyproject_toml_skips_non_exact_specs():
+    text = """
+[project]
+dependencies = ["httpx>=0.27,<1.0", "foo", "bar~=1.2", "requests==2.31.0"]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version) for d in deps] == [("requests", "2.31.0")]
+
+
+def test_parse_pyproject_toml_malformed_toml():
+    assert parse_pyproject_toml("not = toml =", "pyproject.toml") == []
+
+
+def test_parse_pyproject_toml_no_project_table():
+    assert parse_pyproject_toml("[tool.other]\nx = 1\n", "pyproject.toml") == []
+
+
+def test_parse_pyproject_toml_adversarial_shapes_degrade_safely():
+    # dependencies as a string instead of a list
+    assert (
+        parse_pyproject_toml(
+            '[project]\ndependencies = "requests==2.31.0"\n', "pyproject.toml"
+        )
+        == []
+    )
+    # optional-dependencies as a list instead of a table
+    assert (
+        parse_pyproject_toml(
+            '[project]\noptional-dependencies = ["requests==2.31.0"]\n',
+            "pyproject.toml",
+        )
+        == []
+    )
+    # list entries that are dicts/ints instead of strings
+    text = """
+[project]
+dependencies = [1, true]
+
+[project.optional-dependencies]
+dev = [{name = "requests"}, 42]
+"""
+    assert parse_pyproject_toml(text, "pyproject.toml") == []
+    # a dependency string with an embedded null byte or thousands of chars
+    huge = "requests" + "x" * 5000 + "==2.31.0"
+    null_byte = "requests\x00==2.31.0"
+    # json's double-quote escaping is a valid subset of TOML basic-string
+    # escaping, so this is a safe way to embed a null byte / huge string.
+    text = f"""
+[project]
+dependencies = [{json.dumps(huge)}, {json.dumps(null_byte)}]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version) for d in deps] == [
+        ("requests" + "x" * 5000, "2.31.0"),
+        ("requests\x00", "2.31.0"),
+    ]
+
+
+def test_parse_pyproject_toml_skips_empty_name_after_stripping():
+    text = """
+[project]
+dependencies = ["==1.0", "[extra]==1.0"]
+"""
+    assert parse_pyproject_toml(text, "pyproject.toml") == []
 
 
 def test_collect_dependencies_dedupes_across_manifests():
@@ -478,3 +582,20 @@ def test_collect_dependencies_reads_lockfiles_and_dedupes():
         ("NuGet", "Moq", "4.2.0"),
     }
     assert len(deps) == 4  # cross-framework NuGet duplicate deduplicated
+
+
+def test_collect_dependencies_pyproject_toml_dedupes_against_poetry_lock():
+    ws = InMemoryWorkspace(
+        {
+            "pyproject.toml": (
+                '[project]\ndependencies = ["requests==2.31.0"]\n'
+            ),
+            "poetry.lock": '[[package]]\nname = "requests"\nversion = "2.31.0"\n',
+        }
+    )
+    deps = collect_dependencies(ws)
+    # the pyproject.toml-derived pin and the poetry.lock-resolved pin agree,
+    # so only one Dependency survives dedup — no spurious duplicate.
+    assert [(d.ecosystem, d.name, d.version) for d in deps] == [
+        ("PyPI", "requests", "2.31.0"),
+    ]
