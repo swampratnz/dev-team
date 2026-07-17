@@ -36,7 +36,16 @@ from .eventlog import EventLog, compose
 from .events import AgentEvent, Listener
 from .execution import DEFAULT_EXCLUDED_DIRS, LocalWorkspace, SubprocessCommandRunner
 from .git import GitError, GitRepo
-from .interaction import ChannelApprovalGate, ConsoleChannel, ask_in_thread, ci_fix_question
+from .agents.intake import TriageAgent
+from .instrument import InstrumentedRunner
+from .interaction import (
+    ChannelApprovalGate,
+    ConsoleChannel,
+    ask_in_thread,
+    ci_fix_question,
+    triage_review_question,
+)
+from .triage import decision_to_dict, equivalent_command
 from .models import FeatureRequest
 from .persona import Roster
 from .pr_comment_channel import GitHubPRCommentChannel, GitHubPRCommentChannelError
@@ -230,6 +239,22 @@ def build_parser() -> argparse.ArgumentParser:
         "instead of the default simulation. Note the simulation is not free: it "
         "runs the same real, paid agents, it just makes no filesystem or git "
         "changes.",
+    )
+    modes.add_argument(
+        "--intake",
+        default=None,
+        metavar="TEXT",
+        help="Triage a raw, free-text request with one bounded agent call and "
+        "propose the mode it needs (deliver / assess / chat), printing the "
+        "equivalent dev-team command. Proposes only, unless --intake-apply or "
+        "an --interactive confirmation says to run the routed mode now.",
+    )
+    modes.add_argument(
+        "--intake-apply",
+        action="store_true",
+        help="Run the mode --intake routes to, without asking (an 'unclear' "
+        "triage still never runs anything). By default the decision is only "
+        "proposed (or confirmed on the terminal with --interactive).",
     )
     modes.add_argument(
         "--assess",
@@ -777,6 +802,24 @@ def _validate_args(
             "with --assess/--deliver/--chat/--dashboard/--dispatch/"
             "--make-backlog"
         )
+    if args.intake is not None and (
+        args.assess or args.deliver or args.chat or args.dashboard
+        or args.dispatch or args.make_backlog is not None or args.verify is not None
+    ):
+        parser.error(
+            "--intake decides the mode itself; it cannot be combined with "
+            "--assess/--deliver/--chat/--dashboard/--dispatch/--make-backlog/"
+            "--verify"
+        )
+    if args.intake is not None and not args.intake.strip():
+        parser.error("--intake: the request text must not be empty")
+    if args.intake_apply and args.intake is None:
+        parser.error("--intake-apply: only valid with --intake")
+    if args.intake is not None and (args.title is not None or args.description is not None):
+        parser.error(
+            "--intake carries the request as free text; omit the "
+            "title/description arguments"
+        )
     if args.verify is not None and args.finding is None:
         parser.error("--verify requires --finding (a finding id or claim substring)")
     if args.finding is not None and args.verify is None:
@@ -800,12 +843,14 @@ def _validate_args(
     if args.report is not None and not args.assess:
         parser.error("--report: only valid with --assess")
     if args.record_transcripts and not (
-        args.assess or args.deliver or args.dispatch
+        args.assess or args.deliver or args.dispatch or args.intake is not None
     ):
         # --chat is deliberately excluded: a chat has no run id / event log to
         # correlate transcripts with, so recording there captures nothing.
+        # --intake is included because it may route into --assess/--deliver.
         parser.error(
-            "--record-transcripts: only valid with --assess/--deliver/--dispatch"
+            "--record-transcripts: only valid with "
+            "--assess/--deliver/--dispatch/--intake"
         )
     if args.chat:
         if args.title is not None or args.description is not None:
@@ -816,19 +861,24 @@ def _validate_args(
     elif not (
         args.assess or args.dashboard or args.dispatch
         or args.make_backlog is not None or args.verify is not None
+        or args.intake is not None
     ):
         if args.title is None or args.description is None:
             parser.error("title and description are required (or use --chat)")
     if args.roster is not None and args.no_personas:
         parser.error("--roster and --no-personas are mutually exclusive")
-    if args.repo is not None and not (args.assess or args.deliver or args.chat):
-        parser.error("--repo: only valid with --assess, --deliver, or --chat")
+    if args.repo is not None and not (
+        args.assess or args.deliver or args.chat or args.intake is not None
+    ):
+        parser.error(
+            "--repo: only valid with --assess, --deliver, --chat, or --intake"
+        )
     if args.env_file is not None and args.repo is None:
         parser.error("--env-file: only valid with --repo")
     if args.remote_verify_trigger is not None and args.remote_verify_status is None:
         parser.error("--remote-verify-trigger requires --remote-verify-status")
-    if args.pull_request and not (args.deliver or args.chat):
-        parser.error("--pull-request: only valid with --deliver or --chat")
+    if args.pull_request and not (args.deliver or args.chat or args.intake is not None):
+        parser.error("--pull-request: only valid with --deliver, --chat, or --intake")
     if args.pull_request and args.repo is None:
         parser.error(
             "--pull-request requires --repo (to know which GitHub repository "
@@ -965,12 +1015,13 @@ def _reject_deliver_only_flags(
 
     These flags only affect the delivery engine; silently ignoring them in
     simulation mode would let e.g. ``--no-commit`` go unheeded. A chat session
-    may end in ``/deliver``, so chat mode accepts them too. (``--budget-usd``
-    is NOT deliver-only — the simulation, assessment, and verification all run
-    metered agents — so it is validated separately.)
+    may end in ``/deliver``, and an intake triage may route to delivery, so
+    those modes accept them too. (``--budget-usd`` is NOT deliver-only — the
+    simulation, assessment, and verification all run metered agents — so it is
+    validated separately.)
     """
 
-    if args.deliver or args.chat:
+    if args.deliver or args.chat or args.intake is not None:
         return
     checks = [
         ("--verify-command", args.verify_command is not None),
@@ -1447,6 +1498,89 @@ async def _chat(
     return await session.run()
 
 
+async def _intake(args, runner: AgentRunner, budget: Budget) -> Optional[int]:
+    """Triage ``--intake`` text and propose (or apply) the routed mode.
+
+    Returns an exit code to stop the run here — the propose-only default, an
+    ``unclear`` triage, or a declined confirmation — or ``None`` to fall
+    through into the routed mode, with ``args`` rewritten in place so the
+    normal ``_run`` flow handles it exactly as if the flags had been typed.
+    The mode choice is consequential (it decides spend and repo mutation), so
+    it is never executed silently: ``--intake-apply`` opts in explicitly, and
+    ``--interactive`` confirms on the terminal (fail-safe: abort).
+    """
+
+    agent = TriageAgent(
+        InstrumentedRunner(runner, TriageAgent.role, budget=budget),
+        model=args.model,
+    )
+    decision = await agent.triage(args.intake)
+    proposal_lines = [f"intake triage: route={decision.route}"]
+    if decision.rationale:
+        proposal_lines.append(f"  rationale: {decision.rationale}")
+    if decision.request is not None:
+        proposal_lines.append(f"  title:       {decision.request.title}")
+        proposal_lines.append(f"  description: {decision.request.description}")
+        for constraint in decision.request.constraints:
+            proposal_lines.append(f"    - {constraint}")
+    proposal_lines.append(
+        "  equivalent command: " + shlex.join(equivalent_command(decision))
+    )
+    proposal_lines.append(f"  triage cost: ${budget.spent:.4f}")
+    proposal = "\n".join(proposal_lines)
+
+    def _emit_result() -> None:
+        # The proposal is this mode's result document: JSON or text on stdout.
+        if args.json:
+            print(json.dumps(decision_to_dict(decision), indent=2))
+        else:
+            print(proposal)
+
+    if decision.route == "unclear":
+        _emit_result()
+        print(
+            "triage could not route this; start with --chat to shape it",
+            file=sys.stderr,
+        )
+        # An explicitly requested apply that cannot happen is a failure; a
+        # proposal that concludes "unroutable" is a successful proposal.
+        return 1 if args.intake_apply else 0
+
+    apply = args.intake_apply
+    if not apply and args.interactive:
+        # Progress (the proposal under review) goes to stderr; the channel
+        # prompts on the terminal and fails safe to abort on EOF.
+        reply = await ask_in_thread(
+            ConsoleChannel(),
+            triage_review_question(decision.route, context=proposal, asked_by="intake"),
+        )
+        apply = reply.choice == "apply"
+        if not apply:
+            print("triage aborted; nothing was run", file=sys.stderr)
+            return 0
+    if not apply:
+        _emit_result()
+        return 0
+
+    if decision.route == "deliver":
+        args.deliver = True
+        args.title = decision.request.title
+        args.description = decision.request.description
+        args.constraints = list(decision.request.constraints)
+    elif decision.route == "assess":
+        args.assess = True
+    else:  # chat
+        if args.json:
+            # --chat owns stdout for the conversation and rejects --json, so a
+            # json-mode apply that routes to chat reports instead of entering
+            # the REPL — same fail-safe posture as an unclear route.
+            _emit_result()
+            return 0
+        args.chat = True
+    print(proposal, file=sys.stderr)
+    return None
+
+
 def _materialise_repo(args, default_workspace: str) -> Tuple[RepoRef, Optional[str]]:
     """Clone (or update) ``--repo`` and point ``--workspace`` at the result.
 
@@ -1760,6 +1894,17 @@ def _run(
     # the summary prints, and the live cost the default progress printer shows
     # all read from it. Uncapped (limit_usd=None) still meters spend.
     budget = Budget(limit_usd=args.budget_usd)
+
+    if args.intake is not None:
+        # Triage the free-text request first. Either it stops here (propose
+        # only / unclear / declined), or args comes back rewritten to the
+        # routed mode and the normal flow below runs it — on the same budget,
+        # so the triage call's spend counts against the run's ceiling.
+        early = asyncio.run(
+            _intake(args, runner or ClaudeAgentRunner(default_model=args.model), budget)
+        )
+        if early is not None:
+            return early
 
     # Progress goes to stderr so stdout stays a clean result document (text
     # summary or JSON), safe to pipe into e.g. ``jq``. -v prints the full event

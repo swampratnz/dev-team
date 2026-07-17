@@ -207,6 +207,13 @@ from .sources import (
 )
 from .team import DevTeam, build_workflow
 from .trace import Tracer, TraceSpan
+from .triage import (
+    TRIAGE_ROUTES,
+    TriageDecision,
+    decision_to_dict,
+    equivalent_command,
+    triage_decision_from_dict,
+)
 from .verification import (
     CommandGate,
     CoverageGate,
@@ -227,6 +234,12 @@ __all__ = [
     # facade & engines
     "DevTeam",
     "build_workflow",
+    # front-door triage (ROADMAP #9)
+    "TRIAGE_ROUTES",
+    "TriageDecision",
+    "triage_decision_from_dict",
+    "decision_to_dict",
+    "equivalent_command",
     "DevelopmentWorkflow",
     "DeliveryEngine",
     "DeliveryOutcome",

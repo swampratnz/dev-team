@@ -879,6 +879,204 @@ def test_main_chat_builds_real_backend_lazily(monkeypatch, capsys):
     assert "chatting with Priya" in capsys.readouterr().out
 
 
+# --- --intake: front-door triage (ROADMAP #9) --------------------------------
+
+
+def _triage_payload(route="deliver", **extra):
+    payload = {"route": route, "rationale": "because"}
+    if route == "deliver":
+        payload.update(title="Login", description="Add login", constraints=["c1"])
+    payload.update(extra)
+    return payload
+
+
+def test_main_intake_rejected_with_other_modes(capsys):
+    for other in ("--deliver", "--chat", "--assess", "--dashboard"):
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--intake", "x", other], runner=ScriptedRunner([]))
+        assert excinfo.value.code == 2
+    assert "--intake decides the mode itself" in capsys.readouterr().err
+
+
+def test_main_intake_apply_requires_intake(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["T", "D", "--intake-apply"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--intake-apply: only valid with --intake" in err
+
+
+def test_main_intake_rejects_positionals(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Title", "Desc", "--intake", "x"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "free text" in err
+
+
+def test_main_intake_rejects_empty_text(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--intake", "   "], runner=ScriptedRunner([]))
+    assert excinfo.value.code == 2
+    assert "must not be empty" in capsys.readouterr().err
+
+
+def test_main_intake_allows_deliver_only_flags():
+    # a triage may route to delivery, so deliver-only flags are accepted
+    runner = ScriptedRunner([json_response(_triage_payload())])
+    code = main(["--intake", "build login", "--no-commit"], runner=runner)
+    assert code == 0
+
+
+def test_main_intake_proposes_without_running(capsys):
+    runner = ScriptedRunner([json_response(_triage_payload())])
+    code = main(["--intake", "build a login page"], runner=runner)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "route=deliver" in out
+    assert "because" in out
+    assert "equivalent command:" in out and "--deliver" in out
+    assert "triage cost:" in out
+    assert len(runner.calls) == 1  # the triage call only — no engine ran
+
+
+def test_main_intake_proposes_json_document(capsys):
+    runner = ScriptedRunner([json_response(_triage_payload())])
+    code = main(["--intake", "build a login page", "--json"], runner=runner)
+    assert code == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["route"] == "deliver"
+    assert doc["request"]["title"] == "Login"
+    assert doc["equivalent_command"][-1] == "--deliver"
+
+
+def test_main_intake_unclear_proposes_with_guidance(capsys):
+    runner = ScriptedRunner([json_response({"route": "banana"})])
+    code = main(["--intake", "???"], runner=runner)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "route=unclear" in captured.out
+    assert "start with --chat" in captured.err
+
+
+def test_main_intake_unclear_fails_an_explicit_apply(capsys):
+    runner = ScriptedRunner([json_response({"route": "banana"})])
+    code = main(["--intake", "???", "--intake-apply"], runner=runner)
+    assert code == 1  # the requested autonomous action could not be taken
+    assert len(runner.calls) == 1
+
+
+def test_main_intake_apply_deliver_end_to_end(tmp_path, capsys):
+    from helpers import engine_responses
+
+    responses = dict(engine_responses())
+    responses["intake coordinator"] = json_response(_triage_payload())
+    runner = ScriptedRunner(by_system_prompt=responses)
+    code = main(
+        ["--intake", "build a login page", "--intake-apply",
+         "--workspace", str(tmp_path), "--no-commit",
+         "--verify-command", "python -c pass"],
+        runner=runner,
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "SUCCESS" in captured.out
+    assert "route=deliver" in captured.err  # the proposal became progress output
+
+
+def test_main_intake_apply_chat_routes_into_the_repl(monkeypatch, capsys):
+    import io as _io
+
+    from test_chat import FakeBackend
+
+    monkeypatch.setattr("sys.stdin", _io.StringIO("/quit\n"))
+    runner = ScriptedRunner([json_response(_triage_payload(route="chat"))])
+    code = main(
+        ["--intake", "maybe some kind of portal?", "--intake-apply"],
+        runner=runner,
+        chat_backend=FakeBackend(),
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "chatting with" in captured.out
+    assert "route=chat" in captured.err
+
+
+def test_main_intake_apply_chat_with_json_reports_instead(capsys):
+    runner = ScriptedRunner([json_response(_triage_payload(route="chat"))])
+    code = main(
+        ["--intake", "vague idea", "--intake-apply", "--json"], runner=runner
+    )
+    assert code == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["route"] == "chat"  # reported, not entered: --chat owns stdout
+
+
+def test_main_intake_interactive_confirm_applies(monkeypatch, capsys):
+    import io as _io
+
+    import dev_team.cli as cli_module
+    from dev_team.interaction import Reply, ScriptedChannel
+    from test_chat import FakeBackend
+
+    monkeypatch.setattr(
+        cli_module, "ConsoleChannel",
+        lambda *a, **k: ScriptedChannel(script=[Reply(choice="apply")]),
+    )
+    monkeypatch.setattr("sys.stdin", _io.StringIO("/quit\n"))
+    runner = ScriptedRunner([json_response(_triage_payload(route="chat"))])
+    code = main(
+        ["--intake", "an idea", "--interactive"],
+        runner=runner,
+        chat_backend=FakeBackend(),
+    )
+    assert code == 0
+    assert "chatting with" in capsys.readouterr().out
+
+
+def test_main_intake_interactive_confirm_aborts(monkeypatch, capsys):
+    import dev_team.cli as cli_module
+    from dev_team.interaction import Reply, ScriptedChannel
+
+    monkeypatch.setattr(
+        cli_module, "ConsoleChannel",
+        lambda *a, **k: ScriptedChannel(script=[Reply(choice="abort")]),
+    )
+    runner = ScriptedRunner([json_response(_triage_payload())])
+    code = main(["--intake", "build login", "--interactive"], runner=runner)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "aborted; nothing was run" in captured.err
+    assert len(runner.calls) == 1  # triage only; the routed mode never ran
+
+
+def test_intake_apply_rewrites_args_for_deliver():
+    import dev_team.cli as cli_module
+    from dev_team.budget import Budget
+    from helpers import run
+
+    args = build_parser().parse_args(["--intake", "req", "--intake-apply"])
+    runner = ScriptedRunner([json_response(_triage_payload(constraints=[]))])
+    code = run(cli_module._intake(args, runner, Budget()))
+    assert code is None  # fall through into the routed mode
+    assert args.deliver is True
+    assert args.title == "Login" and args.description == "Add login"
+    assert args.constraints == []
+
+
+def test_intake_apply_rewrites_args_for_assess():
+    import dev_team.cli as cli_module
+    from dev_team.budget import Budget
+    from helpers import run
+
+    args = build_parser().parse_args(["--intake", "req", "--intake-apply"])
+    # no rationale: the proposal simply omits that line
+    runner = ScriptedRunner([json_response({"route": "assess"})])
+    code = run(cli_module._intake(args, runner, Budget()))
+    assert code is None
+    assert args.assess is True and args.deliver is False
+
+
 # --- assess mode ----------------------------------------------------------------
 
 

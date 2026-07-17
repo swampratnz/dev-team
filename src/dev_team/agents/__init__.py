@@ -4,6 +4,7 @@ from .architect import ArchitectAgent
 from .base import BaseAgent
 from .devops import DevOpsAgent
 from .engineer import EngineerAgent
+from .intake import TriageAgent
 from .manager import ProductManagerAgent
 from .qa import QAAgent
 from .retrospector import RetrospectorAgent
@@ -24,4 +25,5 @@ __all__ = [
     "SecurityEngineerAgent",
     "SREAgent",
     "TechnicalWriterAgent",
+    "TriageAgent",
 ]

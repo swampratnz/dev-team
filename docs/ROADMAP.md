@@ -282,3 +282,44 @@ linters, issue trackers) and from debate on contentious calls.
 **Shape:** expose MCP servers through `allowed_tools`; for high-severity
 review disagreements, a short structured debate (reviewer vs engineer,
 security as judge) before the verdict is final.
+
+**Shipped (debate half):** opt-in `EngineConfig.review_debate` /
+`--review-debate`. When the reviewer blocks a task with a major/critical
+finding, the engineer gets one read-only rebuttal turn
+(`EngineerAgent.rebut`) and the security engineer adjudicates
+(`SecurityEngineerAgent.adjudicate`) — overturning the block only when the
+rebuttal verifies against the actual code, with a human supervising the
+overturn when an interaction channel is attached (`review-dispute` question;
+fail-safe: uphold). The debate runs before the commit-gating security review,
+so an overturned change is still vetted; findings and rebuttals cross prompts
+only as defused `<review-findings>`/`<rebuttal>` blocks. The MCP tool
+provider remains future work.
+
+## 9. Top-level orchestration
+
+**Why:** the engines each know how to do one kind of work, and inside them
+control flow is deliberately code-owned — but nothing above them decides
+*which* engine a raw request needs, or *what to work on next* from a backlog.
+The human encodes both choices by hand (CLI flags; one curled dispatch job at
+a time).
+
+**Shape:** two additive layers above the engines, keeping their determinism
+intact. (a) **Intake triage**: one bounded model call that routes free text to
+a mode from a closed set (`deliver`/`assess`/`chat`, fail-safe `unclear`) and
+distils the brief — proposed to the human, never silently executed. (b) A
+**backlog foreman** over the dispatch service: deterministic (no model)
+selection of dependency-ready stories, enqueued as bounded deliver jobs with
+story↔job provenance and status write-back, so an assessment's remediation
+backlog becomes scheduled work.
+
+**Shipped (intake half):** `dev-team --intake "TEXT"` runs
+`TriageAgent.triage` (the raw text enters the prompt as a defused
+`<intake-request>` block; the reply is parsed against the closed
+`TRIAGE_ROUTES` set, degrading out-of-contract or brief-less replies to
+`unclear`, never to an action). The decision is printed with its rationale,
+distilled brief, and the exact equivalent `dev-team` command — and is only
+*executed* under explicit `--intake-apply` or an `--interactive` terminal
+confirmation (`triage-review` question; fail-safe: abort), because the mode
+choice decides spend and repo mutation. An applied route falls through into
+the ordinary `--deliver`/`--assess`/`--chat` flow on the same budget, so the
+triage call's spend counts against the run's ceiling. The foreman is next.

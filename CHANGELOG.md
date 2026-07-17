@@ -5,6 +5,21 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Orchestration
+- **A front door that routes raw requests** (`--intake "TEXT"`, ROADMAP #9's
+  intake half): one bounded `TriageAgent` call picks a mode from the closed
+  `TRIAGE_ROUTES` set (`deliver`/`assess`/`chat`, fail-safe `unclear`) and,
+  for a delivery, distils the brief. The request text is untrusted and enters
+  the prompt as a defused `<intake-request>` block; an out-of-contract route
+  or a delivery without a usable brief degrades to `unclear`, never to an
+  action. The decision is *proposed* — route, rationale, brief, the exact
+  equivalent `dev-team` command, and the triage cost — and only executed
+  under explicit `--intake-apply` or an `--interactive` confirmation (new
+  `triage-review` question, fail-safe abort on EOF). An applied route falls
+  through into the ordinary `--deliver`/`--assess`/`--chat` flow on the same
+  budget, so triage spend counts against `--budget-usd`; `--json` emits the
+  decision document instead of the text proposal.
+
 ### Delivery
 - **Session reuse (`--reuse-engineer-session`) now composes with worktree
   mode (`--worktrees`)** instead of silently no-oping. `_develop_task_in_worktree`

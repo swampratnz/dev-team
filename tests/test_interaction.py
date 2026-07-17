@@ -29,6 +29,7 @@ from dev_team.interaction import (
     render_replan,
     replan_review_question,
     review_dispute_question,
+    triage_review_question,
     task_failure_question,
 )
 from dev_team.models import Plan, Task
@@ -385,6 +386,17 @@ def test_review_dispute_question_defaults_to_overturn_and_fails_safe_to_uphold()
     assert question.asked_by == "Sasha"
     assert "T3" in question.prompt
     assert question.context == "findings + rationale"
+
+
+def test_triage_review_question_defaults_to_apply_and_fails_safe_to_abort():
+    question = triage_review_question("deliver", context="the proposal", asked_by="intake")
+    # unattended (AutoChannel) applies the route, matching --intake-apply...
+    assert question.default.key == "apply"
+    # ...but a detached (EOF) run must not start work no human confirmed.
+    assert question.fail_safe.key == "abort"
+    assert question.topic == "triage-review"
+    assert "deliver" in question.prompt
+    assert question.context == "the proposal"
 
 
 def test_queue_channel_is_importable_from_package_root():
