@@ -53,7 +53,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
-from .accesslog import AccessLog
+from .accesslog import AccessLog, read_access_log
 from .approval import PolicyApprovalGate
 from .assessment import (
     AssessConfig,
@@ -118,6 +118,14 @@ _MAX_BODY = 1 << 20
 _LIST_LIMIT = 25
 _LIST_LIMIT_MAX = 100
 _PROGRESS_LIMIT = 12
+
+#: Default :data:`GET /access-log` ``?limit=``, and the floor/ceiling every
+#: requested value is clamped to before use — mirrors
+#: :data:`_resolved_interactive_timeout`'s clamp-not-reject posture for a
+#: caller-supplied bound instead of erroring on an out-of-range value.
+_ACCESS_LOG_LIMIT_DEFAULT = 100
+_ACCESS_LOG_LIMIT_MIN = 1
+_ACCESS_LOG_LIMIT_MAX = 1000
 
 #: Wall-clock ceiling for a single job. The single-flight worker runs one job
 #: at a time, so a job that hangs (a stuck clone, an agent session that never
@@ -1296,6 +1304,27 @@ class Dispatcher:
             "jobs_counted": jobs_counted,
         }
 
+    def access_log_entries(
+        self, *, limit: int = _ACCESS_LOG_LIMIT_DEFAULT
+    ) -> Tuple[int, Dict[str, Any]]:
+        """The ``GET /access-log`` core: newest-first page of recorded requests.
+
+        ``limit`` is clamped to ``[1, 1000]`` (default 100) rather than
+        rejected, mirroring :func:`_resolved_interactive_timeout`'s posture
+        for a caller-supplied bound. Reads straight off
+        ``jobs_root/access.jsonl`` via :func:`~dev_team.accesslog.read_access_log`,
+        which already tolerates a missing file (empty list) and skips a
+        corrupt line rather than raising; this just reverses that
+        oldest-first result into the newest-first order the route contracts
+        for. No dashboard-workspace guard needed — ``access.jsonl`` lives
+        under ``jobs_root``, independent of the dashboard workspace, exactly
+        like :meth:`costs`.
+        """
+
+        limit = max(_ACCESS_LOG_LIMIT_MIN, min(limit, _ACCESS_LOG_LIMIT_MAX))
+        entries = list(reversed(read_access_log(self._jobs_root, limit=limit)))
+        return 200, {"entries": entries}
+
     def _merge_backlog(
         self,
         data: Dict[str, Any],
@@ -1777,6 +1806,16 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                     parse_qs(split.query).get("archived", ["0"])[0] == "1"
                 )
                 status, payload = dispatcher.costs(include_archived=include_archived)
+                self._json(status, payload)
+                return
+            if path == "/access-log":
+                # ?limit= (default 100, clamped to [1, 1000]) — missing or
+                # non-numeric falls back to the default, same forgiving
+                # posture _int_param already gives ?limit=/?offset= on /jobs.
+                limit = self._int_param(
+                    parse_qs(split.query), "limit", _ACCESS_LOG_LIMIT_DEFAULT
+                )
+                status, payload = dispatcher.access_log_entries(limit=limit)
                 self._json(status, payload)
                 return
             parts = path.strip("/").split("/")

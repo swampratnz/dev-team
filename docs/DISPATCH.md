@@ -590,10 +590,30 @@ handler level and never turns an otherwise-successful response into a
 crash; it also never affects the response already sent to the caller,
 since the record is appended only after `send_response` has been called.
 
-There is no HTTP route to read this log in v1 — it is reviewed the same way
-an operator already reviews `events.jsonl`/`verifications.jsonl` (filesystem
-access to the deployment). An authenticated `GET /access-log` route is
-natural growth once there is a proven need to view it remotely.
+### `GET /access-log` (auth) — recent access records
+
+A newest-first page of the journal above, so the tailnet-only deployment
+(see *Deployment* below) can be glanced at from the dashboard instead of
+requiring an SSH session to `cat access.jsonl`:
+
+```json
+{"entries":[{"ts":1789345680.0,"method":"GET","path":"/jobs","status":200},
+            {"ts":1789345678.0,"method":"GET","path":"/whatever","status":404}]}
+```
+
+`?limit=` defaults to 100 and is clamped to `[1, 1000]`; a missing or
+non-numeric value falls back to the default rather than erroring — the same
+clamp-not-reject posture `interactive_timeout_seconds` uses. A missing or
+empty `access.jsonl` (a fresh deployment with zero requests logged yet)
+answers `200 {"entries":[]}`, never an error, and a corrupted/non-JSON line
+mixed into the journal is skipped rather than failing the whole request —
+both inherited directly from :func:`read_access_log`'s existing tolerant-read
+contract. No dashboard-workspace guard needed: `access.jsonl` lives under
+`jobs_root`, independent of `--dashboard-workspace`, exactly like `GET
+/costs`. Every entry carries exactly the four fields the write path
+persists (`ts`/`method`/`path`/`status`) — never an `Authorization` header
+or a request/response body, since those are never written in the first
+place (see above).
 
 ## Deployment
 

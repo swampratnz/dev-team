@@ -37,7 +37,7 @@ import urllib.request
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, List, Optional
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from .assessment import calibration_summary
 from .backlog import BacklogStore
@@ -417,9 +417,11 @@ def _make_handler(
     ``/api/jobs/{id}/archive``, ``/api/jobs/{id}/unarchive``, or
     ``/api/jobs/{id}/purge`` are forwarded to the matching
     ``/jobs/{id}/...`` lifecycle route; ``GET /api/costs`` is forwarded to
-    the dispatch service's ``GET /costs`` spend rollup; with either unset
-    all three stay unavailable and answer ``501``. The dispatch token is
-    only ever sent to ``dispatch_url`` — never logged or reflected.
+    the dispatch service's ``GET /costs`` spend rollup; ``GET
+    /api/access-log`` is forwarded to the dispatch service's ``GET
+    /access-log`` recent-requests page; with either unset all four stay
+    unavailable and answer ``501``. The dispatch token is only ever sent to
+    ``dispatch_url`` — never logged or reflected.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -647,6 +649,8 @@ def _make_handler(
                 self._transcript(parts.query)
             elif parts.path == "/api/costs":
                 self._costs(parts.query)
+            elif parts.path == "/api/access-log":
+                self._access_log(parts.query)
             else:
                 self._send(404, "text/plain", "not found")
 
@@ -689,6 +693,25 @@ def _make_handler(
             # contract /api/state and the dispatch service's GET /jobs use.
             include_archived = parse_qs(query).get("archived", ["0"])[0] == "1"
             suffix = "/costs?archived=1" if include_archived else "/costs"
+            self._proxy("GET", suffix, None)
+
+        # -- access log: a fourth narrow read-only proxy, same shape as the
+        # spend rollup above. Scope is exactly this one path (see do_GET's
+        # exact-match dispatch above) — never a general dispatch passthrough.
+
+        def _access_log(self, query: str) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "access log not configured"}),
+                )
+                return
+            # ?limit= is forwarded unchanged (the dispatch service itself
+            # clamps/defaults an out-of-range or non-numeric value) — an
+            # absent limit forwards no query string at all.
+            limit = parse_qs(query).get("limit", [""])[0]
+            suffix = f"/access-log?limit={quote(limit, safe='')}" if limit else "/access-log"
             self._proxy("GET", suffix, None)
 
         # -- transcripts: a SENSITIVE surface -------------------------------
@@ -1056,6 +1079,9 @@ details[open] summary .preview { display: none; }
 .cal-table th, .cal-table td { text-align: left; padding: 4px 6px; border-top: 1px solid var(--line-soft); }
 .cal-table th { color: var(--ink-3); font-weight: 600; }
 .cal-table .cal-overall { font-weight: 600; }
+.al-status { font-weight: 600; }
+.al-status.al-bad { color: var(--critical); }
+.al-status.al-warn { color: var(--warning); }
 
 .report { display: block; width: 100%; text-align: left; background: none; border: none;
           border-radius: 4px; padding: 7px 4px;
@@ -1173,6 +1199,11 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
       <button id="spend-refresh" class="ghost">refresh</button>
     </div>
     <div class="panel" id="spend"><span class="muted">loading&hellip;</span></div>
+    <div class="section-head">
+      <h2>Access log</h2>
+      <button id="access-log-refresh" class="ghost">refresh</button>
+    </div>
+    <div class="panel" id="access-log"><span class="muted">loading&hellip;</span></div>
     <h2>Reports</h2>
     <div class="panel" id="reports"><span class="muted">no assessment reports</span></div>
   </div>
@@ -1619,6 +1650,42 @@ async function loadSpend() {
     put($("spend"), spendPanel(await res.json()));
   } catch (err) {
     put($("spend"), '<span class="muted">failed to load spend</span>');
+  }
+}
+
+// The Access log panel: recent dispatch HTTP requests from GET
+// /api/access-log. Fetched once on load plus manual refresh only — same
+// on-demand-not-polled discipline as Spend above, for the same reason (a
+// proxied dispatch hop must not multiply by open tabs x poll cadence).
+// SECURITY: path values are arbitrary caller-supplied URL paths (an
+// external caller can hit "/whatever<script>" and have it logged verbatim,
+// by design) — esc() before innerHTML, never raw HTML, same discipline as
+// every other panel.
+function accessLogRow(e) {
+  const cls = e.status >= 400 ? "al-bad" : e.status >= 300 ? "al-warn" : "";
+  return `<tr><td>${esc(e.method)}</td><td>${esc(e.path)}</td>`
+    + `<td class="al-status ${cls}">${esc(e.status)}</td></tr>`;
+}
+
+function accessLogPanel(data) {
+  const entries = data.entries || [];
+  if (!entries.length) return '<span class="muted">no requests recorded yet</span>';
+  const rows = entries.map(accessLogRow).join("");
+  return `<table class="cal-table"><thead><tr><th>method</th><th>path</th><th>status</th></tr></thead>`
+    + `<tbody>${rows}</tbody></table>`;
+}
+
+async function loadAccessLog() {
+  try {
+    const res = await fetch("/api/access-log");
+    if (res.status === 501) {
+      put($("access-log"), '<span class="muted">access log not configured</span>');
+      return;
+    }
+    if (!res.ok) throw new Error(String(res.status));
+    put($("access-log"), accessLogPanel(await res.json()));
+  } catch (err) {
+    put($("access-log"), '<span class="muted">failed to load access log</span>');
   }
 }
 
@@ -2151,6 +2218,7 @@ $("agent-overlay").addEventListener("click", e => { if (e.target === $("agent-ov
 $("story-close").addEventListener("click", closeStory);
 $("story-overlay").addEventListener("click", e => { if (e.target === $("story-overlay")) closeStory(); });
 $("spend-refresh").addEventListener("click", loadSpend);
+$("access-log-refresh").addEventListener("click", loadAccessLog);
 document.addEventListener("keydown", e => { if (e.key === "Escape") { closeModal(); closeAgent(); closeStory(); } });
 
 // ---- poll loop ----
@@ -2188,6 +2256,7 @@ async function refresh() {
 refresh();
 setInterval(refresh, 2500);
 loadSpend();
+loadAccessLog();
 </script>
 </body>
 </html>

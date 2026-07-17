@@ -3550,3 +3550,119 @@ def test_access_log_concurrent_requests_never_lose_an_entry(tmp_path):
             t.join()
     records = _access_records(tmp_path, expect=20, limit=1000)
     assert len(records) == 20
+
+
+# --- access log read route (GET /access-log) ------------------------------
+
+
+def _seed_access_log(jobs_root, entries):
+    """Write raw JSONL lines directly to ``jobs_root/access.jsonl``.
+
+    Bypasses ``AccessLog.append`` so a test can seed exact ``ts`` ordering
+    (and, for the corrupt-line test, an actually-invalid line) without
+    racing the dispatch handler's own async per-request writes to the same
+    file. ``entries`` items that are already ``str`` are written verbatim
+    (a deliberately corrupt line); dict items are JSON-encoded.
+    """
+
+    target = Path(jobs_root) / "access.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lines = [e if isinstance(e, str) else json.dumps(e) for e in entries]
+    target.write_text("\n".join(lines) + "\n")
+
+
+def test_access_log_route_returns_newest_first_capped_at_limit(tmp_path):
+    # AC1 + AC2 (valid int within range → used as-is).
+    _seed_access_log(tmp_path, [
+        {"ts": 1.0, "method": "GET", "path": "/a", "status": 200},
+        {"ts": 2.0, "method": "GET", "path": "/b", "status": 200},
+        {"ts": 3.0, "method": "GET", "path": "/c", "status": 404},
+    ])
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        status, payload = _call(server, "/access-log?limit=2")
+    assert status == 200
+    assert [e["path"] for e in payload["entries"]] == ["/c", "/b"]
+
+
+def test_access_log_route_limit_missing_defaults_to_100(tmp_path):
+    _seed_access_log(tmp_path, [
+        {"ts": float(i), "method": "GET", "path": f"/p{i}", "status": 200}
+        for i in range(150)
+    ])
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        status, payload = _call(server, "/access-log")
+    assert status == 200
+    assert len(payload["entries"]) == 100
+    assert payload["entries"][0]["path"] == "/p149"  # newest first
+
+
+def test_access_log_route_limit_below_min_is_clamped(tmp_path):
+    _seed_access_log(tmp_path, [
+        {"ts": 1.0, "method": "GET", "path": "/a", "status": 200},
+        {"ts": 2.0, "method": "GET", "path": "/b", "status": 200},
+    ])
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        status, payload = _call(server, "/access-log?limit=0")
+    assert status == 200
+    assert [e["path"] for e in payload["entries"]] == ["/b"]
+
+
+def test_access_log_route_limit_above_max_is_clamped(tmp_path):
+    _seed_access_log(tmp_path, [
+        {"ts": float(i), "method": "GET", "path": f"/p{i}", "status": 200}
+        for i in range(1005)
+    ])
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        status, payload = _call(server, "/access-log?limit=5000")
+    assert status == 200
+    assert len(payload["entries"]) == 1000
+
+
+def test_access_log_route_limit_non_numeric_falls_back_to_default(tmp_path):
+    _seed_access_log(tmp_path, [
+        {"ts": float(i), "method": "GET", "path": f"/p{i}", "status": 200}
+        for i in range(3)
+    ])
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        status, payload = _call(server, "/access-log?limit=abc")
+    assert status == 200
+    assert len(payload["entries"]) == 3  # falls back to the default (100)
+
+
+def test_access_log_route_missing_file_is_empty_entries(tmp_path):
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        status, payload = _call(server, "/access-log")
+    assert status == 200
+    assert payload == {"entries": []}
+
+
+def test_access_log_route_skips_a_corrupt_line(tmp_path):
+    _seed_access_log(tmp_path, [
+        {"ts": 1.0, "method": "GET", "path": "/a", "status": 200},
+        "not-json-at-all",
+        {"ts": 2.0, "method": "GET", "path": "/b", "status": 200},
+    ])
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        status, payload = _call(server, "/access-log")
+    assert status == 200
+    assert [e["path"] for e in payload["entries"]] == ["/b", "/a"]
+
+
+def test_access_log_route_requires_auth(tmp_path):
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        assert _call(server, "/access-log", token=None) == (
+            401, {"error": "unauthorized"})
+
+
+def test_access_log_route_entry_shape_is_exactly_four_fields(tmp_path):
+    # SECURITY (AC6): pinned against a synthetic entry appended through the
+    # REAL write path (AccessLog.append, same code #54 shipped) — proving
+    # the read route relays exactly what that path persists and never
+    # reintroduces an Authorization header or a request/response body.
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        server.dispatcher.access_log.append(
+            method="GET", request_path="/seed", status=200)
+        status, payload = _call(server, "/access-log")
+    assert status == 200
+    entry = next(e for e in payload["entries"] if e["path"] == "/seed")
+    assert set(entry.keys()) == {"ts", "method", "path", "status"}
