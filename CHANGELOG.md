@@ -246,6 +246,16 @@ sections below are reconstructed from the repository history.
   when set, so pre-existing custom runners keep working.
 
 ### Assessment
+- **Live EOL/support-status scan extended to Ruby and Go runtimes**
+  (`eolscan.py`): `.ruby-version` (pyenv/rbenv convention) and `go.mod`'s
+  `go` directive (e.g. `go 1.21.3`) are now parsed alongside the existing
+  Node.js/Python/.NET manifests and checked against endoflife.date the
+  same way — one request per distinct detected product, degrading to
+  `unknown`/model-knowledge on a malformed manifest or a failed query,
+  never guessed. No change to the scan orchestration, HTTP fetch, cycle-
+  matching, or verdict logic — just two new parser functions registered
+  in the existing `_PARSERS` table (issue #117, follow-on to the original
+  three-runtime scan above).
 - **Live EOL/support-status scanning via endoflife.date** (`eolscan.py`,
   mirroring `depscan.py`'s shape): Node.js/Python/.NET runtime versions
   parsed deterministically from `package.json` (`engines.node`),
