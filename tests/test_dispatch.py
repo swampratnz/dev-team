@@ -455,6 +455,23 @@ def test_run_job_does_not_record_transcripts_by_default():
     assert list_transcripts(dash, "assess-off", "architect") == []
 
 
+def test_run_job_journals_a_trace_log_always_on_without_record_transcripts():
+    from dev_team.tracelog import read_trace_log
+
+    job_ws = _clone_ws()
+    disp = Dispatcher(
+        token="x",
+        runner=_assess_runner(),
+        materialise=lambda spec, dest: job_ws,
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec.id = "assess-trace"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    spans = read_trace_log(job_ws)
+    assert spans, "assess job left no trace journal"
+    assert all(s["run"] == "assess-trace" for s in spans)
+
+
 def test_mirror_report_is_a_noop_without_a_dashboard_workspace():
     # No dashboard configured → returns immediately, touches nothing.
     Dispatcher(token="x")._mirror_report("job-x", object())

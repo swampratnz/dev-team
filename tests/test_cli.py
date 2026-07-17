@@ -2668,6 +2668,38 @@ def test_main_deliver_records_transcripts_under_the_events_run_id(tmp_path):
     assert list_transcripts(ws, run_id, "engineer")
 
 
+def test_main_deliver_journals_a_trace_log_always_on(tmp_path):
+    # No --record-transcripts passed: proves the trace log is always-on, not
+    # opt-in — unlike the transcript recorder above.
+    from helpers import engine_responses
+
+    from dev_team.eventlog import EVENTS_PATH
+    from dev_team.tracelog import TRACE_PATH
+
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    code = main(_deliver_args(tmp_path), runner=runner)
+    assert code == 0
+    events = [json.loads(line) for line in (tmp_path / EVENTS_PATH).read_text().splitlines()]
+    run_id = events[0]["run"]
+    spans = [json.loads(line) for line in (tmp_path / TRACE_PATH).read_text().splitlines()]
+    assert spans, "delivery left no trace journal"
+    assert all(s["run"] == run_id for s in spans)  # same run id as the events
+    assert {"engineer", "reviewer"} <= {s["name"] for s in spans if s["kind"] == "agent"}
+
+
+def test_main_assess_journals_a_trace_log_always_on(tmp_path):
+    from test_assessment import assess_responses
+
+    from dev_team.tracelog import TRACE_PATH
+
+    repo = _dotnet_repo(tmp_path)
+    runner = ScriptedRunner(by_system_prompt=assess_responses())
+    code = main(["--assess", "--workspace", str(repo)], runner=runner)
+    assert code == 0
+    spans = [json.loads(line) for line in (repo / TRACE_PATH).read_text().splitlines()]
+    assert spans, "assessment left no trace journal"
+
+
 def test_main_deliver_records_no_transcripts_by_default(tmp_path):
     from helpers import engine_responses
 
@@ -2736,6 +2768,30 @@ def test_sandbox_config_absent_and_defaults():
     sc = _sandbox_config(parser.parse_args(["--deliver", "--sandbox", "T", "D"]))
     assert sc is not None
     assert sc.network == "none"  # secure default preserved when not overridden
+
+
+def test_tracer_helper_returns_none_without_a_run_id():
+    # No event log means no run id to correlate against — the tracer helper
+    # mirrors _transcript_recorder's "nothing to tie it to" contract.
+    from dev_team.cli import _tracer
+
+    parser = build_parser()
+    args = parser.parse_args(["--deliver", "T", "D"])
+    assert _tracer(args, None) is None
+
+
+def test_tracer_helper_is_always_on_given_a_run_id():
+    # Unlike the transcript recorder, no flag gates this — a run id alone
+    # is enough to get a tracer wired to the workspace's trace log.
+    from dev_team.cli import _tracer
+    from dev_team.tracelog import TraceLog
+
+    parser = build_parser()
+    args = parser.parse_args(["--deliver", "T", "D", "--workspace", "."])
+    tracer = _tracer(args, "deliver-1")
+    assert tracer is not None
+    assert isinstance(tracer._sink, TraceLog)
+    assert tracer._sink.run == "deliver-1"
 
 
 def test_sandbox_wired_into_engine_config():
