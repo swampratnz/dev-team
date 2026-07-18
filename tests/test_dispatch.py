@@ -22,7 +22,7 @@ from dev_team import __version__
 from dev_team import dispatch as dispatch_mod
 from dev_team.accesslog import read_access_log
 from dev_team.approval import ApprovalRequest, PolicyApprovalGate
-from dev_team.backlog import BacklogStore
+from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.budget import Budget
 from dev_team.policy import EXIT_DENIED
 from dev_team.sdk import AgentResult
@@ -3986,3 +3986,380 @@ def test_access_log_route_entry_shape_is_exactly_four_fields(tmp_path):
     assert status == 200
     entry = next(e for e in payload["entries"] if e["path"] == "/seed")
     assert set(entry.keys()) == {"ts", "method", "path", "status"}
+
+
+# --- the backlog foreman (GET /foreman/plan + POST /foreman/run) --------------
+
+
+def _foreman_dash(*, stories=2, with_meta=True, description="do the work"):
+    """A dashboard workspace seeded with ready stories bred from assess-1."""
+
+    dash = InMemoryWorkspace()
+    store = BacklogStore(dash)
+    backlog = store.load()
+    epic = backlog.add_epic("Remediation — acme/mono")
+    for n in range(stories):
+        backlog.add_story(
+            f"Fix thing {n + 1}", description, epic_id=epic.id, source_job="assess-1"
+        )
+    store.save(backlog)
+    if with_meta:
+        dash.write_text("audit/assess-1/meta.json", json.dumps({"repo": "acme/mono"}))
+    return dash
+
+
+def _story(dash, story_id):
+    backlog = BacklogStore(dash).load()
+    return next(s for s in backlog.stories if s.id == story_id)
+
+
+def test_foreman_plan_needs_a_dashboard_workspace():
+    status, payload = Dispatcher(token="x").foreman_plan()
+    assert status == 409
+    assert "dashboard workspace" in payload["error"]
+
+
+def test_foreman_plan_lists_ready_stories_with_resolved_repo():
+    disp = Dispatcher(token="x", dashboard_workspace=_foreman_dash())
+    status, payload = disp.foreman_plan()
+    assert status == 200
+    assert payload["ready_total"] == 2
+    assert [e["story_id"] for e in payload["plan"]] == ["S1", "S2"]
+    assert all(e["repo"] == "acme/mono" for e in payload["plan"])
+    assert all(e["eligible"] and e["reason"] is None for e in payload["plan"])
+
+
+def test_foreman_plan_clamps_max_stories_forgivingly():
+    disp = Dispatcher(token="x", dashboard_workspace=_foreman_dash())
+    status, payload = disp.foreman_plan(max_stories=0)
+    assert (status, len(payload["plan"])) == (200, 1)  # floor 1
+    assert payload["ready_total"] == 2  # the full count is still reported
+    status, payload = disp.foreman_plan(max_stories=99)
+    assert (status, payload["max_stories"]) == (200, 10)  # ceiling
+
+
+def test_foreman_plan_flags_stories_it_cannot_route():
+    dash = _foreman_dash(with_meta=False)  # provenance points at no meta.json
+    store = BacklogStore(dash)
+    backlog = store.load()
+    backlog.add_story("   ", "blank title")  # S3
+    store.save(backlog)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.foreman_plan()
+    assert status == 200
+    by_id = {e["story_id"]: e for e in payload["plan"]}
+    assert by_id["S1"]["eligible"] is False
+    assert "no repository provenance" in by_id["S1"]["reason"]
+    assert by_id["S3"]["eligible"] is False
+    assert by_id["S3"]["reason"] == "story has no title"
+
+
+def test_foreman_plan_treats_corrupt_meta_as_unrouteable():
+    dash = _foreman_dash(stories=1, with_meta=False)
+    dash.write_text("audit/assess-1/meta.json", "{not json")  # unreadable meta
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.foreman_plan()
+    assert status == 200
+    assert payload["plan"][0]["eligible"] is False
+    assert "no repository provenance" in payload["plan"][0]["reason"]
+
+
+def test_foreman_run_needs_a_dashboard_workspace():
+    status, payload = Dispatcher(token="x").foreman_run({"budget_usd": 1})
+    assert status == 409
+
+
+def test_foreman_run_validates_strictly():
+    disp = Dispatcher(token="x", dashboard_workspace=_foreman_dash())
+    for body, fragment in (
+        ({}, "budget_usd is required"),
+        ({"budget_usd": 0}, "budget_usd is required"),
+        ({"budget_usd": True}, "budget_usd is required"),
+        ({"budget_usd": 1, "max_stories": "three"}, "must be an integer"),
+        ({"budget_usd": 1, "max_stories": True}, "must be an integer"),
+        ({"budget_usd": 1, "max_stories": 0}, "between 1 and 10"),
+        ({"budget_usd": 1, "max_stories": 11}, "between 1 and 10"),
+        ({"budget_usd": 1, "repo": "  "}, "repo must be a non-empty string"),
+        ({"budget_usd": 1, "repo": 7}, "repo must be a non-empty string"),
+        ({"budget_usd": 1, "repo": "%%%"}, "invalid repo"),
+    ):
+        status, payload = disp.foreman_run(body)
+        assert status == 400, body
+        assert fragment in payload["error"], body
+    # nothing was enqueued or mutated by any rejected request
+    assert disp.recent() == []
+
+
+def test_foreman_run_enqueues_ready_stories_with_provenance_both_ways():
+    dash = _foreman_dash()
+    disp = Dispatcher(token="x", dashboard_workspace=dash, clock=lambda: 42.0)
+    status, payload = disp.foreman_run({"budget_usd": 2.5})
+    assert status == 202
+    assert [j["story_id"] for j in payload["jobs"]] == ["S1", "S2"]
+    assert payload["skipped"] == []
+    assert payload["budget_usd_per_story"] == 2.5
+    for entry in payload["jobs"]:
+        record = disp.get(entry["job_id"])
+        assert record.state == "queued"
+        assert record.spec.mode == "deliver"
+        assert record.spec.repo == "acme/mono"
+        assert record.spec.budget_usd == 2.5
+        assert record.spec.story_id == entry["story_id"]
+        # summary carries the reverse edge only for foreman jobs
+        assert disp.summary(record)["story_id"] == entry["story_id"]
+        story = _story(dash, entry["story_id"])
+        assert story.status is ItemStatus.IN_PROGRESS
+        assert story.delivery_job == entry["job_id"]
+        assert story.updated_at == 42.0
+
+
+def test_foreman_run_uses_the_story_description_or_falls_back():
+    dash = _foreman_dash(stories=1, description="")
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    _, payload = disp.foreman_run({"budget_usd": 1})
+    spec = disp.get(payload["jobs"][0]["job_id"]).spec
+    assert spec.description == "Implement backlog story S1: Fix thing 1"
+
+
+def test_foreman_run_respects_max_stories():
+    dash = _foreman_dash()
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.foreman_run({"budget_usd": 1, "max_stories": 1})
+    assert status == 202
+    assert [j["story_id"] for j in payload["jobs"]] == ["S1"]
+    assert _story(dash, "S2").status is ItemStatus.TODO  # untouched
+
+
+def test_foreman_run_fallback_repo_covers_missing_provenance():
+    dash = _foreman_dash(stories=1, with_meta=False)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    # without a fallback the story is skipped, not guessed at
+    status, payload = disp.foreman_run({"budget_usd": 1})
+    assert (status, payload["jobs"]) == (200, [])
+    assert "no repository provenance" in payload["skipped"][0]["reason"]
+    assert _story(dash, "S1").status is ItemStatus.TODO
+    # with one it is enqueued against exactly that repo
+    status, payload = disp.foreman_run({"budget_usd": 1, "repo": "acme/other"})
+    assert status == 202
+    assert disp.get(payload["jobs"][0]["job_id"]).spec.repo == "acme/other"
+
+
+def test_foreman_run_skips_blank_title_stories():
+    dash = _foreman_dash(stories=1)
+    store = BacklogStore(dash)
+    backlog = store.load()
+    backlog.add_story("  ", "no title", source_job="assess-1")  # S2
+    store.save(backlog)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.foreman_run({"budget_usd": 1})
+    assert status == 202
+    assert [j["story_id"] for j in payload["jobs"]] == ["S1"]
+    assert {"story_id": "S2", "reason": "story has no title"} in payload["skipped"]
+
+
+def test_foreman_run_stops_at_a_full_queue():
+    dash = _foreman_dash()
+    disp = Dispatcher(token="x", dashboard_workspace=dash, queue_cap=1)
+    status, payload = disp.foreman_run({"budget_usd": 1})
+    assert status == 202
+    assert [j["story_id"] for j in payload["jobs"]] == ["S1"]
+    assert {"story_id": "S2", "reason": "queue full"} in payload["skipped"]
+    # the enqueued story's write-back still persisted
+    assert _story(dash, "S1").status is ItemStatus.IN_PROGRESS
+    assert _story(dash, "S2").status is ItemStatus.TODO
+
+
+def test_foreman_run_with_nothing_ready_is_a_200_noop():
+    dash = _foreman_dash(stories=1)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    first_status, _ = disp.foreman_run({"budget_usd": 1})
+    assert first_status == 202
+    # every ready story is now in_progress: a second run selects nothing, so
+    # a double-fired foreman can never enqueue the same story twice
+    status, payload = disp.foreman_run({"budget_usd": 1})
+    assert (status, payload["jobs"], payload["skipped"]) == (200, [], [])
+
+
+def _foreman_record(disp, story_id="S1", job_id="deliver-fx-1"):
+    spec = JobSpec(
+        mode="deliver", repo="a/b", title="t", description="d",
+        budget_usd=1.0, id=job_id, story_id=story_id,
+    )
+    record = JobRecord(spec=spec)
+    disp._registry[job_id] = record
+    disp._events[job_id] = threading.Event()
+    return record
+
+
+def test_foreman_write_back_marks_a_successful_delivery_done():
+    import types
+
+    # the full chain: foreman_run enqueues (in_progress + delivery_job set),
+    # then the worker's _execute finishes the story's lifecycle
+    dash = _foreman_dash(stories=1)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    _, payload = disp.foreman_run({"budget_usd": 1})
+    job_id = payload["jobs"][0]["job_id"]
+
+    async def deliver_ok(rec):
+        return types.SimpleNamespace(success=True), 1.25
+
+    disp.run_job = deliver_ok
+    asyncio.run(disp._execute(job_id))
+    assert disp.get(job_id).state == "succeeded"
+    story = _story(dash, "S1")
+    assert story.status is ItemStatus.DONE
+    assert story.delivery_job == job_id  # forward provenance survives the flip
+
+
+def test_foreman_write_back_blocks_an_unsuccessful_delivery():
+    import types
+
+    dash = _foreman_dash(stories=1)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    record = _foreman_record(disp)
+
+    async def deliver_incomplete(rec):
+        # the job ran, but the delivery banked nothing (tasks failed /
+        # commit blocked): the story's work did not happen
+        return types.SimpleNamespace(success=False), 0.5
+
+    disp.run_job = deliver_incomplete
+    asyncio.run(disp._execute(record.spec.id))
+    assert record.state == "succeeded"
+    assert _story(dash, "S1").status is ItemStatus.BLOCKED
+
+
+def test_foreman_write_back_blocks_a_failed_job():
+    dash = _foreman_dash(stories=1)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    record = _foreman_record(disp)
+
+    async def boom(rec):
+        raise RuntimeError("clone exploded")
+
+    disp.run_job = boom
+    asyncio.run(disp._execute(record.spec.id))
+    assert record.state == "failed"
+    assert _story(dash, "S1").status is ItemStatus.BLOCKED
+
+
+def test_foreman_write_back_blocks_a_timed_out_job():
+    dash = _foreman_dash(stories=1)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    record = _foreman_record(disp)
+    disp._fail_timed_out(record.spec.id)
+    assert record.state == "failed"
+    assert _story(dash, "S1").status is ItemStatus.BLOCKED
+
+
+def test_foreman_cancel_returns_the_story_to_todo():
+    dash = _foreman_dash(stories=1)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    _, payload = disp.foreman_run({"budget_usd": 1})
+    job_id = payload["jobs"][0]["job_id"]
+    assert _story(dash, "S1").status is ItemStatus.IN_PROGRESS
+    status, _ = disp.cancel_job(job_id)
+    assert status == 200
+    story = _story(dash, "S1")
+    assert story.status is ItemStatus.TODO
+    assert story.delivery_job is None  # the edge to a job that never ran is shed
+
+
+def test_foreman_write_back_noops_without_a_story_or_workspace():
+    import types
+
+    # story_id None (every ordinary job): nothing to write, no workspace needed
+    disp = Dispatcher(token="x")
+    record = _foreman_record(disp, story_id=None)
+
+    async def ok(rec):
+        return types.SimpleNamespace(success=True), 0.1
+
+    disp.run_job = ok
+    asyncio.run(disp._execute(record.spec.id))
+    assert record.state == "succeeded"
+    # story_id set but no dashboard workspace: same no-op, no crash
+    disp2 = Dispatcher(token="x")
+    record2 = _foreman_record(disp2, job_id="deliver-fx-2")
+    disp2.run_job = ok
+    asyncio.run(disp2._execute(record2.spec.id))
+    assert record2.state == "succeeded"
+
+
+def test_foreman_write_back_tolerates_a_story_deleted_mid_flight():
+    import types
+
+    dash = _foreman_dash(stories=1)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    record = _foreman_record(disp, story_id="S404")  # never existed
+
+    async def ok(rec):
+        return types.SimpleNamespace(success=True), 0.1
+
+    disp.run_job = ok
+    asyncio.run(disp._execute(record.spec.id))
+    assert record.state == "succeeded"  # no crash; the job's own state stands
+
+
+def test_foreman_write_back_swallows_a_save_failure(monkeypatch):
+    import types
+
+    dash = _foreman_dash(stories=1)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    record = _foreman_record(disp)
+
+    class _BrokenStore:
+        def __init__(self, workspace):
+            self._real = BacklogStore(workspace)
+
+        def load(self):
+            return self._real.load()
+
+        def save(self, backlog):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(dispatch_mod, "BacklogStore", _BrokenStore)
+
+    async def ok(rec):
+        return types.SimpleNamespace(success=True), 0.1
+
+    disp.run_job = ok
+    asyncio.run(disp._execute(record.spec.id))
+    # the write-back failure is swallowed: the job's terminal state is intact
+    # and the worker (here: the caller) was never taken down
+    assert record.state == "succeeded"
+
+
+def test_summary_omits_story_id_for_ordinary_jobs():
+    disp = Dispatcher(token="x")
+    spec = JobSpec(mode="assess", repo="a/b", title="t", description="",
+                   budget_usd=None, id="assess-1")
+    assert "story_id" not in disp.summary(JobRecord(spec=spec))
+
+
+def test_foreman_routes_over_http(tmp_path):
+    dash = _foreman_dash()
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=dash,
+        jobs_root=str(tmp_path),
+    ) as server:
+        assert _call(server, "/foreman/plan", token=None) == (
+            401, {"error": "unauthorized"})
+        status, payload = _call(server, "/foreman/plan?max_stories=1")
+        assert status == 200
+        assert len(payload["plan"]) == 1 and payload["ready_total"] == 2
+        status, payload = _call(
+            server, "/foreman/run", method="POST", body={"budget_usd": 1.5,
+                                                         "max_stories": 1},
+        )
+        assert status == 202
+        assert [j["story_id"] for j in payload["jobs"]] == ["S1"]
+        status, payload = _call(server, "/foreman/run", method="POST", body={})
+        assert status == 400
+        assert "budget_usd is required" in payload["error"]
+        # a malformed body is _read_body's own 400, never a 500 or an enqueue
+        status, payload = _call(
+            server, "/foreman/run", method="POST", body=b"{not json"
+        )
+        assert status == 400

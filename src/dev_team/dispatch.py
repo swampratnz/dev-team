@@ -90,6 +90,12 @@ from .interaction import QueueChannel, Question, Reply
 from .models import FeatureRequest
 from .report import delivery_to_dict
 from .sdk import AgentRunner
+from .foreman import (
+    DEFAULT_MAX_STORIES,
+    MAX_STORIES_CEILING,
+    ready_for_delivery,
+    story_job_description,
+)
 from .sources import (
     SourceError,
     clone_or_update,
@@ -216,6 +222,11 @@ class JobSpec:
     # plurality of (see dev_team.assessment.verify_finding); validated at
     # submit time against MAX_VERIFY_VOTES (see _verify_spec).
     votes: int = 1
+    # Set only on a foreman-enqueued deliver job: the backlog story this job
+    # implements (see dev_team.foreman). The worker writes the story's status
+    # back on the job's terminal transition; None (every other job) means no
+    # write-back ever happens.
+    story_id: Optional[str] = None
 
 
 @dataclass
@@ -482,6 +493,9 @@ class Dispatcher:
             )
             record.cost_usd = _failed_cost(record)
             record.ended = self._clock()
+        # wait_for cancelled _execute, so its own write-back never ran: a
+        # timed-out foreman job blocks its story exactly like a failed one.
+        self._write_back_story(record.spec.story_id, ItemStatus.BLOCKED)
         self._events[job_id].set()
 
     # -- submit / query ------------------------------------------------------
@@ -720,12 +734,24 @@ class Dispatcher:
                 record.error = str(exc)
                 record.cost_usd = _failed_cost(record)
                 record.ended = self._clock()
+            # One attempt per story: a failed foreman job blocks its story for
+            # a human rather than retrying (the needs-human posture).
+            self._write_back_story(record.spec.story_id, ItemStatus.BLOCKED)
         else:
             with self._lock:
                 record.outcome = outcome
                 record.cost_usd = cost
                 record.state = "succeeded"
                 record.ended = self._clock()
+            # A job that ran but delivered nothing (tasks failed, commit
+            # blocked) did not do the story's work — block it for a human too;
+            # only a genuinely successful delivery marks the story done.
+            self._write_back_story(
+                record.spec.story_id,
+                ItemStatus.DONE
+                if bool(getattr(outcome, "success", False))
+                else ItemStatus.BLOCKED,
+            )
         self._events[job_id].set()
 
     async def run_job(self, record: JobRecord) -> Tuple[Any, float]:
@@ -998,6 +1024,9 @@ class Dispatcher:
                 return 409, {"error": "job is not queued", "state": record.state}
             record.state = "cancelled"
             record.ended = self._clock()
+        # A cancelled foreman job never ran: the story goes back to TODO (and
+        # sheds its delivery_job edge) so a later run can pick it up again.
+        self._write_back_story(record.spec.story_id, ItemStatus.TODO)
         self._events[job_id].set()
         return 200, {"id": job_id, "state": "cancelled"}
 
@@ -1381,6 +1410,196 @@ class Dispatcher:
         entries = list(reversed(read_access_log(self._jobs_root, limit=limit)))
         return 200, {"entries": entries}
 
+    # -- the backlog foreman (ROADMAP #9, deterministic) -----------------------
+    # Selection is pure code (dev_team.foreman.ready_for_delivery); these cores
+    # own the stateful parts — provenance, submitting, and status write-back —
+    # under the same backlog lock every other backlog write uses.
+
+    def _story_repo(self, story: Story) -> Optional[str]:
+        """The repository ``story``'s provenance names, or ``None``.
+
+        Follows the existing chain: a story bred from an assessment carries
+        ``source_job``, and ``audit/<source_job>/meta.json`` records the repo
+        that job audited (the same lookup ``_verify_spec`` and
+        :meth:`make_backlog` already trust). Corrupt or missing state answers
+        ``None`` — the caller skips the story rather than guessing a repo.
+        """
+
+        if story.source_job is None or self._dashboard_workspace is None:
+            return None
+        meta_path = f"audit/{story.source_job}/meta.json"
+        if not self._exists(meta_path):
+            return None
+        try:
+            meta = json.loads(self._dashboard_workspace.read_text(meta_path))
+        except (OSError, ValueError, WorkspaceError):
+            return None
+        repo = meta.get("repo")
+        return repo if isinstance(repo, str) and repo.strip() else None
+
+    def foreman_plan(self, *, max_stories: int = DEFAULT_MAX_STORIES) -> Tuple[int, Dict[str, Any]]:
+        """The ``GET /foreman/plan`` core: a $0 dry-run of ``/foreman/run``.
+
+        Read-only — which dependency-ready stories would be enqueued, with the
+        repo each resolves to (or why it is ineligible). ``max_stories`` is
+        clamped (forgiving, like every GET paging knob) rather than rejected;
+        the spend-bearing POST validates strictly instead.
+        """
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "the foreman needs a dashboard workspace"}
+        limit = max(1, min(MAX_STORIES_CEILING, max_stories))
+        with self._backlog_lock:
+            backlog = BacklogStore(self._dashboard_workspace).load()
+        ready = ready_for_delivery(backlog)
+        plan = []
+        for story in ready[:limit]:
+            repo = self._story_repo(story)
+            eligible = repo is not None and bool(story.title.strip())
+            reason = None
+            if not story.title.strip():
+                reason = "story has no title"
+            elif repo is None:
+                reason = "no repository provenance (pass repo to /foreman/run)"
+            plan.append(
+                {
+                    "story_id": story.id,
+                    "title": story.title,
+                    "estimate": story.estimate,
+                    "repo": repo,
+                    "eligible": eligible,
+                    "reason": reason,
+                }
+            )
+        return 200, {
+            "ready_total": len(ready),
+            "max_stories": limit,
+            "plan": plan,
+        }
+
+    def foreman_run(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /foreman/run`` core: enqueue ready stories as deliver jobs.
+
+        Validation is strict (400, never a silent clamp) because this knob
+        multiplies spend: ``budget_usd`` is **required** and positive — it is
+        the per-story ceiling, so autonomous spend is bounded by
+        ``max_stories × budget_usd`` — and ``max_stories`` must sit in
+        ``[1, MAX_STORIES_CEILING]``. ``repo`` optionally supplies a fallback
+        for stories without provenance (validated like every submitted repo).
+
+        The whole select → submit → mark pass runs under the backlog lock, so
+        two concurrent runs can never enqueue the same story twice; each
+        enqueued story flips to ``in_progress`` with ``delivery_job`` set, and
+        the worker's terminal write-back (:meth:`_write_back_story`) finishes
+        the story's lifecycle. Jobs land on the existing single-flight queue —
+        the foreman adds no new executor, only work for the current one.
+        """
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "the foreman needs a dashboard workspace"}
+        budget = body.get("budget_usd")
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+            return 400, {
+                "error": "budget_usd is required and must be greater than 0 "
+                "(the per-story ceiling)"
+            }
+        max_stories = body.get("max_stories", DEFAULT_MAX_STORIES)
+        if isinstance(max_stories, bool) or not isinstance(max_stories, int):
+            return 400, {"error": "max_stories must be an integer"}
+        if not 1 <= max_stories <= MAX_STORIES_CEILING:
+            return 400, {
+                "error": f"max_stories must be between 1 and {MAX_STORIES_CEILING}"
+            }
+        fallback_repo = body.get("repo")
+        if fallback_repo is not None:
+            if not isinstance(fallback_repo, str) or not fallback_repo.strip():
+                return 400, {"error": "repo must be a non-empty string"}
+            try:
+                parse_repo(fallback_repo)
+            except (SourceError, ValueError) as exc:
+                return 400, {"error": f"invalid repo: {exc}"}
+        store = BacklogStore(self._dashboard_workspace)
+        enqueued: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        with self._backlog_lock:
+            backlog = store.load()
+            for story in ready_for_delivery(backlog):
+                if len(enqueued) >= max_stories:
+                    break
+                if not story.title.strip():
+                    skipped.append({"story_id": story.id, "reason": "story has no title"})
+                    continue
+                repo = self._story_repo(story) or fallback_repo
+                if repo is None:
+                    skipped.append(
+                        {
+                            "story_id": story.id,
+                            "reason": "no repository provenance (pass repo)",
+                        }
+                    )
+                    continue
+                spec = JobSpec(
+                    mode="deliver",
+                    repo=repo,
+                    title=story.title,
+                    description=story_job_description(story),
+                    budget_usd=float(budget),
+                    story_id=story.id,
+                )
+                try:
+                    job_id, position = self.submit(spec)
+                except QueueFull:
+                    skipped.append({"story_id": story.id, "reason": "queue full"})
+                    break
+                story.status = ItemStatus.IN_PROGRESS
+                story.delivery_job = job_id
+                story.updated_at = self._clock()
+                enqueued.append(
+                    {
+                        "job_id": job_id,
+                        "story_id": story.id,
+                        "title": story.title,
+                        "position": position,
+                    }
+                )
+            if enqueued:
+                store.save(backlog)
+        return 202 if enqueued else 200, {
+            "jobs": enqueued,
+            "skipped": skipped,
+            "budget_usd_per_story": float(budget),
+        }
+
+    def _write_back_story(self, story_id: Optional[str], status: ItemStatus) -> None:
+        """Best-effort status write-back for a foreman-tagged job's story.
+
+        No-op for untagged jobs (``story_id`` is ``None``) and without a
+        dashboard workspace; tolerates a story deleted mid-flight; and
+        swallows write failures — the job's own terminal state is already
+        recorded in the registry, and a backlog write failure must never take
+        the single-flight worker down with it (the ``TraceLog`` posture).
+        A revert to ``TODO`` (a cancelled job that never ran) also clears
+        ``delivery_job``, so the story carries no edge to a job that did
+        nothing.
+        """
+
+        if story_id is None or self._dashboard_workspace is None:
+            return
+        store = BacklogStore(self._dashboard_workspace)
+        try:
+            with self._backlog_lock:
+                backlog = store.load()
+                story = next((s for s in backlog.stories if s.id == story_id), None)
+                if story is None:
+                    return
+                story.status = status
+                if status is ItemStatus.TODO:
+                    story.delivery_job = None
+                story.updated_at = self._clock()
+                store.save(backlog)
+        except (OSError, ValueError, WorkspaceError):
+            return
+
     def _merge_backlog(
         self,
         data: Dict[str, Any],
@@ -1659,7 +1878,7 @@ class Dispatcher:
     def summary(self, record: JobRecord) -> Dict[str, Any]:
         """One entry in the ``GET /jobs`` list."""
 
-        return {
+        entry = {
             "id": record.spec.id,
             "mode": record.spec.mode,
             "repo": record.spec.repo,
@@ -1667,6 +1886,12 @@ class Dispatcher:
             "started": record.started,
             "ended": record.ended,
         }
+        if record.spec.story_id is not None:
+            # Foreman provenance (story -> job is delivery_job on the story;
+            # this is the reverse edge). Only-when-set keeps the historical
+            # payload shape for every non-foreman job.
+            entry["story_id"] = record.spec.story_id
+        return entry
 
     def result(self, record: JobRecord) -> Tuple[int, Dict[str, Any]]:
         """The ``GET /jobs/{id}/result`` ``(status_code, payload)``."""
@@ -1886,6 +2111,16 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 status, payload = dispatcher.access_log_entries(limit=limit)
                 self._json(status, payload)
                 return
+            if path == "/foreman/plan":
+                # $0 dry-run of POST /foreman/run. ?max_stories= gets the same
+                # forgiving clamp every GET paging knob has; the spend-bearing
+                # POST validates strictly instead.
+                max_stories = self._int_param(
+                    parse_qs(split.query), "max_stories", DEFAULT_MAX_STORIES
+                )
+                status, payload = dispatcher.foreman_plan(max_stories=max_stories)
+                self._json(status, payload)
+                return
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "jobs":
                 self._job(parts[1])
@@ -1915,6 +2150,16 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             if path == "/jobs":
                 self._create()
+                return
+            if path == "/foreman/run":
+                # Synchronous like the other cores: selection + enqueueing is
+                # a locked disk/registry transform; the jobs themselves run on
+                # the single-flight queue afterwards.
+                body = self._read_body()
+                if body is None:
+                    return
+                status, payload = dispatcher.foreman_run(body)
+                self._json(status, payload)
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "backlog":

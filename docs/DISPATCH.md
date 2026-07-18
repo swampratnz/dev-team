@@ -576,6 +576,84 @@ needs **no** dashboard-workspace guard — it works standalone off the
 registry, and archived-exclusion simply no-ops (never excludes anything)
 until `--dashboard-workspace` is configured.
 
+## The backlog foreman
+
+The second half of ROADMAP #9 (top-level orchestration): an assessment run
+with `--backlog` breeds a dependency-ordered remediation backlog, but nothing
+decided *what to work on next* — a human curled one deliver job at a time.
+The foreman turns ready stories into deliver jobs, **deterministically** — no
+model picks work, no new executor exists. Selection is pure code
+(`dev_team.foreman.ready_for_delivery`): `todo` stories whose every
+`depends_on` edge is `done` or `declined`, in backlog order. Each selected
+story becomes one bounded deliver job on the existing single-flight queue,
+tagged with the story id, and its lifecycle writes back to the story under
+the same backlog write lock every other backlog mutation uses:
+
+| Job event | Story becomes |
+|-----------|---------------|
+| enqueued by `/foreman/run` | `in_progress`, `delivery_job` set to the job id |
+| job succeeded **and** the delivery reports `success` | `done` |
+| job succeeded but delivered nothing (tasks failed / commit blocked) | `blocked` |
+| job failed or timed out | `blocked` |
+| job cancelled while still queued | back to `todo`, `delivery_job` cleared |
+
+One story gets exactly **one** autonomous attempt: `blocked` stories are
+never re-selected — they wait for a human, the `needs-human` posture. The
+write-back is best-effort (a backlog write failure never takes the worker
+down; the job's own state is already recorded) and tolerates a story deleted
+mid-flight. `delivery_job` is the forward mirror of `source_job`, so a story
+traces to the job that set its status and a `GET /jobs` entry carries
+`story_id` back the other way.
+
+The repository each story runs against comes from its provenance chain —
+`story.source_job` → `audit/<source_job>/meta.json` → `repo`, the same lookup
+`verify` submits trust — and a story without resolvable provenance is
+*skipped with a reason*, never guessed at (a `repo` in the run body supplies
+an explicit fallback).
+
+### `GET /foreman/plan` (auth) — the $0 dry-run
+
+What `/foreman/run` would enqueue right now: each ready story with the repo
+it resolves to, or why it is ineligible. `?max_stories=` is clamped
+forgivingly (`[1, 10]`, default 3) like every GET paging knob. Needs the
+dashboard workspace (`409` without one); never spends, never mutates.
+
+```json
+{"ready_total":2,"max_stories":3,"plan":[
+  {"story_id":"S1","title":"Remove hardcoded secret","estimate":1,
+   "repo":"acme/rota","eligible":true,"reason":null}]}
+```
+
+### `POST /foreman/run` (auth) — enqueue ready stories
+
+```bash
+curl -sX POST "$URL/foreman/run" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"budget_usd": 5, "max_stories": 2}'
+```
+
+Validation is **strict** (400, never a silent clamp) because this knob
+multiplies spend: `budget_usd` is required and positive — it is the
+**per-story** ceiling, so one run's autonomous spend is bounded by
+`max_stories × budget_usd` — and `max_stories` must sit in `[1, 10]`
+(default 3, echoing the development pipeline's own WIP cap). An optional
+`repo` supplies the fallback for provenance-less stories (validated like any
+submitted repo). The whole select → submit → mark pass runs under the
+backlog lock, so two concurrent runs can never enqueue the same story twice;
+a full queue stops the batch with the remainder skipped as `queue full`.
+Answers `202` with the enqueued jobs (or `200` when nothing was ready):
+
+```json
+{"jobs":[{"job_id":"deliver-20260718-090000-3","story_id":"S1",
+  "title":"Remove hardcoded secret","position":0}],
+ "skipped":[{"story_id":"S2","reason":"no repository provenance (pass repo)"}],
+ "budget_usd_per_story":5.0}
+```
+
+The jobs themselves are ordinary deliver jobs: same clone, same engines, same
+`PolicyApprovalGate` (no autonomous push/deploy), same status/result routes —
+the foreman adds work to the queue, never a new way of executing it.
+
 ## Access log
 
 Every HTTP request the service receives — `GET /health`, an authorised

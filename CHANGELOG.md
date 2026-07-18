@@ -6,6 +6,24 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Orchestration
+- **A backlog foreman turns ready stories into deliver jobs** (ROADMAP #9's
+  second half, completing the item; see `docs/DISPATCH.md`). `GET
+  /foreman/plan` is a $0 dry-run; `POST /foreman/run` enqueues
+  dependency-ready `todo` stories (selection is pure code —
+  `dev_team.foreman.ready_for_delivery`, backlog order, no model) as bounded
+  deliver jobs on the existing single-flight queue. Spend is hard-bounded by
+  a **required per-story** `budget_usd` × `max_stories` (`[1, 10]`, default
+  3); repos resolve through the existing `source_job` → `meta.json`
+  provenance chain (a provenance-less story is skipped with a reason, never
+  guessed at, unless the body passes an explicit `repo` fallback). Stories
+  carry forward provenance (`delivery_job`, serialised only when set) and
+  jobs the reverse (`JobSpec.story_id`, surfaced in `GET /jobs`); the
+  worker's terminal transition writes the story back under the shared
+  backlog lock — `done` only for a genuinely successful delivery, `blocked`
+  on failure/timeout/delivered-nothing (one autonomous attempt per story,
+  the needs-human posture), back to `todo` when a still-queued job is
+  cancelled. Write-backs are best-effort: a backlog write failure never
+  takes the single-flight worker down.
 - **A front door that routes raw requests** (`--intake "TEXT"`, ROADMAP #9's
   intake half): one bounded `TriageAgent` call picks a mode from the closed
   `TRIAGE_ROUTES` set (`deliver`/`assess`/`chat`, fail-safe `unclear`) and,
