@@ -636,11 +636,14 @@ Validation is **strict** (400, never a silent clamp) because this knob
 multiplies spend: `budget_usd` is required and positive — it is the
 **per-story** ceiling, so one run's autonomous spend is bounded by
 `max_stories × budget_usd` — and `max_stories` must sit in `[1, 10]`
-(default 3, echoing the development pipeline's own WIP cap). An optional
+(default 3, echoing the development pipeline's own WIP cap). `Infinity`/`NaN`
+— which `json.loads` accepts as numbers — are rejected like any other
+non-positive budget, so the ceiling is always a real number. An optional
 `repo` supplies the fallback for provenance-less stories (validated like any
 submitted repo). The whole select → submit → mark pass runs under the
 backlog lock, so two concurrent runs can never enqueue the same story twice;
-a full queue stops the batch with the remainder skipped as `queue full`.
+a full queue stops the batch and every story of the batch that never got its
+submit is reported in `skipped` as `queue full`, never silently omitted.
 Answers `202` with the enqueued jobs (or `200` when nothing was ready):
 
 ```json
@@ -653,6 +656,17 @@ Answers `202` with the enqueued jobs (or `200` when nothing was ready):
 The jobs themselves are ordinary deliver jobs: same clone, same engines, same
 `PolicyApprovalGate` (no autonomous push/deploy), same status/result routes —
 the foreman adds work to the queue, never a new way of executing it.
+
+**The autonomy boundary** (CLAUDE.md §1): story titles/descriptions can trace
+back to LLM-generated assessment findings, and the foreman submits them as
+deliver jobs without a per-story human review. The human decision point moves
+from per-story to **per-batch**, and it stays a human decision: the foreman
+has no schedule and never fires itself — every batch exists because an
+authenticated operator explicitly `POST`ed `/foreman/run` with an explicit
+per-story budget. Inside a batch the guardrails above hold (no push/deploy
+approval, one attempt per story, `blocked` waits for a human), and nothing
+the jobs produce merges without a human. Do not wire this route to a
+schedule without revisiting that boundary.
 
 ## Access log
 

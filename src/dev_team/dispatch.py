@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import math
 import queue
 import shutil
 import threading
@@ -514,8 +515,11 @@ class Dispatcher:
         if budget is not None:
             if isinstance(budget, bool) or not isinstance(budget, (int, float)):
                 raise ValidationError("budget_usd must be a number or null")
-            if budget <= 0:
-                raise ValidationError("budget_usd must be greater than 0")
+            # json.loads accepts the Infinity/NaN tokens, and both slip past a
+            # plain <= 0 check (NaN compares False to everything) — either one
+            # would make the "ceiling" unbounded, so require a finite number.
+            if not math.isfinite(budget) or budget <= 0:
+                raise ValidationError("budget_usd must be a finite number greater than 0")
         if mode == "verify":
             return self._verify_spec(body, budget)
         repo = body.get("repo")
@@ -1498,10 +1502,18 @@ class Dispatcher:
         if self._dashboard_workspace is None:
             return 409, {"error": "the foreman needs a dashboard workspace"}
         budget = body.get("budget_usd")
-        if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            # Infinity/NaN parse as valid JSON numbers and slip past <= 0
+            # (NaN compares False to everything); either would unbound the
+            # very ceiling this endpoint's safety rests on.
+            or not math.isfinite(budget)
+            or budget <= 0
+        ):
             return 400, {
-                "error": "budget_usd is required and must be greater than 0 "
-                "(the per-story ceiling)"
+                "error": "budget_usd is required and must be a finite number "
+                "greater than 0 (the per-story ceiling)"
             }
         max_stories = body.get("max_stories", DEFAULT_MAX_STORIES)
         if isinstance(max_stories, bool) or not isinstance(max_stories, int):
@@ -1523,8 +1535,14 @@ class Dispatcher:
         skipped: List[Dict[str, Any]] = []
         with self._backlog_lock:
             backlog = store.load()
+            # ``attempts`` counts stories that reached the submit stage
+            # (enqueued or stopped by a full queue) — the batch max_stories
+            # promises. Once the queue fills, the rest of the batch is still
+            # *reported* (skipped: queue full), never silently omitted.
+            attempts = 0
+            queue_full = False
             for story in ready_for_delivery(backlog):
-                if len(enqueued) >= max_stories:
+                if attempts >= max_stories:
                     break
                 if not story.title.strip():
                     skipped.append({"story_id": story.id, "reason": "story has no title"})
@@ -1538,6 +1556,10 @@ class Dispatcher:
                         }
                     )
                     continue
+                attempts += 1
+                if queue_full:
+                    skipped.append({"story_id": story.id, "reason": "queue full"})
+                    continue
                 spec = JobSpec(
                     mode="deliver",
                     repo=repo,
@@ -1549,8 +1571,9 @@ class Dispatcher:
                 try:
                     job_id, position = self.submit(spec)
                 except QueueFull:
+                    queue_full = True
                     skipped.append({"story_id": story.id, "reason": "queue full"})
-                    break
+                    continue
                 story.status = ItemStatus.IN_PROGRESS
                 story.delivery_job = job_id
                 story.updated_at = self._clock()

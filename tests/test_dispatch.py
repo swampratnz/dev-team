@@ -128,7 +128,10 @@ def test_build_spec_validates_budget():
     assert disp.build_spec(
         {"mode": "assess", "repo": "a/b", "budget_usd": None}
     ).budget_usd is None
-    for bad in (True, "5", 0, -1):
+    # Infinity/NaN are valid JSON numbers to json.loads and slip past a plain
+    # <= 0 check; either would make the ceiling unbounded, so they are
+    # rejected alongside the ordinary bad shapes.
+    for bad in (True, "5", 0, -1, float("inf"), float("nan")):
         with pytest.raises(ValidationError):
             disp.build_spec({"mode": "assess", "repo": "a/b", "budget_usd": bad})
 
@@ -4075,6 +4078,11 @@ def test_foreman_run_validates_strictly():
         ({}, "budget_usd is required"),
         ({"budget_usd": 0}, "budget_usd is required"),
         ({"budget_usd": True}, "budget_usd is required"),
+        # json.loads accepts Infinity/NaN tokens; both slip past a plain <= 0
+        # check and would unbound the per-story ceiling — the endpoint's core
+        # safety property — so they must be rejected like any bad budget.
+        ({"budget_usd": float("inf")}, "budget_usd is required"),
+        ({"budget_usd": float("nan")}, "budget_usd is required"),
         ({"budget_usd": 1, "max_stories": "three"}, "must be an integer"),
         ({"budget_usd": 1, "max_stories": True}, "must be an integer"),
         ({"budget_usd": 1, "max_stories": 0}, "between 1 and 10"),
@@ -4157,16 +4165,22 @@ def test_foreman_run_skips_blank_title_stories():
     assert {"story_id": "S2", "reason": "story has no title"} in payload["skipped"]
 
 
-def test_foreman_run_stops_at_a_full_queue():
-    dash = _foreman_dash()
+def test_foreman_run_stops_at_a_full_queue_and_reports_the_whole_remainder():
+    dash = _foreman_dash(stories=3)
     disp = Dispatcher(token="x", dashboard_workspace=dash, queue_cap=1)
     status, payload = disp.foreman_run({"budget_usd": 1})
     assert status == 202
     assert [j["story_id"] for j in payload["jobs"]] == ["S1"]
-    assert {"story_id": "S2", "reason": "queue full"} in payload["skipped"]
-    # the enqueued story's write-back still persisted
+    # S2 hit the full queue; S3 never got a submit attempt — BOTH are
+    # reported, so the batch's accounting is complete, never silently short
+    assert payload["skipped"] == [
+        {"story_id": "S2", "reason": "queue full"},
+        {"story_id": "S3", "reason": "queue full"},
+    ]
+    # the enqueued story's write-back still persisted; the rest untouched
     assert _story(dash, "S1").status is ItemStatus.IN_PROGRESS
     assert _story(dash, "S2").status is ItemStatus.TODO
+    assert _story(dash, "S3").status is ItemStatus.TODO
 
 
 def test_foreman_run_with_nothing_ready_is_a_200_noop():
