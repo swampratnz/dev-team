@@ -59,10 +59,14 @@ def ready_for_delivery(backlog: Backlog) -> List[Story]:
 
 
 def story_job_description(story: Story) -> str:
-    """The deliver job's description for ``story`` (never empty).
+    """The deliver job's description for ``story`` (never blank).
 
-    A deliver job requires a non-empty description; a hand-written card may
-    carry none, so fall back to a deterministic one naming the story.
+    A deliver job requires a non-blank description — the manual ``/jobs``
+    submit path enforces ``description.strip()`` — and a hand-written card may
+    carry none (or only whitespace, which is truthy and would slip past a
+    plain ``or``), so fall back to a deterministic one naming the story.
     """
 
-    return story.description or f"Implement backlog story {story.id}: {story.title}"
+    if story.description.strip():
+        return story.description
+    return f"Implement backlog story {story.id}: {story.title}"

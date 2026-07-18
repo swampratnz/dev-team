@@ -78,3 +78,10 @@ def test_story_job_description_prefers_the_story_description():
 def test_story_job_description_falls_back_deterministically():
     story = Story(id="S7", title="Fix auth")
     assert story_job_description(story) == "Implement backlog story S7: Fix auth"
+
+
+def test_story_job_description_treats_whitespace_as_missing():
+    # "   " is truthy, so a plain `or` fallback would hand the deliver job a
+    # description the manual /jobs submit path (description.strip()) rejects
+    story = Story(id="S7", title="Fix auth", description="   ")
+    assert story_job_description(story) == "Implement backlog story S7: Fix auth"
