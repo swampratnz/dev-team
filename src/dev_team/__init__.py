@@ -82,6 +82,12 @@ from .errors import (
 from .evals import EvalCase, EvalReport, EvalResult, evaluate
 from .events import AgentEvent
 from .failures import new_failures, parse_failed_tests
+from .foreman import (
+    DEFAULT_MAX_STORIES,
+    MAX_STORIES_CEILING,
+    ready_for_delivery,
+    story_job_description,
+)
 from .execution import (
     CommandResult,
     CommandRunner,
@@ -240,6 +246,11 @@ __all__ = [
     "triage_decision_from_dict",
     "decision_to_dict",
     "equivalent_command",
+    # backlog foreman (ROADMAP #9)
+    "DEFAULT_MAX_STORIES",
+    "MAX_STORIES_CEILING",
+    "ready_for_delivery",
+    "story_job_description",
     "DevelopmentWorkflow",
     "DeliveryEngine",
     "DeliveryOutcome",

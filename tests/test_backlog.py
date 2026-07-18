@@ -99,6 +99,21 @@ def test_story_provenance_fields_roundtrip():
     assert restored.stories[1].finding_id is None
 
 
+def test_story_delivery_job_roundtrips_and_is_omitted_when_unset():
+    bl = Backlog()
+    bl.add_story("Foreman-tracked")
+    bl.add_story("Untouched")
+    bl.stories[0].delivery_job = "deliver-20260718-1"
+    data = bl.to_dict()
+    tracked, plain = data["stories"]
+    assert tracked["delivery_job"] == "deliver-20260718-1"
+    # unset forward provenance is omitted — the pre-foreman on-disk shape
+    assert "delivery_job" not in plain
+    restored = Backlog.from_dict(data)
+    assert restored.stories[0].delivery_job == "deliver-20260718-1"
+    assert restored.stories[1].delivery_job is None
+
+
 def test_declined_status_roundtrips():
     bl = Backlog()
     bl.add_story("Won't do")

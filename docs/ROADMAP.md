@@ -322,4 +322,20 @@ distilled brief, and the exact equivalent `dev-team` command — and is only
 confirmation (`triage-review` question; fail-safe: abort), because the mode
 choice decides spend and repo mutation. An applied route falls through into
 the ordinary `--deliver`/`--assess`/`--chat` flow on the same budget, so the
-triage call's spend counts against the run's ceiling. The foreman is next.
+triage call's spend counts against the run's ceiling.
+
+**Shipped (foreman half):** `GET /foreman/plan` ($0 dry-run) and
+`POST /foreman/run` on the dispatch service (see `docs/DISPATCH.md`).
+Selection is pure code (`dev_team.foreman.ready_for_delivery`): `todo`
+stories whose dependencies are all `done`/`declined`, in backlog order. Each
+selected story becomes one bounded deliver job on the existing single-flight
+queue — `budget_usd` (required, per-story) × `max_stories` (`[1, 10]`,
+default 3) hard-bounds a run's autonomous spend — with story↔job provenance
+both ways (`Story.delivery_job` / `JobSpec.story_id`) and lifecycle
+write-back under the shared backlog lock (`in_progress` on enqueue; `done`
+only on a genuinely successful delivery; `blocked` on failure/timeout/
+delivered-nothing; back to `todo` on a queued-job cancel). One story gets
+exactly one autonomous attempt — `blocked` waits for a human. With both
+halves shipped, item 9 is complete: intake routes raw requests in, the
+foreman drains the backlog, and the engines' code-owned determinism is
+untouched.

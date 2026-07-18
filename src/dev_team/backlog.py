@@ -51,6 +51,11 @@ class Story:
     (validated by :func:`validate_dependencies`); ``updated_at`` is the epoch
     timestamp of the last mutation through the dispatch backlog API. Both
     serialise only when set, so older backlog files keep their shape.
+
+    ``delivery_job`` is forward provenance, the mirror of ``source_job``: the
+    dispatch deliver job the foreman enqueued for this story (see
+    :mod:`dev_team.foreman`), so a story's status can be traced to the job
+    that set it — and back. Serialises only when set, same rule as above.
     """
 
     id: str
@@ -63,6 +68,7 @@ class Story:
     finding_id: Optional[str] = None
     depends_on: List[str] = field(default_factory=list)
     updated_at: Optional[float] = None
+    delivery_job: Optional[str] = None
 
 
 @dataclass
@@ -238,7 +244,7 @@ def _story_to_dict(story: Story) -> Dict[str, Any]:
     data["status"] = story.status.value
     # The provenance fields are serialised only when set, so backlogs written
     # before (or without) finding provenance keep their exact on-disk shape.
-    for key in ("source_job", "finding_id"):
+    for key in ("source_job", "finding_id", "delivery_job"):
         if data[key] is None:
             del data[key]
     # Same rule for the board fields: an empty dependency list and an unset
