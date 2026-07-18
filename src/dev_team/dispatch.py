@@ -169,6 +169,28 @@ _AUDIT_FILES = ("assessment.md", "assessment.json", "meta.json", "verifications.
 _SHUTDOWN = object()
 
 
+def _valid_budget(value: Any) -> bool:
+    """Whether ``value`` is a usable budget ceiling: a real, positive number.
+
+    ``bool`` is excluded first (a subtype of ``int``); ``Infinity``/``NaN``
+    (which ``json.loads`` accepts as numbers) fail ``math.isfinite``; and an
+    integer too large to convert to a C double — where ``math.isfinite``
+    itself raises ``OverflowError`` rather than answering — is rejected the
+    same way, so a 400-digit "budget" gets a clean 400, never a crashed
+    handler. A ceiling that cannot even be represented as a float is not a
+    ceiling.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        if not math.isfinite(value):
+            return False
+    except OverflowError:
+        return False
+    return value > 0
+
+
 class ValidationError(Exception):
     """A bad SUBMIT body — surfaced to the client as ``400``."""
 
@@ -512,14 +534,10 @@ class Dispatcher:
         if mode not in _MODES:
             raise ValidationError("mode must be 'assess', 'deliver' or 'verify'")
         budget = body.get("budget_usd")
-        if budget is not None:
-            if isinstance(budget, bool) or not isinstance(budget, (int, float)):
-                raise ValidationError("budget_usd must be a number or null")
-            # json.loads accepts the Infinity/NaN tokens, and both slip past a
-            # plain <= 0 check (NaN compares False to everything) — either one
-            # would make the "ceiling" unbounded, so require a finite number.
-            if not math.isfinite(budget) or budget <= 0:
-                raise ValidationError("budget_usd must be a finite number greater than 0")
+        if budget is not None and not _valid_budget(budget):
+            raise ValidationError(
+                "budget_usd must be a finite number greater than 0, or null"
+            )
         if mode == "verify":
             return self._verify_spec(body, budget)
         repo = body.get("repo")
@@ -1502,15 +1520,7 @@ class Dispatcher:
         if self._dashboard_workspace is None:
             return 409, {"error": "the foreman needs a dashboard workspace"}
         budget = body.get("budget_usd")
-        if (
-            isinstance(budget, bool)
-            or not isinstance(budget, (int, float))
-            # Infinity/NaN parse as valid JSON numbers and slip past <= 0
-            # (NaN compares False to everything); either would unbound the
-            # very ceiling this endpoint's safety rests on.
-            or not math.isfinite(budget)
-            or budget <= 0
-        ):
+        if not _valid_budget(budget):
             return 400, {
                 "error": "budget_usd is required and must be a finite number "
                 "greater than 0 (the per-story ceiling)"

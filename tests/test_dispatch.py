@@ -129,9 +129,10 @@ def test_build_spec_validates_budget():
         {"mode": "assess", "repo": "a/b", "budget_usd": None}
     ).budget_usd is None
     # Infinity/NaN are valid JSON numbers to json.loads and slip past a plain
-    # <= 0 check; either would make the ceiling unbounded, so they are
-    # rejected alongside the ordinary bad shapes.
-    for bad in (True, "5", 0, -1, float("inf"), float("nan")):
+    # <= 0 check; either would make the ceiling unbounded. A huge plain
+    # integer (parsed fine by json.loads) makes math.isfinite itself raise
+    # OverflowError. All are rejected as cleanly as the ordinary bad shapes.
+    for bad in (True, "5", 0, -1, float("inf"), float("nan"), 10**400):
         with pytest.raises(ValidationError):
             disp.build_spec({"mode": "assess", "repo": "a/b", "budget_usd": bad})
 
@@ -4083,6 +4084,9 @@ def test_foreman_run_validates_strictly():
         # safety property — so they must be rejected like any bad budget.
         ({"budget_usd": float("inf")}, "budget_usd is required"),
         ({"budget_usd": float("nan")}, "budget_usd is required"),
+        # an int too large for a C double makes math.isfinite raise
+        # OverflowError — must be a clean 400, never a crashed handler
+        ({"budget_usd": 10**400}, "budget_usd is required"),
         ({"budget_usd": 1, "max_stories": "three"}, "must be an integer"),
         ({"budget_usd": 1, "max_stories": True}, "must be an integer"),
         ({"budget_usd": 1, "max_stories": 0}, "between 1 and 10"),
@@ -4377,3 +4381,10 @@ def test_foreman_routes_over_http(tmp_path):
             server, "/foreman/run", method="POST", body=b"{not json"
         )
         assert status == 400
+        # a 401-digit integer budget parses as JSON but overflows a C double:
+        # a clean 400 over the wire, never a crashed handler / reset socket
+        status, payload = _call(
+            server, "/foreman/run", method="POST", body={"budget_usd": 10**400}
+        )
+        assert status == 400
+        assert "budget_usd is required" in payload["error"]
