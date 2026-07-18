@@ -1457,7 +1457,18 @@ class Dispatcher:
         except (OSError, ValueError, WorkspaceError):
             return None
         repo = meta.get("repo")
-        return repo if isinstance(repo, str) and repo.strip() else None
+        if not isinstance(repo, str) or not repo.strip():
+            return None
+        # meta.json is on-disk state (hand-editable), so hold its repo to the
+        # same parse_repo bar every submitted repo passes: an unparseable one
+        # means "no provenance" — the story is skipped at plan/run time with a
+        # reason, rather than enqueued into a job doomed to fail at clone time
+        # (which would burn a queue slot and block the story).
+        try:
+            parse_repo(repo)
+        except (SourceError, ValueError):
+            return None
+        return repo
 
     def foreman_plan(self, *, max_stories: int = DEFAULT_MAX_STORIES) -> Tuple[int, Dict[str, Any]]:
         """The ``GET /foreman/plan`` core: a $0 dry-run of ``/foreman/run``.
@@ -1595,8 +1606,33 @@ class Dispatcher:
                         "position": position,
                     }
                 )
+            save_failed = False
             if enqueued:
-                store.save(backlog)
+                try:
+                    store.save(backlog)
+                except (OSError, ValueError, WorkspaceError):
+                    # Jobs are already queued (and would spend), but the disk
+                    # still shows their stories as TODO — a later run would
+                    # re-select and double-enqueue them. Compensate below,
+                    # outside this lock: cancel_job re-takes the backlog lock
+                    # via its own write-back.
+                    save_failed = True
+        if save_failed:
+            cancelled: List[Dict[str, Any]] = []
+            uncancellable: List[Dict[str, Any]] = []
+            for entry in enqueued:
+                status, _ = self.cancel_job(entry["job_id"])
+                target = cancelled if status == 200 else uncancellable
+                target.append({"job_id": entry["job_id"], "story_id": entry["story_id"]})
+            # 500, not 202: the run did not do what it promised. The payload
+            # is the honest ledger — cancelled jobs never spend; a job the
+            # single-flight worker had already started cannot be pulled back
+            # and is named so the operator knows a re-run would duplicate it.
+            return 500, {
+                "error": "backlog write failed; enqueued jobs were cancelled",
+                "cancelled": cancelled,
+                "uncancellable": uncancellable,
+            }
         return 202 if enqueued else 200, {
             "jobs": enqueued,
             "skipped": skipped,

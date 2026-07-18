@@ -644,6 +644,11 @@ submitted repo). The whole select → submit → mark pass runs under the
 backlog lock, so two concurrent runs can never enqueue the same story twice;
 a full queue stops the batch and every story of the batch that never got its
 submit is reported in `skipped` as `queue full`, never silently omitted.
+If the post-submit backlog save fails, the run **compensates instead of
+double-spending**: the just-enqueued jobs are cancelled (a cancelled job
+never runs or spends) and the answer is a `500` naming what was cancelled —
+plus, in the `uncancellable` list, any job the single-flight worker had
+already started, so the operator knows a blind re-run would duplicate it.
 Answers `202` with the enqueued jobs (or `200` when nothing was ready):
 
 ```json

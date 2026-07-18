@@ -4068,6 +4068,29 @@ def test_foreman_plan_treats_corrupt_meta_as_unrouteable():
     assert "no repository provenance" in payload["plan"][0]["reason"]
 
 
+def test_foreman_plan_treats_a_blank_meta_repo_as_unrouteable():
+    dash = _foreman_dash(stories=1, with_meta=False)
+    dash.write_text("audit/assess-1/meta.json", json.dumps({"repo": "  "}))
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.foreman_plan()
+    assert status == 200
+    assert payload["plan"][0]["eligible"] is False
+    assert "no repository provenance" in payload["plan"][0]["reason"]
+
+
+def test_foreman_plan_treats_an_unparseable_meta_repo_as_unrouteable():
+    # meta.json is on-disk (hand-editable) state: a repo that fails the same
+    # parse_repo bar submitted repos pass is "no provenance", so the story is
+    # skipped at plan time instead of enqueued into a clone doomed to fail
+    dash = _foreman_dash(stories=1, with_meta=False)
+    dash.write_text("audit/assess-1/meta.json", json.dumps({"repo": "%%%"}))
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.foreman_plan()
+    assert status == 200
+    assert payload["plan"][0]["eligible"] is False
+    assert "no repository provenance" in payload["plan"][0]["reason"]
+
+
 def test_foreman_run_needs_a_dashboard_workspace():
     status, payload = Dispatcher(token="x").foreman_run({"budget_usd": 1})
     assert status == 409
@@ -4347,6 +4370,66 @@ def test_foreman_write_back_swallows_a_save_failure(monkeypatch):
     # the write-back failure is swallowed: the job's terminal state is intact
     # and the worker (here: the caller) was never taken down
     assert record.state == "succeeded"
+
+
+def test_foreman_run_save_failure_cancels_the_enqueued_jobs(monkeypatch):
+    # SPEND INTEGRITY: if the post-submit backlog save fails, the disk still
+    # shows the stories as TODO — a later run would re-select and DOUBLE-enqueue
+    # them. The run must compensate: cancel what it enqueued and answer
+    # honestly, never a 202 that hides the lost write-back.
+    dash = _foreman_dash()
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+
+    class _SaveBoomStore:
+        def __init__(self, workspace):
+            self._real = BacklogStore(workspace)
+
+        def load(self):
+            return self._real.load()
+
+        def save(self, backlog):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(dispatch_mod, "BacklogStore", _SaveBoomStore)
+    status, payload = disp.foreman_run({"budget_usd": 1})
+    assert status == 500
+    assert "backlog write failed" in payload["error"]
+    assert [c["story_id"] for c in payload["cancelled"]] == ["S1", "S2"]
+    assert payload["uncancellable"] == []
+    # the compensating cancel really landed: neither job can ever run
+    for entry in payload["cancelled"]:
+        assert disp.get(entry["job_id"]).state == "cancelled"
+    # and the stories were never persisted as in_progress, so nothing is stuck
+    monkeypatch.setattr(dispatch_mod, "BacklogStore", BacklogStore)
+    assert _story(dash, "S1").status is ItemStatus.TODO
+    assert _story(dash, "S2").status is ItemStatus.TODO
+
+
+def test_foreman_run_save_failure_names_a_job_it_cannot_pull_back(monkeypatch):
+    # If the single-flight worker already started a job before the save
+    # failure, cancel_job answers 409 — the run must name that job as
+    # uncancellable so the operator knows a re-run would duplicate it.
+    dash = _foreman_dash(stories=1)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+
+    class _SaveBoomRunningStore:
+        def __init__(self, workspace):
+            self._real = BacklogStore(workspace)
+
+        def load(self):
+            return self._real.load()
+
+        def save(self, backlog):
+            # simulate the worker winning the race before the save fails
+            for record in disp._registry.values():
+                record.state = "running"
+            raise OSError("disk full")
+
+    monkeypatch.setattr(dispatch_mod, "BacklogStore", _SaveBoomRunningStore)
+    status, payload = disp.foreman_run({"budget_usd": 1})
+    assert status == 500
+    assert payload["cancelled"] == []
+    assert [u["story_id"] for u in payload["uncancellable"]] == ["S1"]
 
 
 def test_summary_omits_story_id_for_ordinary_jobs():
