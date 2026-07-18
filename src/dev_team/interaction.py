@@ -392,6 +392,28 @@ def review_dispute_question(task_id: str, *, context: str, asked_by: str) -> Que
     )
 
 
+def triage_review_question(route: str, *, context: str, asked_by: str) -> Question:
+    """Confirm applying an intake triage decision (``--intake --interactive``).
+
+    Default (unattended :class:`AutoChannel`) answer: apply — matching
+    ``--intake-apply``'s autonomous posture. With no input available (EOF) the
+    fail-safe is ``abort``: a detached run must not start work (and spend) on a
+    route no human confirmed.
+    """
+
+    return Question(
+        topic="triage-review",
+        prompt=f"Apply the triaged route ({route})?",
+        choices=(
+            Choice("apply", "run the routed mode now"),
+            Choice("abort", "stop; nothing is run"),
+        ),
+        context=context,
+        asked_by=asked_by,
+        fail_safe_key="abort",
+    )
+
+
 def replan_review_question(decision: Replan, *, asked_by: str) -> Question:
     """Supervise a manager-proposed re-plan: apply, revise, or reject.
 
