@@ -32,7 +32,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, MutableMapping, Optional, Sequence
+from typing import Dict, MutableMapping, Optional, Protocol, Sequence
 from urllib.parse import urlsplit
 
 from .errors import DevTeamError
@@ -240,6 +240,29 @@ def resolve_github_token(
             if values.get(key):
                 return values[key]
     return inherited
+
+
+class TokenProvider(Protocol):
+    """The seam every GitHub credential flows through.
+
+    ``token_for`` returns the credential to present for ``ref`` **right
+    now** — call it at each use rather than caching the result, so a
+    provider backed by short-lived credentials (a GitHub App installation
+    token) can re-mint under a long run while the static-PAT provider keeps
+    returning the same value.
+    """
+
+    def token_for(self, ref: "RepoRef") -> Optional[str]: ...
+
+
+@dataclass(frozen=True)
+class StaticTokenProvider:
+    """The classic model: one PAT (or nothing) for every repository."""
+
+    token: Optional[str] = None
+
+    def token_for(self, ref: "RepoRef") -> Optional[str]:
+        return self.token
 
 
 #: Hosts a GitHub PAT may be sent to. The token is scoped to GitHub, so the
