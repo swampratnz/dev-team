@@ -3671,6 +3671,34 @@ def test_maybe_refresh_profile_ends_on_evidence_based_review_when_toolchain_miss
     assert report.passed is True
 
 
+def test_maybe_refresh_profile_detects_nested_manifest_with_no_root_change():
+    # A task that scaffolds a project into a subdirectory (no root-level
+    # manifest change) must still trigger a re-detect, since
+    # _manifest_signature now fingerprints first-level nested manifests too.
+    engine = _engine(ScriptedRunner([]))
+    assert engine._resolve_gates() is None
+    assert engine._profile.kind == "unknown"
+
+    engine.workspace.write_text("backend/go.mod", "module backend\n")
+    engine._maybe_refresh_profile()
+
+    assert engine._profile.kind == "go"
+    assert engine._profile.locally_runnable is False
+
+
+def test_manifest_signature_noop_when_nested_manifest_set_is_unchanged():
+    # No redundant re-detection when the nested manifest set didn't change
+    # between calls (reuses the existing signature-equality short-circuit).
+    ws = InMemoryWorkspace({"backend/go.mod": "module backend\n"})
+    engine = _engine(ScriptedRunner([]), workspace=ws)
+    assert engine._resolve_gates() is None
+    profile_before = engine._profile
+
+    engine._maybe_refresh_profile()
+
+    assert engine._profile is profile_before
+
+
 def test_vacuous_check_skipped_without_local_verification():
     engine = DeliveryEngine(
         ScriptedRunner([]),

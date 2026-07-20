@@ -46,6 +46,108 @@ _LEGACY_CSPROJ_MARKERS = ("<TargetFrameworkVersion>", "ToolsVersion=")
 # How many project files to sample for legacy markers before concluding.
 _LEGACY_CSPROJ_SAMPLE = 5
 
+# Manifest filenames that identify a python project, shared by the
+# root-level check and the nested (depth-1) scan below.
+_PYTHON_MARKERS = frozenset(
+    {"pyproject.toml", "setup.py", "setup.cfg", "pytest.ini", "requirements.txt"}
+)
+
+
+def manifest_kind_for_filename(name: str) -> Optional[str]:
+    """The project ``kind`` a bare filename identifies, or ``None``.
+
+    Mirrors the root-level manifest rules in :func:`_detect_from_manifests`
+    so a nested manifest one directory down is recognised by the same
+    filenames a root-level one would be. Exported (not module-private) so
+    :func:`dev_team.engine.Engine._manifest_signature` can fingerprint the
+    same nested manifest filenames this module's depth-1 scan reacts to.
+    """
+
+    if name.endswith(".sln") or name.endswith(".csproj") or name == "global.json":
+        return "dotnet"
+    if name == "package.json":
+        return "node"
+    if name == "Cargo.toml":
+        return "rust"
+    if name == "go.mod":
+        return "go"
+    if name in _PYTHON_MARKERS:
+        return "python"
+    return None
+
+
+def _nested_manifest_matches(files: set) -> list:
+    """``(path, kind)`` pairs for manifests exactly one directory down.
+
+    Bounded to depth 1 (``f.count("/") == 1``) — no recursion, and reused
+    from the same ``files`` set the caller already computed rather than a
+    new filesystem walk.
+    """
+
+    matches = []
+    for f in sorted(files):
+        if f.count("/") != 1:
+            continue
+        _directory, name = f.split("/", 1)
+        kind = manifest_kind_for_filename(name)
+        if kind is not None:
+            matches.append((f, kind))
+    return matches
+
+
+def _detect_nested_manifest(workspace: Workspace, files: set) -> ProjectProfile:
+    """Depth-1 nested-manifest fallback, once no root-level manifest matches.
+
+    A single nested directory with a single recognised kind degrades to
+    evidence-based review (``locally_runnable=False``) instead of the bare
+    ``unknown``/pytest guess, naming the nested path so the degrade is
+    diagnosable. Two or more candidate directories or kinds are ambiguous —
+    behaviour stays the unchanged ``unknown``/pytest guess, only the reason
+    is enriched to name what was found.
+    """
+
+    matches = _nested_manifest_matches(files)
+    if not matches:
+        return ProjectProfile(
+            kind="unknown",
+            verify_command=_FALLBACK,
+            reason="no recognised manifest; defaulting to pytest",
+        )
+
+    dirs = {path.split("/", 1)[0] for path, _kind in matches}
+    kinds = {kind for _path, kind in matches}
+    if len(dirs) > 1 or len(kinds) > 1:
+        candidates = ", ".join(path for path, _kind in matches)
+        return ProjectProfile(
+            kind="unknown",
+            verify_command=_FALLBACK,
+            reason=(
+                f"multiple nested manifest candidates found ({candidates}); "
+                "no unambiguous nested stack, defaulting to pytest"
+            ),
+        )
+
+    path, kind = matches[0]
+    _directory, name = path.split("/", 1)
+    if kind == "dotnet":
+        legacy = _legacy_dotnet_reason(workspace, files)
+        if legacy is not None:
+            return ProjectProfile(
+                kind="dotnet-framework",
+                verify_command=None,
+                reason=f"{path} at nested path, not workspace root; {legacy}",
+                locally_runnable=False,
+            )
+    return ProjectProfile(
+        kind=kind,
+        verify_command=None,
+        reason=(
+            f"{name} found at {path}, not workspace root; "
+            "degrading to evidence-based review"
+        ),
+        locally_runnable=False,
+    )
+
 
 def _legacy_dotnet_reason(workspace: Workspace, files: set) -> Optional[str]:
     """Why the workspace looks like legacy .NET Framework, or ``None``.
@@ -74,12 +176,17 @@ def _legacy_dotnet_reason(workspace: Workspace, files: set) -> Optional[str]:
 def detect_project(workspace: Workspace) -> ProjectProfile:
     """Inspect ``workspace`` and return the best-matching profile.
 
-    Only root-level manifests are considered — that is where build tooling
-    lives in every ecosystem this recognises. Detection order puts the most
-    specific manifests first. A profile whose verify/setup command names a
-    binary that isn't actually on this machine's ``PATH`` is degraded to
-    ``locally_runnable=False`` (mirroring the legacy-.NET-Framework path
-    below) rather than proposing a command guaranteed to fail every task.
+    Root-level manifests are tried first — that is where build tooling lives
+    in every ecosystem this recognises — with detection order putting the
+    most specific manifests first. Only when no root-level manifest matches
+    does it fall back to a depth-1 nested-manifest scan (see
+    :func:`_detect_nested_manifest`), which degrades to
+    ``locally_runnable=False`` rather than proposing a verify command for a
+    stack that isn't at the workspace root. A profile whose verify/setup
+    command names a binary that isn't actually on this machine's ``PATH`` is
+    likewise degraded to ``locally_runnable=False`` (mirroring the
+    legacy-.NET-Framework path below) rather than proposing a command
+    guaranteed to fail every task.
     """
 
     return _degrade_if_toolchain_missing(_detect_from_manifests(workspace))
@@ -172,8 +279,7 @@ def _detect_from_manifests(workspace: Workspace) -> ProjectProfile:
             verify_command=("go", "test", "./..."),
             reason="go.mod at workspace root",
         )
-    python_markers = {"pyproject.toml", "setup.py", "setup.cfg", "pytest.ini", "requirements.txt"}
-    marker = sorted(python_markers & files)
+    marker = sorted(_PYTHON_MARKERS & files)
     if marker:
         setup = ("pip", "install", "-r", "requirements.txt") if "requirements.txt" in files else None
         return ProjectProfile(
@@ -183,8 +289,4 @@ def _detect_from_manifests(workspace: Workspace) -> ProjectProfile:
             security_scan_command=("bandit", "-r", ".", "-q", "-x", "./tests,./.dev_team"),
             reason=f"{marker[0]} at workspace root",
         )
-    return ProjectProfile(
-        kind="unknown",
-        verify_command=_FALLBACK,
-        reason="no recognised manifest; defaulting to pytest",
-    )
+    return _detect_nested_manifest(workspace, files)
