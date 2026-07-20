@@ -287,6 +287,69 @@ def test_provider_malformed_token_response():
 # --- resolve_token_provider -------------------------------------------------
 
 
+def test_provider_mints_distinct_repos_concurrently():
+    # The lock must never be held across the network mint: two threads
+    # minting for DIFFERENT repos must overlap, or --max-concurrent-jobs and
+    # /checks would serialise every tenant's credential behind one lock.
+    import threading
+
+    both_in = threading.Barrier(2, timeout=5)
+
+    def slow_http(method, url, headers, body):
+        if url.endswith("/installation"):
+            both_in.wait()  # only clears if two mints run at once
+            return {"id": 1}
+        return {"token": "ghs_x", "expires_at": "2100-01-01T00:00:00+00:00"}
+
+    provider = GitHubAppTokenProvider(CREDS, http=slow_http, clock=lambda: 0.0)
+    results = {}
+
+    def mint(slug):
+        results[slug] = provider.token_for(parse_repo(slug))
+
+    threads = [
+        threading.Thread(target=mint, args=(slug,))
+        for slug in ("acme/one", "acme/two")
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert results == {"acme/one": "ghs_x", "acme/two": "ghs_x"}
+
+
+def test_provider_cache_race_tolerates_a_duplicate_mint():
+    # Two concurrent cache-misses for the SAME repo may both mint; that is
+    # acceptable (GitHub issues independent tokens, last write wins) — the
+    # point is neither thread blocks the other on the network.
+    import threading
+
+    both_in = threading.Barrier(2, timeout=5)
+    mints = []
+
+    def slow_http(method, url, headers, body):
+        if url.endswith("/installation"):
+            both_in.wait()
+            return {"id": 1}
+        mints.append(url)
+        return {"token": "ghs_x", "expires_at": "2100-01-01T00:00:00+00:00"}
+
+    provider = GitHubAppTokenProvider(CREDS, http=slow_http, clock=lambda: 0.0)
+
+    def mint():
+        provider.token_for(REF)
+
+    threads = [threading.Thread(target=mint) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert len(mints) == 2  # both minted concurrently, neither blocked
+    # the cache settled on a valid token; a later call is served from it
+    assert provider.token_for(REF) == "ghs_x"
+    assert len(mints) == 2  # no third mint — cache hit
+
+
 def test_resolve_token_provider_prefers_the_app(tmp_path):
     environ = {
         APP_ID_KEY: "77",

@@ -229,14 +229,26 @@ class GitHubAppTokenProvider:
     def token_for(self, ref: RepoRef) -> Optional[str]:
         if not _is_github_https(ref.url):
             return None
+        now = self._clock()
+        # Lock only the cache read/write — never the network mint. This is a
+        # single process-wide instance shared by every worker thread and
+        # every GET /checks request, so holding the lock across _mint's two
+        # blocking GitHub round-trips would serialise ALL repos' minting
+        # behind one lock (and let one tenant's slow installation lookup
+        # stall dispatch and /checks for every other tenant), defeating
+        # --max-concurrent-jobs. Mirrors GitHubOAuth, which does its network
+        # calls unlocked. The cost is a possible duplicate mint when two
+        # threads miss the cache for the same repo at once — harmless: GitHub
+        # issues independent tokens and the last write wins, so distinct
+        # repos never block each other on the credential path.
         with self._lock:
-            now = self._clock()
             cached = self._tokens.get(ref.slug)
-            if cached is not None and cached[1] - _REFRESH_MARGIN_SECONDS > now:
-                return cached[0]
-            token, expires = self._mint(ref, now)
+        if cached is not None and cached[1] - _REFRESH_MARGIN_SECONDS > now:
+            return cached[0]
+        token, expires = self._mint(ref, now)
+        with self._lock:
             self._tokens[ref.slug] = (token, expires)
-            return token
+        return token
 
     def _mint(self, ref: RepoRef, now: float) -> tuple:
         """Resolve the installation and mint a token scoped to ``ref``."""
