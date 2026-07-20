@@ -39,6 +39,22 @@ sections below are reconstructed from the repository history.
   decision document instead of the text proposal.
 
 ### Delivery
+- **Project detection now recognises Maven, Gradle, and Composer manifests**
+  (#145, the "smarter unknown fallback" ④ deferred by #133/#135): root
+  `pom.xml` (`kind="maven"`, `mvn test`), root `build.gradle`/
+  `build.gradle.kts` (`kind="gradle"`, `gradle test`), and root
+  `composer.json` (`kind="php"`, `composer test`/`composer install`) join the
+  five previously recognised kinds, so these repos no longer fall through to
+  the `pytest` guess that caused #133's costed .NET incident. The three new
+  filenames are added only to `manifest_kind_for_filename`, the single
+  source of truth `_detect_nested_manifest` and `engine.py`'s
+  `_manifest_signature` re-detection both key off, so depth-1 nested
+  detection and re-detection-on-manifest-change work for the new kinds with
+  no changes to either. The existing generic `_degrade_if_toolchain_missing`
+  (`shutil.which`) likewise covers all three automatically: a runner missing
+  `mvn`/`gradle`/`composer` degrades to `locally_runnable=False` instead of a
+  `CommandGate` configured to invoke a binary that isn't on `PATH`. Ruby is
+  deliberately excluded (no single canonical test command).
 - **Session reuse (`--reuse-engineer-session`) now composes with worktree
   mode (`--worktrees`)** instead of silently no-oping. `_develop_task_in_worktree`
   opens one persistent engineer session per task, rooted in that task's own

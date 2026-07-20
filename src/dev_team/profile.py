@@ -6,6 +6,10 @@ attempt with baffling feedback. :func:`detect_project` inspects the
 workspace's manifests and proposes the verify (and setup) commands that match
 what is actually there; the engine uses it whenever no explicit
 ``verify_command`` was configured.
+
+Eight ecosystems are recognised: dotnet, node, rust, go, python, maven,
+gradle, and php (Composer). Anything else falls back to the ``pytest``
+guess below.
 """
 
 from __future__ import annotations
@@ -71,6 +75,12 @@ def manifest_kind_for_filename(name: str) -> Optional[str]:
         return "rust"
     if name == "go.mod":
         return "go"
+    if name == "pom.xml":
+        return "maven"
+    if name in ("build.gradle", "build.gradle.kts"):
+        return "gradle"
+    if name == "composer.json":
+        return "php"
     if name in _PYTHON_MARKERS:
         return "python"
     return None
@@ -278,6 +288,26 @@ def _detect_from_manifests(workspace: Workspace) -> ProjectProfile:
             kind="go",
             verify_command=("go", "test", "./..."),
             reason="go.mod at workspace root",
+        )
+    if "pom.xml" in files:
+        return ProjectProfile(
+            kind="maven",
+            verify_command=("mvn", "test"),
+            reason="pom.xml at workspace root",
+        )
+    gradle_marker = "build.gradle" if "build.gradle" in files else "build.gradle.kts"
+    if gradle_marker in files:
+        return ProjectProfile(
+            kind="gradle",
+            verify_command=("gradle", "test"),
+            reason=f"{gradle_marker} at workspace root",
+        )
+    if "composer.json" in files:
+        return ProjectProfile(
+            kind="php",
+            verify_command=("composer", "test"),
+            setup_command=("composer", "install"),
+            reason="composer.json at workspace root",
         )
     marker = sorted(_PYTHON_MARKERS & files)
     if marker:

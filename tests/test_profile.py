@@ -44,6 +44,38 @@ def test_detect_python_without_requirements():
     assert profile.setup_command is None
 
 
+def test_detect_maven():
+    profile = detect_project(_ws("pom.xml", "src/main/java/App.java"))
+    assert profile.kind == "maven"
+    assert profile.verify_command == ("mvn", "test")
+    assert profile.setup_command is None
+    assert profile.reason == "pom.xml at workspace root"
+
+
+def test_detect_gradle_groovy():
+    profile = detect_project(_ws("build.gradle", "settings.gradle"))
+    assert profile.kind == "gradle"
+    assert profile.verify_command == ("gradle", "test")
+    assert profile.setup_command is None
+    assert profile.reason == "build.gradle at workspace root"
+
+
+def test_detect_gradle_kotlin_dsl():
+    profile = detect_project(_ws("build.gradle.kts"))
+    assert profile.kind == "gradle"
+    assert profile.verify_command == ("gradle", "test")
+    assert profile.setup_command is None
+    assert profile.reason == "build.gradle.kts at workspace root"
+
+
+def test_detect_composer_php():
+    profile = detect_project(_ws("composer.json", "src/App.php"))
+    assert profile.kind == "php"
+    assert profile.verify_command == ("composer", "test")
+    assert profile.setup_command == ("composer", "install")
+    assert profile.reason == "composer.json at workspace root"
+
+
 def test_detect_unknown_falls_back_to_pytest():
     profile = detect_project(_ws("README.md"))
     assert profile.kind == "unknown"
@@ -168,6 +200,17 @@ def test_recognised_stack_degrades_when_toolchain_missing(monkeypatch):
     assert "'dotnet' not found on PATH" in profile.reason
 
 
+def test_maven_degrades_when_toolchain_missing(monkeypatch):
+    # Security-relevant: the engine must never get a CommandGate configured
+    # to invoke a binary (mvn) that isn't actually on PATH.
+    monkeypatch.setattr(profile_module.shutil, "which", lambda _name: None)
+    profile = detect_project(_ws("pom.xml"))
+    assert profile.kind == "maven"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "'mvn' not found on PATH" in profile.reason
+
+
 def test_recognised_stack_unaffected_when_toolchain_present(monkeypatch):
     # Byte-identical to today's behaviour once the binary is actually there.
     monkeypatch.setattr(
@@ -268,6 +311,47 @@ def test_multiple_nested_candidates_falls_back_to_unknown_with_enriched_reason()
     assert profile.verify_command == ("pytest", "-q")
     assert "backend/package.json" in profile.reason
     assert "frontend/Cargo.toml" in profile.reason
+
+
+def test_maven_root_wins_over_unrelated_nested_go_manifest():
+    # Mirrors test_root_manifest_present_skips_nested_scan_entirely: a root
+    # manifest of a new kind must resolve without ever falling through to
+    # the nested scan for an unrelated nested manifest of a different kind.
+    profile = detect_project(_ws("pom.xml", "other/go.mod"))
+    assert profile.kind == "maven"
+    assert profile.reason == "pom.xml at workspace root"
+
+
+def test_nested_maven_degrades_to_evidence_based_review():
+    profile = detect_project(_ws("backend/pom.xml"))
+    assert profile.kind == "maven"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "backend/pom.xml" in profile.reason
+
+
+def test_nested_gradle_degrades_to_evidence_based_review():
+    profile = detect_project(_ws("backend/build.gradle"))
+    assert profile.kind == "gradle"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "backend/build.gradle" in profile.reason
+
+
+def test_nested_gradle_kotlin_dsl_degrades_to_evidence_based_review():
+    profile = detect_project(_ws("backend/build.gradle.kts"))
+    assert profile.kind == "gradle"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "backend/build.gradle.kts" in profile.reason
+
+
+def test_nested_composer_php_degrades_to_evidence_based_review():
+    profile = detect_project(_ws("backend/composer.json"))
+    assert profile.kind == "php"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "backend/composer.json" in profile.reason
 
 
 def test_root_manifest_present_skips_nested_scan_entirely():
