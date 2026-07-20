@@ -510,7 +510,9 @@ def build_parser() -> argparse.ArgumentParser:
         "assessment build probe) inside a rootless container with no network, "
         "dropped capabilities, and resource limits — real containment for the "
         "arbitrary code those commands run. git stays on the host. Requires a "
-        "container engine (rootless docker/podman) at runtime.",
+        "container engine (rootless docker/podman) at runtime. With --dispatch, "
+        "this is a server-start-time choice applied to every dispatched job, "
+        "not a per-request one.",
     )
     sandbox.add_argument(
         "--sandbox-image",
@@ -987,8 +989,8 @@ def _validate_args(
             "--interactive-pr-comment-author: only valid with "
             "--interactive-pr-comments"
         )
-    if args.sandbox and not (args.deliver or args.assess):
-        parser.error("--sandbox: only valid with --deliver or --assess")
+    if args.sandbox and not (args.deliver or args.assess or args.dispatch):
+        parser.error("--sandbox: only valid with --deliver, --assess, or --dispatch")
     sandbox_tuning = [
         ("--sandbox-image", args.sandbox_image is not None),
         ("--sandbox-network", args.sandbox_network is not None),
@@ -1904,6 +1906,7 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
             args.record_transcripts
             or _env_truthy(os.environ.get(RECORD_TRANSCRIPTS_ENV))
         ),
+        sandbox=_sandbox_config(args),
     )
     print(
         f"dev-team dispatch service at {server.url} (Ctrl-C to stop)",

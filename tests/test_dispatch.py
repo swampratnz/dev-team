@@ -25,6 +25,7 @@ from dev_team.approval import ApprovalRequest, PolicyApprovalGate
 from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.budget import Budget
 from dev_team.policy import EXIT_DENIED
+from dev_team.sandbox import SandboxConfig
 from dev_team.sdk import AgentResult
 from dev_team.dispatch import (
     Dispatcher,
@@ -265,6 +266,128 @@ def test_dispatch_deliver_gates_high_risk_commands(monkeypatch):
     assert approval.review(
         ApprovalRequest(action="commit feature", detail="", risk="medium")
     ).approved is True
+
+
+def test_run_job_deliver_threads_configured_sandbox_into_engine_config(monkeypatch):
+    # #139 criterion 1: a Dispatcher constructed with a SandboxConfig must
+    # hand the runner an EngineConfig carrying that exact sandbox.
+    captured = {}
+    real_make_engine = dispatch_mod.DevTeam.make_engine
+
+    def spy_make_engine(self, **kwargs):
+        captured["config"] = kwargs.get("config")
+        return real_make_engine(self, **kwargs)
+
+    monkeypatch.setattr(dispatch_mod.DevTeam, "make_engine", spy_make_engine)
+
+    sandbox = SandboxConfig(image="acme/sandbox:pinned")
+    disp = Dispatcher(
+        token="x", runner=_deliver_runner(), materialise=_mem_materialise, sandbox=sandbox
+    )
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d"}
+    )
+    spec.id = "deliver-sandbox"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+
+    assert captured["config"].sandbox is sandbox
+
+
+def test_run_job_assess_threads_configured_sandbox_into_assess_config(monkeypatch):
+    # #139 criterion 2: same guarantee for assess mode.
+    captured = {}
+    real_make_assessor = dispatch_mod.DevTeam.make_assessor
+
+    def spy_make_assessor(self, **kwargs):
+        captured["config"] = kwargs.get("config")
+        return real_make_assessor(self, **kwargs)
+
+    monkeypatch.setattr(dispatch_mod.DevTeam, "make_assessor", spy_make_assessor)
+
+    sandbox = SandboxConfig(network="bridge")
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=_mem_materialise, sandbox=sandbox
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec.id = "assess-sandbox"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+
+    assert captured["config"].sandbox is sandbox
+
+
+def test_run_job_without_configured_sandbox_leaves_configs_sandbox_none(monkeypatch):
+    # #139 criterion 3 (regression): omitting `sandbox` at construction keeps
+    # existing dispatch behaviour byte-for-byte — no operator opt-in, no
+    # containment, for both modes.
+    captured = {}
+    real_make_engine = dispatch_mod.DevTeam.make_engine
+    real_make_assessor = dispatch_mod.DevTeam.make_assessor
+
+    def spy_make_engine(self, **kwargs):
+        captured["deliver_config"] = kwargs.get("config")
+        return real_make_engine(self, **kwargs)
+
+    def spy_make_assessor(self, **kwargs):
+        captured["assess_config"] = kwargs.get("config")
+        return real_make_assessor(self, **kwargs)
+
+    monkeypatch.setattr(dispatch_mod.DevTeam, "make_engine", spy_make_engine)
+    monkeypatch.setattr(dispatch_mod.DevTeam, "make_assessor", spy_make_assessor)
+
+    disp = Dispatcher(token="x", runner=_deliver_runner(), materialise=_mem_materialise)
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d"}
+    )
+    spec.id = "deliver-no-sandbox"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert captured["deliver_config"].sandbox is None
+
+    disp2 = Dispatcher(token="x", runner=_assess_runner(), materialise=_mem_materialise)
+    spec2 = disp2.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec2.id = "assess-no-sandbox"
+    asyncio.run(disp2.run_job(JobRecord(spec=spec2)))
+    assert captured["assess_config"].sandbox is None
+
+
+def test_submit_body_sandbox_key_cannot_override_server_configured_sandbox(monkeypatch):
+    # SECURITY (#139 criterion 6): a POST /jobs body cannot inject, disable,
+    # or redirect the operator's sandbox choice. JobSpec carries no
+    # sandbox-related field at all, and the config the runner actually
+    # receives always reflects only the server's construction-time
+    # `sandbox=` value — never anything derived from request body content.
+    captured = {}
+    real_make_engine = dispatch_mod.DevTeam.make_engine
+
+    def spy_make_engine(self, **kwargs):
+        captured["config"] = kwargs.get("config")
+        return real_make_engine(self, **kwargs)
+
+    monkeypatch.setattr(dispatch_mod.DevTeam, "make_engine", spy_make_engine)
+
+    server_sandbox = SandboxConfig(image="server-pinned:latest")
+    disp = Dispatcher(
+        token="x",
+        runner=_deliver_runner(),
+        materialise=_mem_materialise,
+        sandbox=server_sandbox,
+    )
+    spec = disp.build_spec(
+        {
+            "mode": "deliver",
+            "repo": "acme/mono",
+            "title": "F",
+            "description": "d",
+            # An attacker-controlled body claiming to redirect/disable
+            # containment — build_spec must silently drop it.
+            "sandbox": {"image": "attacker/escape:latest", "network": "bridge"},
+        }
+    )
+    assert not hasattr(spec, "sandbox")
+    spec.id = "deliver-body-sandbox"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+
+    assert captured["config"].sandbox is server_sandbox
+    assert captured["config"].sandbox.image == "server-pinned:latest"
 
 
 def test_worker_runs_a_successful_job():
@@ -2531,6 +2654,19 @@ def test_url_names_host_and_port():
     with running(materialise=_mem_materialise) as server:
         assert server.url.startswith("http://127.0.0.1:")
         assert server.url.endswith("/")
+
+
+def test_dispatch_server_threads_sandbox_into_its_dispatcher():
+    # #139 criterion 1/2: DispatchServer forwards its `sandbox=` constructor
+    # argument straight through to the Dispatcher it wraps.
+    sandbox = SandboxConfig(image="acme/sandbox:pinned")
+    with running(materialise=_mem_materialise, sandbox=sandbox) as server:
+        assert server.dispatcher._sandbox is sandbox
+
+
+def test_dispatch_server_defaults_sandbox_to_none():
+    with running(materialise=_mem_materialise) as server:
+        assert server.dispatcher._sandbox is None
 
 
 def test_unauthorized_without_and_with_wrong_token():

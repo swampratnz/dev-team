@@ -90,6 +90,7 @@ from .execution import (
 from .interaction import QueueChannel, Question, Reply
 from .models import FeatureRequest
 from .report import delivery_to_dict
+from .sandbox import SandboxConfig
 from .sdk import AgentRunner
 from .foreman import (
     DEFAULT_MAX_STORIES,
@@ -407,6 +408,7 @@ class Dispatcher:
         dashboard_workspace: Optional[Workspace] = None,
         record_transcripts: bool = False,
         job_timeout: float = _JOB_TIMEOUT_SECONDS,
+        sandbox: Optional[SandboxConfig] = None,
     ) -> None:
         self.token = token
         self._runner = runner
@@ -414,6 +416,12 @@ class Dispatcher:
         self._clock = clock
         self._jobs_root = jobs_root
         self._job_timeout = job_timeout
+        # Operator-chosen at process start, applied uniformly to every job —
+        # deliberately NOT a per-job/HTTP-controllable field (see JobSpec):
+        # letting a caller pick or omit sandboxing per request would let it
+        # weaken containment. Mirrors how --sandbox already works for
+        # --deliver/--assess (see docs/SANDBOX.md).
+        self._sandbox = sandbox
         # Constructing this touches no filesystem state (see AccessLog's
         # docstring) — safe to do unconditionally here even though most
         # Dispatcher instances (every non-HTTP unit test) never end up
@@ -853,7 +861,7 @@ class Dispatcher:
             outcome = await team.assess(
                 workspace=workspace,
                 budget=budget,
-                config=AssessConfig(update_backlog=spec.backlog),
+                config=AssessConfig(update_backlog=spec.backlog, sandbox=self._sandbox),
                 **kwargs,
             )
             self._mirror_report(spec.id, outcome)
@@ -877,7 +885,7 @@ class Dispatcher:
                 FeatureRequest(title=spec.title, description=spec.description),
                 workspace=workspace,
                 budget=budget,
-                config=EngineConfig(commit=True),
+                config=EngineConfig(commit=True, sandbox=self._sandbox),
                 # Unattended delivery must not silently push/deploy/rm: gate
                 # high-risk commands behind an explicit human approval instead
                 # of the engine's default no-op AutoApprover. The risk="medium"
@@ -2451,6 +2459,7 @@ class DispatchServer:
         dashboard_workspace: Optional[Workspace] = None,
         record_transcripts: bool = False,
         job_timeout: float = _JOB_TIMEOUT_SECONDS,
+        sandbox: Optional[SandboxConfig] = None,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -2462,6 +2471,7 @@ class DispatchServer:
             dashboard_workspace=dashboard_workspace,
             record_transcripts=record_transcripts,
             job_timeout=job_timeout,
+            sandbox=sandbox,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()
