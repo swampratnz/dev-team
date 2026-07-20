@@ -117,7 +117,7 @@ from .models import (
 from .ordering import lint_plan
 from .persona import Roster
 from .policy import GuardedCommandRunner, SideEffectPolicy
-from .profile import ProjectProfile, detect_project
+from .profile import ProjectProfile, detect_project, manifest_kind_for_filename
 from .replan import Replan, ReplanError, apply_replan
 from .retrieval import char_budget_for_tokens, estimate_tokens, retrieve
 from .sandbox import ContainerCommandRunner, SandboxConfig
@@ -1489,14 +1489,26 @@ class DeliveryEngine:
         )
 
     def _manifest_signature(self) -> frozenset:
-        """Fingerprint of the root-level files :func:`detect_project` reads.
+        """Fingerprint of the files :func:`detect_project` reads.
 
         Used to tell whether a task actually changed what the profile
         detector looks at, so :meth:`_maybe_refresh_profile` re-detects only
-        when it could change the outcome — not on every task.
+        when it could change the outcome — not on every task. Includes both
+        root-level files and first-level nested manifest filenames (same
+        ``"/"``-count rule as :func:`dev_team.profile._detect_nested_manifest`),
+        so a task that scaffolds a project into a subdirectory with no
+        root-level change still triggers a re-detect.
         """
 
-        return frozenset(f for f in self.workspace.list_files() if "/" not in f)
+        files = self.workspace.list_files()
+        root = frozenset(f for f in files if "/" not in f)
+        nested = frozenset(
+            f
+            for f in files
+            if f.count("/") == 1
+            and manifest_kind_for_filename(f.split("/", 1)[1]) is not None
+        )
+        return root | nested
 
     def _maybe_refresh_profile(self) -> None:
         """Re-detect the project profile once a task changes root manifests.

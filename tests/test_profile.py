@@ -204,3 +204,97 @@ def test_toolchain_check_skips_already_degraded_profiles(monkeypatch):
     assert profile.kind == "dotnet-framework"
     assert profile.locally_runnable is False
     assert "not found on PATH" not in profile.reason
+
+
+# --- nested (depth-1) manifest detection --------------------------------
+
+
+def test_nested_node_degrades_to_evidence_based_review():
+    profile = detect_project(_ws("backend/package.json", "backend/index.js"))
+    assert profile.kind == "node"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "backend/package.json" in profile.reason
+
+
+def test_nested_rust_degrades_to_evidence_based_review():
+    profile = detect_project(_ws("backend/Cargo.toml"))
+    assert profile.kind == "rust"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "backend/Cargo.toml" in profile.reason
+
+
+def test_nested_go_degrades_to_evidence_based_review():
+    profile = detect_project(_ws("backend/go.mod"))
+    assert profile.kind == "go"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "backend/go.mod" in profile.reason
+
+
+def test_nested_python_degrades_to_evidence_based_review():
+    profile = detect_project(_ws("backend/pyproject.toml"))
+    assert profile.kind == "python"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "backend/pyproject.toml" in profile.reason
+
+
+def test_nested_sdk_style_dotnet_degrades_to_evidence_based_review():
+    ws = InMemoryWorkspace({"backend/App.csproj": _SDK_CSPROJ})
+    profile = detect_project(ws)
+    assert profile.kind == "dotnet"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "backend/App.csproj" in profile.reason
+
+
+def test_nested_legacy_dotnet_still_routes_through_legacy_reason():
+    # Legacy detection must not be bypassed just because the manifest is
+    # nested: a nested legacy .csproj is still "dotnet-framework", not a
+    # bare not-locally-runnable "dotnet" reason.
+    ws = InMemoryWorkspace({"backend/App.csproj": _LEGACY_CSPROJ})
+    profile = detect_project(ws)
+    assert profile.kind == "dotnet-framework"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "backend/App.csproj" in profile.reason
+
+
+def test_multiple_nested_candidates_falls_back_to_unknown_with_enriched_reason():
+    profile = detect_project(_ws("backend/package.json", "frontend/Cargo.toml"))
+    assert profile.kind == "unknown"
+    assert profile.verify_command == ("pytest", "-q")
+    assert "backend/package.json" in profile.reason
+    assert "frontend/Cargo.toml" in profile.reason
+
+
+def test_root_manifest_present_skips_nested_scan_entirely():
+    # Byte-identical to today when a root-level manifest resolves things:
+    # the unrelated nested go.mod must not appear in the reason at all.
+    profile = detect_project(_ws("package.json", "other/go.mod"))
+    assert profile.kind == "node"
+    assert profile.reason == "package.json at workspace root"
+
+
+def test_nested_scan_ignores_manifest_reachable_only_via_symlink_escape(tmp_path):
+    # The nested scan must never add its own filesystem access — it only
+    # reads from Workspace.list_files(), which already drops symlinks and
+    # root-escapes (see test_execution.py's symlink-containment test). A
+    # manifest reachable only via such a symlink must never be surfaced.
+    from dev_team.execution import LocalWorkspace
+
+    root = tmp_path / "root"
+    root.mkdir()
+    backend = root / "backend"
+    backend.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "package.json").write_text("{}")
+    (backend / "package.json").symlink_to(outside / "package.json")
+
+    ws = LocalWorkspace(str(root))
+    profile = detect_project(ws)
+    assert profile.kind == "unknown"
+    assert profile.verify_command == ("pytest", "-q")
