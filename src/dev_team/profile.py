@@ -176,12 +176,17 @@ def _legacy_dotnet_reason(workspace: Workspace, files: set) -> Optional[str]:
 def detect_project(workspace: Workspace) -> ProjectProfile:
     """Inspect ``workspace`` and return the best-matching profile.
 
-    Only root-level manifests are considered — that is where build tooling
-    lives in every ecosystem this recognises. Detection order puts the most
-    specific manifests first. A profile whose verify/setup command names a
-    binary that isn't actually on this machine's ``PATH`` is degraded to
-    ``locally_runnable=False`` (mirroring the legacy-.NET-Framework path
-    below) rather than proposing a command guaranteed to fail every task.
+    Root-level manifests are tried first — that is where build tooling lives
+    in every ecosystem this recognises — with detection order putting the
+    most specific manifests first. Only when no root-level manifest matches
+    does it fall back to a depth-1 nested-manifest scan (see
+    :func:`_detect_nested_manifest`), which degrades to
+    ``locally_runnable=False`` rather than proposing a verify command for a
+    stack that isn't at the workspace root. A profile whose verify/setup
+    command names a binary that isn't actually on this machine's ``PATH`` is
+    likewise degraded to ``locally_runnable=False`` (mirroring the
+    legacy-.NET-Framework path below) rather than proposing a command
+    guaranteed to fail every task.
     """
 
     return _degrade_if_toolchain_missing(_detect_from_manifests(workspace))
