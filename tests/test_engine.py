@@ -6,6 +6,8 @@ import asyncio
 import os
 
 import pytest
+
+import dev_team.profile as profile_module
 from helpers import (
     GateCycleRunner,
     engine_responses,
@@ -3595,6 +3597,78 @@ def test_require_recognised_project_allows_a_recognised_stack():
     assert engine._resolve_gates() is None
     (gate,) = engine.definition_of_done.gates
     assert gate.name == "tests"
+
+
+def test_maybe_refresh_profile_swaps_dod_when_a_task_adds_a_manifest():
+    # The incident this fixes: a thin/greenfield root guesses pytest, then a
+    # task scaffolds a recognised stack (.csproj) — the stale baseline guess
+    # must not keep gating the rest of the run.
+    engine = _engine(ScriptedRunner([]))
+    assert engine._resolve_gates() is None
+    assert engine._profile.kind == "unknown"
+    (gate,) = engine.definition_of_done.gates
+    assert gate.command == ("pytest", "-q")
+
+    engine.workspace.write_text("Tool.csproj", "<Project Sdk='Microsoft.NET.Sdk' />")
+    engine._maybe_refresh_profile()
+
+    assert engine._profile.kind == "dotnet"
+    (gate,) = engine.definition_of_done.gates
+    assert gate.command == ("dotnet", "test")
+
+
+def test_maybe_refresh_profile_noop_when_manifest_set_is_unchanged():
+    # No redundant re-detection/thrashing when nothing a task did could have
+    # changed the outcome.
+    engine = _engine(ScriptedRunner([]))
+    assert engine._resolve_gates() is None
+    dod_before = engine.definition_of_done
+    profile_before = engine._profile
+
+    engine._maybe_refresh_profile()
+
+    assert engine.definition_of_done is dod_before
+    assert engine._profile is profile_before
+
+
+def test_maybe_refresh_profile_noop_for_explicitly_configured_runs():
+    # verify_command (or remote_verify_status / an injected definition_of_done)
+    # never entered auto-detection, so a mid-run manifest change must not
+    # override the operator's explicit configuration.
+    engine = _engine(
+        ScriptedRunner([]), config=EngineConfig(verify_command=("make", "test"))
+    )
+    assert engine._resolve_gates() is None
+    (gate,) = engine.definition_of_done.gates
+    assert gate.command == ("make", "test")
+
+    engine.workspace.write_text("Tool.csproj", "<Project Sdk='Microsoft.NET.Sdk' />")
+    engine._maybe_refresh_profile()
+
+    (gate,) = engine.definition_of_done.gates
+    assert gate.command == ("make", "test")
+
+
+def test_maybe_refresh_profile_ends_on_evidence_based_review_when_toolchain_missing(
+    monkeypatch,
+):
+    # Combined scenario: a thin root guesses pytest, a task then creates a
+    # recognised-but-not-locally-runnable stack (dotnet, binary absent) — the
+    # run must end up gated on evidence-based review, not a doomed CommandGate.
+    monkeypatch.setattr(profile_module.shutil, "which", lambda _name: None)
+    engine = _engine(ScriptedRunner([]))
+    assert engine._resolve_gates() is None
+    assert engine._profile.kind == "unknown"
+
+    engine.workspace.write_text("Tool.csproj", "<Project Sdk='Microsoft.NET.Sdk' />")
+    engine._maybe_refresh_profile()
+
+    assert engine._profile.kind == "dotnet"
+    assert engine._local_verification is False
+    (gate,) = engine.definition_of_done.gates
+    assert gate.name == "verification-unavailable"
+    report = engine.definition_of_done.evaluate(engine._gate_context())
+    assert report.passed is True
 
 
 def test_vacuous_check_skipped_without_local_verification():

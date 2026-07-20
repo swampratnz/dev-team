@@ -10,7 +10,8 @@ what is actually there; the engine uses it whenever no explicit
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 from .execution import Workspace
@@ -75,8 +76,49 @@ def detect_project(workspace: Workspace) -> ProjectProfile:
 
     Only root-level manifests are considered — that is where build tooling
     lives in every ecosystem this recognises. Detection order puts the most
-    specific manifests first.
+    specific manifests first. A profile whose verify/setup command names a
+    binary that isn't actually on this machine's ``PATH`` is degraded to
+    ``locally_runnable=False`` (mirroring the legacy-.NET-Framework path
+    below) rather than proposing a command guaranteed to fail every task.
     """
+
+    return _degrade_if_toolchain_missing(_detect_from_manifests(workspace))
+
+
+def _missing_binary(command: Optional[Tuple[str, ...]]) -> Optional[str]:
+    """The command's binary name if it isn't found via ``shutil.which``."""
+
+    if not command:
+        return None
+    return command[0] if shutil.which(command[0]) is None else None
+
+
+def _degrade_if_toolchain_missing(profile: ProjectProfile) -> ProjectProfile:
+    """Degrade ``profile`` to not-locally-runnable if its tools aren't on PATH.
+
+    A recognised manifest is worthless as a local gate when the runner lacks
+    the toolchain: the command would fail every task for reasons no engineer
+    can fix. Already-degraded profiles (``locally_runnable=False``) are
+    untouched.
+    """
+
+    if not profile.locally_runnable:
+        return profile
+    missing = _missing_binary(profile.verify_command) or _missing_binary(
+        profile.setup_command
+    )
+    if missing is None:
+        return profile
+    return replace(
+        profile,
+        verify_command=None,
+        locally_runnable=False,
+        reason=f"{profile.reason}; {missing!r} not found on PATH",
+    )
+
+
+def _detect_from_manifests(workspace: Workspace) -> ProjectProfile:
+    """The manifest-matching rules, before the toolchain-presence check."""
 
     files = set(workspace.list_files())
 

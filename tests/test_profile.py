@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dev_team.profile as profile_module
 from dev_team.execution import InMemoryWorkspace
 from dev_team.profile import detect_project
 
@@ -151,3 +152,55 @@ def test_legacy_probe_tolerates_unreadable_csproj():
     ws = _Flaky({"MyApp.sln": "x", "src/App/App.csproj": _LEGACY_CSPROJ})
     profile = detect_project(ws)
     assert profile.kind == "dotnet"
+
+
+# --- toolchain-presence check -------------------------------------------
+
+
+def test_recognised_stack_degrades_when_toolchain_missing(monkeypatch):
+    # A recognised manifest (.csproj) whose runtime isn't on this machine's
+    # PATH must not propose a verify command guaranteed to fail every task.
+    monkeypatch.setattr(profile_module.shutil, "which", lambda _name: None)
+    profile = detect_project(_ws("Tool.csproj"))
+    assert profile.kind == "dotnet"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "'dotnet' not found on PATH" in profile.reason
+
+
+def test_recognised_stack_unaffected_when_toolchain_present(monkeypatch):
+    # Byte-identical to today's behaviour once the binary is actually there.
+    monkeypatch.setattr(
+        profile_module.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
+    profile = detect_project(_ws("Tool.csproj"))
+    assert profile.kind == "dotnet"
+    assert profile.verify_command == ("dotnet", "test")
+    assert profile.locally_runnable is True
+    assert "not found on PATH" not in profile.reason
+
+
+def test_toolchain_check_looks_at_setup_command_too(monkeypatch):
+    # Python's setup_command (pip) is checked even when the verify binary
+    # (pytest) is present, since either one missing dooms the task.
+    monkeypatch.setattr(
+        profile_module.shutil,
+        "which",
+        lambda name: None if name == "pip" else f"/usr/bin/{name}",
+    )
+    profile = detect_project(_ws("requirements.txt"))
+    assert profile.kind == "python"
+    assert profile.verify_command is None
+    assert profile.locally_runnable is False
+    assert "'pip' not found on PATH" in profile.reason
+
+
+def test_toolchain_check_skips_already_degraded_profiles(monkeypatch):
+    # Legacy .NET Framework is already locally_runnable=False for its own
+    # reason; the toolchain check must not layer a second reason onto it.
+    monkeypatch.setattr(profile_module.shutil, "which", lambda _name: None)
+    ws = InMemoryWorkspace({"MyApp.csproj": _SDK_CSPROJ, "packages.config": "<packages />"})
+    profile = detect_project(ws)
+    assert profile.kind == "dotnet-framework"
+    assert profile.locally_runnable is False
+    assert "not found on PATH" not in profile.reason
