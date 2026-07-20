@@ -5307,3 +5307,57 @@ def test_session_locked_out_of_cross_tenant_aggregates():
                 403,
                 {"error": "operator token required"},
             ), path
+
+
+def test_session_verify_cannot_probe_foreign_assessments():
+    # Review fix: mode=verify used to hit _verify_spec's disk reads before
+    # the tenant gate, so "no assessment" vs "finding not found" vs 403
+    # leaked whether a guessed foreign source-job id existed. A foreign
+    # tenant's assessment must answer exactly what a nonexistent one does.
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-f/assessment.json", json.dumps(_assessment_payload())
+    )
+    dash.write_text("audit/assess-f/meta.json", json.dumps({"repo": "other/mono"}))
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, dashboard_workspace=dash) as server:
+        session_token = _sign_in(server)
+        for source in ("assess-f", "assess-nonexistent"):
+            status, payload = _call(
+                server, "/jobs", method="POST", token=session_token,
+                body={"mode": "verify", "source_job": source,
+                      "finding_id": "recommendation.plan[0]"},
+            )
+            assert (status, payload) == (
+                404, {"error": "no assessment for that job"}
+            ), source
+        # malformed source_job still gets the ordinary validation 400
+        status, _ = _call(
+            server, "/jobs", method="POST", token=session_token,
+            body={"mode": "verify", "source_job": "", "finding_id": "x"},
+        )
+        assert status == 400
+        # the operator is unaffected: finding resolution still answers
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-f",
+                  "finding_id": "nope"},
+        )
+        assert (status, payload) == (404, {"error": "finding not found"})
+
+
+def test_session_verify_own_tenant_still_submits():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-o/assessment.json", json.dumps(_assessment_payload())
+    )
+    dash.write_text("audit/assess-o/meta.json", json.dumps({"repo": "acme/mono"}))
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, dashboard_workspace=dash) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server, "/jobs", method="POST", token=session_token,
+            body={"mode": "verify", "source_job": "assess-o",
+                  "finding_id": "recommendation.plan[0]"},
+        )
+        assert status == 202 and payload["id"].startswith("verify-")

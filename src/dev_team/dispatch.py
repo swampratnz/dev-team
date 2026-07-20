@@ -2750,6 +2750,22 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             body = self._read_body()
             if body is None:
                 return
+            if session is not None and body.get("mode") == "verify":
+                # Tenant-gate BEFORE build_spec's disk reads: _verify_spec's
+                # "no assessment" / "finding not found" answers would
+                # otherwise let a session probe whether a foreign tenant's
+                # (guessable) source-job id exists. A foreign tenant's
+                # assessment must answer exactly what a nonexistent one
+                # does. Malformed source_job values fall through to the
+                # ordinary validation 400, which reveals nothing.
+                source = body.get("source_job")
+                if (
+                    isinstance(source, str)
+                    and source.strip()
+                    and not dispatcher.session_sees_job(session, source.strip())
+                ):
+                    self._json(404, {"error": "no assessment for that job"})
+                    return
             try:
                 spec = dispatcher.build_spec(body)
             except ValidationError as exc:

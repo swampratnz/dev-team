@@ -90,7 +90,7 @@ matching GitHub's user-token lifetime.
 
 | Capability | Operator token | Signed-in session |
 |---|---|---|
-| Submit jobs (`POST /jobs`) | any repo | only repos whose **owner is in the user's installation snapshot** (403 otherwise; uniform across assess/deliver/verify) |
+| Submit jobs (`POST /jobs`) | any repo | only repos whose **owner is in the user's installation snapshot** (assess/deliver answer 403 for anything else; a verify against a foreign or unknown source job answers the same `404 no assessment` a nonexistent one does, before any disk read, so assessments can't be enumerated) |
 | Observe jobs (`GET /jobs`, `/jobs/{id}` status/result/findings/verifications/question) | all jobs | **only jobs on repos in the user's installations** — the listing is filtered, and a foreign tenant's job answers the same `404 unknown job` a nonexistent one does |
 | `GET /checks` | any repo | installation-gated like submits |
 | Answer interactive questions, cancel queued jobs | ✓ | ✓ for the session's own tenants' jobs (404 otherwise) |
