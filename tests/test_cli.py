@@ -2876,12 +2876,13 @@ class _FakeDispatchServer:
     instances = []
 
     def __init__(self, token, *, host, port, runner=None, dashboard_workspace=None,
-                 record_transcripts=False, oauth=None, max_workers=1):
+                 record_transcripts=False, oauth=None, max_workers=1, sandbox=None):
         self.token, self.host, self.port, self.runner = token, host, port, runner
         self.dashboard_workspace = dashboard_workspace
         self.record_transcripts = record_transcripts
         self.oauth = oauth
         self.max_workers = max_workers
+        self.sandbox = sandbox
         self.interrupted = False
         self.shut_down = False
         _FakeDispatchServer.instances.append(self)
@@ -2924,10 +2925,11 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
 
     def interrupting_init(self, token, *, host, port, runner=None,
                           dashboard_workspace=None, record_transcripts=False,
-                          oauth=None, max_workers=1):
+                          oauth=None, max_workers=1, sandbox=None):
         original_init(self, token, host=host, port=port, runner=runner,
                       dashboard_workspace=dashboard_workspace,
-                      record_transcripts=record_transcripts)
+                      record_transcripts=record_transcripts, oauth=oauth,
+                      max_workers=max_workers, sandbox=sandbox)
         self.interrupted = True
 
     monkeypatch.setattr(_FakeDispatchServer, "__init__", interrupting_init)
@@ -3043,6 +3045,52 @@ def test_main_dispatch_flag_validation():
         with pytest.raises(SystemExit) as excinfo:
             main(argv, runner=ScriptedRunner([]))
         assert excinfo.value.code == 2
+
+
+def test_main_dispatch_sandbox_is_wired(monkeypatch):
+    # Acceptance criterion 4 (#139): --dispatch --sandbox parses and
+    # constructs DispatchServer(..., sandbox=<SandboxConfig>) via the same
+    # _sandbox_config helper --deliver/--assess already use, with fields
+    # matching the flags given.
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    code = main(
+        [
+            "--dispatch", "--sandbox",
+            "--sandbox-image", "node:22",
+            "--sandbox-network", "bridge",
+            "--sandbox-engine", "podman",
+        ],
+        runner=ScriptedRunner([]),
+    )
+    assert code == 0
+    (server,) = _FakeDispatchServer.instances
+    assert server.sandbox is not None
+    assert (server.sandbox.engine, server.sandbox.image, server.sandbox.network) == (
+        "podman", "node:22", "bridge",
+    )
+
+
+def test_main_dispatch_without_sandbox_flag_stays_none(monkeypatch):
+    # Regression (criterion 3): omitting --sandbox with --dispatch keeps
+    # sandbox=None, identical to today's behaviour.
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    assert main(["--dispatch"], runner=ScriptedRunner([])) == 0
+    (server,) = _FakeDispatchServer.instances
+    assert server.sandbox is None
+
+
+def test_main_dispatch_sandbox_tuning_without_sandbox_exits_2(capsys):
+    # Acceptance criterion 5: the "only valid with --sandbox" guard covers
+    # --dispatch too, not just --deliver/--assess.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--dispatch", "--sandbox-image", "x"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--sandbox-image" in err
 
 
 def test_main_deliver_journals_events_for_the_dashboard(tmp_path):
