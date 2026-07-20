@@ -377,7 +377,7 @@ the only way to reclaim that space was, until now, shell access and a manual
 gated** alternative: permanent deletion made an explicit two-step action
 (archive, confirm, then purge) rather than a single-click irreversible one.
 
-v1 removes four things, each independently testable:
+v1 removes five things, each independently testable:
 
 - the job's workspace clone (`jobs_root/{id}`) — `shutil.rmtree`, since this
   directory already sits outside the `Workspace` abstraction (the same raw
@@ -391,17 +391,21 @@ v1 removes four things, each independently testable:
   through `Workspace.delete_dir()`, the same guarded abstraction as the
   audit mirror, so a symlink planted at that path is refused rather than
   followed;
+- this job's lines in the dashboard workspace's shared `events.jsonl`
+  (`dev_team.eventlog.remove_run`) — a line-filtering read-modify-write
+  under the same lock every dashboard `EventLog` append uses
+  (`Dispatcher._dashboard_events_lock`), so a live job's append and a
+  concurrent purge of a different job can never interleave and lose an
+  update. A line that fails to parse, or parses to something other than a
+  dict, is kept as-is rather than dropped, since it can't be attributed to
+  the purged job;
 - backlog stories whose `source_job` is this job, removed under the same
   write lock `DELETE /backlog/story/{id}` already uses, dependency edges
   stripped the same way.
 
-`events.jsonl` is **still out of scope** — hand-filtering an append-only,
-size-bounded journal shared across jobs is a separable, harder-to-test
-surface than a directory delete, and stays a deliberately deferred follow-up.
-
 ### `POST /jobs/{id}/purge` (auth, no body)
 
-→ `200 {"id":"assess-…","purged":true,"removed":{"workspace":true,"audit":true,"transcripts":true,"backlog_stories":2}}`.
+→ `200 {"id":"assess-…","purged":true,"removed":{"workspace":true,"audit":true,"transcripts":true,"events":3,"backlog_stories":2}}`.
 Each `removed.*` field reflects what was actually found and deleted — `false`/`0`
 if that piece was already gone (a job purged after someone already ran a
 manual `rm -r` on its clone, say, or transcript recording was never enabled
@@ -434,10 +438,6 @@ purge and a concurrent board write can never interleave into a corrupt
 
 ### Natural growth (not in v1)
 
-- Fold `events.jsonl` filtering into the purge — the one deferred half of
-  the original "transcript surgery" follow-up; still a separable, harder
-  surface (append-only, size-bounded, shared across jobs) than a directory
-  delete.
 - A scheduled/TTL auto-purge policy over already-archived jobs past N days.
 - Bulk purge (`?archived_before=`) once the single-job primitive has real
   usage to generalise from.
