@@ -374,6 +374,16 @@ def build_parser() -> argparse.ArgumentParser:
         "dashboard. Each job still runs in its own isolated workspace.",
     )
     serving.add_argument(
+        "--max-concurrent-jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="With --dispatch: how many jobs may run at once (default 1, the "
+        "classic single-flight queue). Jobs on the same repository always "
+        "serialise regardless; every concurrent job draws on the one shared "
+        "Claude subscription, so keep this small.",
+    )
+    serving.add_argument(
         "--dispatch-url",
         default=None,
         metavar="URL",
@@ -1918,6 +1928,8 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
             "set it in the environment (or the service's EnvironmentFile) and "
             "share it only with the authorised caller"
         )
+    if args.max_concurrent_jobs < 1:
+        raise DevTeamError("--max-concurrent-jobs must be at least 1")
     # GitHub OAuth sign-in is wired only when configured (same env-file
     # search as every other credential); unconfigured keeps the classic
     # single-token service with no new routes.
@@ -1940,6 +1952,7 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
             or _env_truthy(os.environ.get(RECORD_TRANSCRIPTS_ENV))
         ),
         oauth=oauth,
+        max_workers=args.max_concurrent_jobs,
     )
     print(
         f"dev-team dispatch service at {server.url} (Ctrl-C to stop)"

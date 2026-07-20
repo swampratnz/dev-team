@@ -4757,3 +4757,126 @@ def test_auth_refresh_without_bearer_is_401():
     oauth, _ = _oauth_fixture()
     with running(oauth=oauth) as server:
         assert _call(server, "/auth/refresh", method="POST", token=None)[0] == 401
+
+
+# --- worker pool + per-repo serialisation ------------------------------------
+
+
+def test_max_workers_must_be_positive():
+    with pytest.raises(ValueError):
+        Dispatcher(token="x", max_workers=0)
+
+
+def test_pool_runs_distinct_repos_concurrently():
+    both_in = threading.Barrier(2, timeout=5)
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        both_in.wait()  # only passes if two jobs are in-flight AT ONCE
+        release.wait(5)
+        return _clone_ws()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise, max_workers=2
+    )
+    disp.start()
+    try:
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        id2, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/two"}))
+        release.set()
+        assert disp.wait(id1, 10) and disp.wait(id2, 10)
+        assert disp.get(id1).state == "succeeded"
+        assert disp.get(id2).state == "succeeded"
+    finally:
+        release.set()
+        disp.stop()
+
+
+def test_same_repo_serialises_even_with_spare_workers():
+    order = []
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        order.append(spec.id)
+        if len(order) == 1:
+            first_in.set()
+            release.wait(5)
+        return _clone_ws()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise, max_workers=2
+    )
+    disp.start()
+    try:
+        # Same repository in two spellings: the slug and its clone URL must
+        # collide on one serialisation key.
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        id2, _ = disp.submit(
+            disp.build_spec(
+                {"mode": "assess", "repo": "https://github.com/A/one.git"}
+            )
+        )
+        assert first_in.wait(5)
+        time.sleep(0.2)  # give the second worker a chance to (wrongly) start it
+        assert disp.get(id1).state == "running"
+        assert disp.get(id2).state == "queued"  # parked, not started
+        release.set()
+        assert disp.wait(id1, 10) and disp.wait(id2, 10)
+        assert order == [id1, id2]
+        assert disp.get(id2).state == "succeeded"
+    finally:
+        release.set()
+        disp.stop()
+
+
+def test_deferred_job_cancelled_while_parked_never_runs():
+    ran = []
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        ran.append(spec.id)
+        if len(ran) == 1:
+            first_in.set()
+            release.wait(5)
+        return _clone_ws()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise, max_workers=2
+    )
+    disp.start()
+    try:
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        id2, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+        time.sleep(0.2)  # let the pool park job 2 behind job 1's repo
+        status, payload = disp.cancel_job(id2)
+        assert (status, payload["state"]) == (200, "cancelled")
+        release.set()
+        assert disp.wait(id1, 10)
+        assert disp.wait(id2, 5)  # cancel set the event; the job never ran
+        assert ran == [id1]
+        assert disp.get(id2).state == "cancelled"
+    finally:
+        release.set()
+        disp.stop()
+
+
+def test_repo_key_normalises_and_tolerates_junk():
+    disp = Dispatcher(token="x")
+    spec = JobSpec(mode="assess", repo="ACME/Mono", title="t", description="",
+                   budget_usd=None, id="assess-k1")
+    junk = JobSpec(mode="verify", repo="", title="t", description="",
+                   budget_usd=None, id="verify-k2")
+    with disp._lock:
+        disp._registry["assess-k1"] = JobRecord(spec=spec)
+        disp._registry["verify-k2"] = JobRecord(spec=junk)
+    assert disp._repo_key("assess-k1") == "acme/mono"
+    assert disp._repo_key("verify-k2") == ""
+
+
+def test_server_threads_max_workers_through():
+    with running(max_workers=2) as server:
+        assert server.dispatcher._max_workers == 2
+        assert len(server.dispatcher._threads) == 2

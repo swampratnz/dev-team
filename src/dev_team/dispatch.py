@@ -405,12 +405,13 @@ def _default_materialise(spec: JobSpec, dest: str) -> Workspace:
 
 
 class Dispatcher:
-    """The job registry + single-flight worker behind the HTTP layer.
+    """The job registry + worker pool behind the HTTP layer.
 
     Directly unit-testable without a socket: :meth:`build_spec` validates a
-    SUBMIT body, :meth:`submit` enqueues, and the worker thread (started by
-    :meth:`start`) drains the queue one job at a time through
-    :meth:`run_job`.
+    SUBMIT body, :meth:`submit` enqueues, and the worker threads (started by
+    :meth:`start`) drain the queue — one job at a time with the default
+    ``max_workers=1``, or concurrently across **distinct** repositories with
+    a larger pool; same-repo jobs always serialise.
     """
 
     def __init__(
@@ -426,6 +427,7 @@ class Dispatcher:
         record_transcripts: bool = False,
         job_timeout: float = _JOB_TIMEOUT_SECONDS,
         oauth: Optional[GitHubOAuth] = None,
+        max_workers: int = 1,
     ) -> None:
         self.token = token
         # Optional GitHub OAuth sign-in (docs/GITHUB_APP.md): when wired, a
@@ -477,35 +479,62 @@ class Dispatcher:
         self._meta_lock = threading.Lock()
         self._queue: "queue.Queue[Any]" = queue.Queue()
         self._seq = 0
-        self._thread: Optional[threading.Thread] = None
+        self._threads: List[threading.Thread] = []
+        if max_workers < 1:
+            raise ValueError("max_workers must be at least 1")
+        self._max_workers = max_workers
+        # Per-repo serialisation state (both guarded by self._lock): repos
+        # with a job mid-run, and jobs parked because their repo was busy.
+        self._active_repos: set = set()
+        self._deferred: Dict[str, List[str]] = {}
 
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
-        """Spawn the single-flight worker thread (idempotent)."""
+        """Spawn the worker pool (idempotent).
 
-        if self._thread is None:
-            self._thread = threading.Thread(target=self._worker_loop, daemon=True)
-            self._thread.start()
+        ``max_workers`` defaults to 1, which is exactly the classic
+        single-flight service. More workers run jobs on **distinct**
+        repositories concurrently; two jobs on the same repository never
+        overlap (see :meth:`_worker_loop`), because dev-team has no
+        cross-run locking within a workspace. Every concurrent job still
+        draws on the one shared Claude subscription — keep the pool small.
+        """
+
+        if not self._threads:
+            for _ in range(self._max_workers):
+                thread = threading.Thread(target=self._worker_loop, daemon=True)
+                thread.start()
+                self._threads.append(thread)
 
     def stop(self) -> None:
-        """Signal the worker to drain-and-exit and join it."""
+        """Signal every worker to drain-and-exit and join them."""
 
-        if self._thread is not None:
+        if self._threads:
             self._queue.put(_SHUTDOWN)
-            self._thread.join(timeout=10)
-            self._thread = None
+            for thread in self._threads:
+                thread.join(timeout=10)
+            self._threads = []
 
     def _worker_loop(self) -> None:
-        """Own an asyncio loop and run queued jobs strictly one at a time.
+        """Own an asyncio loop and run queued jobs, serialised per repo.
+
+        A popped job whose repository already has a job mid-run is parked
+        (deferred) rather than run — two jobs on one workspace clone would
+        corrupt each other — and re-enqueued the moment the running job for
+        that repository finishes, preserving submit order per repo. With one
+        worker this degenerates to the classic strict single-flight queue.
 
         Each job runs under a wall-clock ceiling (:attr:`_job_timeout`): a job
-        that hangs would otherwise wedge the single-flight queue forever, so on
-        timeout the worker aborts it, marks it failed, and moves on to the next
-        job. ``asyncio.wait_for`` can only unwind the coroutine at an ``await``
+        that hangs would otherwise wedge its worker forever, so on timeout
+        the worker aborts it, marks it failed, and moves on to the next job.
+        ``asyncio.wait_for`` can only unwind the coroutine at an ``await``
         point — a job blocked in synchronous CPU/IO is not interruptible — but
         the stuck cases this guards (an agent session or clone that never
         returns) are all awaiting.
+
+        The shutdown sentinel is re-enqueued before a worker exits, so one
+        :meth:`stop` drains the whole pool.
         """
 
         loop = asyncio.new_event_loop()
@@ -513,15 +542,52 @@ class Dispatcher:
             while True:
                 item = self._queue.get()
                 if item is _SHUTDOWN:
+                    self._queue.put(_SHUTDOWN)
                     return
+                repo_key = self._repo_key(item)
+                with self._lock:
+                    still_queued = self._registry[item].state == "queued"
+                    if still_queued and repo_key in self._active_repos:
+                        self._deferred.setdefault(repo_key, []).append(item)
+                        continue
+                    self._active_repos.add(repo_key)
                 try:
                     loop.run_until_complete(
                         asyncio.wait_for(self._execute(item), timeout=self._job_timeout)
                     )
                 except asyncio.TimeoutError:
                     self._fail_timed_out(item)
+                finally:
+                    self._release_repo(repo_key)
         finally:
             loop.close()
+
+    def _repo_key(self, job_id: str) -> str:
+        """The serialisation key for a job's repository.
+
+        Normalised through :func:`parse_repo` so a slug and its clone URL
+        spell the same repository; a spec whose repo does not parse (a
+        corrupt verify ``meta.json``) falls back to the raw string — the job
+        will fail on its own, it just never dodges serialisation.
+        """
+
+        repo = self._registry[job_id].spec.repo
+        try:
+            return parse_repo(repo).slug.lower()
+        except SourceError:
+            return repo.lower()
+
+    def _release_repo(self, repo_key: str) -> None:
+        """Free ``repo_key`` and re-enqueue its oldest parked job, if any."""
+
+        with self._lock:
+            self._active_repos.discard(repo_key)
+            waiting = self._deferred.get(repo_key)
+            next_id = waiting.pop(0) if waiting else None
+            if not waiting and repo_key in self._deferred:
+                del self._deferred[repo_key]
+        if next_id is not None:
+            self._queue.put(next_id)
 
     def _fail_timed_out(self, job_id: str) -> None:
         """Mark a job failed after it blew the wall-clock ceiling.
@@ -2590,6 +2656,7 @@ class DispatchServer:
         record_transcripts: bool = False,
         job_timeout: float = _JOB_TIMEOUT_SECONDS,
         oauth: Optional[GitHubOAuth] = None,
+        max_workers: int = 1,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -2602,6 +2669,7 @@ class DispatchServer:
             record_transcripts=record_transcripts,
             job_timeout=job_timeout,
             oauth=oauth,
+            max_workers=max_workers,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()

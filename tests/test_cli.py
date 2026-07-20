@@ -2876,11 +2876,12 @@ class _FakeDispatchServer:
     instances = []
 
     def __init__(self, token, *, host, port, runner=None, dashboard_workspace=None,
-                 record_transcripts=False, oauth=None):
+                 record_transcripts=False, oauth=None, max_workers=1):
         self.token, self.host, self.port, self.runner = token, host, port, runner
         self.dashboard_workspace = dashboard_workspace
         self.record_transcripts = record_transcripts
         self.oauth = oauth
+        self.max_workers = max_workers
         self.interrupted = False
         self.shut_down = False
         _FakeDispatchServer.instances.append(self)
@@ -2923,7 +2924,7 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
 
     def interrupting_init(self, token, *, host, port, runner=None,
                           dashboard_workspace=None, record_transcripts=False,
-                          oauth=None):
+                          oauth=None, max_workers=1):
         original_init(self, token, host=host, port=port, runner=runner,
                       dashboard_workspace=dashboard_workspace,
                       record_transcripts=record_transcripts)
@@ -2984,6 +2985,27 @@ def test_main_dispatch_requires_token(monkeypatch, capsys):
     code = main(["--dispatch"], runner=ScriptedRunner([]))
     assert code == 2
     assert "DEV_TEAM_DISPATCH_TOKEN" in capsys.readouterr().err
+
+
+def test_main_dispatch_rejects_nonpositive_concurrency(monkeypatch, capsys):
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    code = main(
+        ["--dispatch", "--max-concurrent-jobs", "0"], runner=ScriptedRunner([])
+    )
+    assert code == 2
+    assert "--max-concurrent-jobs" in capsys.readouterr().err
+
+
+def test_main_dispatch_threads_max_workers(monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    code = main(
+        ["--dispatch", "--max-concurrent-jobs", "3"], runner=ScriptedRunner([])
+    )
+    assert code == 0
+    (server,) = _FakeDispatchServer.instances
+    assert server.max_workers == 3
 
 
 def test_main_dispatch_dashboard_workspace_is_wired(monkeypatch, tmp_path):
