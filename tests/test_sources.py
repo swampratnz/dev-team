@@ -103,6 +103,25 @@ def test_parse_repo_rejects_dot_segment_owner_or_name():
             parse_repo(bad)
 
 
+def test_parse_repo_rejects_url_hostile_owner_or_name():
+    # URL/scp forms derive owner/name from raw path segments and feed them
+    # unescaped into GitHub API paths and the App token-mint body, so a
+    # crafted repo must not smuggle URL-significant or control characters
+    # (percent-encoded or literal) into either segment.
+    for bad in (
+        "https://github.com/acme/name%3Fx",   # %-encoded '?'
+        "https://github.com/acme/name%23y",   # %-encoded '#'
+        "https://github.com/ac%20me/name",    # %-encoded space in owner
+        "git@github.com:acme/na me.git",      # literal space
+        "https://github.com/acme/name#frag",  # a real fragment on the name
+    ):
+        with pytest.raises(SourceError):
+            parse_repo(bad)
+    # legitimate owner/name characters (alnum, '-', '_', '.') still parse
+    ref = parse_repo("https://github.com/acme-org/my_repo.v2.git")
+    assert (ref.owner, ref.name) == ("acme-org", "my_repo.v2")
+
+
 def test_parse_repo_rejects_embedded_credentials():
     # A URL carrying credentials would leak them into argv and .git/config,
     # out of reach of the header-auth design and the scrubber; refuse it.

@@ -80,6 +80,14 @@ _GIT_TIMEOUT_SECONDS = 900.0
 
 _SLUG_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
+#: The character set a single owner or name segment may use — the same
+#: ``[\w.-]`` a bare slug is held to. URL and scp forms derive owner/name
+#: from raw path segments, so they must be constrained identically: without
+#: this a URL like ``https://github.com/acme/name%3Fx`` would splice ``?``
+#: (or ``#``, whitespace, control chars) straight into a GitHub API path and
+#: the token-mint body.
+_SEGMENT_RE = re.compile(r"^[\w.-]+$")
+
 
 class SourceError(DevTeamError):
     """Fetching the repository failed (parse, clone, or update)."""
@@ -185,13 +193,19 @@ def _owner_name_from_path(path: str, ref: str) -> tuple:
             f"cannot derive owner/name from repository reference: {ref!r}"
         )
     owner, name = segments[-2], _strip_git_suffix(segments[-1])
-    # Reject dot-segments so a crafted URL (``.../../evil.git``) can never
-    # yield an owner/name of ``.`` or ``..``. Such a value never matches a
-    # real GitHub App installation, but these derivations are now reachable
-    # over the authenticated dispatch API (job submit, GET /checks), so the
-    # owner/name must be as constrained as the bare-slug form already is.
-    if owner in (".", "..") or name in (".", ".."):
-        raise SourceError(f"invalid owner/name in repository reference: {ref!r}")
+    # Constrain owner/name to the same ``[\w.-]`` charset a bare slug is held
+    # to, AND reject the pure dot-segments ``.``/``..`` (which that charset
+    # otherwise allows, since ``.`` is legal inside a real name like
+    # ``my_repo.v2``). These derivations are reachable over the authenticated
+    # dispatch API (job submit, GET /checks) and feed unescaped into GitHub
+    # API paths and the App token-mint body, so a crafted URL must not
+    # smuggle ``?``/``#``/whitespace/control chars — nor a traversal
+    # segment — into either.
+    for segment in (owner, name):
+        if segment in (".", "..") or not _SEGMENT_RE.match(segment):
+            raise SourceError(
+                f"invalid owner/name in repository reference: {ref!r}"
+            )
     return owner, name
 
 

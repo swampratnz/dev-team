@@ -127,7 +127,7 @@ def test_callback_exchanges_code_and_creates_session():
     assert exchange["body"]["code"] == "code123"
     assert exchange["body"]["client_secret"] == "csec"
     assert user["headers"]["Authorization"] == "Bearer user_at"
-    assert installations["url"].endswith("/user/installations")
+    assert "/user/installations?per_page=100&page=1" in installations["url"]
 
 
 def test_callback_rejects_unknown_and_replayed_state():
@@ -213,6 +213,46 @@ def test_callback_tolerates_malformed_installation_entries():
     status, payload = oauth.handle_callback("code123", state)
     assert status == 200
     assert payload["installations"] == ["acme"]
+
+
+def test_callback_paginates_installations():
+    # A user in >30 orgs must not silently lose access to installations past
+    # page one: _identify follows pagination to total_count.
+    http = FakeHttp(
+        {"access_token": "user_at"},
+        {"login": "chris"},
+        {
+            "total_count": 3,
+            "installations": [
+                {"account": {"login": "org-a"}},
+                {"account": {"login": "org-b"}},
+            ],
+        },
+        {"total_count": 3, "installations": [{"account": {"login": "org-c"}}]},
+    )
+    oauth = GitHubOAuth(CONFIG, http=http, token_source=_sequential_tokens())
+    state = oauth.login_url()["state"]
+    status, payload = oauth.handle_callback("code123", state)
+    assert status == 200
+    assert payload["installations"] == ["org-a", "org-b", "org-c"]
+    # page 1 then page 2 were both requested
+    urls = [c["url"] for c in http.calls if "/user/installations" in c["url"]]
+    assert "page=1" in urls[0] and "page=2" in urls[1]
+
+
+def test_callback_stops_paginating_on_empty_page():
+    # total_count never reached (an installation lacked a login) — the empty
+    # trailing page is the backstop that ends the loop.
+    http = FakeHttp(
+        {"access_token": "user_at"},
+        {"login": "chris"},
+        {"total_count": 5, "installations": [{"account": {"login": "org-a"}}]},
+        {"total_count": 5, "installations": []},
+    )
+    oauth = GitHubOAuth(CONFIG, http=http, token_source=_sequential_tokens())
+    state = oauth.login_url()["state"]
+    status, payload = oauth.handle_callback("code123", state)
+    assert status == 200 and payload["installations"] == ["org-a"]
 
 
 def test_callback_tolerates_missing_installations_key():

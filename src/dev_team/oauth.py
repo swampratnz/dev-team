@@ -328,16 +328,39 @@ class GitHubOAuth:
         login = user.get("login")
         if not isinstance(login, str) or not login:
             raise OAuthError("could not identify the signed-in user")
-        listing = self._http(
-            "GET", f"{_API_BASE}/user/installations", headers, None
-        )
-        accounts = []
-        for installation in listing.get("installations") or []:
-            account = (installation or {}).get("account") or {}
-            account_login = account.get("login")
-            if isinstance(account_login, str) and account_login:
-                accounts.append(account_login)
-        return login, tuple(accounts)
+        return login, self._installation_accounts(headers)
+
+    def _installation_accounts(self, headers: Mapping[str, str]) -> Tuple[str, ...]:
+        """Every installation-account login for the user, following pages.
+
+        ``GET /user/installations`` returns 30 per page by default; a user in
+        many orgs would otherwise silently lose tenant access to the repos
+        past page one. Request the max page size and keep paging until the
+        collected count reaches the reported ``total_count`` (or a page comes
+        back empty) — the same discipline
+        :meth:`GitHubChecksReader._all_check_runs` uses.
+        """
+
+        accounts: list = []
+        page = 1
+        while True:
+            listing = self._http(
+                "GET",
+                f"{_API_BASE}/user/installations?per_page=100&page={page}",
+                dict(headers),
+                None,
+            )
+            batch = listing.get("installations")
+            batch = batch if isinstance(batch, list) else []
+            for installation in batch:
+                account = (installation or {}).get("account") or {}
+                account_login = account.get("login")
+                if isinstance(account_login, str) and account_login:
+                    accounts.append(account_login)
+            total = listing.get("total_count")
+            if not batch or not isinstance(total, int) or len(accounts) >= total:
+                return tuple(accounts)
+            page += 1
 
 
 __all__ = [
