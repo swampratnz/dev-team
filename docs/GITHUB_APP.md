@@ -91,9 +91,16 @@ matching GitHub's user-token lifetime.
 | Capability | Operator token | Signed-in session |
 |---|---|---|
 | Submit jobs (`POST /jobs`) | any repo | only repos whose **owner is in the user's installation snapshot** (403 otherwise; uniform across assess/deliver/verify) |
-| Read routes (`/jobs*`, `/backlog`, `/calibration`, `/costs`, `/checks`) | ✓ | ✓ (`/checks` installation-gated like submits) |
-| Answer interactive questions, cancel queued jobs | ✓ | ✓ |
+| Observe jobs (`GET /jobs`, `/jobs/{id}` status/result/findings/verifications/question) | all jobs | **only jobs on repos in the user's installations** — the listing is filtered, and a foreign tenant's job answers the same `404 unknown job` a nonexistent one does |
+| `GET /checks` | any repo | installation-gated like submits |
+| Answer interactive questions, cancel queued jobs | ✓ | ✓ for the session's own tenants' jobs (404 otherwise) |
+| Cross-tenant aggregates: `GET /backlog`, `/calibration`, `/costs`, `/foreman/plan`, `POST /jobs/{id}/backlog` | ✓ | **403 — operator only** (they aggregate every tenant's data) |
 | `POST /foreman/run`, purge/archive/unarchive, backlog mutations, `/access-log` | ✓ | **403 — operator only** |
+
+One dispatch instance can therefore serve unrelated organisations: a
+signed-in user can neither read nor probe another tenant's jobs, findings,
+costs, or backlog — their world is exactly the repos their App
+installations cover.
 
 The operator token remains what it always was: the box's admin
 credential in `DEV_TEAM_DISPATCH_TOKEN`.

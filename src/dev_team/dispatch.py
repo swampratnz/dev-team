@@ -540,11 +540,16 @@ class Dispatcher:
     def _worker_loop(self) -> None:
         """Own an asyncio loop and run queued jobs, serialised per repo.
 
-        A popped job whose repository already has a job mid-run is parked
-        (deferred) rather than run — two jobs on one workspace clone would
-        corrupt each other — and re-enqueued the moment the running job for
-        that repository finishes, preserving submit order per repo. With one
-        worker this degenerates to the classic strict single-flight queue.
+        A popped job runs only when its repository is idle **and** no older
+        submission for that repository is still parked; otherwise it is
+        parked (deferred) — two jobs on one workspace clone would corrupt
+        each other, and a newer job overtaking an older parked one would
+        break the per-repo FIFO promise. The parked list is kept in submit
+        order (worker pop order can race lock order, so parking re-sorts by
+        the registry's submit sequence), its head is re-enqueued — but left
+        in place — when the repository frees, and removed only by the worker
+        that actually starts it. With one worker this degenerates to the
+        classic strict single-flight queue.
 
         Each job runs under a wall-clock ceiling (:attr:`_job_timeout`): a job
         that hangs would otherwise wedge its worker forever, so on timeout
@@ -567,10 +572,24 @@ class Dispatcher:
                     return
                 repo_key = self._repo_key(item)
                 with self._lock:
-                    still_queued = self._registry[item].state == "queued"
-                    if still_queued and repo_key in self._active_repos:
-                        self._deferred.setdefault(repo_key, []).append(item)
+                    waiting = self._deferred.get(repo_key)
+                    head_of_line = not waiting or waiting[0] == item
+                    if repo_key in self._active_repos or not head_of_line:
+                        # Park: busy repo, or an older same-repo submission
+                        # is already waiting its turn. A cancelled job parks
+                        # like any other and no-ops when it finally pops —
+                        # special-casing it here would free the repo under
+                        # the job that is actually running.
+                        bucket = self._deferred.setdefault(repo_key, [])
+                        bucket.append(item)
+                        bucket.sort(key=self._order.index)
                         continue
+                    if waiting:
+                        # We are the parked head, re-enqueued by the last
+                        # release — claim our slot.
+                        waiting.pop(0)
+                        if not waiting:
+                            del self._deferred[repo_key]
                     self._active_repos.add(repo_key)
                 try:
                     loop.run_until_complete(
@@ -599,14 +618,17 @@ class Dispatcher:
             return repo.lower()
 
     def _release_repo(self, repo_key: str) -> None:
-        """Free ``repo_key`` and re-enqueue its oldest parked job, if any."""
+        """Free ``repo_key`` and re-enqueue its oldest parked job, if any.
+
+        The head stays in the parked list until the worker that pops it
+        actually starts it — removing it here would let a newer same-repo
+        submission still sitting in the main queue overtake it.
+        """
 
         with self._lock:
             self._active_repos.discard(repo_key)
             waiting = self._deferred.get(repo_key)
-            next_id = waiting.pop(0) if waiting else None
-            if not waiting and repo_key in self._deferred:
-                del self._deferred[repo_key]
+            next_id = waiting[0] if waiting else None
         if next_id is not None:
             self._queue.put(next_id)
 
@@ -808,12 +830,43 @@ class Dispatcher:
         with self._lock:
             return self._registry.get(job_id)
 
+    def session_sees_job(self, session: Optional[Session], job_id: str) -> bool:
+        """Whether this caller may observe ``job_id`` at all.
+
+        The operator (``session is None``) sees everything. A signed-in
+        session sees only jobs whose repository owner is in its installation
+        snapshot — the same boundary as submit — so one dispatch instance
+        can serve unrelated organisations without leaking each other's job
+        lists, results, or findings. The repo comes from the registry, or
+        (after a restart, for disk-keyed routes) the job's mirrored
+        ``meta.json``; a job with no discoverable repo is visible — there is
+        nothing tenant-scoped to leak and the route 404s on its own — while
+        a repo that will not parse fails **closed** for sessions.
+        """
+
+        if session is None:
+            return True
+        record = self.get(job_id)
+        repo = record.spec.repo if record is not None else None
+        if repo is None:
+            meta = self._read_meta(job_id)
+            if meta is not None:
+                repo = str(meta.get("repo", "")) or None
+        if repo is None:
+            return True
+        try:
+            ref = parse_repo(repo)
+        except SourceError:
+            return False
+        return self.oauth is not None and self.oauth.authorises_repo(session, ref)
+
     def recent(
         self,
         *,
         limit: int = _LIST_LIMIT,
         offset: int = 0,
         include_archived: bool = False,
+        session: Optional[Session] = None,
     ) -> List[JobRecord]:
         """A newest-first page of records.
 
@@ -834,6 +887,10 @@ class Dispatcher:
         records = list(reversed(ordered))
         if not include_archived:
             records = [r for r in records if not self._is_archived(r.spec.id)]
+        if session is not None:
+            # A signed-in session's page holds only its own tenants' jobs —
+            # filtered before pagination so pages stay full.
+            records = [r for r in records if self.session_sees_job(session, r.spec.id)]
         return records[offset : offset + limit]
 
     def wait(self, job_id: str, timeout: float = 5.0) -> bool:
@@ -2294,9 +2351,6 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                     return ("user", session)
             return None
 
-        def _authorised(self) -> bool:
-            return self._authenticate() is not None
-
         def _operator_only(self) -> bool:
             """Answer the 403 unless the caller holds the operator token.
 
@@ -2314,6 +2368,20 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 self._json(403, {"error": "operator token required"})
                 return False
             return True
+
+        def _session_sees(self, session: Optional[Session], job_id: str) -> bool:
+            """Answer the tenant-scoping 404 for a job outside the session.
+
+            A foreign tenant's job answers exactly what a nonexistent one
+            does — ``404 {"error":"unknown job"}`` — so a signed-in user
+            cannot even probe which job ids exist. The operator
+            (``session is None``) always passes.
+            """
+
+            if dispatcher.session_sees_job(session, job_id):
+                return True
+            self._json(404, {"error": "unknown job"})
+            return False
 
         def _auth_route(self, path: str, query: Dict[str, List[str]]) -> bool:
             """Handle the unauthenticated ``/auth/*`` sign-in routes.
@@ -2354,13 +2422,16 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             if self._auth_route(path, parse_qs(split.query)):
                 return
-            if not self._authorised():
+            auth = self._authenticate()
+            if auth is None:
                 self._json(401, {"error": "unauthorized"})
                 return
+            session = auth[1]
             if path == "/jobs":
                 # ?archived=1 reveals archived jobs too; any other value (or
                 # its absence) keeps the default exclusion. ?limit=/?offset=
                 # page the newest-first list (bounds enforced by recent()).
+                # A session's page is scoped to its installations.
                 query = parse_qs(split.query)
                 include_archived = query.get("archived", ["0"])[0] == "1"
                 limit = self._int_param(query, "limit", _LIST_LIMIT)
@@ -2374,22 +2445,34 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                                 limit=limit,
                                 offset=offset,
                                 include_archived=include_archived,
+                                session=session,
                             )
                         ]
                     },
                 )
                 return
             if path == "/backlog":
+                # Operator-only: the board aggregates stories bred from every
+                # tenant's assessments.
+                if not self._operator_only():
+                    return
                 status, payload = dispatcher.board()
                 self._json(status, payload)
                 return
             if path == "/calibration":
+                # Operator-only: a cross-tenant rollup over every job's
+                # verification history.
+                if not self._operator_only():
+                    return
                 status, payload = dispatcher.calibration()
                 self._json(status, payload)
                 return
             if path == "/costs":
+                # Operator-only: total spend across every tenant's jobs.
                 # ?archived=1 reveals archived jobs too — same exact-match
                 # contract as /jobs.
+                if not self._operator_only():
+                    return
                 include_archived = (
                     parse_qs(split.query).get("archived", ["0"])[0] == "1"
                 )
@@ -2414,7 +2497,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 # the per-repo credential. Sessions are held to the same
                 # installation boundary as job submission.
                 query = parse_qs(split.query)
-                # _authorised() passed above, so this re-resolve never
+                # authentication passed above, so this re-resolve never
                 # returns None; [1] is the session (None for the operator).
                 status, payload = dispatcher.repo_checks(
                     (query.get("repo") or [""])[0],
@@ -2424,9 +2507,12 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 self._json(status, payload)
                 return
             if path == "/foreman/plan":
-                # $0 dry-run of POST /foreman/run. ?max_stories= gets the same
-                # forgiving clamp every GET paging knob has; the spend-bearing
-                # POST validates strictly instead.
+                # Operator-only, like the run it previews (it reveals every
+                # tenant's ready stories and repos). ?max_stories= gets the
+                # same forgiving clamp every GET paging knob has; the
+                # spend-bearing POST validates strictly instead.
+                if not self._operator_only():
+                    return
                 max_stories = self._int_param(
                     parse_qs(split.query), "max_stories", DEFAULT_MAX_STORIES
                 )
@@ -2435,21 +2521,31 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "jobs":
+                if not self._session_sees(session, parts[1]):
+                    return
                 self._job(parts[1])
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "result":
+                if not self._session_sees(session, parts[1]):
+                    return
                 self._result(parts[1])
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "findings":
                 # Disk-keyed (no registry lookup): works after a restart.
+                if not self._session_sees(session, parts[1]):
+                    return
                 status, payload = dispatcher.list_job_findings(parts[1])
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "verifications":
+                if not self._session_sees(session, parts[1]):
+                    return
                 status, payload = dispatcher.verifications(parts[1])
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "question":
+                if not self._session_sees(session, parts[1]):
+                    return
                 status, payload = dispatcher.get_question(parts[1])
                 self._json(status, payload)
                 return
@@ -2497,18 +2593,26 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "backlog":
-                # Synchronous on purpose: a pure disk transform (no agents,
-                # no queue slot needed) that answers in one round-trip.
+                # Operator-only: it writes into the shared cross-tenant
+                # backlog. Synchronous on purpose: a pure disk transform (no
+                # agents, no queue slot needed) answering in one round-trip.
+                if not self._operator_only():
+                    return
                 status, payload = dispatcher.make_backlog(parts[1])
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "cancel":
                 # Same shape as .../backlog above: a pure in-memory
-                # transition, synchronous, no queue slot.
+                # transition, synchronous, no queue slot. Tenant-scoped for
+                # sessions like every job observation.
+                if not self._session_sees(auth[1], parts[1]):
+                    return
                 status, payload = dispatcher.cancel_job(parts[1])
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "answer":
+                if not self._session_sees(auth[1], parts[1]):
+                    return
                 body = self._read_body()
                 if body is None:
                     return

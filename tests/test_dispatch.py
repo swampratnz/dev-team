@@ -5128,3 +5128,182 @@ def test_default_checks_reader_authenticates_per_repo(monkeypatch):
     # anonymous (no credential) degrades to an empty token, not a crash
     monkeypatch.setattr(dispatch_mod, "_token_provider", StaticTokenProvider(None))
     assert dispatch_mod._default_checks_reader(parse_repo("acme/mono")).token == ""
+
+
+def test_three_same_repo_jobs_preserve_submit_order():
+    # The review-caught interleaving: J2 gets parked (leaving the main
+    # queue) while J1 runs; J3 is submitted afterwards and sits in the main
+    # queue. On J1's release the parked J2 must still run before J3, even
+    # though J3 reaches the queue's head first.
+    order = []
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        order.append(spec.id)
+        if len(order) == 1:
+            first_in.set()
+            release.wait(5)
+        return _clone_ws()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise, max_workers=3
+    )
+    disp.start()
+    try:
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+        id2, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        deadline = time.time() + 5
+        while time.time() < deadline:  # wait until J2 is genuinely parked
+            with disp._lock:
+                if any(id2 in bucket for bucket in disp._deferred.values()):
+                    break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("job 2 was never parked behind job 1")
+        id3, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        release.set()
+        assert disp.wait(id1, 10) and disp.wait(id2, 10) and disp.wait(id3, 10)
+        assert order == [id1, id2, id3]
+        assert disp._deferred == {}  # nothing left parked
+    finally:
+        release.set()
+        disp.stop()
+
+
+# --- tenant scoping of session reads (review fix) -----------------------------
+
+
+def test_session_sees_job_unit():
+    from dev_team.oauth import Session as OAuthSession
+
+    oauth, _ = _oauth_fixture()
+    disp = Dispatcher(token="x", oauth=oauth)
+    session = OAuthSession(
+        token="t", login="chris", installations=("acme",),
+        refresh_token=None, expires=10**12,
+    )
+    _insert_job(disp, "assess-own", "assess", "queued", None)  # repo acme/mono
+    foreign = JobSpec(mode="assess", repo="other/mono", title="T", description="",
+                      budget_usd=None, id="assess-foreign")
+    junk = JobSpec(mode="verify", repo="::junk::", title="T", description="",
+                   budget_usd=None, id="verify-junk")
+    with disp._lock:
+        disp._registry["assess-foreign"] = JobRecord(spec=foreign)
+        disp._registry["verify-junk"] = JobRecord(spec=junk)
+    assert disp.session_sees_job(None, "assess-own")  # operator sees all
+    assert disp.session_sees_job(None, "nonexistent")
+    assert disp.session_sees_job(session, "assess-own")
+    assert not disp.session_sees_job(session, "assess-foreign")
+    assert not disp.session_sees_job(session, "verify-junk")  # fails closed
+    # unknown job with no registry/meta: visible, the route 404s on its own
+    assert disp.session_sees_job(session, "nonexistent")
+    # no oauth wired at all: a stray session object fails closed too
+    bare = Dispatcher(token="x")
+    _insert_job(bare, "assess-b", "assess", "queued", None)
+    assert not bare.session_sees_job(session, "assess-b")
+
+
+def test_session_sees_job_reads_meta_after_restart():
+    from dev_team.oauth import Session as OAuthSession
+
+    oauth, _ = _oauth_fixture()
+    dash = InMemoryWorkspace()
+    dash.write_text("audit/assess-m/meta.json", json.dumps({"repo": "acme/mono"}))
+    dash.write_text("audit/assess-f/meta.json", json.dumps({"repo": "other/mono"}))
+    dash.write_text("audit/assess-e/meta.json", json.dumps({"repo": ""}))
+    disp = Dispatcher(token="x", oauth=oauth, dashboard_workspace=dash)
+    session = OAuthSession(
+        token="t", login="chris", installations=("acme",),
+        refresh_token=None, expires=10**12,
+    )
+    assert disp.session_sees_job(session, "assess-m")
+    assert not disp.session_sees_job(session, "assess-f")
+    # meta with an empty repo carries no tenant info: visible, route 404s
+    assert disp.session_sees_job(session, "assess-e")
+
+
+def test_session_job_listing_is_filtered():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        _insert_job(server.dispatcher, "assess-mine", "assess", "queued", None)
+        foreign = JobSpec(mode="assess", repo="other/mono", title="T",
+                          description="", budget_usd=None, id="assess-theirs")
+        with server.dispatcher._lock:
+            server.dispatcher._registry["assess-theirs"] = JobRecord(spec=foreign)
+            server.dispatcher._order.append("assess-theirs")
+        session_token = _sign_in(server)
+        _, payload = _call(server, "/jobs", token=session_token)
+        assert [j["id"] for j in payload["jobs"]] == ["assess-mine"]
+        # the operator still sees both
+        _, payload = _call(server, "/jobs")
+        assert {j["id"] for j in payload["jobs"]} == {"assess-mine", "assess-theirs"}
+
+
+def test_session_foreign_job_routes_answer_unknown_job():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        foreign = JobSpec(mode="assess", repo="other/mono", title="T",
+                          description="", budget_usd=None, id="assess-theirs")
+        with server.dispatcher._lock:
+            server.dispatcher._registry["assess-theirs"] = JobRecord(spec=foreign)
+            server.dispatcher._order.append("assess-theirs")
+        session_token = _sign_in(server)
+        probes = [
+            ("GET", "/jobs/assess-theirs", None),
+            ("GET", "/jobs/assess-theirs/result", None),
+            ("GET", "/jobs/assess-theirs/findings", None),
+            ("GET", "/jobs/assess-theirs/verifications", None),
+            ("GET", "/jobs/assess-theirs/question", None),
+            ("POST", "/jobs/assess-theirs/cancel", None),
+            ("POST", "/jobs/assess-theirs/answer", {"choice": "approve"}),
+        ]
+        for method, path, body in probes:
+            status, payload = _call(
+                server, path, method=method, token=session_token, body=body
+            )
+            assert (status, payload) == (404, {"error": "unknown job"}), path
+
+
+def test_session_own_job_routes_still_work():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        _insert_job(server.dispatcher, "assess-mine", "assess", "queued", None)
+        # _insert_job bypasses submit; cancel needs the completion event a
+        # real submit would have registered.
+        server.dispatcher._events["assess-mine"] = threading.Event()
+        session_token = _sign_in(server)
+        status, payload = _call(server, "/jobs/assess-mine", token=session_token)
+        assert (status, payload["id"]) == (200, "assess-mine")
+        status, payload = _call(
+            server, "/jobs/assess-mine/question", token=session_token
+        )
+        assert (status, payload) == (200, {"pending": False})
+        status, payload = _call(
+            server, "/jobs/assess-mine/answer", method="POST",
+            token=session_token, body={"choice": "approve"},
+        )
+        assert status == 409  # no pending question — but never "unknown job"
+        status, payload = _call(
+            server, "/jobs/assess-mine/cancel", method="POST", token=session_token
+        )
+        assert (status, payload["state"]) == (200, "cancelled")
+
+
+def test_session_locked_out_of_cross_tenant_aggregates():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        for method, path in [
+            ("GET", "/backlog"),
+            ("GET", "/calibration"),
+            ("GET", "/costs"),
+            ("GET", "/foreman/plan"),
+            ("POST", "/jobs/assess-x/backlog"),
+        ]:
+            status, payload = _call(server, path, method=method, token=session_token)
+            assert (status, payload) == (
+                403,
+                {"error": "operator token required"},
+            ), path

@@ -37,9 +37,14 @@ authorised caller, and rotate it by editing the env file and restarting.
 **GitHub sign-in (optional)**: with `GITHUB_OAUTH_CLIENT_ID`/`_SECRET`
 configured, users can sign in with GitHub (`GET /auth/login` →
 `GET /auth/callback` → session token, renewable via `POST /auth/refresh`)
-and use their session token as the bearer instead. Sessions may submit and
-observe jobs — but only against repositories covered by the GitHub App
-installations their account can reach (403 otherwise) — while
+and use their session token as the bearer instead. Sessions are
+**tenant-scoped end to end**: they may submit only against repositories
+covered by the GitHub App installations their account can reach (403
+otherwise), and they observe only those tenants' jobs — the `/jobs`
+listing is filtered, and any other tenant's job id answers the same
+`404 unknown job` a nonexistent one does. Cross-tenant aggregates
+(`GET /backlog`, `/calibration`, `/costs`, `/foreman/plan`,
+`POST /jobs/{id}/backlog`) and the
 spend-multiplying/destructive/audit routes (`/foreman/run`, purge,
 archive/unarchive, backlog mutations, `/access-log`) stay operator-only.
 See [`docs/GITHUB_APP.md`](GITHUB_APP.md) for the full model, including how
