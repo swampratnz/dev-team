@@ -117,7 +117,7 @@ from .models import (
 from .ordering import lint_plan
 from .persona import Roster
 from .policy import GuardedCommandRunner, SideEffectPolicy
-from .profile import detect_project
+from .profile import ProjectProfile, detect_project
 from .replan import Replan, ReplanError, apply_replan
 from .retrieval import char_budget_for_tokens, estimate_tokens, retrieve
 from .sandbox import ContainerCommandRunner, SandboxConfig
@@ -873,6 +873,13 @@ class DeliveryEngine:
         self._baseline_failures = None
         self._baseline_sha: Optional[str] = None
         self._profile = None
+        # Whether the DoD came from auto-detection (vs. an injected
+        # definition_of_done / verify_command / remote_verify_status), and a
+        # fingerprint of the root manifests that produced it — together these
+        # let _maybe_refresh_profile re-detect exactly once per manifest
+        # change, and never touch an explicitly configured run.
+        self._profile_autodetected = False
+        self._last_manifest_signature: frozenset = frozenset()
         self._conventions: Optional[str] = None
         self._scorecard: Dict[str, int] = {}
 
@@ -1394,15 +1401,45 @@ class DeliveryEngine:
 
         if self.definition_of_done is not None:
             return None
+        self._profile_autodetected = True
         profile = self._profile or detect_project(self.workspace)
+        if profile.verify_command is None:
+            self._apply_profile(profile)
+            return None
+        if profile.kind == "unknown" and self.config.require_recognised_project:
+            # No manifest was recognised, so the verify command is a *guess*
+            # (pytest). Silently guessing is what makes a from-scratch delivery
+            # of, say, a Node or Go project fail every task on a command that
+            # was never theirs. Refuse outright when asked to.
+            return (
+                "no build manifest was recognised in the workspace and "
+                "require_recognised_project is set: refusing to guess a "
+                "verify command. Set verify_command (or remote_verify_status) "
+                "to tell the delivery how to test this project."
+            )
+        self._apply_profile(profile)
+        return None
+
+    def _apply_profile(self, profile: ProjectProfile) -> None:
+        """Point the gates (and profile-derived state) at ``profile``.
+
+        Shared by the baseline auto-detect above and the mid-run re-detect
+        in :meth:`_maybe_refresh_profile`, so a workspace that only grows its
+        real manifests after a from-scratch task announces and gates on the
+        switch identically to the baseline path.
+        """
+
+        self._profile = profile
+        self._last_manifest_signature = self._manifest_signature()
         self.blackboard.put("project_profile", profile.kind)
         if profile.verify_command is None:
             # The stack was recognised but cannot build or test on this
-            # machine (e.g. legacy .NET Framework). Running any local command
-            # would fail every task for reasons no engineer can fix, so
-            # verification degrades to an always-pass marker gate: review,
-            # security, and static findings become the quality bar, and the
-            # fail-to-pass check is disabled as meaningless.
+            # machine (e.g. legacy .NET Framework, or a recognised toolchain
+            # missing from PATH). Running any local command would fail every
+            # task for reasons no engineer can fix, so verification degrades
+            # to an always-pass marker gate: review, security, and static
+            # findings become the quality bar, and the fail-to-pass check is
+            # disabled as meaningless.
             self._local_verification = False
             self.definition_of_done = DefinitionOfDone(
                 [
@@ -1426,23 +1463,14 @@ class DeliveryEngine:
                     "review (set remote_verify_status to gate on real CI)"
                 ),
             )
-            return None
+            return
+        self.definition_of_done = DefinitionOfDone(
+            [CommandGate("tests", profile.verify_command)]
+        )
         if profile.kind == "unknown":
-            # No manifest was recognised, so the verify command is a *guess*
-            # (pytest). Silently guessing is what makes a from-scratch delivery
+            # Silently guessing pytest is what makes a from-scratch delivery
             # of, say, a Node or Go project fail every task on a command that
-            # was never theirs. Refuse outright when asked to; otherwise fall
-            # back — but loudly, naming the assumption so it is never silent.
-            if self.config.require_recognised_project:
-                return (
-                    "no build manifest was recognised in the workspace and "
-                    "require_recognised_project is set: refusing to guess a "
-                    "verify command. Set verify_command (or remote_verify_status) "
-                    "to tell the delivery how to test this project."
-                )
-            self.definition_of_done = DefinitionOfDone(
-                [CommandGate("tests", profile.verify_command)]
-            )
+            # was never theirs — name the assumption so it is never silent.
             self._event(
                 "gates",
                 "No build manifest recognised — guessing a Python/pytest project",
@@ -1453,16 +1481,44 @@ class DeliveryEngine:
                     "task fails on a command that was never yours."
                 ),
             )
-            return None
-        self.definition_of_done = DefinitionOfDone(
-            [CommandGate("tests", profile.verify_command)]
-        )
+            return
         self._event(
             "gates",
             f"Auto-detected {profile.kind} project",
             detail=f"verify: {' '.join(profile.verify_command)} ({profile.reason})",
         )
-        return None
+
+    def _manifest_signature(self) -> frozenset:
+        """Fingerprint of the root-level files :func:`detect_project` reads.
+
+        Used to tell whether a task actually changed what the profile
+        detector looks at, so :meth:`_maybe_refresh_profile` re-detects only
+        when it could change the outcome — not on every task.
+        """
+
+        return frozenset(f for f in self.workspace.list_files() if "/" not in f)
+
+    def _maybe_refresh_profile(self) -> None:
+        """Re-detect the project profile once a task changes root manifests.
+
+        Baseline detection above runs exactly once, before any task
+        executes; a from-scratch or thin-root delivery is often still
+        mid-guess the moment a task adds the workspace's first real manifest
+        (e.g. a ``.csproj``), and without this the stale baseline guess
+        keeps gating every remaining task — including the one that just
+        introduced the real stack, which is what let the original incident
+        thrash to INCOMPLETE. A no-op when the manifest set is unchanged (no
+        redundant re-detection) or when the DoD was never auto-detected in
+        the first place (an injected ``definition_of_done`` / configured
+        ``verify_command`` / ``remote_verify_status`` never enters this
+        path).
+        """
+
+        if not self._profile_autodetected:
+            return
+        if self._manifest_signature() == self._last_manifest_signature:
+            return
+        self._apply_profile(detect_project(self.workspace))
 
     def _remote_ci_gate(self) -> RemoteCIGate:
         """The configured external-CI gate (requires remote_verify_status)."""
@@ -2371,6 +2427,11 @@ class DeliveryEngine:
                         )
                     ],
                 )
+            # The squash merge just landed the task's files onto the
+            # canonical delivery branch — the authoritative point (serialised
+            # by the lock above) to notice a manifest change and re-gate the
+            # merged state, and every task after it, on the real stack.
+            self._maybe_refresh_profile()
             dod = await asyncio.to_thread(
                 self.definition_of_done.evaluate, self._gate_context(task)
             )
@@ -2414,6 +2475,12 @@ class DeliveryEngine:
             else:
                 snapshot = self._snapshot(implementation)
                 applier.apply(implementation)
+            if workspace is None:
+                # Only for the canonical (non-worktree) workspace: a private
+                # worktree arena isn't the authoritative manifest set, so
+                # worktree-mode tasks refresh at _merge_task instead, once
+                # their change has actually landed on the delivery branch.
+                self._maybe_refresh_profile()
             contents = self._contents(implementation, ws)
             self.blackboard.post_artifact("implementation", task.id, implementation.summary)
 
