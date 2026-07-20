@@ -2876,10 +2876,11 @@ class _FakeDispatchServer:
     instances = []
 
     def __init__(self, token, *, host, port, runner=None, dashboard_workspace=None,
-                 record_transcripts=False):
+                 record_transcripts=False, oauth=None):
         self.token, self.host, self.port, self.runner = token, host, port, runner
         self.dashboard_workspace = dashboard_workspace
         self.record_transcripts = record_transcripts
+        self.oauth = oauth
         self.interrupted = False
         self.shut_down = False
         _FakeDispatchServer.instances.append(self)
@@ -2921,7 +2922,8 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
     original_init = _FakeDispatchServer.__init__
 
     def interrupting_init(self, token, *, host, port, runner=None,
-                          dashboard_workspace=None, record_transcripts=False):
+                          dashboard_workspace=None, record_transcripts=False,
+                          oauth=None):
         original_init(self, token, host=host, port=port, runner=runner,
                       dashboard_workspace=dashboard_workspace,
                       record_transcripts=record_transcripts)

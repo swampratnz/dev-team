@@ -98,6 +98,7 @@ from .foreman import (
     story_job_description,
 )
 from .githubapp import resolve_token_provider
+from .oauth import GitHubOAuth, Session
 from .sources import (
     SourceError,
     TokenProvider,
@@ -424,8 +425,14 @@ class Dispatcher:
         dashboard_workspace: Optional[Workspace] = None,
         record_transcripts: bool = False,
         job_timeout: float = _JOB_TIMEOUT_SECONDS,
+        oauth: Optional[GitHubOAuth] = None,
     ) -> None:
         self.token = token
+        # Optional GitHub OAuth sign-in (docs/GITHUB_APP.md): when wired, a
+        # session token is accepted as a bearer alongside the operator token,
+        # with per-user repo authorisation and operator-only routes enforced
+        # by the handler. None keeps the classic single-token service.
+        self.oauth = oauth
         self._runner = runner
         self._materialise = materialise or _default_materialise
         self._clock = clock
@@ -2133,23 +2140,76 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             except ValueError:
                 return default
 
-        def _authorised(self) -> bool:
-            """Constant-time bearer check over the whole header value.
+        def _authenticate(self) -> Optional[Tuple[str, Optional[Session]]]:
+            """``("operator", None)``, ``("user", session)``, or ``None``.
 
-            Compares UTF-8 *bytes*, not str: headers decode as latin-1, so a
-            non-ASCII ``Authorization`` value is a valid str that
-            :func:`hmac.compare_digest` refuses (it raises on non-ASCII text).
-            The header is attacker-controlled and reached before auth, so a
-            stray byte must read as "no match", never crash the handler
-            (which would be a pre-auth 500/connection-reset DoS). Mirrors the
-            dashboard's ``_tokens_match``.
+            The operator check is a constant-time bearer comparison over the
+            whole header value, in UTF-8 *bytes*, not str: headers decode as
+            latin-1, so a non-ASCII ``Authorization`` value is a valid str
+            that :func:`hmac.compare_digest` refuses (it raises on non-ASCII
+            text). The header is attacker-controlled and reached before
+            auth, so a stray byte must read as "no match", never crash the
+            handler (which would be a pre-auth 500/connection-reset DoS).
+            Mirrors the dashboard's ``_tokens_match``. When OAuth sign-in is
+            wired, a bearer that is not the operator token is then looked up
+            as a session token (the lookup is constant-time per stored
+            token).
             """
 
             expected = f"Bearer {dispatcher.token}"
             provided = self.headers.get("Authorization", "")
-            return hmac.compare_digest(
+            if hmac.compare_digest(
                 provided.encode("utf-8"), expected.encode("utf-8")
-            )
+            ):
+                return ("operator", None)
+            if dispatcher.oauth is not None and provided.startswith("Bearer "):
+                session = dispatcher.oauth.session_for(provided[len("Bearer "):])
+                if session is not None:
+                    return ("user", session)
+            return None
+
+        def _authorised(self) -> bool:
+            return self._authenticate() is not None
+
+        def _operator_only(self) -> bool:
+            """Answer the 403 unless the caller holds the operator token.
+
+            Spend-multiplying, destructive, and audit routes (foreman runs,
+            purge/archive, backlog mutation, the access log) stay with the
+            operator even when user sign-in is enabled: a signed-in user may
+            submit and observe work, never administer the service.
+            """
+
+            auth = self._authenticate()
+            if auth is None:
+                self._json(401, {"error": "unauthorized"})
+                return False
+            if auth[0] != "operator":
+                self._json(403, {"error": "operator token required"})
+                return False
+            return True
+
+        def _auth_route(self, path: str, query: Dict[str, List[str]]) -> bool:
+            """Handle the unauthenticated ``/auth/*`` sign-in routes.
+
+            Returns ``True`` when the path was one of them (handled either
+            way). All 404 when OAuth sign-in is not configured, so the
+            classic single-token service exposes no new surface.
+            """
+
+            if path not in ("/auth/login", "/auth/callback"):
+                return False
+            if dispatcher.oauth is None:
+                self._json(404, {"error": "not found"})
+                return True
+            if path == "/auth/login":
+                self._json(200, dispatcher.oauth.login_url())
+                return True
+            code = (query.get("code") or [""])[0]
+            state = (query.get("state") or [""])[0]
+            status, payload = dispatcher.oauth.handle_callback(code, state)
+            self._json(status, payload)
+            return True
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             split = urlsplit(self.path)
@@ -2165,6 +2225,8 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                         "version": __version__,
                     },
                 )
+                return
+            if self._auth_route(path, parse_qs(split.query)):
                 return
             if not self._authorised():
                 self._json(401, {"error": "unauthorized"})
@@ -2209,9 +2271,12 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 self._json(status, payload)
                 return
             if path == "/access-log":
+                # Operator-only: the access journal is the audit surface.
                 # ?limit= (default 100, clamped to [1, 1000]) — missing or
                 # non-numeric falls back to the default, same forgiving
                 # posture _int_param already gives ?limit=/?offset= on /jobs.
+                if not self._operator_only():
+                    return
                 limit = self._int_param(
                     parse_qs(split.query), "limit", _ACCESS_LOG_LIMIT_DEFAULT
                 )
@@ -2252,16 +2317,38 @@ def _make_handler(dispatcher: Dispatcher) -> type:
 
         def do_POST(self) -> None:  # noqa: N802 (http.server API)
             path = urlsplit(self.path).path
-            if not self._authorised():
+            if path == "/auth/refresh":
+                # Session-bearer route: rotates the session from its stored
+                # refresh token. 404 when sign-in is not configured (no new
+                # surface for the classic service); the operator token has
+                # no session to refresh, so it gets the same 401 an unknown
+                # bearer does.
+                if dispatcher.oauth is None:
+                    self._json(404, {"error": "not found"})
+                    return
+                provided = self.headers.get("Authorization", "")
+                bearer = (
+                    provided[len("Bearer "):]
+                    if provided.startswith("Bearer ")
+                    else ""
+                )
+                status, payload = dispatcher.oauth.refresh(bearer)
+                self._json(status, payload)
+                return
+            auth = self._authenticate()
+            if auth is None:
                 self._json(401, {"error": "unauthorized"})
                 return
             if path == "/jobs":
-                self._create()
+                self._create(auth[1])
                 return
             if path == "/foreman/run":
-                # Synchronous like the other cores: selection + enqueueing is
-                # a locked disk/registry transform; the jobs themselves run on
-                # the single-flight queue afterwards.
+                # Operator-only (it multiplies spend). Synchronous like the
+                # other cores: selection + enqueueing is a locked
+                # disk/registry transform; the jobs themselves run on the
+                # single-flight queue afterwards.
+                if not self._operator_only():
+                    return
                 body = self._read_body()
                 if body is None:
                     return
@@ -2292,8 +2379,10 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 "archive",
                 "unarchive",
             ):
-                # Same shape as .../backlog above: a pure disk transform,
-                # synchronous, no queue slot.
+                # Operator-only lifecycle admin. Same shape as .../backlog
+                # above: a pure disk transform, synchronous, no queue slot.
+                if not self._operator_only():
+                    return
                 if parts[2] == "archive":
                     status, payload = dispatcher.archive_job(parts[1])
                 else:
@@ -2301,20 +2390,25 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "purge":
-                # Same shape as .../archive above: a pure disk transform,
-                # synchronous, no queue slot.
+                # Operator-only (permanent deletion). Same shape as
+                # .../archive above: a pure disk transform, synchronous, no
+                # queue slot.
+                if not self._operator_only():
+                    return
                 status, payload = dispatcher.purge_job(parts[1])
                 self._json(status, payload)
                 return
             if parts[0] == "backlog":
+                # Operator-only: the shared backlog is cross-user state.
+                if not self._operator_only():
+                    return
                 self._backlog_post(parts)
                 return
             self._json(404, {"error": "not found"})
 
         def do_PATCH(self) -> None:  # noqa: N802 (http.server API)
             path = urlsplit(self.path).path
-            if not self._authorised():
-                self._json(401, {"error": "unauthorized"})
+            if not self._operator_only():
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "backlog" and parts[1] == "story":
@@ -2328,8 +2422,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
 
         def do_DELETE(self) -> None:  # noqa: N802 (http.server API)
             path = urlsplit(self.path).path
-            if not self._authorised():
-                self._json(401, {"error": "unauthorized"})
+            if not self._operator_only():
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "backlog" and parts[1] == "story":
@@ -2409,7 +2502,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return None
             return body
 
-        def _create(self) -> None:
+        def _create(self, session: Optional[Session]) -> None:
             body = self._read_body()
             if body is None:
                 return
@@ -2421,12 +2514,40 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             except SubmitRejected as exc:
                 self._json(exc.status, {"error": str(exc)})
                 return
+            if session is not None and not self._session_may_target(session, spec):
+                return
             try:
                 job_id, position = dispatcher.submit(spec)
             except QueueFull:
                 self._json(503, {"error": "queue full"})
                 return
             self._json(202, {"id": job_id, "state": "queued", "position": position})
+
+        def _session_may_target(self, session: Session, spec: JobSpec) -> bool:
+            """Gate a signed-in user's submit on their installation set.
+
+            The operator token is never gated (it administers the box); a
+            session may only point work at a repository whose owner is one
+            of the GitHub App installations that user can reach. The check
+            covers every mode uniformly — a verify job's repo was already
+            re-derived from the source job's ``meta.json`` by
+            ``build_spec``, so the same field is authoritative there too. A
+            repo that does not parse answers the same 403 (never a 500):
+            the spec validation already vetted submitted repos, so an
+            unparseable one here can only be a corrupt verify ``meta.json``.
+            """
+
+            try:
+                ref = parse_repo(spec.repo)
+            except SourceError:
+                self._json(403, {"error": "repository not in your installations"})
+                return False
+            if dispatcher.oauth is not None and dispatcher.oauth.authorises_repo(
+                session, ref
+            ):
+                return True
+            self._json(403, {"error": "repository not in your installations"})
+            return False
 
         def _job(self, job_id: str) -> None:
             record = dispatcher.get(job_id)
@@ -2468,6 +2589,7 @@ class DispatchServer:
         dashboard_workspace: Optional[Workspace] = None,
         record_transcripts: bool = False,
         job_timeout: float = _JOB_TIMEOUT_SECONDS,
+        oauth: Optional[GitHubOAuth] = None,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -2479,6 +2601,7 @@ class DispatchServer:
             dashboard_workspace=dashboard_workspace,
             record_transcripts=record_transcripts,
             job_timeout=job_timeout,
+            oauth=oauth,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()

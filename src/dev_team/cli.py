@@ -71,6 +71,7 @@ from .report import (
 from .sandbox import SandboxConfig
 from .sdk import AgentRunner, ChatBackend, ClaudeAgentRunner, ClaudeChatBackend
 from .githubapp import GitHubAppError, resolve_token_provider
+from .oauth import GitHubOAuth, resolve_oauth_config
 from .sources import (
     RepoRef,
     TokenProvider,
@@ -1917,6 +1918,13 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
             "set it in the environment (or the service's EnvironmentFile) and "
             "share it only with the authorised caller"
         )
+    # GitHub OAuth sign-in is wired only when configured (same env-file
+    # search as every other credential); unconfigured keeps the classic
+    # single-token service with no new routes.
+    oauth_config = resolve_oauth_config(
+        args.env_file if args.env_file is not None else default_env_file()
+    )
+    oauth = GitHubOAuth(oauth_config) if oauth_config is not None else None
     server = DispatchServer(
         token,
         host=args.host if args.host is not None else "127.0.0.1",
@@ -1931,9 +1939,11 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
             args.record_transcripts
             or _env_truthy(os.environ.get(RECORD_TRANSCRIPTS_ENV))
         ),
+        oauth=oauth,
     )
     print(
-        f"dev-team dispatch service at {server.url} (Ctrl-C to stop)",
+        f"dev-team dispatch service at {server.url} (Ctrl-C to stop)"
+        + (" — GitHub sign-in enabled" if oauth is not None else ""),
         file=sys.stderr,
     )
     try:

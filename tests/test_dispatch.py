@@ -4572,3 +4572,188 @@ def test_foreman_routes_over_http(tmp_path):
         )
         assert status == 400
         assert "budget_usd is required" in payload["error"]
+
+
+# --- GitHub OAuth sign-in over HTTP ------------------------------------------
+
+
+def _oauth_fixture(*, installations=({"account": {"login": "acme"}},)):
+    """A deterministic GitHubOAuth whose GitHub side is queued fakes."""
+
+    from test_oauth import FakeHttp
+
+    from dev_team.oauth import GitHubOAuth, OAuthConfig
+
+    counter = {"n": 0}
+
+    def token_source():
+        counter["n"] += 1
+        return f"tok{counter['n']}"
+
+    http = FakeHttp(
+        {"access_token": "user_at", "refresh_token": "rt_1"},
+        {"login": "chris"},
+        {"installations": list(installations)},
+    )
+    return GitHubOAuth(
+        OAuthConfig(client_id="cid", client_secret="csec"),
+        http=http,
+        token_source=token_source,
+    ), http
+
+
+def _sign_in(server):
+    """Drive /auth/login → /auth/callback over HTTP; returns the session token."""
+
+    status, login = _call(server, "/auth/login", token=None)
+    assert status == 200 and "github.com/login/oauth/authorize" in login["url"]
+    status, session = _call(
+        server, f"/auth/callback?code=c1&state={login['state']}", token=None
+    )
+    assert status == 200
+    return session["session_token"]
+
+
+def test_auth_routes_404_when_oauth_not_configured():
+    with running() as server:
+        assert _call(server, "/auth/login", token=None)[0] == 404
+        assert _call(server, "/auth/callback?code=x&state=y", token=None)[0] == 404
+        assert _call(server, "/auth/refresh", method="POST", token=None)[0] == 404
+
+
+def test_oauth_sign_in_grants_a_working_session():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(server, "/jobs", token=session_token)
+        assert (status, payload) == (200, {"jobs": []})
+
+
+def test_oauth_callback_without_code_is_400():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        status, login = _call(server, "/auth/login", token=None)
+        status, payload = _call(
+            server, f"/auth/callback?state={login['state']}", token=None
+        )
+        assert status == 400 and "code" in payload["error"]
+
+
+def test_oauth_wrong_bearer_still_401():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        assert _call(server, "/jobs", token="not-a-session")[0] == 401
+        assert _call(server, "/jobs", token=None)[0] == 401
+
+
+def test_session_submit_gated_by_installations():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server,
+            "/jobs",
+            method="POST",
+            token=session_token,
+            body={"mode": "assess", "repo": "acme/rota"},
+        )
+        assert status == 202
+        status, payload = _call(
+            server,
+            "/jobs",
+            method="POST",
+            token=session_token,
+            body={"mode": "assess", "repo": "otherorg/rota"},
+        )
+        assert status == 403
+        assert "installations" in payload["error"]
+
+
+def test_session_verify_gated_on_meta_repo():
+    # A verify job's repo comes from the source job's meta.json; a session
+    # whose installations don't cover it (here: an unparseable repo from a
+    # corrupt meta) answers the same 403, never a 500.
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-g/assessment.json", json.dumps(_assessment_payload())
+    )
+    dash.write_text("audit/assess-g/meta.json", json.dumps({"repo": ""}))
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, dashboard_workspace=dash) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server,
+            "/jobs",
+            method="POST",
+            token=session_token,
+            body={
+                "mode": "verify",
+                "source_job": "assess-g",
+                "finding_id": "recommendation.plan[0]",
+            },
+        )
+        assert status == 403 and "installations" in payload["error"]
+
+
+def test_operator_submit_is_never_gated():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        status, _ = _call(
+            server,
+            "/jobs",
+            method="POST",
+            body={"mode": "assess", "repo": "anyorg/anywhere"},
+        )
+        assert status == 202
+
+
+def test_session_is_locked_out_of_operator_routes():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        locked = [
+            ("GET", "/access-log", None),
+            ("POST", "/foreman/run", {"budget_usd": 1}),
+            ("POST", "/jobs/assess-x/purge", None),
+            ("POST", "/jobs/assess-x/archive", None),
+            ("POST", "/jobs/assess-x/unarchive", None),
+            ("POST", "/backlog/story", {"title": "t"}),
+            ("PATCH", "/backlog/story/S1", {"title": "t"}),
+            ("DELETE", "/backlog/story/S1", None),
+        ]
+        for method, path, body in locked:
+            status, payload = _call(
+                server, path, method=method, token=session_token, body=body
+            )
+            assert (status, payload) == (
+                403,
+                {"error": "operator token required"},
+            ), (method, path)
+        # the same routes stay 401 for an unauthenticated caller
+        assert _call(server, "/backlog/story/S1", method="DELETE", token="bad")[0] == 401
+
+
+def test_auth_refresh_rotates_over_http():
+    oauth, http = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        http.responses.extend(
+            [
+                {"access_token": "user_at2", "refresh_token": "rt_2"},
+                {"login": "chris"},
+                {"installations": [{"account": {"login": "acme"}}]},
+            ]
+        )
+        status, renewed = _call(
+            server, "/auth/refresh", method="POST", token=session_token
+        )
+        assert status == 200 and renewed["session_token"] != session_token
+        # rotated: old dies, new lives
+        assert _call(server, "/jobs", token=session_token)[0] == 401
+        assert _call(server, "/jobs", token=renewed["session_token"])[0] == 200
+
+
+def test_auth_refresh_without_bearer_is_401():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        assert _call(server, "/auth/refresh", method="POST", token=None)[0] == 401
