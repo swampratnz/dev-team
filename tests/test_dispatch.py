@@ -4880,3 +4880,115 @@ def test_server_threads_max_workers_through():
     with running(max_workers=2) as server:
         assert server.dispatcher._max_workers == 2
         assert len(server.dispatcher._threads) == 2
+
+
+# --- GET /checks (cross-repo CI state) ----------------------------------------
+
+
+class _FakeChecksReader:
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.calls = []
+
+    def status(self, owner, name, ref):
+        self.calls.append((owner, name, ref))
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
+def _checks_dispatcher(outcome, **kwargs):
+    reader = _FakeChecksReader(outcome)
+    made = []
+
+    def factory(ref):
+        made.append(ref.slug)
+        return reader
+
+    return Dispatcher(token="x", checks_reader=factory, **kwargs), reader, made
+
+
+def test_repo_checks_reports_the_outcome():
+    from dev_team.checks import ChecksOutcome
+
+    disp, reader, made = _checks_dispatcher(
+        ChecksOutcome("failure", failed=("ci",), summary="failed check(s): ci")
+    )
+    status, payload = disp.repo_checks("acme/mono", "abc123")
+    assert status == 200
+    assert payload == {
+        "repo": "acme/mono",
+        "ref": "abc123",
+        "state": "failure",
+        "ok": False,
+        "concluded": True,
+        "failed": ["ci"],
+        "summary": "failed check(s): ci",
+    }
+    assert made == ["acme/mono"] and reader.calls == [("acme", "mono", "abc123")]
+
+
+def test_repo_checks_validates_input():
+    from dev_team.checks import ChecksOutcome
+
+    disp, _, _ = _checks_dispatcher(ChecksOutcome("success"))
+    assert disp.repo_checks("", "abc")[0] == 400
+    assert disp.repo_checks("acme/mono", " ")[0] == 400
+    status, payload = disp.repo_checks("not a repo!", "abc")
+    assert status == 400 and "unrecognised" in payload["error"]
+
+
+def test_repo_checks_upstream_failure_is_502():
+    from dev_team.checks import ChecksError
+
+    disp, _, _ = _checks_dispatcher(ChecksError("HTTP 403 rate limited"))
+    status, payload = disp.repo_checks("acme/mono", "abc")
+    assert status == 502 and "rate limited" in payload["error"]
+
+
+def test_repo_checks_token_mint_failure_is_502():
+    from dev_team.githubapp import GitHubAppError
+
+    def exploding_factory(ref):
+        raise GitHubAppError("not installed")
+
+    disp = Dispatcher(token="x", checks_reader=exploding_factory)
+    status, payload = disp.repo_checks("acme/mono", "abc")
+    assert status == 502 and "not installed" in payload["error"]
+
+
+def test_checks_route_operator_and_session_gating():
+    from dev_team.checks import ChecksOutcome
+
+    reader = _FakeChecksReader(ChecksOutcome("success", summary="all green"))
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, checks_reader=lambda ref: reader) as server:
+        # operator: any repo
+        status, payload = _call(server, "/checks?repo=anyorg/thing&ref=main")
+        assert (status, payload["state"]) == (200, "success")
+        # session: installation-gated
+        session_token = _sign_in(server)
+        status, _ = _call(
+            server, "/checks?repo=acme/mono&ref=main", token=session_token
+        )
+        assert status == 200
+        status, payload = _call(
+            server, "/checks?repo=otherorg/mono&ref=main", token=session_token
+        )
+        assert status == 403 and "installations" in payload["error"]
+        # missing params answer 400, unauthenticated 401
+        assert _call(server, "/checks")[0] == 400
+        assert _call(server, "/checks?repo=a/b&ref=c", token="bad")[0] == 401
+
+
+def test_default_checks_reader_authenticates_per_repo(monkeypatch):
+    from dev_team.checks import GitHubChecksReader
+    from dev_team.sources import StaticTokenProvider, parse_repo
+
+    monkeypatch.setattr(dispatch_mod, "_token_provider", StaticTokenProvider("ghs_x"))
+    reader = dispatch_mod._default_checks_reader(parse_repo("acme/mono"))
+    assert isinstance(reader, GitHubChecksReader)
+    assert reader.token == "ghs_x"
+    # anonymous (no credential) degrades to an empty token, not a crash
+    monkeypatch.setattr(dispatch_mod, "_token_provider", StaticTokenProvider(None))
+    assert dispatch_mod._default_checks_reader(parse_repo("acme/mono")).token == ""

@@ -97,9 +97,11 @@ from .foreman import (
     ready_for_delivery,
     story_job_description,
 )
-from .githubapp import resolve_token_provider
+from .checks import ChecksError, ChecksReader, GitHubChecksReader
+from .githubapp import GitHubAppError, resolve_token_provider
 from .oauth import GitHubOAuth, Session
 from .sources import (
+    RepoRef,
     SourceError,
     TokenProvider,
     clone_or_update,
@@ -389,6 +391,13 @@ def _shared_token_provider() -> TokenProvider:
         return _token_provider
 
 
+def _default_checks_reader(ref: "RepoRef") -> ChecksReader:
+    """A per-repo authenticated checks reader (the real GitHub one)."""
+
+    token = _shared_token_provider().token_for(ref)
+    return GitHubChecksReader(token=token or "")
+
+
 def _default_materialise(spec: JobSpec, dest: str) -> Workspace:
     """Clone (or fast-forward) ``spec.repo`` into ``dest`` — the real path.
 
@@ -428,8 +437,12 @@ class Dispatcher:
         job_timeout: float = _JOB_TIMEOUT_SECONDS,
         oauth: Optional[GitHubOAuth] = None,
         max_workers: int = 1,
+        checks_reader: Optional[Callable[[RepoRef], ChecksReader]] = None,
     ) -> None:
         self.token = token
+        # Injectable factory for GET /checks (tests never touch the network);
+        # the default authenticates per repo through the token provider.
+        self._checks_reader = checks_reader or _default_checks_reader
         # Optional GitHub OAuth sign-in (docs/GITHUB_APP.md): when wired, a
         # session token is accepted as a bearer alongside the operator token,
         # with per-user repo authorisation and operator-only routes enforced
@@ -1548,6 +1561,45 @@ class Dispatcher:
     # own the stateful parts — provenance, submitting, and status write-back —
     # under the same backlog lock every other backlog write uses.
 
+    def repo_checks(
+        self, repo: str, ref: str, *, session: Optional[Session] = None
+    ) -> Tuple[int, Dict[str, Any]]:
+        """The live CI state of ``ref`` on ``repo`` — ``GET /checks``.
+
+        A $0-of-budget read: one authenticated GitHub API round-trip through
+        the per-repo credential, no agents, no queue slot. This is the
+        cross-repo half of the CLI's ``--watch-checks``: any repository the
+        service can reach can be polled here, not just the one a delivery
+        just pushed to. A signed-in session is held to the same installation
+        boundary as job submission.
+        """
+
+        if not repo.strip() or not ref.strip():
+            return 400, {"error": "checks needs repo and ref"}
+        try:
+            parsed = parse_repo(repo)
+        except SourceError as exc:
+            return 400, {"error": str(exc)}
+        if session is not None and (
+            self.oauth is None or not self.oauth.authorises_repo(session, parsed)
+        ):
+            return 403, {"error": "repository not in your installations"}
+        try:
+            outcome = self._checks_reader(parsed).status(
+                parsed.owner, parsed.name, ref.strip()
+            )
+        except (ChecksError, GitHubAppError) as exc:
+            return 502, {"error": f"could not read checks: {exc}"}
+        return 200, {
+            "repo": parsed.slug,
+            "ref": ref.strip(),
+            "state": outcome.state,
+            "ok": outcome.ok,
+            "concluded": outcome.concluded,
+            "failed": list(outcome.failed),
+            "summary": outcome.summary,
+        }
+
     def _story_repo(self, story: Story) -> Optional[str]:
         """The repository ``story``'s provenance names, or ``None``.
 
@@ -2349,6 +2401,20 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 status, payload = dispatcher.access_log_entries(limit=limit)
                 self._json(status, payload)
                 return
+            if path == "/checks":
+                # ?repo=owner/name&ref=SHA-or-branch — live CI state through
+                # the per-repo credential. Sessions are held to the same
+                # installation boundary as job submission.
+                query = parse_qs(split.query)
+                # _authorised() passed above, so this re-resolve never
+                # returns None; [1] is the session (None for the operator).
+                status, payload = dispatcher.repo_checks(
+                    (query.get("repo") or [""])[0],
+                    (query.get("ref") or [""])[0],
+                    session=self._authenticate()[1],
+                )
+                self._json(status, payload)
+                return
             if path == "/foreman/plan":
                 # $0 dry-run of POST /foreman/run. ?max_stories= gets the same
                 # forgiving clamp every GET paging knob has; the spend-bearing
@@ -2657,6 +2723,7 @@ class DispatchServer:
         job_timeout: float = _JOB_TIMEOUT_SECONDS,
         oauth: Optional[GitHubOAuth] = None,
         max_workers: int = 1,
+        checks_reader: Optional[Callable[[RepoRef], ChecksReader]] = None,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -2670,6 +2737,7 @@ class DispatchServer:
             job_timeout=job_timeout,
             oauth=oauth,
             max_workers=max_workers,
+            checks_reader=checks_reader,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()
