@@ -14,6 +14,11 @@ surface per-agent in the dashboard's agent modal.
 > [DASHBOARD.md](DASHBOARD.md#authentication-opt-in-token)). This token is a
 > stopgap until an Auth0/IdP layer lands. Keep the bind on a trusted network
 > regardless, and treat the `.dev_team/transcripts/` directory as sensitive.
+> `POST /jobs/{id}/purge` (see [DISPATCH.md](DISPATCH.md#purge-permanent-deletion))
+> now removes a job's `.dev_team/transcripts/{id}/` directory along with its
+> workspace clone and audit mirror, so an archived-then-purged job no longer
+> leaves its transcripts behind even when they were written to a separate
+> `--dashboard-workspace` from the job's own clone.
 
 ## What it captures
 

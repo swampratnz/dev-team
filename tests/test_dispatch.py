@@ -40,6 +40,7 @@ from dev_team.eventlog import read_events
 from dev_team.execution import InMemoryWorkspace, LocalWorkspace
 from dev_team.interaction import Choice, Question, Reply
 from dev_team.testing import ScriptedRunner
+from dev_team.transcripts import TRANSCRIPTS_DIR
 
 TOKEN = "s3cr3t-token"
 
@@ -1080,6 +1081,7 @@ def test_purge_removes_workspace_audit_files_and_backlog_stories(tmp_path):
     dash.write_text(f"audit/{job_id}/assessment.md", "# report")
     dash.write_text(f"audit/{job_id}/assessment.json", json.dumps({"success": True}))
     dash.write_text(f"audit/{job_id}/verifications.jsonl", "{}\n")
+    dash.write_text(f"{TRANSCRIPTS_DIR}/{job_id}/agent-001.json", "{}")
 
     store = BacklogStore(dash)
     backlog = store.load()
@@ -1094,15 +1096,53 @@ def test_purge_removes_workspace_audit_files_and_backlog_stories(tmp_path):
         {
             "id": job_id,
             "purged": True,
-            "removed": {"workspace": True, "audit": True, "backlog_stories": 2},
+            "removed": {
+                "workspace": True, "audit": True, "transcripts": True,
+                "backlog_stories": 2,
+            },
         },
     )
     assert not clone_dir.exists()
     for name in ("assessment.md", "assessment.json", "meta.json", "verifications.jsonl"):
         assert not dash.exists(f"audit/{job_id}/{name}")
+    assert not dash.exists(f"{TRANSCRIPTS_DIR}/{job_id}")
     survivors = store.load().stories
     assert [s.id for s in survivors] == [other.id]
     assert disp.get(job_id) is None
+
+
+def test_purge_no_transcripts_ever_recorded_reports_removed_false(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-notranscripts"
+    _seed_terminal_job(disp, job_id, archived=True)
+    dash.write_text(f"audit/{job_id}/assessment.md", "# report")
+
+    status, payload = disp.purge_job(job_id)
+    assert status == 200
+    assert payload["removed"] == {
+        "workspace": False, "audit": True, "transcripts": False,
+        "backlog_stories": 0,
+    }
+
+
+def test_purge_transcripts_does_not_touch_a_sibling_jobs_transcripts(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-a"
+    sibling_id = "assess-b"
+    _seed_terminal_job(disp, job_id, archived=True)
+    _seed_terminal_job(disp, sibling_id, archived=True)
+    dash.write_text(f"{TRANSCRIPTS_DIR}/{job_id}/agent-001.json", "{}")
+    dash.write_text(f"{TRANSCRIPTS_DIR}/{sibling_id}/agent-001.json", "{}")
+
+    status, payload = disp.purge_job(job_id)
+    assert status == 200
+    assert payload["removed"]["transcripts"] is True
+    assert not dash.exists(f"{TRANSCRIPTS_DIR}/{job_id}")
+    assert dash.exists(f"{TRANSCRIPTS_DIR}/{sibling_id}/agent-001.json")
 
 
 def test_purge_missing_workspace_dir_reports_removed_false_without_raising(tmp_path):
@@ -1161,16 +1201,19 @@ def test_purge_is_not_idempotent_second_call_is_404(tmp_path):
 
 
 class _SpyWorkspace:
-    """Wraps a real :class:`Workspace`, recording every ``delete`` call.
+    """Wraps a real :class:`Workspace`, recording every ``delete``/``delete_dir``
+    call.
 
     Exposes no raw filesystem primitives itself — the whole point is proving
-    a caller only ever removes files through :meth:`Workspace.delete`, never
-    a raw ``os``/``pathlib``/``shutil`` call against the wrapped root.
+    a caller only ever removes files through :meth:`Workspace.delete` /
+    :meth:`Workspace.delete_dir`, never a raw ``os``/``pathlib``/``shutil``
+    call against the wrapped root.
     """
 
     def __init__(self, inner):
         self.inner = inner
         self.deleted = []
+        self.deleted_dirs = []
 
     def read_text(self, path):
         return self.inner.read_text(path)
@@ -1185,6 +1228,10 @@ class _SpyWorkspace:
         self.deleted.append(path)
         self.inner.delete(path)
 
+    def delete_dir(self, path):
+        self.deleted_dirs.append(path)
+        self.inner.delete_dir(path)
+
     def list_files(self):
         return self.inner.list_files()
 
@@ -1192,10 +1239,11 @@ class _SpyWorkspace:
 def test_purge_audit_deletion_never_touches_the_dashboard_root_directly(
     tmp_path, monkeypatch
 ):
-    # SECURITY: the audit/<id>/ mirror must be removed exclusively through
-    # Workspace.delete (the traversal/symlink-escape-checked abstraction
-    # every other route uses) -- never shutil.rmtree or a raw fs call
-    # against the dashboard workspace's own root.
+    # SECURITY: the audit/<id>/ mirror and the transcripts directory must be
+    # removed exclusively through Workspace.delete / Workspace.delete_dir
+    # (the traversal/symlink-escape-checked abstraction every other route
+    # uses) -- never shutil.rmtree or a raw fs call against the dashboard
+    # workspace's own root.
     real = LocalWorkspace(str(tmp_path / "dash"))
     spy = _SpyWorkspace(real)
     jobs_root = tmp_path / "jobs"
@@ -1205,6 +1253,9 @@ def test_purge_audit_deletion_never_touches_the_dashboard_root_directly(
     real.write_text(f"audit/{job_id}/assessment.md", "# report")
     real.write_text(f"audit/{job_id}/assessment.json", "{}")
     real.write_text(f"audit/{job_id}/verifications.jsonl", "{}\n")
+    # No transcripts ever recorded for this job -- delete_dir below is a
+    # documented no-op (nothing to rmtree), so it stays out of the rmtree
+    # count and this test's original audit-only assertion is unaffected.
     (jobs_root / job_id).mkdir(parents=True)
 
     rmtree_calls = []
@@ -1222,6 +1273,9 @@ def test_purge_audit_deletion_never_touches_the_dashboard_root_directly(
         f"audit/{job_id}/{name}" for name in
         ("assessment.md", "assessment.json", "meta.json", "verifications.jsonl")
     }
+    # delete_dir is still called (through the Workspace abstraction, not a
+    # raw fs call) even though there is nothing to remove.
+    assert spy.deleted_dirs == [f"{TRANSCRIPTS_DIR}/{job_id}"]
 
 
 def test_purge_refuses_a_symlink_escape_in_the_audit_mirror(tmp_path):
@@ -1246,6 +1300,32 @@ def test_purge_refuses_a_symlink_escape_in_the_audit_mirror(tmp_path):
     assert payload["purged"] is True
     assert outside.exists()
     assert outside.read_text() == "do not delete me"
+
+
+def test_purge_refuses_a_symlink_escape_in_the_transcripts_directory(tmp_path):
+    # SECURITY: a symlink planted at the transcripts directory path, pointing
+    # outside the dashboard workspace root, must be refused by
+    # LocalWorkspace.delete_dir's own _within_root check -- never followed.
+    dash_root = tmp_path / "dash"
+    dash = LocalWorkspace(str(dash_root))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-transcript-symlink"
+    _seed_terminal_job(disp, job_id, archived=True)
+
+    outside = tmp_path / "outside-transcripts"
+    outside.mkdir()
+    (outside / "secret.json").write_text("do not delete me")
+    transcripts_parent = dash_root / TRANSCRIPTS_DIR
+    transcripts_parent.mkdir(parents=True, exist_ok=True)
+    (transcripts_parent / job_id).symlink_to(outside, target_is_directory=True)
+
+    status, payload = disp.purge_job(job_id)
+    assert status == 200  # the rest of the purge still completes
+    assert payload["purged"] is True
+    assert payload["removed"]["transcripts"] is False
+    assert outside.exists()
+    assert (outside / "secret.json").read_text() == "do not delete me"
 
 
 def test_purge_never_reenters_the_registry_lock(tmp_path, monkeypatch):

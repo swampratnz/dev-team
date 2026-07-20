@@ -12,6 +12,7 @@ from __future__ import annotations
 import itertools
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +48,10 @@ class Workspace(Protocol):
 
     def delete(self, path: str) -> None:
         """Remove ``path`` if present."""
+        ...
+
+    def delete_dir(self, path: str) -> None:
+        """Remove everything stored under the directory ``path``, if any."""
         ...
 
     def list_files(self) -> List[str]:
@@ -96,6 +101,14 @@ class InMemoryWorkspace:
 
     def delete(self, path: str) -> None:
         self._files.pop(_normalise(path), None)
+
+    def delete_dir(self, path: str) -> None:
+        # Segment-boundary match, not a raw string prefix: "foo" must not
+        # sweep up a sibling like "foo-bar/x", only "foo/..." (or "foo"
+        # itself, if a key with that exact name were ever stored).
+        prefix = _normalise(path)
+        for key in [k for k in self._files if k == prefix or k.startswith(prefix + "/")]:
+            del self._files[key]
 
     def list_files(self) -> List[str]:
         return sorted(self._files)
@@ -188,6 +201,11 @@ class LocalWorkspace:
         target = self._path(path)
         if target.is_file():
             target.unlink()
+
+    def delete_dir(self, path: str) -> None:
+        target = self._path(path)
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
 
     def list_files(self) -> List[str]:
         results = []
