@@ -217,6 +217,22 @@ sections below are reconstructed from the repository history.
   The dashboard gained a "delete permanently" button on each archived run
   row, behind the same two-step confirm the backlog's story-delete already
   uses (`docs/DASHBOARD.md`).
+- **`POST /jobs/{id}/purge` now also removes recorded transcripts**
+  (`docs/DISPATCH.md`, `docs/TRANSCRIPTS.md`): completes the transcript
+  half of the "fold `events.jsonl`/transcript surgery into the purge" follow-up
+  the original purge PR pre-scoped and deferred. `Workspace` gains
+  `delete_dir(path)` (implemented on both `LocalWorkspace` and
+  `InMemoryWorkspace`), routed through the same traversal/symlink-escape
+  guard every other `Workspace` method uses; `purge_job` calls it against
+  `.dev_team/transcripts/{id}/` in the dashboard workspace, and the
+  `removed` response dict gains a `transcripts` field alongside `workspace`/
+  `audit`/`backlog_stories`. Closes a real gap: when `--record-transcripts`
+  and a `--dashboard-workspace` are both configured, transcripts land in
+  the dashboard workspace rather than the job's own clone, so the prior
+  purge (which only ever touched the job's clone and the `audit/{id}/`
+  mirror) silently left them behind. `events.jsonl` remains explicitly
+  out of scope — still a separable, harder surface (append-only,
+  size-bounded, shared across jobs) than a directory delete.
 - **Spend rollup** (`docs/DISPATCH.md`): `GET /costs`, a pure, $0,
   in-memory aggregate summing `cost_usd` across every `succeeded`/`failed`
   job into `total_usd`, `by_mode`, and `jobs_counted`. Unlike

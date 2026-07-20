@@ -105,7 +105,7 @@ from .sources import (
     resolve_github_token,
 )
 from .team import DevTeam
-from .transcripts import TranscriptRecorder
+from .transcripts import TRANSCRIPTS_DIR, TranscriptRecorder
 
 #: Default port for the dispatch service (the dashboard keeps 8737).
 DEFAULT_PORT = 8738
@@ -1226,15 +1226,23 @@ class Dispatcher:
     def purge_job(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
         """The ``POST /jobs/{id}/purge`` core: permanent, archive-gated deletion.
 
-        Removes exactly three things: the workspace clone
-        (``jobs_root/<id>``, ``shutil.rmtree`` — it already sits outside the
-        :class:`Workspace` abstraction, the same raw ``Path`` join
-        :meth:`run_job` itself uses), the ``audit/<id>/`` mirror (each of
-        :data:`_AUDIT_FILES` through ``self._dashboard_workspace.delete`` —
-        **never** a raw filesystem call against the dashboard workspace, so
-        the existing traversal/symlink-escape guard on that abstraction
-        (``_within_root``) still applies), and any backlog stories bred from
-        this job (:meth:`_purge_backlog_stories`).
+        Removes four things: the workspace clone (``jobs_root/<id>``,
+        ``shutil.rmtree`` — it already sits outside the :class:`Workspace`
+        abstraction, the same raw ``Path`` join :meth:`run_job` itself
+        uses), the ``audit/<id>/`` mirror (each of :data:`_AUDIT_FILES`
+        through ``self._dashboard_workspace.delete``), the
+        ``.dev_team/transcripts/<id>/`` directory recorded by
+        :class:`~dev_team.transcripts.TranscriptRecorder` (through
+        ``self._dashboard_workspace.delete_dir``) — **never** a raw
+        filesystem call against the dashboard workspace, so the existing
+        traversal/symlink-escape guard on that abstraction (``_within_root``)
+        still applies to both — and any backlog stories bred from this job
+        (:meth:`_purge_backlog_stories`).
+
+        ``events.jsonl`` is deliberately left untouched: it is a single
+        append-only, size-bounded journal shared across jobs and needs
+        line-filtering rather than a directory delete — a separately-scoped
+        follow-up, not silently dropped scope.
 
         The terminal-state check happens directly against ``record.state``
         inside a single ``self._lock`` block — never via :meth:`_job_running`,
@@ -1276,6 +1284,18 @@ class Dispatcher:
                 # for the rest of the job's state.
                 continue
 
+        removed_transcripts = False
+        transcripts_path = f"{TRANSCRIPTS_DIR}/{job_id}"
+        try:
+            removed_transcripts = self._dashboard_workspace.exists(transcripts_path)
+            self._dashboard_workspace.delete_dir(transcripts_path)
+        except WorkspaceError:
+            # Same defence-in-depth as the audit-files loop above: a
+            # traversal-shaped job id or a planted symlink escape is refused
+            # by the workspace's own guard, not silently followed. The rest
+            # of the purge still completes.
+            pass
+
         removed_stories = self._purge_backlog_stories(job_id)
 
         return 200, {
@@ -1284,6 +1304,7 @@ class Dispatcher:
             "removed": {
                 "workspace": removed_workspace,
                 "audit": removed_audit,
+                "transcripts": removed_transcripts,
                 "backlog_stories": removed_stories,
             },
         }

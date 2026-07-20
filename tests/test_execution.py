@@ -65,6 +65,25 @@ def test_in_memory_missing_read_raises():
         ws.read_text("missing.txt")
 
 
+def test_in_memory_delete_dir_removes_only_the_prefixed_keys():
+    ws = InMemoryWorkspace(
+        {
+            "dir/a.txt": "1",
+            "dir/nested/b.txt": "2",
+            "dir-sibling/x.txt": "keep",  # shared string prefix, different segment
+            "outside.txt": "keep",
+        }
+    )
+    ws.delete_dir("dir")
+    assert ws.list_files() == ["dir-sibling/x.txt", "outside.txt"]
+
+
+def test_in_memory_delete_dir_missing_prefix_is_a_noop():
+    ws = InMemoryWorkspace({"a.txt": "1"})
+    ws.delete_dir("nope")
+    assert ws.list_files() == ["a.txt"]
+
+
 # --- LocalWorkspace -----------------------------------------------------
 
 
@@ -90,6 +109,29 @@ def test_local_workspace_list_files_skips_excluded_dirs(tmp_path):
     ws.write_text("src/mod.py", "code")
     ws.write_text(".git/config", "junk")  # a tooling-internal dir, never listed
     assert ws.list_files() == ["src/mod.py"]
+
+
+def test_local_workspace_delete_dir_removes_a_populated_nested_directory(tmp_path):
+    ws = LocalWorkspace(str(tmp_path))
+    ws.write_text("dir/a.txt", "1")
+    ws.write_text("dir/nested/b.txt", "2")
+    ws.write_text("outside.txt", "keep")
+    ws.delete_dir("dir")
+    assert not (tmp_path / "dir").exists()
+    assert ws.list_files() == ["outside.txt"]
+
+
+def test_local_workspace_delete_dir_missing_directory_is_a_noop(tmp_path):
+    ws = LocalWorkspace(str(tmp_path))
+    ws.delete_dir("nope")  # no exception
+
+
+def test_local_workspace_delete_dir_on_a_file_path_is_a_noop(tmp_path):
+    # delete_dir is directory-only, delete() stays file-only -- no overlap.
+    ws = LocalWorkspace(str(tmp_path))
+    ws.write_text("a.txt", "1")
+    ws.delete_dir("a.txt")
+    assert ws.exists("a.txt")
 
 
 # --- CommandResult ------------------------------------------------------
@@ -276,6 +318,26 @@ def test_local_workspace_refuses_symlink_escape(tmp_path):
         ws.read_text("escape.txt")
     # ... and excluded from listing entirely
     assert ws.list_files() == []
+
+
+def test_local_workspace_delete_dir_refuses_textual_escape(tmp_path):
+    ws = LocalWorkspace(str(tmp_path / "root"))
+    with pytest.raises(WorkspaceError):
+        ws.delete_dir("../escape")
+
+
+def test_local_workspace_delete_dir_refuses_symlink_escape(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("do not delete me")
+    ws = LocalWorkspace(str(root))
+    (root / "escape_dir").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(WorkspaceError):
+        ws.delete_dir("escape_dir")
+    assert outside.exists()
+    assert (outside / "secret.txt").read_text() == "do not delete me"
 
 
 # --- unique staging paths (A5) ------------------------------------------
