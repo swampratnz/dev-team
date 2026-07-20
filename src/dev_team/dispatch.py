@@ -97,12 +97,13 @@ from .foreman import (
     ready_for_delivery,
     story_job_description,
 )
+from .githubapp import resolve_token_provider
 from .sources import (
     SourceError,
+    TokenProvider,
     clone_or_update,
     default_env_file,
     parse_repo,
-    resolve_github_token,
 )
 from .team import DevTeam
 from .transcripts import TRANSCRIPTS_DIR, TranscriptRecorder
@@ -371,17 +372,33 @@ def _failed_cost(record: JobRecord) -> float:
     return record.budget.spent if record.budget is not None else 0.0
 
 
+#: The process-wide credential source, resolved lazily on the first clone —
+#: resolution pops credentials out of the process environment, so it must
+#: happen exactly once. A GitHub App configuration (docs/GITHUB_APP.md) mints
+#: a fresh repo-scoped token per clone; a PAT behaves exactly as before.
+_token_provider: Optional[TokenProvider] = None
+_token_provider_lock = threading.Lock()
+
+
+def _shared_token_provider() -> TokenProvider:
+    global _token_provider
+    with _token_provider_lock:
+        if _token_provider is None:
+            _token_provider = resolve_token_provider(default_env_file())
+        return _token_provider
+
+
 def _default_materialise(spec: JobSpec, dest: str) -> Workspace:
     """Clone (or fast-forward) ``spec.repo`` into ``dest`` — the real path.
 
-    Mirrors the CLI's ``_materialise_repo``: resolve the ref, find the GitHub
-    token via the default env-file search, take it *out of* the process
-    environment, and clone header-authenticated. Returns a workspace rooted at
-    the clone.
+    Mirrors the CLI's ``_materialise_repo``: resolve the ref, resolve the
+    credential source (GitHub App if configured, else the PAT — taken *out
+    of* the process environment either way), and clone header-authenticated.
+    Returns a workspace rooted at the clone.
     """
 
     ref = parse_repo(spec.repo)
-    token = resolve_github_token(default_env_file())
+    token = _shared_token_provider().token_for(ref)
     clone_or_update(ref, dest, runner=SubprocessCommandRunner(), token=token)
     return LocalWorkspace(dest)
 

@@ -2306,7 +2306,7 @@ def _run_fix_loop(monkeypatch, engine, outcome, *, team=None, rounds=2, rewatch=
 
     import dev_team.cli as cli_module
     from dev_team.checks import ChecksOutcome
-    from dev_team.sources import RepoRef
+    from dev_team.sources import RepoRef, StaticTokenProvider
     from helpers import run
 
     pushes = []
@@ -2326,7 +2326,7 @@ def _run_fix_loop(monkeypatch, engine, outcome, *, team=None, rounds=2, rewatch=
     )
     run(
         cli_module._run_ci_fix_loop(
-            engine, team or _fix_team(), outcome, args, RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), "tok"
+            engine, team or _fix_team(), outcome, args, RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), StaticTokenProvider("tok")
         )
     )
     return pushes
@@ -2404,7 +2404,7 @@ def test_watch_fix_loop_stops_on_push_failure(monkeypatch):
     import dev_team.cli as cli_module
     from dev_team.engine import RemediationOutcome
     from dev_team.git import GitError
-    from dev_team.sources import RepoRef
+    from dev_team.sources import RepoRef, StaticTokenProvider
     from helpers import run
 
     def boom_push(*a, **k):
@@ -2422,7 +2422,7 @@ def test_watch_fix_loop_stops_on_push_failure(monkeypatch):
     )
     run(
         cli_module._run_ci_fix_loop(
-            engine, _fix_team(), outcome, args, RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), "tok"
+            engine, _fix_team(), outcome, args, RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), StaticTokenProvider("tok")
         )
     )
     assert engine.calls == ["boom"]  # fixed once, but the push failed -> stopped
@@ -2487,6 +2487,24 @@ def test_main_interactive_pr_comment_author_requires_the_flag():
     assert exc.value.code == 2
 
 
+def test_mint_token_degrades_cleanly(capsys):
+    from dev_team.cli import _mint_token
+    from dev_team.githubapp import GitHubAppError
+    from dev_team.sources import RepoRef, StaticTokenProvider
+
+    ref = RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git")
+    assert _mint_token(None, ref) == ""
+    assert _mint_token(StaticTokenProvider(None), ref) == ""
+    assert _mint_token(StaticTokenProvider("ghp_x"), ref) == "ghp_x"
+
+    class Broken:
+        def token_for(self, ref):
+            raise GitHubAppError("app uninstalled mid-run")
+
+    assert _mint_token(Broken(), ref) == ""
+    assert "app uninstalled mid-run" in capsys.readouterr().err
+
+
 def test_pr_comment_channel_is_none_when_not_opted_in():
     import types
 
@@ -2546,7 +2564,7 @@ def test_run_ci_fix_loop_uses_pr_comment_channel_when_opted_in(monkeypatch):
     from dev_team.checks import ChecksOutcome
     from dev_team.engine import RemediationOutcome
     from dev_team.interaction import Reply, ScriptedChannel
-    from dev_team.sources import RepoRef
+    from dev_team.sources import RepoRef, StaticTokenProvider
     from helpers import run
 
     pr_channel = ScriptedChannel(script=[Reply("apply")])
@@ -2573,7 +2591,7 @@ def test_run_ci_fix_loop_uses_pr_comment_channel_when_opted_in(monkeypatch):
     run(
         cli_module._run_ci_fix_loop(
             engine, team, outcome, args,
-            RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), "tok",
+            RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), StaticTokenProvider("tok"),
         )
     )
     assert pr_channel.questions and pr_channel.questions[0].topic == "ci-fix"
@@ -2585,7 +2603,7 @@ def test_run_ci_fix_loop_pr_comment_error_stops_gracefully(monkeypatch, capsys):
 
     import dev_team.cli as cli_module
     from dev_team.pr_comment_channel import GitHubPRCommentChannelError
-    from dev_team.sources import RepoRef
+    from dev_team.sources import RepoRef, StaticTokenProvider
     from helpers import run
 
     class _BoomChannel:
@@ -2603,7 +2621,7 @@ def test_run_ci_fix_loop_pr_comment_error_stops_gracefully(monkeypatch, capsys):
     run(
         cli_module._run_ci_fix_loop(
             engine, _fix_team(), outcome, args,
-            RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), "tok",
+            RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), StaticTokenProvider("tok"),
         )
     )
     assert engine.calls == []  # never reached remediation

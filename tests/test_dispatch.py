@@ -2465,6 +2465,8 @@ def test_worker_is_single_flight_and_ordered():
 
 
 def test_default_materialise_clones_and_returns_local_workspace(tmp_path, monkeypatch):
+    from dev_team.sources import StaticTokenProvider
+
     calls = {}
 
     def fake_clone(ref, dest, *, runner, token=None, timeout=None):
@@ -2473,13 +2475,32 @@ def test_default_materialise_clones_and_returns_local_workspace(tmp_path, monkey
         return dest
 
     monkeypatch.setattr(dispatch_mod, "clone_or_update", fake_clone)
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(dispatch_mod, "_token_provider", StaticTokenProvider("ghs_test"))
     spec = JobSpec(mode="assess", repo="acme/mono", title="t", description="",
                    budget_usd=None, id="assess-1")
     ws = _default_materialise(spec, str(tmp_path / "clone"))
     assert calls["slug"] == "acme/mono"
+    assert calls["token"] == "ghs_test"  # per-repo credential from the provider
     assert isinstance(ws, LocalWorkspace)
+
+
+def test_shared_token_provider_resolves_exactly_once(monkeypatch):
+    # Resolution pops credentials from the process environment, so the
+    # provider must be built once and cached for the process lifetime.
+    from dev_team.sources import StaticTokenProvider
+
+    monkeypatch.setattr(dispatch_mod, "_token_provider", None)
+    resolutions = []
+
+    def fake_resolve(env_file):
+        resolutions.append(env_file)
+        return StaticTokenProvider("once")
+
+    monkeypatch.setattr(dispatch_mod, "resolve_token_provider", fake_resolve)
+    first = dispatch_mod._shared_token_provider()
+    second = dispatch_mod._shared_token_provider()
+    assert first is second
+    assert len(resolutions) == 1
 
 
 # --- the HTTP server ----------------------------------------------------------
