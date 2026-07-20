@@ -72,6 +72,19 @@ def _signed_in(clock=lambda: 0.0, **kwargs):
 # --- resolve_oauth_config ---------------------------------------------------
 
 
+def test_secrets_are_hidden_from_repr():
+    from dev_team.oauth import Session
+
+    assert "csec" not in repr(CONFIG) and "cid" in repr(CONFIG)
+    session = Session(
+        token="sekret-bearer", login="chris", installations=("acme",),
+        refresh_token="sekret-refresh", expires=0.0,
+    )
+    text = repr(session)
+    assert "sekret-bearer" not in text and "sekret-refresh" not in text
+    assert "chris" in text and "acme" in text  # non-secret fields still shown
+
+
 def test_resolve_oauth_config_absent_is_none():
     assert resolve_oauth_config(None, environ={}) is None
 

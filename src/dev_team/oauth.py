@@ -44,7 +44,7 @@ import os
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, Mapping, MutableMapping, Optional, Tuple
 
 from .errors import DevTeamError
@@ -76,7 +76,8 @@ class OAuthConfig:
     """The OAuth app's client credentials (already resolved)."""
 
     client_id: str
-    client_secret: str
+    # Hidden from repr/traceback dumps — a secret, unlike the client id.
+    client_secret: str = field(repr=False)
 
 
 def resolve_oauth_config(
@@ -115,13 +116,19 @@ def resolve_oauth_config(
 
 @dataclass
 class Session:
-    """An authenticated user: who they are and what they may target."""
+    """An authenticated user: who they are and what they may target.
 
-    token: str
-    login: str
-    installations: Tuple[str, ...]
-    refresh_token: Optional[str]
-    expires: float
+    ``token`` and ``refresh_token`` are bearer credentials, kept out of any
+    repr/traceback/log dump (``repr=False``) — the same guard the rest of
+    this PR applies to secrets. They stay required positional fields:
+    ``repr=False`` without a default does not change the constructor.
+    """
+
+    token: str = field(repr=False)
+    login: str = field()
+    installations: Tuple[str, ...] = field()
+    refresh_token: Optional[str] = field(repr=False)
+    expires: float = field()
 
 
 class GitHubOAuth:

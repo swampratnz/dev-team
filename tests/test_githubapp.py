@@ -48,6 +48,12 @@ def _key_file(tmp_path):
 # --- resolve_app_credentials ------------------------------------------------
 
 
+def test_app_credentials_repr_hides_the_private_key():
+    text = repr(CREDS)
+    assert "1234" in text  # app_id is fine to show
+    assert "PRIVATE KEY" not in text and PRIVATE_PEM not in text
+
+
 def test_resolve_app_credentials_absent_is_none():
     assert resolve_app_credentials(None, environ={}) is None
 

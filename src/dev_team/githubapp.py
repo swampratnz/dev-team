@@ -39,7 +39,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, Mapping, MutableMapping, Optional
 
@@ -92,7 +92,10 @@ class AppCredentials:
     """The App's identity: its id and PEM private key (already read)."""
 
     app_id: str
-    private_key_pem: str
+    # Never let a repr/traceback/config dump print the private key — it is the
+    # App's most sensitive credential (it mints installation tokens for every
+    # repo the App can reach). Mirrors GitHubChecksReader.token's guard.
+    private_key_pem: str = field(repr=False)
 
 
 def resolve_app_credentials(
