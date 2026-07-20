@@ -40,6 +40,7 @@ class EventLog:
         run: str,
         clock: Callable[[], float] = time.time,
         path: str = EVENTS_PATH,
+        lock: Optional[threading.Lock] = None,
     ) -> None:
         self.workspace = workspace
         self.run = run
@@ -50,8 +51,13 @@ class EventLog:
         # (Workspace has no append primitive), which is a lost-update race: two
         # writers read the same file, each appends its line, and the second
         # write clobbers the first's event. Serialise the whole RMW per log so
-        # concurrent deliveries cannot lose each other's events.
-        self._lock = threading.Lock()
+        # concurrent deliveries cannot lose each other's events. A caller that
+        # shares this file with another read-modify-write (e.g. Dispatcher
+        # threading its purge-time `remove_run` call through the same lock)
+        # passes its own lock so the two can never interleave; every existing
+        # caller omits it and gets a fresh, private Lock() -- byte-identical
+        # behaviour to before this parameter existed.
+        self._lock = lock if lock is not None else threading.Lock()
 
     def __call__(self, event: AgentEvent) -> None:
         record = {
@@ -94,6 +100,59 @@ def read_events(
         if isinstance(record, dict):
             events.append(record)
     return events[-limit:]
+
+
+def remove_run(
+    workspace: Workspace,
+    run: str,
+    *,
+    path: str = EVENTS_PATH,
+    lock: Optional[threading.Lock] = None,
+) -> int:
+    """Drop every journaled line whose ``run`` field equals ``run``.
+
+    Used by purge to permanently remove a job's events from the shared
+    journal -- the one piece of purge's deletion `EventLog.__call__`
+    doesn't cover, since purge acts on a job id after the job itself has
+    finished appending.
+
+    A line that fails to parse as JSON, or parses to something other than
+    a dict, is kept as-is: it can't be attributed to ``run``, so dropping
+    it risks losing another job's malformed-but-real entry. ``run`` is only
+    ever compared against the parsed ``"run"`` field -- never used to build
+    a path -- so a path-traversal-shaped id just matches nothing.
+
+    Missing file is a no-op that returns ``0`` without creating one. A file
+    that exists but has no matching line is still rewritten (matching
+    :class:`EventLog`'s own always-rewrite behaviour), byte-for-byte equal
+    to its input, and also returns ``0``.
+
+    ``lock`` should be the same lock instance passed to any :class:`EventLog`
+    writing the same ``path``, so a concurrent append and this read-modify-
+    write can never interleave and lose an update. Omitted, a fresh private
+    lock is used -- safe only when no concurrent writer shares ``path``.
+    """
+
+    if lock is None:
+        lock = threading.Lock()
+    with lock:
+        if not workspace.exists(path):
+            return 0
+        text = workspace.read_text(path)
+        kept: List[str] = []
+        removed = 0
+        for line in text.splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                kept.append(line)
+                continue
+            if isinstance(record, dict) and record.get("run") == run:
+                removed += 1
+                continue
+            kept.append(line)
+        workspace.write_text(path, "\n".join(kept) + "\n")
+        return removed
 
 
 def compose(*listeners: Optional[Listener]) -> Optional[Listener]:

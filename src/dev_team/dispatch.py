@@ -78,7 +78,7 @@ from .budget import Budget
 from .config import TeamConfig
 from .engine import EngineConfig
 from .errors import DependencyCycleError, DevTeamError
-from .eventlog import EventLog, compose, read_events
+from .eventlog import EventLog, compose, read_events, remove_run
 from .trace import Tracer
 from .tracelog import TraceLog
 from .execution import (
@@ -478,6 +478,13 @@ class Dispatcher:
         # is the one deliberate exception (the dashboard workspace owns the
         # cross-job backlog).
         self._dashboard_workspace = dashboard_workspace
+        # Guards every read-modify-write of the dashboard workspace's shared
+        # events.jsonl: a live job's EventLog append (dispatch is
+        # single-flight for execution, but the HTTP server thread can purge
+        # an older job while a different job is mid-run on the worker
+        # thread) and purge_job's remove_run both mutate this same file, so
+        # they share one lock rather than each racing with independent ones.
+        self._dashboard_events_lock = threading.Lock()
         self._queue_cap = queue_cap
         self._registry: Dict[str, JobRecord] = {}
         self._order: List[str] = []
@@ -986,7 +993,12 @@ class Dispatcher:
         if self._dashboard_workspace is not None:
             listener = compose(
                 listener,
-                EventLog(self._dashboard_workspace, run=spec.id, clock=self._clock),
+                EventLog(
+                    self._dashboard_workspace,
+                    run=spec.id,
+                    clock=self._clock,
+                    lock=self._dashboard_events_lock,
+                ),
             )
         # Interactive plan review / re-plan supervision / failure escalation
         # is opt-in and deliver-only: a queued/non-interactive job (the
@@ -1399,7 +1411,7 @@ class Dispatcher:
     def purge_job(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
         """The ``POST /jobs/{id}/purge`` core: permanent, archive-gated deletion.
 
-        Removes four things: the workspace clone (``jobs_root/<id>``,
+        Removes the workspace clone (``jobs_root/<id>``,
         ``shutil.rmtree`` — it already sits outside the :class:`Workspace`
         abstraction, the same raw ``Path`` join :meth:`run_job` itself
         uses), the ``audit/<id>/`` mirror (each of :data:`_AUDIT_FILES`
@@ -1412,10 +1424,23 @@ class Dispatcher:
         still applies to both — and any backlog stories bred from this job
         (:meth:`_purge_backlog_stories`).
 
-        ``events.jsonl`` is deliberately left untouched: it is a single
-        append-only, size-bounded journal shared across jobs and needs
-        line-filtering rather than a directory delete — a separately-scoped
-        follow-up, not silently dropped scope.
+        Also removes this job's lines from the dashboard workspace's shared
+        ``events.jsonl`` (:func:`~dev_team.eventlog.remove_run`, guarded by
+        ``self._dashboard_events_lock`` — the same lock every dashboard
+        ``EventLog`` append uses, so a live job's append and this purge can
+        never interleave and lose an update). Without this, a purged job's
+        events survived in the journal while its ``audit/<id>/meta.json``
+        archive marker — the file :meth:`_archived_job_ids` reads to hide a
+        job from the dashboard — was deleted by this same method, so the
+        job's events would resurface in the activity feed: purge, meant as
+        the *stronger* deletion, made the job's trace *more* visible than
+        plain archiving. This call reaches ``self._dashboard_workspace``
+        only when it is not ``None`` — never independently checked here,
+        because the ``_is_archived`` check above already returns 409 before
+        this point whenever ``self._dashboard_workspace is None`` (it reads
+        ``None`` for the meta marker unconditionally, so no job is ever
+        archived without one), the same implicit guard the audit-file and
+        transcripts removal below already rely on.
 
         The terminal-state check happens directly against ``record.state``
         inside a single ``self._lock`` block — never via :meth:`_job_running`,
@@ -1469,6 +1494,10 @@ class Dispatcher:
             # of the purge still completes.
             pass
 
+        removed_events = remove_run(
+            self._dashboard_workspace, job_id, lock=self._dashboard_events_lock
+        )
+
         removed_stories = self._purge_backlog_stories(job_id)
 
         return 200, {
@@ -1478,6 +1507,7 @@ class Dispatcher:
                 "workspace": removed_workspace,
                 "audit": removed_audit,
                 "transcripts": removed_transcripts,
+                "events": removed_events,
                 "backlog_stories": removed_stories,
             },
         }

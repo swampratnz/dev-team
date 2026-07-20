@@ -37,7 +37,8 @@ from dev_team.dispatch import (
     ValidationError,
     _default_materialise,
 )
-from dev_team.eventlog import read_events
+from dev_team.dashboard import agent_history, collect_state
+from dev_team.eventlog import EVENTS_PATH, read_events
 from dev_team.execution import InMemoryWorkspace, LocalWorkspace
 from dev_team.interaction import Choice, Question, Reply
 from dev_team.testing import ScriptedRunner
@@ -1221,7 +1222,7 @@ def test_purge_removes_workspace_audit_files_and_backlog_stories(tmp_path):
             "purged": True,
             "removed": {
                 "workspace": True, "audit": True, "transcripts": True,
-                "backlog_stories": 2,
+                "events": 0, "backlog_stories": 2,
             },
         },
     )
@@ -1246,7 +1247,7 @@ def test_purge_no_transcripts_ever_recorded_reports_removed_false(tmp_path):
     assert status == 200
     assert payload["removed"] == {
         "workspace": False, "audit": True, "transcripts": False,
-        "backlog_stories": 0,
+        "events": 0, "backlog_stories": 0,
     }
 
 
@@ -1310,6 +1311,112 @@ def test_purge_no_matching_backlog_stories_is_zero(tmp_path):
     assert status == 200
     assert payload["removed"]["backlog_stories"] == 0
     assert len(store.load().stories) == 1  # the unrelated story survives
+
+
+def test_purge_removes_the_jobs_events_from_the_shared_journal(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-events"
+    sibling_id = "assess-sibling"
+    _seed_terminal_job(disp, job_id, archived=True)
+    _seed_terminal_job(disp, sibling_id, archived=True)
+    events = [
+        {"ts": 1.0, "run": job_id, "role": "engineer", "stage": "implement",
+         "message": "m1", "detail": None, "name": "Sam"},
+        {"ts": 2.0, "run": sibling_id, "role": "qa", "stage": "test",
+         "message": "m2", "detail": None, "name": "Ada"},
+        {"ts": 3.0, "run": job_id, "role": "engineer", "stage": "review",
+         "message": "m3", "detail": None, "name": "Sam"},
+    ]
+    dash.write_text(EVENTS_PATH, "\n".join(json.dumps(e) for e in events) + "\n")
+
+    status, payload = disp.purge_job(job_id)
+
+    assert status == 200
+    assert payload["removed"]["events"] == 2
+    remaining = read_events(dash)
+    assert [e["run"] for e in remaining] == [sibling_id]
+
+
+def test_purge_with_no_dashboard_workspace_never_attempts_event_removal(
+    monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.setattr(
+        dispatch_mod, "remove_run",
+        lambda *a, **k: calls.append((a, k)) or 0,
+    )
+    disp = Dispatcher(
+        token="x", dashboard_workspace=None, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-nodash"
+    # Bypass _seed_terminal_job -- it writes meta.json through
+    # disp._dashboard_workspace, which is None here.
+    spec = JobSpec(
+        mode="assess", repo="acme/mono", title="t", description="",
+        budget_usd=None, id=job_id,
+    )
+    disp._registry[job_id] = JobRecord(spec=spec, state="succeeded")
+    disp._order.append(job_id)
+    disp._events[job_id] = threading.Event()
+
+    status, payload = disp.purge_job(job_id)
+
+    # dashboard_workspace=None means _is_archived always answers False (no
+    # meta.json marker is ever reachable), so purge refuses before it would
+    # ever reach event removal -- mirrors the audit/transcripts guard, which
+    # relies on the same structural precondition rather than its own
+    # explicit None check.
+    assert (status, payload) == (409, {"error": "job is not archived"})
+    assert calls == []
+
+
+def test_purge_zero_events_for_the_job_reports_zero_without_error(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-noevents"
+    # e.g. a verify-mode job, which never gets an EventLog -- no
+    # events.jsonl is ever written for it.
+    _seed_terminal_job(disp, job_id, archived=True)
+
+    status, payload = disp.purge_job(job_id)
+
+    assert status == 200
+    assert payload["removed"]["events"] == 0
+
+
+def test_purge_regression_dashboard_state_no_longer_shows_the_purged_jobs_events(
+    tmp_path,
+):
+    # The actual bug this closes: archiving a job hid it from the dashboard
+    # via audit/<id>/meta.json's `archived` flag, but purge deleted that
+    # exact marker while leaving events.jsonl's lines for the job in place --
+    # so a *purged* job's events resurfaced in the activity feed and agent
+    # history, more visible than a merely-archived job. Assert the fixed
+    # behaviour end-to-end, through the actual dashboard readers, not just
+    # that remove_run ran.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-visibility-bug"
+    _seed_terminal_job(disp, job_id, archived=True)
+    events = [
+        {"ts": 1.0, "run": job_id, "role": "engineer", "stage": "implement",
+         "message": "m1", "detail": None, "name": "Sam"},
+        {"ts": 2.0, "run": job_id, "role": "qa", "stage": "test",
+         "message": "m2", "detail": None, "name": "Ada"},
+    ]
+    dash.write_text(EVENTS_PATH, "\n".join(json.dumps(e) for e in events) + "\n")
+
+    status, payload = disp.purge_job(job_id)
+    assert status == 200
+    assert payload["removed"]["events"] == 2
+
+    state = collect_state(dash)
+    assert all(event.get("run") != job_id for event in state["activity"])
+    assert agent_history(dash, "engineer") == []
+    assert agent_history(dash, "qa") == []
 
 
 def test_purge_is_not_idempotent_second_call_is_404(tmp_path):
