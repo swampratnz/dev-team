@@ -18,10 +18,37 @@ from dev_team.sources import (
     RepoRef,
     SourceError,
     clone_or_update,
+    is_github_repo,
     load_env_file,
     parse_repo,
     resolve_github_token,
 )
+
+
+def test_is_github_repo_across_url_forms():
+    for on_github in (
+        "acme/legacy",  # bare slug → https://github.com
+        "https://github.com/acme/legacy.git",
+        "https://www.github.com/acme/legacy",
+        "ssh://git@github.com/acme/legacy",
+        "git@github.com:acme/legacy.git",
+    ):
+        assert is_github_repo(parse_repo(on_github)), on_github
+    for off_github in (
+        "https://internal-git.corp.example/acme/legacy",
+        "ssh://git@internal.example/acme/x",
+        "git@evil.example:acme/x.git",
+        "git://10.0.0.1/acme/x",
+        "https://api.github.com/acme/x",  # REST host, not a clone remote
+    ):
+        assert not is_github_repo(parse_repo(off_github)), off_github
+    # A hostless ref (a bare local path, or a colon whose authority is a
+    # path) has no host to trust — never github.
+    for hostless in (
+        RepoRef(owner="a", name="b", url="/tmp/local/repo"),
+        RepoRef(owner="a", name="b", url="./weird/path:branch"),
+    ):
+        assert not is_github_repo(hostless), hostless.url
 
 
 # --- parsing ---------------------------------------------------------------------

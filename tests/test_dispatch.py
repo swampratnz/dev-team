@@ -5383,3 +5383,42 @@ def test_repo_checks_rejects_traversal_ref():
     # legitimate refs still pass (SHA, tag, slash-bearing branch)
     for good in ("abc123", "v1.2.3", "dev-team/feature-x"):
         assert disp.repo_checks("acme/mono", good)[0] == 200
+
+
+def test_session_submit_rejects_non_github_host():
+    # SSRF/boundary fix at the HTTP layer: a session member of org acme
+    # cannot point a job at a non-github host whose path happens to start
+    # with /acme — the installation check now verifies the host, not just
+    # the owner path segment.
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server, "/jobs", method="POST", token=session_token,
+            body={"mode": "assess",
+                  "repo": "https://internal-git.corp.example/acme/anything"},
+        )
+        assert status == 403 and "installations" in payload["error"]
+        # the operator, by contrast, may still target any git URL
+        status, _ = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "assess",
+                  "repo": "https://internal-git.corp.example/acme/anything"},
+        )
+        assert status == 202
+
+
+def test_session_checks_rejects_non_github_host():
+    from dev_team.checks import ChecksOutcome
+
+    reader = _FakeChecksReader(ChecksOutcome("success"))
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, checks_reader=lambda ref: reader) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server,
+            "/checks?repo=https://internal-git.corp.example/acme/x&ref=main",
+            token=session_token,
+        )
+        assert status == 403 and "installations" in payload["error"]
+        assert reader.calls == []  # never reached the reader

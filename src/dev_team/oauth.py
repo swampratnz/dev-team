@@ -49,7 +49,7 @@ from typing import Callable, Dict, Mapping, MutableMapping, Optional, Tuple
 
 from .errors import DevTeamError
 from .githubapp import GitHubAppError, HttpJson, _default_http
-from .sources import RepoRef, load_env_file
+from .sources import RepoRef, is_github_repo, load_env_file
 
 OAUTH_CLIENT_ID_KEY = "GITHUB_OAUTH_CLIENT_ID"
 OAUTH_CLIENT_SECRET_KEY = "GITHUB_OAUTH_CLIENT_SECRET"
@@ -249,8 +249,12 @@ class GitHubOAuth:
     def session_for(self, presented: str) -> Optional[Session]:
         """The live session for a presented bearer value, or ``None``.
 
-        Constant-time comparison per stored token (the registry is small),
-        matching the operator-token check's posture; expired sessions are
+        Each candidate token is compared with :func:`hmac.compare_digest`,
+        so the comparison itself is constant-time; the *number* of iterations
+        (and the dict lookup for state pruning) is not, which is an accepted
+        trade-off — session and CSRF-state tokens are 256-bit
+        ``secrets.token_urlsafe`` values, so the count/timing of live
+        sessions leaks nothing that helps guess one. Expired sessions are
         dropped on sight.
         """
 
@@ -266,8 +270,22 @@ class GitHubOAuth:
         return None
 
     def authorises_repo(self, session: Session, ref: RepoRef) -> bool:
-        """Whether the session's installations cover ``ref``'s owner."""
+        """Whether the session may target ``ref``.
 
+        Two conditions, both required: the repo must actually be on
+        github.com (``is_github_repo``), and its owner must be one of the
+        session's App installations. The host check is what makes the owner
+        comparison a real boundary — without it a session member of org
+        ``acme`` could submit ``https://internal-git.corp/acme/x`` (or an
+        ``ssh://…/acme/x``) and pass on the ``owner`` path segment alone,
+        pointing the clone/agent pipeline at an arbitrary internal or
+        external host (SSRF / off-tenant content). A session's authority is
+        a github.com installation membership, so anything off github.com is
+        outside their tenant by construction.
+        """
+
+        if not is_github_repo(ref):
+            return False
         owner = ref.owner.lower()
         return any(owner == account.lower() for account in session.installations)
 

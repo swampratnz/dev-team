@@ -247,6 +247,28 @@ def test_authorises_repo_by_installation_owner_case_insensitive():
     assert not oauth.authorises_repo(session, parse_repo("other/repo"))
 
 
+def test_authorises_repo_rejects_non_github_hosts():
+    # SSRF/boundary-bypass fix: a session member of org 'acme' must NOT pass
+    # the installation check for a same-owner-segment repo on another host —
+    # the owner string-match is only a real boundary once the host is known
+    # to be github.com.
+    oauth, _, payload = _signed_in()
+    session = oauth.session_for(payload["session_token"])
+    for hostile in (
+        "https://internal-git.corp.example/acme/anything",
+        "ssh://git@internal.example/acme/x",
+        "git@evil.example:acme/x.git",
+        "git://10.0.0.1/acme/x",
+    ):
+        assert not oauth.authorises_repo(session, parse_repo(hostile)), hostile
+    # the canonical github.com forms still pass
+    assert oauth.authorises_repo(session, parse_repo("acme/x"))
+    assert oauth.authorises_repo(
+        session, parse_repo("https://github.com/acme/x.git")
+    )
+    assert oauth.authorises_repo(session, parse_repo("git@github.com:acme/x.git"))
+
+
 # --- refresh ----------------------------------------------------------------
 
 

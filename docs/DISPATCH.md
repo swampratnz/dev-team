@@ -38,9 +38,12 @@ authorised caller, and rotate it by editing the env file and restarting.
 configured, users can sign in with GitHub (`GET /auth/login` →
 `GET /auth/callback` → session token, renewable via `POST /auth/refresh`)
 and use their session token as the bearer instead. Sessions are
-**tenant-scoped end to end**: they may submit only against repositories
-covered by the GitHub App installations their account can reach (403
-otherwise), and they observe only those tenants' jobs — the `/jobs`
+**tenant-scoped end to end**: they may submit only against **github.com**
+repositories covered by the GitHub App installations their account can
+reach (403 otherwise — the repo's host is verified, not just the owner
+path segment, so a session cannot aim the clone/agent pipeline at an
+arbitrary internal or external git host), and they observe only those
+tenants' jobs — the `/jobs`
 listing is filtered, and any other tenant's job id answers the same
 `404 unknown job` a nonexistent one does. Cross-tenant aggregates
 (`GET /backlog`, `/calibration`, `/costs`, `/foreman/plan`,

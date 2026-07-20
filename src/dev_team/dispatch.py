@@ -582,6 +582,11 @@ class Dispatcher:
                         # the job that is actually running.
                         bucket = self._deferred.setdefault(repo_key, [])
                         bucket.append(item)
+                        # Keep the bucket in submit order. O(n·|order|) per
+                        # park, negligible at the WIP sizes this service runs
+                        # (queue cap 16, a handful of workers); if job volume
+                        # ever grows large, precompute an id→submit-index map
+                        # instead of scanning self._order per key.
                         bucket.sort(key=self._order.index)
                         continue
                     if waiting:

@@ -294,6 +294,46 @@ def _is_github_https(url: str) -> bool:
     return (parts.hostname or "") in _GITHUB_HOSTS
 
 
+#: Hosts a repository may actually be cloned from and still count as
+#: "on github.com" for tenant authorisation. Narrower than
+#: :data:`_GITHUB_HOSTS` — ``api.github.com`` is a REST host, never a clone
+#: remote.
+_GITHUB_REPO_HOSTS = frozenset({"github.com", "www.github.com"})
+
+
+def _repo_host(url: str) -> Optional[str]:
+    """The lower-cased host of a clone URL, across every form ``parse_repo``
+    accepts: ``scheme://…`` URLs and the scp-like ``[user@]host:path``.
+    ``None`` when no host is present (a bare local path)."""
+
+    if "://" in url:
+        return (urlsplit(url).hostname or "").lower() or None
+    # scp-like ``git@host:owner/name``: the authority is everything before the
+    # first colon, and it must not itself contain a slash (else it is a bare
+    # path like ``./a:b``). Strip an optional ``user@``.
+    authority, sep, _ = url.partition(":")
+    if sep and "/" not in authority:
+        host = authority.rpartition("@")[2]
+        return host.lower() or None
+    return None
+
+
+def is_github_repo(ref: "RepoRef") -> bool:
+    """Whether ``ref`` resolves to a repository hosted on github.com.
+
+    The bare-slug form (``owner/name``) always does — ``parse_repo`` expands
+    it to an ``https://github.com`` URL. A raw ``https``/``ssh``/``git`` URL
+    or scp-like ref is checked by **host**, so a caller cannot smuggle a
+    non-GitHub target (``https://internal-git.corp/acme/x``) past an
+    authorisation check that only string-matches the ``owner`` path segment.
+    This is the guard session-originated submissions and ``GET /checks`` use:
+    a signed-in user's authority is a github.com App-installation membership,
+    so anything off github.com is outside their tenant by construction.
+    """
+
+    return _repo_host(ref.url) in _GITHUB_REPO_HOSTS
+
+
 def git_auth_env(ref: RepoRef, token: Optional[str]) -> Dict[str, str]:
     """Per-command git environment: never prompt; header-based auth.
 
