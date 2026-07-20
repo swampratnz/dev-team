@@ -5361,3 +5361,25 @@ def test_session_verify_own_tenant_still_submits():
                   "finding_id": "recommendation.plan[0]"},
         )
         assert status == 202 and payload["id"].startswith("verify-")
+
+
+def test_repo_checks_rejects_traversal_ref():
+    # Review fix: an unsanitised ref spliced into the GitHub API path would
+    # let a session re-target the server's credential at another repo. A
+    # traversal-shaped ref is refused before it reaches any URL.
+    from dev_team.checks import ChecksOutcome
+
+    disp, reader, made = _checks_dispatcher(ChecksOutcome("success"))
+    for bad in (
+        "../../../../repos/otherorg/private/commits/main",
+        "main?per_page=1",
+        "a#b",
+        "a b",
+        "..",
+    ):
+        status, payload = disp.repo_checks("acme/mono", bad)
+        assert status == 400 and payload["error"] == "invalid ref", bad
+    assert reader.calls == []  # never reached the reader
+    # legitimate refs still pass (SHA, tag, slash-bearing branch)
+    for good in ("abc123", "v1.2.3", "dev-team/feature-x"):
+        assert disp.repo_checks("acme/mono", good)[0] == 200

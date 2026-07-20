@@ -98,7 +98,7 @@ from .foreman import (
     ready_for_delivery,
     story_job_description,
 )
-from .checks import ChecksError, ChecksReader, GitHubChecksReader
+from .checks import ChecksError, ChecksReader, GitHubChecksReader, valid_ref
 from .githubapp import GitHubAppError, resolve_token_provider
 from .oauth import GitHubOAuth, Session
 from .sources import (
@@ -1645,19 +1645,25 @@ class Dispatcher:
             parsed = parse_repo(repo)
         except SourceError as exc:
             return 400, {"error": str(exc)}
+        ref = ref.strip()
+        if not valid_ref(ref):
+            # The ref is spliced into the API path; a traversal-shaped one
+            # ("../..") would re-target the server's credential at an
+            # arbitrary endpoint — reject it before it reaches any URL.
+            return 400, {"error": "invalid ref"}
         if session is not None and (
             self.oauth is None or not self.oauth.authorises_repo(session, parsed)
         ):
             return 403, {"error": "repository not in your installations"}
         try:
             outcome = self._checks_reader(parsed).status(
-                parsed.owner, parsed.name, ref.strip()
+                parsed.owner, parsed.name, ref
             )
         except (ChecksError, GitHubAppError) as exc:
             return 502, {"error": f"could not read checks: {exc}"}
         return 200, {
             "repo": parsed.slug,
-            "ref": ref.strip(),
+            "ref": ref,
             "state": outcome.state,
             "ok": outcome.ok,
             "concluded": outcome.concluded,
