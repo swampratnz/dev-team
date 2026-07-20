@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,11 @@ class TeamConfig:
     Attributes:
         model: Model identifier passed to the Agent SDK (``None`` uses the
             SDK/CLI default).
+        role_models: Per-role model overrides, keyed by role (e.g.
+            ``{"product-manager": "claude-opus-4-8"}``); roles not listed
+            fall back to ``model``. Mirrors ``EngineConfig.role_models`` so
+            the simulation workflow routes models the same way the delivery
+            engine does.
         max_task_attempts: How many times the engineer may re-attempt a task
             before it is marked failed. Must be at least 1.
         min_coverage: The minimum test coverage percentage QA must report for a
@@ -28,6 +33,7 @@ class TeamConfig:
     """
 
     model: Optional[str] = None
+    role_models: Mapping[str, str] = field(default_factory=dict)
     max_task_attempts: int = 2
     min_coverage: float = 100.0
     working_dir: Optional[str] = None

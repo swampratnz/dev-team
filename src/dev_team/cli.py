@@ -36,7 +36,19 @@ from .eventlog import EventLog, compose
 from .events import AgentEvent, Listener
 from .execution import DEFAULT_EXCLUDED_DIRS, LocalWorkspace, SubprocessCommandRunner
 from .git import GitError, GitRepo
-from .agents.intake import TriageAgent
+from .agents import (
+    ArchitectAgent,
+    DevOpsAgent,
+    EngineerAgent,
+    ProductManagerAgent,
+    QAAgent,
+    RetrospectorAgent,
+    ReviewerAgent,
+    SecurityEngineerAgent,
+    SREAgent,
+    TechnicalWriterAgent,
+    TriageAgent,
+)
 from .instrument import InstrumentedRunner
 from .interaction import (
     ChannelApprovalGate,
@@ -120,6 +132,47 @@ def ensure_credentials(
     raise DevTeamError(_MISSING_CREDENTIALS)
 
 
+# Every role an agent in the system identifies as, for validating
+# --role-model keys at parse time (a typo like "manager" would otherwise
+# silently route nothing and burn the default model instead of the intended
+# one).
+_KNOWN_ROLES = frozenset(
+    cls.role
+    for cls in (
+        ArchitectAgent,
+        DevOpsAgent,
+        EngineerAgent,
+        ProductManagerAgent,
+        QAAgent,
+        RetrospectorAgent,
+        ReviewerAgent,
+        SecurityEngineerAgent,
+        SREAgent,
+        TechnicalWriterAgent,
+        TriageAgent,
+    )
+)
+
+
+def _role_model_pair(value: str) -> Tuple[str, str]:
+    """Parse a ``--role-model ROLE=MODEL`` argument into a ``(role, model)``.
+
+    Rejects malformed values and unknown roles at parse time so a typo fails
+    the command with the valid role list instead of silently applying the
+    default model.
+    """
+
+    role, sep, model = value.partition("=")
+    role, model = role.strip(), model.strip()
+    if not sep or not role or not model:
+        raise argparse.ArgumentTypeError(f"expected ROLE=MODEL, got {value!r}")
+    if role not in _KNOWN_ROLES:
+        raise argparse.ArgumentTypeError(
+            f"unknown role {role!r} (valid roles: {', '.join(sorted(_KNOWN_ROLES))})"
+        )
+    return role, model
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for the ``dev-team`` command."""
 
@@ -190,6 +243,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="A constraint the solution must satisfy (repeatable).",
     )
     misc.add_argument("--model", default=None, help="Model id for the agents.")
+    misc.add_argument(
+        "--role-model",
+        action="append",
+        type=_role_model_pair,
+        default=None,
+        dest="role_models",
+        metavar="ROLE=MODEL",
+        help="Model id for one role, overriding --model for that role only "
+        "(repeatable), e.g. --role-model product-manager=claude-opus-4-8. "
+        f"Roles: {', '.join(sorted(_KNOWN_ROLES))}.",
+    )
     misc.add_argument(
         "--max-attempts",
         type=int,
@@ -1095,6 +1159,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
     return EngineConfig(
         sandbox=_sandbox_config(args),
         model=args.model,
+        role_models=dict(args.role_models or []),
         max_task_attempts=args.max_attempts,
         max_concurrency=args.max_concurrency,
         verify_command=(
@@ -1394,7 +1459,11 @@ async def _assess(
     """Run a read-only repository assessment; returns the exit code."""
 
     focus_parts = [p for p in (args.title, args.description) if p]
-    config_kwargs = {"model": args.model, "focus": " — ".join(focus_parts) or None}
+    config_kwargs = {
+        "model": args.model,
+        "role_models": dict(args.role_models or []),
+        "focus": " — ".join(focus_parts) or None,
+    }
     if args.report is not None:
         config_kwargs["report_path"] = args.report
     if args.exclude_globs is not None:
@@ -1475,8 +1544,13 @@ async def _chat(
 
     pm_persona = team.roster.get("product-manager")
     if backend is None:
+        # The chat partner IS the product manager, so a --role-model override
+        # for that role applies here too.
+        pm_model = dict(args.role_models or []).get(
+            ProductManagerAgent.role, args.model
+        )
         backend = ClaudeChatBackend(
-            system_prompt=chat_system_prompt(pm_persona), model=args.model
+            system_prompt=chat_system_prompt(pm_persona), model=pm_model
         )
 
     async def run_feature(request: FeatureRequest, deliver: bool) -> int:
@@ -1512,7 +1586,7 @@ async def _intake(args, runner: AgentRunner, budget: Budget) -> Optional[int]:
 
     agent = TriageAgent(
         InstrumentedRunner(runner, TriageAgent.role, budget=budget),
-        model=args.model,
+        model=dict(args.role_models or []).get(TriageAgent.role, args.model),
     )
     decision = await agent.triage(args.intake)
     proposal_lines = [f"intake triage: route={decision.route}"]
@@ -1886,6 +1960,7 @@ def _run(
 
     config = TeamConfig(
         model=args.model,
+        role_models=dict(args.role_models or []),
         max_task_attempts=args.max_attempts,
         min_coverage=args.min_coverage,
     )
