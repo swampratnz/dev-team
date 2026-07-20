@@ -183,6 +183,77 @@ def test_engine_config_threads_reuse_engineer_session():
     assert _engine_config(off).reuse_engineer_session is False
 
 
+def test_role_model_flag_threads_engine_config():
+    from dev_team.cli import _engine_config, build_parser
+
+    args = build_parser().parse_args(
+        ["T", "D", "--deliver", "--role-model", "product-manager=claude-opus-4-8"]
+    )
+    assert _engine_config(args).role_models == {"product-manager": "claude-opus-4-8"}
+    off = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(off).role_models == {}
+
+
+def test_role_model_flag_repeatable():
+    from dev_team.cli import _engine_config, build_parser
+
+    args = build_parser().parse_args(
+        [
+            "T",
+            "D",
+            "--deliver",
+            "--role-model",
+            "product-manager=claude-opus-4-8",
+            "--role-model",
+            "technical-writer=claude-haiku-4-5",
+        ]
+    )
+    assert _engine_config(args).role_models == {
+        "product-manager": "claude-opus-4-8",
+        "technical-writer": "claude-haiku-4-5",
+    }
+
+
+def test_role_model_rejects_malformed_value(capsys):
+    from dev_team.cli import build_parser
+
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(["T", "D", "--role-model", "product-manager"])
+    assert excinfo.value.code == 2
+    assert "ROLE=MODEL" in capsys.readouterr().err
+
+
+def test_role_model_rejects_unknown_role(capsys):
+    # "manager" is the obvious typo for "product-manager"; it must fail loudly
+    # with the valid role list, not silently route nothing.
+    from dev_team.cli import build_parser
+
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(["T", "D", "--role-model", "manager=opus"])
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "unknown role" in err
+    assert "product-manager" in err
+
+
+def test_role_model_routes_manager_in_simulation():
+    runner = ScriptedRunner(happy_responses(1))
+    code = main(
+        ["Login", "Add login", "--role-model", "product-manager=claude-opus-4-8"],
+        runner=runner,
+    )
+    assert code == 0
+    manager_models = set()
+    other_models = set()
+    for call in runner.calls:
+        if "product manager" in (call["system_prompt"] or ""):
+            manager_models.add(call["model"])
+        else:
+            other_models.add(call["model"])
+    assert manager_models == {"claude-opus-4-8"}
+    assert other_models == {None}
+
+
 def test_main_llm_retrospective_rejected_without_deliver(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["Login", "Add login", "--llm-retrospective"], runner=ScriptedRunner([]))

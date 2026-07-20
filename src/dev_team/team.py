@@ -46,7 +46,6 @@ def build_workflow(
     """
 
     config = config or TeamConfig()
-    model = config.model
     cast = roster if roster is not None else Roster.default()
     budget = budget if budget is not None else Budget()
 
@@ -56,7 +55,7 @@ def build_workflow(
         metered = InstrumentedRunner(runner, agent_cls.role, budget=budget)
         return agent_cls(
             metered,
-            model=model,
+            model=config.role_models.get(agent_cls.role, config.model),
             listener=listener,
             persona=cast.get(agent_cls.role),
         )
