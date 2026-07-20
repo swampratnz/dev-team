@@ -61,6 +61,21 @@ def test_parse_repo_rejects_junk():
             parse_repo(bad)
 
 
+def test_parse_repo_rejects_dot_segment_owner_or_name():
+    # A crafted URL must not derive an owner/name of "." or ".." — reachable
+    # over the dispatch API (job submit, GET /checks), so it is constrained
+    # like the bare-slug form. (authorises_repo would 403 such an owner
+    # anyway, but the parse fails closed rather than relying on that.)
+    for bad in (
+        "https://github.com/../evil.git",
+        "https://github.com/../../evil",
+        "git@github.com:../evil.git",
+        "https://github.com/owner/..",
+    ):
+        with pytest.raises(SourceError):
+            parse_repo(bad)
+
+
 def test_parse_repo_rejects_embedded_credentials():
     # A URL carrying credentials would leak them into argv and .git/config,
     # out of reach of the header-auth design and the scrubber; refuse it.

@@ -2503,12 +2503,10 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 # the per-repo credential. Sessions are held to the same
                 # installation boundary as job submission.
                 query = parse_qs(split.query)
-                # authentication passed above, so this re-resolve never
-                # returns None; [1] is the session (None for the operator).
                 status, payload = dispatcher.repo_checks(
                     (query.get("repo") or [""])[0],
                     (query.get("ref") or [""])[0],
-                    session=self._authenticate()[1],
+                    session=session,
                 )
                 self._json(status, payload)
                 return

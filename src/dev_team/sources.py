@@ -184,7 +184,15 @@ def _owner_name_from_path(path: str, ref: str) -> tuple:
         raise SourceError(
             f"cannot derive owner/name from repository reference: {ref!r}"
         )
-    return segments[-2], _strip_git_suffix(segments[-1])
+    owner, name = segments[-2], _strip_git_suffix(segments[-1])
+    # Reject dot-segments so a crafted URL (``.../../evil.git``) can never
+    # yield an owner/name of ``.`` or ``..``. Such a value never matches a
+    # real GitHub App installation, but these derivations are now reachable
+    # over the authenticated dispatch API (job submit, GET /checks), so the
+    # owner/name must be as constrained as the bare-slug form already is.
+    if owner in (".", "..") or name in (".", ".."):
+        raise SourceError(f"invalid owner/name in repository reference: {ref!r}")
+    return owner, name
 
 
 def load_env_file(path: str) -> Dict[str, str]:
