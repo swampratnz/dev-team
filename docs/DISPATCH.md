@@ -18,28 +18,74 @@ not combined with `--assess`/`--deliver`/`--chat`/`--dashboard`.
 
 ## Auth
 
-Every route **except `GET /health`** requires a bearer token:
+Every route **except `GET /health`** (and, when sign-in is configured, the
+`/auth/*` flow) requires a bearer token:
 
 ```
 Authorization: Bearer <token>
 ```
 
-The token is read from the `DEV_TEAM_DISPATCH_TOKEN` environment variable at
-startup (a missing/empty token is a hard error — the service never runs
-unauthenticated). It is compared with `hmac.compare_digest` (constant-time);
-a missing or wrong token returns `401 {"error":"unauthorized"}`.
+The **operator token** is read from the `DEV_TEAM_DISPATCH_TOKEN`
+environment variable at startup (a missing/empty token is a hard error — the
+service never runs unauthenticated). It is compared with
+`hmac.compare_digest` (constant-time); a missing or wrong token returns
+`401 {"error":"unauthorized"}`.
 
 The token is a credential: keep it out of version control, hand it only to the
 authorised caller, and rotate it by editing the env file and restarting.
 
-## Single-flight
+**GitHub sign-in (optional)**: with `GITHUB_OAUTH_CLIENT_ID`/`_SECRET`
+configured, users can sign in with GitHub (`GET /auth/login` →
+`GET /auth/callback` → session token, renewable via `POST /auth/refresh`)
+and use their session token as the bearer instead. Sessions are
+**tenant-scoped end to end**: they may submit only against **github.com**
+repositories covered by the GitHub App installations their account can
+reach (403 otherwise — the repo's host is verified, not just the owner
+path segment, so a session cannot aim the clone/agent pipeline at an
+arbitrary internal or external git host), and they observe only those
+tenants' jobs — the `/jobs`
+listing is filtered, and any other tenant's job id answers the same
+`404 unknown job` a nonexistent one does. Cross-tenant aggregates
+(`GET /backlog`, `/calibration`, `/costs`, `/foreman/plan`,
+`POST /jobs/{id}/backlog`) and the
+spend-multiplying/destructive/audit routes (`/foreman/run`, purge,
+archive/unarchive, backlog mutations, `/access-log`) stay operator-only.
+See [`docs/GITHUB_APP.md`](GITHUB_APP.md) for the full model, including how
+repo credentials themselves come from App installation tokens rather than
+the users' grants.
 
-Submitted jobs run **one at a time**. A background worker thread owns an
-asyncio event loop and drains the job queue strictly sequentially: the box has
-one shared Claude subscription and dev-team has no cross-run locking, so
-overlapping runs would corrupt each other. A submit returns immediately with a
-queue `position` (0 = starts as soon as the worker is free); the pending queue
-is capped (default 16) and a submit past the cap returns `503`.
+## Single-flight (default) and the worker pool
+
+Submitted jobs run **one at a time by default**. A background worker thread
+owns an asyncio event loop and drains the job queue strictly sequentially:
+the box has one shared Claude subscription and dev-team has no cross-run
+locking within a workspace, so overlapping runs on one repository would
+corrupt each other. A submit returns immediately with a queue `position`
+(0 = starts as soon as a worker is free); the pending queue is capped
+(default 16) and a submit past the cap returns `503`.
+
+`--max-concurrent-jobs N` widens the pool: jobs on **distinct**
+repositories run concurrently (N workers), while two jobs on the same
+repository still never overlap — a job whose repo is mid-run is parked and
+started the moment that repo frees, preserving submit order per repo. All
+concurrent jobs draw on the one shared Claude subscription, so keep N
+small (2–3); contended jobs run slower rather than failing.
+
+## `GET /checks` (auth) — cross-repo CI state
+
+`?repo=owner/name&ref=SHA-or-branch` reads the live check-runs + legacy
+commit status for any reachable repository through the per-repo credential
+— a $0 synchronous read (no agents, no queue slot), the cross-repo half of
+the CLI's `--watch-checks`:
+
+```json
+{"repo":"acme/mono","ref":"main","state":"failure","ok":false,
+ "concluded":true,"failed":["ci"],"summary":"failed check(s): ci"}
+```
+
+`400` for missing/unparseable `repo`/`ref`; `502` when GitHub cannot be
+read (rate limit, bad credential, App not installed); signed-in sessions
+are held to the same installation boundary as job submission (403).
 
 ## Dashboard visibility
 

@@ -34,6 +34,9 @@ test = [
     "pytest-cov>=5",
     "coverage>=7",
     "ruff>=0.4",
+    # The github extra's pair, so the GitHub App auth paths are exercised in CI.
+    "PyJWT>=2.8",
+    "cryptography>=42",
 ]
 # The advisory visual review (--visual-review): a headless browser to
 # screenshot the delivered UI and the Anthropic API SDK to critique it with a
@@ -43,6 +46,13 @@ test = [
 visual = [
     "anthropic>=0.40",
     "playwright>=1.40",
+]
+# GitHub App authentication (docs/GITHUB_APP.md): signing the App JWT needs
+# PyJWT's RS256, which needs cryptography. Optional and lazily imported — the
+# static-PAT path never needs either.
+github = [
+    "PyJWT>=2.8",
+    "cryptography>=42",
 ]
 
 [project.scripts]

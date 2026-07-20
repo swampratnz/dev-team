@@ -113,6 +113,15 @@ QA, security, docs, reliability, and deployment.
   `--env-file` overrides). The token never touches the URL, argv,
   `.git/config`, or the environment of any command the agents run — it is
   handed to git per-command and stripped from the process environment.
+- ✅ **Authenticates as a GitHub App** — configure `GITHUB_APP_ID` +
+  `GITHUB_APP_PRIVATE_KEY_FILE` (the `github` extra) and every clone, push,
+  PR, and checks read mints a one-hour installation token scoped to the
+  single repository it touches, re-minted near expiry, instead of one
+  long-lived PAT for everything. The dispatch service can additionally let
+  users **sign in with GitHub** (OAuth) and submit jobs only against repos
+  their App installations cover, run jobs on distinct repos concurrently
+  (`--max-concurrent-jobs`, same-repo jobs always serialise), and report
+  any repo's live CI state (`GET /checks`). See `docs/GITHUB_APP.md`.
 - ✅ **Watchable** — `dev-team --dashboard` serves a local web dashboard over
   the workspace: one card per agent (current stage, what it last worked on),
   a live activity feed, recent runs, the backlog with story-point progress,

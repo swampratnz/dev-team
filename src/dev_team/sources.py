@@ -32,7 +32,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, MutableMapping, Optional, Sequence
+from typing import Dict, MutableMapping, Optional, Protocol, Sequence
 from urllib.parse import urlsplit
 
 from .errors import DevTeamError
@@ -79,6 +79,14 @@ def default_env_file(
 _GIT_TIMEOUT_SECONDS = 900.0
 
 _SLUG_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+#: The character set a single owner or name segment may use — the same
+#: ``[\w.-]`` a bare slug is held to. URL and scp forms derive owner/name
+#: from raw path segments, so they must be constrained identically: without
+#: this a URL like ``https://github.com/acme/name%3Fx`` would splice ``?``
+#: (or ``#``, whitespace, control chars) straight into a GitHub API path and
+#: the token-mint body.
+_SEGMENT_RE = re.compile(r"^[\w.-]+$")
 
 
 class SourceError(DevTeamError):
@@ -184,7 +192,21 @@ def _owner_name_from_path(path: str, ref: str) -> tuple:
         raise SourceError(
             f"cannot derive owner/name from repository reference: {ref!r}"
         )
-    return segments[-2], _strip_git_suffix(segments[-1])
+    owner, name = segments[-2], _strip_git_suffix(segments[-1])
+    # Constrain owner/name to the same ``[\w.-]`` charset a bare slug is held
+    # to, AND reject the pure dot-segments ``.``/``..`` (which that charset
+    # otherwise allows, since ``.`` is legal inside a real name like
+    # ``my_repo.v2``). These derivations are reachable over the authenticated
+    # dispatch API (job submit, GET /checks) and feed unescaped into GitHub
+    # API paths and the App token-mint body, so a crafted URL must not
+    # smuggle ``?``/``#``/whitespace/control chars — nor a traversal
+    # segment — into either.
+    for segment in (owner, name):
+        if segment in (".", "..") or not _SEGMENT_RE.match(segment):
+            raise SourceError(
+                f"invalid owner/name in repository reference: {ref!r}"
+            )
+    return owner, name
 
 
 def load_env_file(path: str) -> Dict[str, str]:
@@ -242,6 +264,29 @@ def resolve_github_token(
     return inherited
 
 
+class TokenProvider(Protocol):
+    """The seam every GitHub credential flows through.
+
+    ``token_for`` returns the credential to present for ``ref`` **right
+    now** — call it at each use rather than caching the result, so a
+    provider backed by short-lived credentials (a GitHub App installation
+    token) can re-mint under a long run while the static-PAT provider keeps
+    returning the same value.
+    """
+
+    def token_for(self, ref: "RepoRef") -> Optional[str]: ...
+
+
+@dataclass(frozen=True)
+class StaticTokenProvider:
+    """The classic model: one PAT (or nothing) for every repository."""
+
+    token: Optional[str] = None
+
+    def token_for(self, ref: "RepoRef") -> Optional[str]:
+        return self.token
+
+
 #: Hosts a GitHub PAT may be sent to. The token is scoped to GitHub, so the
 #: ``Authorization`` header is attached only for these hosts — never for an
 #: arbitrary ``--repo https://other-host/...``, which would leak the token to
@@ -261,6 +306,46 @@ def _is_github_https(url: str) -> bool:
     if parts.scheme != "https":
         return False
     return (parts.hostname or "") in _GITHUB_HOSTS
+
+
+#: Hosts a repository may actually be cloned from and still count as
+#: "on github.com" for tenant authorisation. Narrower than
+#: :data:`_GITHUB_HOSTS` — ``api.github.com`` is a REST host, never a clone
+#: remote.
+_GITHUB_REPO_HOSTS = frozenset({"github.com", "www.github.com"})
+
+
+def _repo_host(url: str) -> Optional[str]:
+    """The lower-cased host of a clone URL, across every form ``parse_repo``
+    accepts: ``scheme://…`` URLs and the scp-like ``[user@]host:path``.
+    ``None`` when no host is present (a bare local path)."""
+
+    if "://" in url:
+        return (urlsplit(url).hostname or "").lower() or None
+    # scp-like ``git@host:owner/name``: the authority is everything before the
+    # first colon, and it must not itself contain a slash (else it is a bare
+    # path like ``./a:b``). Strip an optional ``user@``.
+    authority, sep, _ = url.partition(":")
+    if sep and "/" not in authority:
+        host = authority.rpartition("@")[2]
+        return host.lower() or None
+    return None
+
+
+def is_github_repo(ref: "RepoRef") -> bool:
+    """Whether ``ref`` resolves to a repository hosted on github.com.
+
+    The bare-slug form (``owner/name``) always does — ``parse_repo`` expands
+    it to an ``https://github.com`` URL. A raw ``https``/``ssh``/``git`` URL
+    or scp-like ref is checked by **host**, so a caller cannot smuggle a
+    non-GitHub target (``https://internal-git.corp/acme/x``) past an
+    authorisation check that only string-matches the ``owner`` path segment.
+    This is the guard session-originated submissions and ``GET /checks`` use:
+    a signed-in user's authority is a github.com App-installation membership,
+    so anything off github.com is outside their tenant by construction.
+    """
+
+    return _repo_host(ref.url) in _GITHUB_REPO_HOSTS
 
 
 def git_auth_env(ref: RepoRef, token: Optional[str]) -> Dict[str, str]:

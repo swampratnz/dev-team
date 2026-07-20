@@ -102,6 +102,38 @@ def test_reader_status_classifies_from_both_endpoints():
     assert http.calls[0][1]["Authorization"] == "Bearer secret-tok"
 
 
+def test_valid_ref_allows_shas_tags_branches_rejects_url_hostile():
+    from dev_team.checks import valid_ref
+
+    for good in ("abc123", "v1.2.3", "dev-team/feature-x", "release/1.0", "HEAD"):
+        assert valid_ref(good), good
+    for bad in (
+        "../../../repos/x/y/commits/z",
+        "..",
+        "a/../b",
+        "main?per_page=1",
+        "a#frag",
+        "a b",
+        "a\\b",
+        "/leading",
+        "trailing/",
+        "",
+        "a%2fb",
+    ):
+        assert not valid_ref(bad), bad
+
+
+def test_reader_status_rejects_a_traversal_ref_before_any_request():
+    calls = []
+    reader = GitHubChecksReader(
+        token="t", http=lambda url, headers: calls.append(url) or {}
+    )
+    with pytest.raises(ChecksError) as excinfo:
+        reader.status("o", "r", "../../otherorg/private/commits/main")
+    assert "invalid ref" in str(excinfo.value)
+    assert calls == []  # never issued a request with the hostile ref
+
+
 def test_reader_paginates_and_sees_a_failure_beyond_page_one():
     # 150 runs over two pages; the failing run is on page 2 and must be seen
     page1 = [_run(f"t{i}") for i in range(100)]

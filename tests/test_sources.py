@@ -18,10 +18,37 @@ from dev_team.sources import (
     RepoRef,
     SourceError,
     clone_or_update,
+    is_github_repo,
     load_env_file,
     parse_repo,
     resolve_github_token,
 )
+
+
+def test_is_github_repo_across_url_forms():
+    for on_github in (
+        "acme/legacy",  # bare slug → https://github.com
+        "https://github.com/acme/legacy.git",
+        "https://www.github.com/acme/legacy",
+        "ssh://git@github.com/acme/legacy",
+        "git@github.com:acme/legacy.git",
+    ):
+        assert is_github_repo(parse_repo(on_github)), on_github
+    for off_github in (
+        "https://internal-git.corp.example/acme/legacy",
+        "ssh://git@internal.example/acme/x",
+        "git@evil.example:acme/x.git",
+        "git://10.0.0.1/acme/x",
+        "https://api.github.com/acme/x",  # REST host, not a clone remote
+    ):
+        assert not is_github_repo(parse_repo(off_github)), off_github
+    # A hostless ref (a bare local path, or a colon whose authority is a
+    # path) has no host to trust — never github.
+    for hostless in (
+        RepoRef(owner="a", name="b", url="/tmp/local/repo"),
+        RepoRef(owner="a", name="b", url="./weird/path:branch"),
+    ):
+        assert not is_github_repo(hostless), hostless.url
 
 
 # --- parsing ---------------------------------------------------------------------
@@ -59,6 +86,40 @@ def test_parse_repo_rejects_junk():
     for bad in ("not a repo", "https://github.com", "git@nohost", "owner/name/extra"):
         with pytest.raises(SourceError):
             parse_repo(bad)
+
+
+def test_parse_repo_rejects_dot_segment_owner_or_name():
+    # A crafted URL must not derive an owner/name of "." or ".." — reachable
+    # over the dispatch API (job submit, GET /checks), so it is constrained
+    # like the bare-slug form. (authorises_repo would 403 such an owner
+    # anyway, but the parse fails closed rather than relying on that.)
+    for bad in (
+        "https://github.com/../evil.git",
+        "https://github.com/../../evil",
+        "git@github.com:../evil.git",
+        "https://github.com/owner/..",
+    ):
+        with pytest.raises(SourceError):
+            parse_repo(bad)
+
+
+def test_parse_repo_rejects_url_hostile_owner_or_name():
+    # URL/scp forms derive owner/name from raw path segments and feed them
+    # unescaped into GitHub API paths and the App token-mint body, so a
+    # crafted repo must not smuggle URL-significant or control characters
+    # (percent-encoded or literal) into either segment.
+    for bad in (
+        "https://github.com/acme/name%3Fx",   # %-encoded '?'
+        "https://github.com/acme/name%23y",   # %-encoded '#'
+        "https://github.com/ac%20me/name",    # %-encoded space in owner
+        "git@github.com:acme/na me.git",      # literal space
+        "https://github.com/acme/name#frag",  # a real fragment on the name
+    ):
+        with pytest.raises(SourceError):
+            parse_repo(bad)
+    # legitimate owner/name characters (alnum, '-', '_', '.') still parse
+    ref = parse_repo("https://github.com/acme-org/my_repo.v2.git")
+    assert (ref.owner, ref.name) == ("acme-org", "my_repo.v2")
 
 
 def test_parse_repo_rejects_embedded_credentials():

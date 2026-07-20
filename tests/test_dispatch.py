@@ -2588,6 +2588,8 @@ def test_worker_is_single_flight_and_ordered():
 
 
 def test_default_materialise_clones_and_returns_local_workspace(tmp_path, monkeypatch):
+    from dev_team.sources import StaticTokenProvider
+
     calls = {}
 
     def fake_clone(ref, dest, *, runner, token=None, timeout=None):
@@ -2596,13 +2598,32 @@ def test_default_materialise_clones_and_returns_local_workspace(tmp_path, monkey
         return dest
 
     monkeypatch.setattr(dispatch_mod, "clone_or_update", fake_clone)
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(dispatch_mod, "_token_provider", StaticTokenProvider("ghs_test"))
     spec = JobSpec(mode="assess", repo="acme/mono", title="t", description="",
                    budget_usd=None, id="assess-1")
     ws = _default_materialise(spec, str(tmp_path / "clone"))
     assert calls["slug"] == "acme/mono"
+    assert calls["token"] == "ghs_test"  # per-repo credential from the provider
     assert isinstance(ws, LocalWorkspace)
+
+
+def test_shared_token_provider_resolves_exactly_once(monkeypatch):
+    # Resolution pops credentials from the process environment, so the
+    # provider must be built once and cached for the process lifetime.
+    from dev_team.sources import StaticTokenProvider
+
+    monkeypatch.setattr(dispatch_mod, "_token_provider", None)
+    resolutions = []
+
+    def fake_resolve(env_file):
+        resolutions.append(env_file)
+        return StaticTokenProvider("once")
+
+    monkeypatch.setattr(dispatch_mod, "resolve_token_provider", fake_resolve)
+    first = dispatch_mod._shared_token_provider()
+    second = dispatch_mod._shared_token_provider()
+    assert first is second
+    assert len(resolutions) == 1
 
 
 # --- the HTTP server ----------------------------------------------------------
@@ -4687,3 +4708,717 @@ def test_foreman_routes_over_http(tmp_path):
         )
         assert status == 400
         assert "budget_usd is required" in payload["error"]
+
+
+# --- GitHub OAuth sign-in over HTTP ------------------------------------------
+
+
+def _oauth_fixture(*, installations=({"account": {"login": "acme"}},)):
+    """A deterministic GitHubOAuth whose GitHub side is queued fakes."""
+
+    from test_oauth import FakeHttp
+
+    from dev_team.oauth import GitHubOAuth, OAuthConfig
+
+    counter = {"n": 0}
+
+    def token_source():
+        counter["n"] += 1
+        return f"tok{counter['n']}"
+
+    http = FakeHttp(
+        {"access_token": "user_at", "refresh_token": "rt_1"},
+        {"login": "chris"},
+        {"installations": list(installations)},
+    )
+    return GitHubOAuth(
+        OAuthConfig(client_id="cid", client_secret="csec"),
+        http=http,
+        token_source=token_source,
+    ), http
+
+
+def _sign_in(server):
+    """Drive /auth/login → /auth/callback over HTTP; returns the session token."""
+
+    status, login = _call(server, "/auth/login", token=None)
+    assert status == 200 and "github.com/login/oauth/authorize" in login["url"]
+    status, session = _call(
+        server, f"/auth/callback?code=c1&state={login['state']}", token=None
+    )
+    assert status == 200
+    return session["session_token"]
+
+
+def test_auth_routes_404_when_oauth_not_configured():
+    with running() as server:
+        assert _call(server, "/auth/login", token=None)[0] == 404
+        assert _call(server, "/auth/callback?code=x&state=y", token=None)[0] == 404
+        assert _call(server, "/auth/refresh", method="POST", token=None)[0] == 404
+
+
+def test_oauth_sign_in_grants_a_working_session():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(server, "/jobs", token=session_token)
+        assert (status, payload) == (200, {"jobs": []})
+
+
+def test_oauth_callback_without_code_is_400():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        status, login = _call(server, "/auth/login", token=None)
+        status, payload = _call(
+            server, f"/auth/callback?state={login['state']}", token=None
+        )
+        assert status == 400 and "code" in payload["error"]
+
+
+def test_oauth_wrong_bearer_still_401():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        assert _call(server, "/jobs", token="not-a-session")[0] == 401
+        assert _call(server, "/jobs", token=None)[0] == 401
+
+
+def test_session_submit_gated_by_installations():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server,
+            "/jobs",
+            method="POST",
+            token=session_token,
+            body={"mode": "assess", "repo": "acme/rota"},
+        )
+        assert status == 202
+        status, payload = _call(
+            server,
+            "/jobs",
+            method="POST",
+            token=session_token,
+            body={"mode": "assess", "repo": "otherorg/rota"},
+        )
+        assert status == 403
+        assert "installations" in payload["error"]
+
+
+def test_session_verify_gated_on_meta_repo():
+    # A verify job's repo comes from the source job's meta.json; a session
+    # whose installations don't cover it (here: an unparseable repo from a
+    # corrupt meta) answers the same 403, never a 500.
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-g/assessment.json", json.dumps(_assessment_payload())
+    )
+    dash.write_text("audit/assess-g/meta.json", json.dumps({"repo": ""}))
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, dashboard_workspace=dash) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server,
+            "/jobs",
+            method="POST",
+            token=session_token,
+            body={
+                "mode": "verify",
+                "source_job": "assess-g",
+                "finding_id": "recommendation.plan[0]",
+            },
+        )
+        assert status == 403 and "installations" in payload["error"]
+
+
+def test_operator_submit_is_never_gated():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        status, _ = _call(
+            server,
+            "/jobs",
+            method="POST",
+            body={"mode": "assess", "repo": "anyorg/anywhere"},
+        )
+        assert status == 202
+
+
+def test_session_is_locked_out_of_operator_routes():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        locked = [
+            ("GET", "/access-log", None),
+            ("POST", "/foreman/run", {"budget_usd": 1}),
+            ("POST", "/jobs/assess-x/purge", None),
+            ("POST", "/jobs/assess-x/archive", None),
+            ("POST", "/jobs/assess-x/unarchive", None),
+            ("POST", "/backlog/story", {"title": "t"}),
+            ("PATCH", "/backlog/story/S1", {"title": "t"}),
+            ("DELETE", "/backlog/story/S1", None),
+        ]
+        for method, path, body in locked:
+            status, payload = _call(
+                server, path, method=method, token=session_token, body=body
+            )
+            assert (status, payload) == (
+                403,
+                {"error": "operator token required"},
+            ), (method, path)
+        # the same routes stay 401 for an unauthenticated caller
+        assert _call(server, "/backlog/story/S1", method="DELETE", token="bad")[0] == 401
+
+
+def test_auth_refresh_rotates_over_http():
+    oauth, http = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        http.responses.extend(
+            [
+                {"access_token": "user_at2", "refresh_token": "rt_2"},
+                {"login": "chris"},
+                {"installations": [{"account": {"login": "acme"}}]},
+            ]
+        )
+        status, renewed = _call(
+            server, "/auth/refresh", method="POST", token=session_token
+        )
+        assert status == 200 and renewed["session_token"] != session_token
+        # rotated: old dies, new lives
+        assert _call(server, "/jobs", token=session_token)[0] == 401
+        assert _call(server, "/jobs", token=renewed["session_token"])[0] == 200
+
+
+def test_auth_refresh_without_bearer_is_401():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        assert _call(server, "/auth/refresh", method="POST", token=None)[0] == 401
+
+
+# --- worker pool + per-repo serialisation ------------------------------------
+
+
+def test_max_workers_must_be_positive():
+    with pytest.raises(ValueError):
+        Dispatcher(token="x", max_workers=0)
+
+
+def test_pool_runs_distinct_repos_concurrently():
+    both_in = threading.Barrier(2, timeout=5)
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        both_in.wait()  # only passes if two jobs are in-flight AT ONCE
+        release.wait(5)
+        return _clone_ws()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise, max_workers=2
+    )
+    disp.start()
+    try:
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        id2, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/two"}))
+        release.set()
+        assert disp.wait(id1, 10) and disp.wait(id2, 10)
+        assert disp.get(id1).state == "succeeded"
+        assert disp.get(id2).state == "succeeded"
+    finally:
+        release.set()
+        disp.stop()
+
+
+def test_same_repo_serialises_even_with_spare_workers():
+    order = []
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        order.append(spec.id)
+        if len(order) == 1:
+            first_in.set()
+            release.wait(5)
+        return _clone_ws()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise, max_workers=2
+    )
+    disp.start()
+    try:
+        # Same repository in two spellings: the slug and its clone URL must
+        # collide on one serialisation key.
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        id2, _ = disp.submit(
+            disp.build_spec(
+                {"mode": "assess", "repo": "https://github.com/A/one.git"}
+            )
+        )
+        assert first_in.wait(5)
+        time.sleep(0.2)  # give the second worker a chance to (wrongly) start it
+        assert disp.get(id1).state == "running"
+        assert disp.get(id2).state == "queued"  # parked, not started
+        release.set()
+        assert disp.wait(id1, 10) and disp.wait(id2, 10)
+        assert order == [id1, id2]
+        assert disp.get(id2).state == "succeeded"
+    finally:
+        release.set()
+        disp.stop()
+
+
+def test_deferred_job_cancelled_while_parked_never_runs():
+    ran = []
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        ran.append(spec.id)
+        if len(ran) == 1:
+            first_in.set()
+            release.wait(5)
+        return _clone_ws()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise, max_workers=2
+    )
+    disp.start()
+    try:
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        id2, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+        time.sleep(0.2)  # let the pool park job 2 behind job 1's repo
+        status, payload = disp.cancel_job(id2)
+        assert (status, payload["state"]) == (200, "cancelled")
+        release.set()
+        assert disp.wait(id1, 10)
+        assert disp.wait(id2, 5)  # cancel set the event; the job never ran
+        assert ran == [id1]
+        assert disp.get(id2).state == "cancelled"
+    finally:
+        release.set()
+        disp.stop()
+
+
+def test_repo_key_normalises_and_tolerates_junk():
+    disp = Dispatcher(token="x")
+    spec = JobSpec(mode="assess", repo="ACME/Mono", title="t", description="",
+                   budget_usd=None, id="assess-k1")
+    junk = JobSpec(mode="verify", repo="", title="t", description="",
+                   budget_usd=None, id="verify-k2")
+    with disp._lock:
+        disp._registry["assess-k1"] = JobRecord(spec=spec)
+        disp._registry["verify-k2"] = JobRecord(spec=junk)
+    assert disp._repo_key("assess-k1") == "acme/mono"
+    assert disp._repo_key("verify-k2") == ""
+
+
+def test_server_threads_max_workers_through():
+    with running(max_workers=2) as server:
+        assert server.dispatcher._max_workers == 2
+        assert len(server.dispatcher._threads) == 2
+
+
+# --- GET /checks (cross-repo CI state) ----------------------------------------
+
+
+class _FakeChecksReader:
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.calls = []
+
+    def status(self, owner, name, ref):
+        self.calls.append((owner, name, ref))
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
+def _checks_dispatcher(outcome, **kwargs):
+    reader = _FakeChecksReader(outcome)
+    made = []
+
+    def factory(ref):
+        made.append(ref.slug)
+        return reader
+
+    return Dispatcher(token="x", checks_reader=factory, **kwargs), reader, made
+
+
+def test_repo_checks_reports_the_outcome():
+    from dev_team.checks import ChecksOutcome
+
+    disp, reader, made = _checks_dispatcher(
+        ChecksOutcome("failure", failed=("ci",), summary="failed check(s): ci")
+    )
+    status, payload = disp.repo_checks("acme/mono", "abc123")
+    assert status == 200
+    assert payload == {
+        "repo": "acme/mono",
+        "ref": "abc123",
+        "state": "failure",
+        "ok": False,
+        "concluded": True,
+        "failed": ["ci"],
+        "summary": "failed check(s): ci",
+    }
+    assert made == ["acme/mono"] and reader.calls == [("acme", "mono", "abc123")]
+
+
+def test_repo_checks_validates_input():
+    from dev_team.checks import ChecksOutcome
+
+    disp, _, _ = _checks_dispatcher(ChecksOutcome("success"))
+    assert disp.repo_checks("", "abc")[0] == 400
+    assert disp.repo_checks("acme/mono", " ")[0] == 400
+    status, payload = disp.repo_checks("not a repo!", "abc")
+    assert status == 400 and "unrecognised" in payload["error"]
+
+
+def test_repo_checks_upstream_failure_is_502():
+    from dev_team.checks import ChecksError
+
+    disp, _, _ = _checks_dispatcher(ChecksError("HTTP 403 rate limited"))
+    status, payload = disp.repo_checks("acme/mono", "abc")
+    assert status == 502 and "rate limited" in payload["error"]
+
+
+def test_repo_checks_token_mint_failure_is_502():
+    from dev_team.githubapp import GitHubAppError
+
+    def exploding_factory(ref):
+        raise GitHubAppError("not installed")
+
+    disp = Dispatcher(token="x", checks_reader=exploding_factory)
+    status, payload = disp.repo_checks("acme/mono", "abc")
+    assert status == 502 and "not installed" in payload["error"]
+
+
+def test_checks_route_operator_and_session_gating():
+    from dev_team.checks import ChecksOutcome
+
+    reader = _FakeChecksReader(ChecksOutcome("success", summary="all green"))
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, checks_reader=lambda ref: reader) as server:
+        # operator: any repo
+        status, payload = _call(server, "/checks?repo=anyorg/thing&ref=main")
+        assert (status, payload["state"]) == (200, "success")
+        # session: installation-gated
+        session_token = _sign_in(server)
+        status, _ = _call(
+            server, "/checks?repo=acme/mono&ref=main", token=session_token
+        )
+        assert status == 200
+        status, payload = _call(
+            server, "/checks?repo=otherorg/mono&ref=main", token=session_token
+        )
+        assert status == 403 and "installations" in payload["error"]
+        # missing params answer 400, unauthenticated 401
+        assert _call(server, "/checks")[0] == 400
+        assert _call(server, "/checks?repo=a/b&ref=c", token="bad")[0] == 401
+
+
+def test_default_checks_reader_authenticates_per_repo(monkeypatch):
+    from dev_team.checks import GitHubChecksReader
+    from dev_team.sources import StaticTokenProvider, parse_repo
+
+    monkeypatch.setattr(dispatch_mod, "_token_provider", StaticTokenProvider("ghs_x"))
+    reader = dispatch_mod._default_checks_reader(parse_repo("acme/mono"))
+    assert isinstance(reader, GitHubChecksReader)
+    assert reader.token == "ghs_x"
+    # anonymous (no credential) degrades to an empty token, not a crash
+    monkeypatch.setattr(dispatch_mod, "_token_provider", StaticTokenProvider(None))
+    assert dispatch_mod._default_checks_reader(parse_repo("acme/mono")).token == ""
+
+
+def test_three_same_repo_jobs_preserve_submit_order():
+    # The review-caught interleaving: J2 gets parked (leaving the main
+    # queue) while J1 runs; J3 is submitted afterwards and sits in the main
+    # queue. On J1's release the parked J2 must still run before J3, even
+    # though J3 reaches the queue's head first.
+    order = []
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        order.append(spec.id)
+        if len(order) == 1:
+            first_in.set()
+            release.wait(5)
+        return _clone_ws()
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise, max_workers=3
+    )
+    disp.start()
+    try:
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+        id2, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        deadline = time.time() + 5
+        while time.time() < deadline:  # wait until J2 is genuinely parked
+            with disp._lock:
+                if any(id2 in bucket for bucket in disp._deferred.values()):
+                    break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("job 2 was never parked behind job 1")
+        id3, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        release.set()
+        assert disp.wait(id1, 10) and disp.wait(id2, 10) and disp.wait(id3, 10)
+        assert order == [id1, id2, id3]
+        assert disp._deferred == {}  # nothing left parked
+    finally:
+        release.set()
+        disp.stop()
+
+
+# --- tenant scoping of session reads (review fix) -----------------------------
+
+
+def test_session_sees_job_unit():
+    from dev_team.oauth import Session as OAuthSession
+
+    oauth, _ = _oauth_fixture()
+    disp = Dispatcher(token="x", oauth=oauth)
+    session = OAuthSession(
+        token="t", login="chris", installations=("acme",),
+        refresh_token=None, expires=10**12,
+    )
+    _insert_job(disp, "assess-own", "assess", "queued", None)  # repo acme/mono
+    foreign = JobSpec(mode="assess", repo="other/mono", title="T", description="",
+                      budget_usd=None, id="assess-foreign")
+    junk = JobSpec(mode="verify", repo="::junk::", title="T", description="",
+                   budget_usd=None, id="verify-junk")
+    with disp._lock:
+        disp._registry["assess-foreign"] = JobRecord(spec=foreign)
+        disp._registry["verify-junk"] = JobRecord(spec=junk)
+    assert disp.session_sees_job(None, "assess-own")  # operator sees all
+    assert disp.session_sees_job(None, "nonexistent")
+    assert disp.session_sees_job(session, "assess-own")
+    assert not disp.session_sees_job(session, "assess-foreign")
+    assert not disp.session_sees_job(session, "verify-junk")  # fails closed
+    # unknown job with no registry/meta: visible, the route 404s on its own
+    assert disp.session_sees_job(session, "nonexistent")
+    # no oauth wired at all: a stray session object fails closed too
+    bare = Dispatcher(token="x")
+    _insert_job(bare, "assess-b", "assess", "queued", None)
+    assert not bare.session_sees_job(session, "assess-b")
+
+
+def test_session_sees_job_reads_meta_after_restart():
+    from dev_team.oauth import Session as OAuthSession
+
+    oauth, _ = _oauth_fixture()
+    dash = InMemoryWorkspace()
+    dash.write_text("audit/assess-m/meta.json", json.dumps({"repo": "acme/mono"}))
+    dash.write_text("audit/assess-f/meta.json", json.dumps({"repo": "other/mono"}))
+    dash.write_text("audit/assess-e/meta.json", json.dumps({"repo": ""}))
+    disp = Dispatcher(token="x", oauth=oauth, dashboard_workspace=dash)
+    session = OAuthSession(
+        token="t", login="chris", installations=("acme",),
+        refresh_token=None, expires=10**12,
+    )
+    assert disp.session_sees_job(session, "assess-m")
+    assert not disp.session_sees_job(session, "assess-f")
+    # meta with an empty repo carries no tenant info: visible, route 404s
+    assert disp.session_sees_job(session, "assess-e")
+
+
+def test_session_job_listing_is_filtered():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        _insert_job(server.dispatcher, "assess-mine", "assess", "queued", None)
+        foreign = JobSpec(mode="assess", repo="other/mono", title="T",
+                          description="", budget_usd=None, id="assess-theirs")
+        with server.dispatcher._lock:
+            server.dispatcher._registry["assess-theirs"] = JobRecord(spec=foreign)
+            server.dispatcher._order.append("assess-theirs")
+        session_token = _sign_in(server)
+        _, payload = _call(server, "/jobs", token=session_token)
+        assert [j["id"] for j in payload["jobs"]] == ["assess-mine"]
+        # the operator still sees both
+        _, payload = _call(server, "/jobs")
+        assert {j["id"] for j in payload["jobs"]} == {"assess-mine", "assess-theirs"}
+
+
+def test_session_foreign_job_routes_answer_unknown_job():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        foreign = JobSpec(mode="assess", repo="other/mono", title="T",
+                          description="", budget_usd=None, id="assess-theirs")
+        with server.dispatcher._lock:
+            server.dispatcher._registry["assess-theirs"] = JobRecord(spec=foreign)
+            server.dispatcher._order.append("assess-theirs")
+        session_token = _sign_in(server)
+        probes = [
+            ("GET", "/jobs/assess-theirs", None),
+            ("GET", "/jobs/assess-theirs/result", None),
+            ("GET", "/jobs/assess-theirs/findings", None),
+            ("GET", "/jobs/assess-theirs/verifications", None),
+            ("GET", "/jobs/assess-theirs/question", None),
+            ("POST", "/jobs/assess-theirs/cancel", None),
+            ("POST", "/jobs/assess-theirs/answer", {"choice": "approve"}),
+        ]
+        for method, path, body in probes:
+            status, payload = _call(
+                server, path, method=method, token=session_token, body=body
+            )
+            assert (status, payload) == (404, {"error": "unknown job"}), path
+
+
+def test_session_own_job_routes_still_work():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        _insert_job(server.dispatcher, "assess-mine", "assess", "queued", None)
+        # _insert_job bypasses submit; cancel needs the completion event a
+        # real submit would have registered.
+        server.dispatcher._events["assess-mine"] = threading.Event()
+        session_token = _sign_in(server)
+        status, payload = _call(server, "/jobs/assess-mine", token=session_token)
+        assert (status, payload["id"]) == (200, "assess-mine")
+        status, payload = _call(
+            server, "/jobs/assess-mine/question", token=session_token
+        )
+        assert (status, payload) == (200, {"pending": False})
+        status, payload = _call(
+            server, "/jobs/assess-mine/answer", method="POST",
+            token=session_token, body={"choice": "approve"},
+        )
+        assert status == 409  # no pending question — but never "unknown job"
+        status, payload = _call(
+            server, "/jobs/assess-mine/cancel", method="POST", token=session_token
+        )
+        assert (status, payload["state"]) == (200, "cancelled")
+
+
+def test_session_locked_out_of_cross_tenant_aggregates():
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        for method, path in [
+            ("GET", "/backlog"),
+            ("GET", "/calibration"),
+            ("GET", "/costs"),
+            ("GET", "/foreman/plan"),
+            ("POST", "/jobs/assess-x/backlog"),
+        ]:
+            status, payload = _call(server, path, method=method, token=session_token)
+            assert (status, payload) == (
+                403,
+                {"error": "operator token required"},
+            ), path
+
+
+def test_session_verify_cannot_probe_foreign_assessments():
+    # Review fix: mode=verify used to hit _verify_spec's disk reads before
+    # the tenant gate, so "no assessment" vs "finding not found" vs 403
+    # leaked whether a guessed foreign source-job id existed. A foreign
+    # tenant's assessment must answer exactly what a nonexistent one does.
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-f/assessment.json", json.dumps(_assessment_payload())
+    )
+    dash.write_text("audit/assess-f/meta.json", json.dumps({"repo": "other/mono"}))
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, dashboard_workspace=dash) as server:
+        session_token = _sign_in(server)
+        for source in ("assess-f", "assess-nonexistent"):
+            status, payload = _call(
+                server, "/jobs", method="POST", token=session_token,
+                body={"mode": "verify", "source_job": source,
+                      "finding_id": "recommendation.plan[0]"},
+            )
+            assert (status, payload) == (
+                404, {"error": "no assessment for that job"}
+            ), source
+        # malformed source_job still gets the ordinary validation 400
+        status, _ = _call(
+            server, "/jobs", method="POST", token=session_token,
+            body={"mode": "verify", "source_job": "", "finding_id": "x"},
+        )
+        assert status == 400
+        # the operator is unaffected: finding resolution still answers
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-f",
+                  "finding_id": "nope"},
+        )
+        assert (status, payload) == (404, {"error": "finding not found"})
+
+
+def test_session_verify_own_tenant_still_submits():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-o/assessment.json", json.dumps(_assessment_payload())
+    )
+    dash.write_text("audit/assess-o/meta.json", json.dumps({"repo": "acme/mono"}))
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, dashboard_workspace=dash) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server, "/jobs", method="POST", token=session_token,
+            body={"mode": "verify", "source_job": "assess-o",
+                  "finding_id": "recommendation.plan[0]"},
+        )
+        assert status == 202 and payload["id"].startswith("verify-")
+
+
+def test_repo_checks_rejects_traversal_ref():
+    # Review fix: an unsanitised ref spliced into the GitHub API path would
+    # let a session re-target the server's credential at another repo. A
+    # traversal-shaped ref is refused before it reaches any URL.
+    from dev_team.checks import ChecksOutcome
+
+    disp, reader, made = _checks_dispatcher(ChecksOutcome("success"))
+    for bad in (
+        "../../../../repos/otherorg/private/commits/main",
+        "main?per_page=1",
+        "a#b",
+        "a b",
+        "..",
+    ):
+        status, payload = disp.repo_checks("acme/mono", bad)
+        assert status == 400 and payload["error"] == "invalid ref", bad
+    assert reader.calls == []  # never reached the reader
+    # legitimate refs still pass (SHA, tag, slash-bearing branch)
+    for good in ("abc123", "v1.2.3", "dev-team/feature-x"):
+        assert disp.repo_checks("acme/mono", good)[0] == 200
+
+
+def test_session_submit_rejects_non_github_host():
+    # SSRF/boundary fix at the HTTP layer: a session member of org acme
+    # cannot point a job at a non-github host whose path happens to start
+    # with /acme — the installation check now verifies the host, not just
+    # the owner path segment.
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server, "/jobs", method="POST", token=session_token,
+            body={"mode": "assess",
+                  "repo": "https://internal-git.corp.example/acme/anything"},
+        )
+        assert status == 403 and "installations" in payload["error"]
+        # the operator, by contrast, may still target any git URL
+        status, _ = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "assess",
+                  "repo": "https://internal-git.corp.example/acme/anything"},
+        )
+        assert status == 202
+
+
+def test_session_checks_rejects_non_github_host():
+    from dev_team.checks import ChecksOutcome
+
+    reader = _FakeChecksReader(ChecksOutcome("success"))
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, checks_reader=lambda ref: reader) as server:
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server,
+            "/checks?repo=https://internal-git.corp.example/acme/x&ref=main",
+            token=session_token,
+        )
+        assert status == 403 and "installations" in payload["error"]
+        assert reader.calls == []  # never reached the reader

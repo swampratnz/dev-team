@@ -98,12 +98,16 @@ from .foreman import (
     ready_for_delivery,
     story_job_description,
 )
+from .checks import ChecksError, ChecksReader, GitHubChecksReader, valid_ref
+from .githubapp import GitHubAppError, resolve_token_provider
+from .oauth import GitHubOAuth, Session
 from .sources import (
+    RepoRef,
     SourceError,
+    TokenProvider,
     clone_or_update,
     default_env_file,
     parse_repo,
-    resolve_github_token,
 )
 from .team import DevTeam
 from .transcripts import TRANSCRIPTS_DIR, TranscriptRecorder
@@ -372,28 +376,52 @@ def _failed_cost(record: JobRecord) -> float:
     return record.budget.spent if record.budget is not None else 0.0
 
 
+#: The process-wide credential source, resolved lazily on the first clone —
+#: resolution pops credentials out of the process environment, so it must
+#: happen exactly once. A GitHub App configuration (docs/GITHUB_APP.md) mints
+#: a fresh repo-scoped token per clone; a PAT behaves exactly as before.
+_token_provider: Optional[TokenProvider] = None
+_token_provider_lock = threading.Lock()
+
+
+def _shared_token_provider() -> TokenProvider:
+    global _token_provider
+    with _token_provider_lock:
+        if _token_provider is None:
+            _token_provider = resolve_token_provider(default_env_file())
+        return _token_provider
+
+
+def _default_checks_reader(ref: "RepoRef") -> ChecksReader:
+    """A per-repo authenticated checks reader (the real GitHub one)."""
+
+    token = _shared_token_provider().token_for(ref)
+    return GitHubChecksReader(token=token or "")
+
+
 def _default_materialise(spec: JobSpec, dest: str) -> Workspace:
     """Clone (or fast-forward) ``spec.repo`` into ``dest`` — the real path.
 
-    Mirrors the CLI's ``_materialise_repo``: resolve the ref, find the GitHub
-    token via the default env-file search, take it *out of* the process
-    environment, and clone header-authenticated. Returns a workspace rooted at
-    the clone.
+    Mirrors the CLI's ``_materialise_repo``: resolve the ref, resolve the
+    credential source (GitHub App if configured, else the PAT — taken *out
+    of* the process environment either way), and clone header-authenticated.
+    Returns a workspace rooted at the clone.
     """
 
     ref = parse_repo(spec.repo)
-    token = resolve_github_token(default_env_file())
+    token = _shared_token_provider().token_for(ref)
     clone_or_update(ref, dest, runner=SubprocessCommandRunner(), token=token)
     return LocalWorkspace(dest)
 
 
 class Dispatcher:
-    """The job registry + single-flight worker behind the HTTP layer.
+    """The job registry + worker pool behind the HTTP layer.
 
     Directly unit-testable without a socket: :meth:`build_spec` validates a
-    SUBMIT body, :meth:`submit` enqueues, and the worker thread (started by
-    :meth:`start`) drains the queue one job at a time through
-    :meth:`run_job`.
+    SUBMIT body, :meth:`submit` enqueues, and the worker threads (started by
+    :meth:`start`) drain the queue — one job at a time with the default
+    ``max_workers=1``, or concurrently across **distinct** repositories with
+    a larger pool; same-repo jobs always serialise.
     """
 
     def __init__(
@@ -408,9 +436,20 @@ class Dispatcher:
         dashboard_workspace: Optional[Workspace] = None,
         record_transcripts: bool = False,
         job_timeout: float = _JOB_TIMEOUT_SECONDS,
+        oauth: Optional[GitHubOAuth] = None,
+        max_workers: int = 1,
+        checks_reader: Optional[Callable[[RepoRef], ChecksReader]] = None,
         sandbox: Optional[SandboxConfig] = None,
     ) -> None:
         self.token = token
+        # Injectable factory for GET /checks (tests never touch the network);
+        # the default authenticates per repo through the token provider.
+        self._checks_reader = checks_reader or _default_checks_reader
+        # Optional GitHub OAuth sign-in (docs/GITHUB_APP.md): when wired, a
+        # session token is accepted as a bearer alongside the operator token,
+        # with per-user repo authorisation and operator-only routes enforced
+        # by the handler. None keeps the classic single-token service.
+        self.oauth = oauth
         self._runner = runner
         self._materialise = materialise or _default_materialise
         self._clock = clock
@@ -461,35 +500,67 @@ class Dispatcher:
         self._meta_lock = threading.Lock()
         self._queue: "queue.Queue[Any]" = queue.Queue()
         self._seq = 0
-        self._thread: Optional[threading.Thread] = None
+        self._threads: List[threading.Thread] = []
+        if max_workers < 1:
+            raise ValueError("max_workers must be at least 1")
+        self._max_workers = max_workers
+        # Per-repo serialisation state (both guarded by self._lock): repos
+        # with a job mid-run, and jobs parked because their repo was busy.
+        self._active_repos: set = set()
+        self._deferred: Dict[str, List[str]] = {}
 
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
-        """Spawn the single-flight worker thread (idempotent)."""
+        """Spawn the worker pool (idempotent).
 
-        if self._thread is None:
-            self._thread = threading.Thread(target=self._worker_loop, daemon=True)
-            self._thread.start()
+        ``max_workers`` defaults to 1, which is exactly the classic
+        single-flight service. More workers run jobs on **distinct**
+        repositories concurrently; two jobs on the same repository never
+        overlap (see :meth:`_worker_loop`), because dev-team has no
+        cross-run locking within a workspace. Every concurrent job still
+        draws on the one shared Claude subscription — keep the pool small.
+        """
+
+        if not self._threads:
+            for _ in range(self._max_workers):
+                thread = threading.Thread(target=self._worker_loop, daemon=True)
+                thread.start()
+                self._threads.append(thread)
 
     def stop(self) -> None:
-        """Signal the worker to drain-and-exit and join it."""
+        """Signal every worker to drain-and-exit and join them."""
 
-        if self._thread is not None:
+        if self._threads:
             self._queue.put(_SHUTDOWN)
-            self._thread.join(timeout=10)
-            self._thread = None
+            for thread in self._threads:
+                thread.join(timeout=10)
+            self._threads = []
 
     def _worker_loop(self) -> None:
-        """Own an asyncio loop and run queued jobs strictly one at a time.
+        """Own an asyncio loop and run queued jobs, serialised per repo.
+
+        A popped job runs only when its repository is idle **and** no older
+        submission for that repository is still parked; otherwise it is
+        parked (deferred) — two jobs on one workspace clone would corrupt
+        each other, and a newer job overtaking an older parked one would
+        break the per-repo FIFO promise. The parked list is kept in submit
+        order (worker pop order can race lock order, so parking re-sorts by
+        the registry's submit sequence), its head is re-enqueued — but left
+        in place — when the repository frees, and removed only by the worker
+        that actually starts it. With one worker this degenerates to the
+        classic strict single-flight queue.
 
         Each job runs under a wall-clock ceiling (:attr:`_job_timeout`): a job
-        that hangs would otherwise wedge the single-flight queue forever, so on
-        timeout the worker aborts it, marks it failed, and moves on to the next
-        job. ``asyncio.wait_for`` can only unwind the coroutine at an ``await``
+        that hangs would otherwise wedge its worker forever, so on timeout
+        the worker aborts it, marks it failed, and moves on to the next job.
+        ``asyncio.wait_for`` can only unwind the coroutine at an ``await``
         point — a job blocked in synchronous CPU/IO is not interruptible — but
         the stuck cases this guards (an agent session or clone that never
         returns) are all awaiting.
+
+        The shutdown sentinel is re-enqueued before a worker exits, so one
+        :meth:`stop` drains the whole pool.
         """
 
         loop = asyncio.new_event_loop()
@@ -497,15 +568,74 @@ class Dispatcher:
             while True:
                 item = self._queue.get()
                 if item is _SHUTDOWN:
+                    self._queue.put(_SHUTDOWN)
                     return
+                repo_key = self._repo_key(item)
+                with self._lock:
+                    waiting = self._deferred.get(repo_key)
+                    head_of_line = not waiting or waiting[0] == item
+                    if repo_key in self._active_repos or not head_of_line:
+                        # Park: busy repo, or an older same-repo submission
+                        # is already waiting its turn. A cancelled job parks
+                        # like any other and no-ops when it finally pops —
+                        # special-casing it here would free the repo under
+                        # the job that is actually running.
+                        bucket = self._deferred.setdefault(repo_key, [])
+                        bucket.append(item)
+                        # Keep the bucket in submit order. O(n·|order|) per
+                        # park, negligible at the WIP sizes this service runs
+                        # (queue cap 16, a handful of workers); if job volume
+                        # ever grows large, precompute an id→submit-index map
+                        # instead of scanning self._order per key.
+                        bucket.sort(key=self._order.index)
+                        continue
+                    if waiting:
+                        # We are the parked head, re-enqueued by the last
+                        # release — claim our slot.
+                        waiting.pop(0)
+                        if not waiting:
+                            del self._deferred[repo_key]
+                    self._active_repos.add(repo_key)
                 try:
                     loop.run_until_complete(
                         asyncio.wait_for(self._execute(item), timeout=self._job_timeout)
                     )
                 except asyncio.TimeoutError:
                     self._fail_timed_out(item)
+                finally:
+                    self._release_repo(repo_key)
         finally:
             loop.close()
+
+    def _repo_key(self, job_id: str) -> str:
+        """The serialisation key for a job's repository.
+
+        Normalised through :func:`parse_repo` so a slug and its clone URL
+        spell the same repository; a spec whose repo does not parse (a
+        corrupt verify ``meta.json``) falls back to the raw string — the job
+        will fail on its own, it just never dodges serialisation.
+        """
+
+        repo = self._registry[job_id].spec.repo
+        try:
+            return parse_repo(repo).slug.lower()
+        except SourceError:
+            return repo.lower()
+
+    def _release_repo(self, repo_key: str) -> None:
+        """Free ``repo_key`` and re-enqueue its oldest parked job, if any.
+
+        The head stays in the parked list until the worker that pops it
+        actually starts it — removing it here would let a newer same-repo
+        submission still sitting in the main queue overtake it.
+        """
+
+        with self._lock:
+            self._active_repos.discard(repo_key)
+            waiting = self._deferred.get(repo_key)
+            next_id = waiting[0] if waiting else None
+        if next_id is not None:
+            self._queue.put(next_id)
 
     def _fail_timed_out(self, job_id: str) -> None:
         """Mark a job failed after it blew the wall-clock ceiling.
@@ -705,12 +835,43 @@ class Dispatcher:
         with self._lock:
             return self._registry.get(job_id)
 
+    def session_sees_job(self, session: Optional[Session], job_id: str) -> bool:
+        """Whether this caller may observe ``job_id`` at all.
+
+        The operator (``session is None``) sees everything. A signed-in
+        session sees only jobs whose repository owner is in its installation
+        snapshot — the same boundary as submit — so one dispatch instance
+        can serve unrelated organisations without leaking each other's job
+        lists, results, or findings. The repo comes from the registry, or
+        (after a restart, for disk-keyed routes) the job's mirrored
+        ``meta.json``; a job with no discoverable repo is visible — there is
+        nothing tenant-scoped to leak and the route 404s on its own — while
+        a repo that will not parse fails **closed** for sessions.
+        """
+
+        if session is None:
+            return True
+        record = self.get(job_id)
+        repo = record.spec.repo if record is not None else None
+        if repo is None:
+            meta = self._read_meta(job_id)
+            if meta is not None:
+                repo = str(meta.get("repo", "")) or None
+        if repo is None:
+            return True
+        try:
+            ref = parse_repo(repo)
+        except SourceError:
+            return False
+        return self.oauth is not None and self.oauth.authorises_repo(session, ref)
+
     def recent(
         self,
         *,
         limit: int = _LIST_LIMIT,
         offset: int = 0,
         include_archived: bool = False,
+        session: Optional[Session] = None,
     ) -> List[JobRecord]:
         """A newest-first page of records.
 
@@ -731,6 +892,10 @@ class Dispatcher:
         records = list(reversed(ordered))
         if not include_archived:
             records = [r for r in records if not self._is_archived(r.spec.id)]
+        if session is not None:
+            # A signed-in session's page holds only its own tenants' jobs —
+            # filtered before pagination so pages stay full.
+            records = [r for r in records if self.session_sees_job(session, r.spec.id)]
         return records[offset : offset + limit]
 
     def wait(self, job_id: str, timeout: float = 5.0) -> bool:
@@ -1466,6 +1631,51 @@ class Dispatcher:
     # own the stateful parts — provenance, submitting, and status write-back —
     # under the same backlog lock every other backlog write uses.
 
+    def repo_checks(
+        self, repo: str, ref: str, *, session: Optional[Session] = None
+    ) -> Tuple[int, Dict[str, Any]]:
+        """The live CI state of ``ref`` on ``repo`` — ``GET /checks``.
+
+        A $0-of-budget read: one authenticated GitHub API round-trip through
+        the per-repo credential, no agents, no queue slot. This is the
+        cross-repo half of the CLI's ``--watch-checks``: any repository the
+        service can reach can be polled here, not just the one a delivery
+        just pushed to. A signed-in session is held to the same installation
+        boundary as job submission.
+        """
+
+        if not repo.strip() or not ref.strip():
+            return 400, {"error": "checks needs repo and ref"}
+        try:
+            parsed = parse_repo(repo)
+        except SourceError as exc:
+            return 400, {"error": str(exc)}
+        ref = ref.strip()
+        if not valid_ref(ref):
+            # The ref is spliced into the API path; a traversal-shaped one
+            # ("../..") would re-target the server's credential at an
+            # arbitrary endpoint — reject it before it reaches any URL.
+            return 400, {"error": "invalid ref"}
+        if session is not None and (
+            self.oauth is None or not self.oauth.authorises_repo(session, parsed)
+        ):
+            return 403, {"error": "repository not in your installations"}
+        try:
+            outcome = self._checks_reader(parsed).status(
+                parsed.owner, parsed.name, ref
+            )
+        except (ChecksError, GitHubAppError) as exc:
+            return 502, {"error": f"could not read checks: {exc}"}
+        return 200, {
+            "repo": parsed.slug,
+            "ref": ref,
+            "state": outcome.state,
+            "ok": outcome.ok,
+            "concluded": outcome.concluded,
+            "failed": list(outcome.failed),
+            "summary": outcome.summary,
+        }
+
     def _story_repo(self, story: Story) -> Optional[str]:
         """The repository ``story``'s provenance names, or ``None``.
 
@@ -2124,23 +2334,87 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             except ValueError:
                 return default
 
-        def _authorised(self) -> bool:
-            """Constant-time bearer check over the whole header value.
+        def _authenticate(self) -> Optional[Tuple[str, Optional[Session]]]:
+            """``("operator", None)``, ``("user", session)``, or ``None``.
 
-            Compares UTF-8 *bytes*, not str: headers decode as latin-1, so a
-            non-ASCII ``Authorization`` value is a valid str that
-            :func:`hmac.compare_digest` refuses (it raises on non-ASCII text).
-            The header is attacker-controlled and reached before auth, so a
-            stray byte must read as "no match", never crash the handler
-            (which would be a pre-auth 500/connection-reset DoS). Mirrors the
-            dashboard's ``_tokens_match``.
+            The operator check is a constant-time bearer comparison over the
+            whole header value, in UTF-8 *bytes*, not str: headers decode as
+            latin-1, so a non-ASCII ``Authorization`` value is a valid str
+            that :func:`hmac.compare_digest` refuses (it raises on non-ASCII
+            text). The header is attacker-controlled and reached before
+            auth, so a stray byte must read as "no match", never crash the
+            handler (which would be a pre-auth 500/connection-reset DoS).
+            Mirrors the dashboard's ``_tokens_match``. When OAuth sign-in is
+            wired, a bearer that is not the operator token is then looked up
+            as a session token (the lookup is constant-time per stored
+            token).
             """
 
             expected = f"Bearer {dispatcher.token}"
             provided = self.headers.get("Authorization", "")
-            return hmac.compare_digest(
+            if hmac.compare_digest(
                 provided.encode("utf-8"), expected.encode("utf-8")
-            )
+            ):
+                return ("operator", None)
+            if dispatcher.oauth is not None and provided.startswith("Bearer "):
+                session = dispatcher.oauth.session_for(provided[len("Bearer "):])
+                if session is not None:
+                    return ("user", session)
+            return None
+
+        def _operator_only(self) -> bool:
+            """Answer the 403 unless the caller holds the operator token.
+
+            Spend-multiplying, destructive, and audit routes (foreman runs,
+            purge/archive, backlog mutation, the access log) stay with the
+            operator even when user sign-in is enabled: a signed-in user may
+            submit and observe work, never administer the service.
+            """
+
+            auth = self._authenticate()
+            if auth is None:
+                self._json(401, {"error": "unauthorized"})
+                return False
+            if auth[0] != "operator":
+                self._json(403, {"error": "operator token required"})
+                return False
+            return True
+
+        def _session_sees(self, session: Optional[Session], job_id: str) -> bool:
+            """Answer the tenant-scoping 404 for a job outside the session.
+
+            A foreign tenant's job answers exactly what a nonexistent one
+            does — ``404 {"error":"unknown job"}`` — so a signed-in user
+            cannot even probe which job ids exist. The operator
+            (``session is None``) always passes.
+            """
+
+            if dispatcher.session_sees_job(session, job_id):
+                return True
+            self._json(404, {"error": "unknown job"})
+            return False
+
+        def _auth_route(self, path: str, query: Dict[str, List[str]]) -> bool:
+            """Handle the unauthenticated ``/auth/*`` sign-in routes.
+
+            Returns ``True`` when the path was one of them (handled either
+            way). All 404 when OAuth sign-in is not configured, so the
+            classic single-token service exposes no new surface.
+            """
+
+            if path not in ("/auth/login", "/auth/callback"):
+                return False
+            if dispatcher.oauth is None:
+                self._json(404, {"error": "not found"})
+                return True
+            if path == "/auth/login":
+                self._json(200, dispatcher.oauth.login_url())
+                return True
+            code = (query.get("code") or [""])[0]
+            state = (query.get("state") or [""])[0]
+            status, payload = dispatcher.oauth.handle_callback(code, state)
+            self._json(status, payload)
+            return True
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             split = urlsplit(self.path)
@@ -2157,13 +2431,18 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                     },
                 )
                 return
-            if not self._authorised():
+            if self._auth_route(path, parse_qs(split.query)):
+                return
+            auth = self._authenticate()
+            if auth is None:
                 self._json(401, {"error": "unauthorized"})
                 return
+            session = auth[1]
             if path == "/jobs":
                 # ?archived=1 reveals archived jobs too; any other value (or
                 # its absence) keeps the default exclusion. ?limit=/?offset=
                 # page the newest-first list (bounds enforced by recent()).
+                # A session's page is scoped to its installations.
                 query = parse_qs(split.query)
                 include_archived = query.get("archived", ["0"])[0] == "1"
                 limit = self._int_param(query, "limit", _LIST_LIMIT)
@@ -2177,22 +2456,34 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                                 limit=limit,
                                 offset=offset,
                                 include_archived=include_archived,
+                                session=session,
                             )
                         ]
                     },
                 )
                 return
             if path == "/backlog":
+                # Operator-only: the board aggregates stories bred from every
+                # tenant's assessments.
+                if not self._operator_only():
+                    return
                 status, payload = dispatcher.board()
                 self._json(status, payload)
                 return
             if path == "/calibration":
+                # Operator-only: a cross-tenant rollup over every job's
+                # verification history.
+                if not self._operator_only():
+                    return
                 status, payload = dispatcher.calibration()
                 self._json(status, payload)
                 return
             if path == "/costs":
+                # Operator-only: total spend across every tenant's jobs.
                 # ?archived=1 reveals archived jobs too — same exact-match
                 # contract as /jobs.
+                if not self._operator_only():
+                    return
                 include_archived = (
                     parse_qs(split.query).get("archived", ["0"])[0] == "1"
                 )
@@ -2200,19 +2491,37 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 self._json(status, payload)
                 return
             if path == "/access-log":
+                # Operator-only: the access journal is the audit surface.
                 # ?limit= (default 100, clamped to [1, 1000]) — missing or
                 # non-numeric falls back to the default, same forgiving
                 # posture _int_param already gives ?limit=/?offset= on /jobs.
+                if not self._operator_only():
+                    return
                 limit = self._int_param(
                     parse_qs(split.query), "limit", _ACCESS_LOG_LIMIT_DEFAULT
                 )
                 status, payload = dispatcher.access_log_entries(limit=limit)
                 self._json(status, payload)
                 return
+            if path == "/checks":
+                # ?repo=owner/name&ref=SHA-or-branch — live CI state through
+                # the per-repo credential. Sessions are held to the same
+                # installation boundary as job submission.
+                query = parse_qs(split.query)
+                status, payload = dispatcher.repo_checks(
+                    (query.get("repo") or [""])[0],
+                    (query.get("ref") or [""])[0],
+                    session=session,
+                )
+                self._json(status, payload)
+                return
             if path == "/foreman/plan":
-                # $0 dry-run of POST /foreman/run. ?max_stories= gets the same
-                # forgiving clamp every GET paging knob has; the spend-bearing
-                # POST validates strictly instead.
+                # Operator-only, like the run it previews (it reveals every
+                # tenant's ready stories and repos). ?max_stories= gets the
+                # same forgiving clamp every GET paging knob has; the
+                # spend-bearing POST validates strictly instead.
+                if not self._operator_only():
+                    return
                 max_stories = self._int_param(
                     parse_qs(split.query), "max_stories", DEFAULT_MAX_STORIES
                 )
@@ -2221,21 +2530,31 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "jobs":
+                if not self._session_sees(session, parts[1]):
+                    return
                 self._job(parts[1])
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "result":
+                if not self._session_sees(session, parts[1]):
+                    return
                 self._result(parts[1])
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "findings":
                 # Disk-keyed (no registry lookup): works after a restart.
+                if not self._session_sees(session, parts[1]):
+                    return
                 status, payload = dispatcher.list_job_findings(parts[1])
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "verifications":
+                if not self._session_sees(session, parts[1]):
+                    return
                 status, payload = dispatcher.verifications(parts[1])
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "question":
+                if not self._session_sees(session, parts[1]):
+                    return
                 status, payload = dispatcher.get_question(parts[1])
                 self._json(status, payload)
                 return
@@ -2243,16 +2562,38 @@ def _make_handler(dispatcher: Dispatcher) -> type:
 
         def do_POST(self) -> None:  # noqa: N802 (http.server API)
             path = urlsplit(self.path).path
-            if not self._authorised():
+            if path == "/auth/refresh":
+                # Session-bearer route: rotates the session from its stored
+                # refresh token. 404 when sign-in is not configured (no new
+                # surface for the classic service); the operator token has
+                # no session to refresh, so it gets the same 401 an unknown
+                # bearer does.
+                if dispatcher.oauth is None:
+                    self._json(404, {"error": "not found"})
+                    return
+                provided = self.headers.get("Authorization", "")
+                bearer = (
+                    provided[len("Bearer "):]
+                    if provided.startswith("Bearer ")
+                    else ""
+                )
+                status, payload = dispatcher.oauth.refresh(bearer)
+                self._json(status, payload)
+                return
+            auth = self._authenticate()
+            if auth is None:
                 self._json(401, {"error": "unauthorized"})
                 return
             if path == "/jobs":
-                self._create()
+                self._create(auth[1])
                 return
             if path == "/foreman/run":
-                # Synchronous like the other cores: selection + enqueueing is
-                # a locked disk/registry transform; the jobs themselves run on
-                # the single-flight queue afterwards.
+                # Operator-only (it multiplies spend). Synchronous like the
+                # other cores: selection + enqueueing is a locked
+                # disk/registry transform; the jobs themselves run on the
+                # single-flight queue afterwards.
+                if not self._operator_only():
+                    return
                 body = self._read_body()
                 if body is None:
                     return
@@ -2261,18 +2602,26 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "backlog":
-                # Synchronous on purpose: a pure disk transform (no agents,
-                # no queue slot needed) that answers in one round-trip.
+                # Operator-only: it writes into the shared cross-tenant
+                # backlog. Synchronous on purpose: a pure disk transform (no
+                # agents, no queue slot needed) answering in one round-trip.
+                if not self._operator_only():
+                    return
                 status, payload = dispatcher.make_backlog(parts[1])
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "cancel":
                 # Same shape as .../backlog above: a pure in-memory
-                # transition, synchronous, no queue slot.
+                # transition, synchronous, no queue slot. Tenant-scoped for
+                # sessions like every job observation.
+                if not self._session_sees(auth[1], parts[1]):
+                    return
                 status, payload = dispatcher.cancel_job(parts[1])
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "answer":
+                if not self._session_sees(auth[1], parts[1]):
+                    return
                 body = self._read_body()
                 if body is None:
                     return
@@ -2283,8 +2632,10 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 "archive",
                 "unarchive",
             ):
-                # Same shape as .../backlog above: a pure disk transform,
-                # synchronous, no queue slot.
+                # Operator-only lifecycle admin. Same shape as .../backlog
+                # above: a pure disk transform, synchronous, no queue slot.
+                if not self._operator_only():
+                    return
                 if parts[2] == "archive":
                     status, payload = dispatcher.archive_job(parts[1])
                 else:
@@ -2292,20 +2643,25 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 self._json(status, payload)
                 return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "purge":
-                # Same shape as .../archive above: a pure disk transform,
-                # synchronous, no queue slot.
+                # Operator-only (permanent deletion). Same shape as
+                # .../archive above: a pure disk transform, synchronous, no
+                # queue slot.
+                if not self._operator_only():
+                    return
                 status, payload = dispatcher.purge_job(parts[1])
                 self._json(status, payload)
                 return
             if parts[0] == "backlog":
+                # Operator-only: the shared backlog is cross-user state.
+                if not self._operator_only():
+                    return
                 self._backlog_post(parts)
                 return
             self._json(404, {"error": "not found"})
 
         def do_PATCH(self) -> None:  # noqa: N802 (http.server API)
             path = urlsplit(self.path).path
-            if not self._authorised():
-                self._json(401, {"error": "unauthorized"})
+            if not self._operator_only():
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "backlog" and parts[1] == "story":
@@ -2319,8 +2675,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
 
         def do_DELETE(self) -> None:  # noqa: N802 (http.server API)
             path = urlsplit(self.path).path
-            if not self._authorised():
-                self._json(401, {"error": "unauthorized"})
+            if not self._operator_only():
                 return
             parts = path.strip("/").split("/")
             if len(parts) == 3 and parts[0] == "backlog" and parts[1] == "story":
@@ -2400,10 +2755,26 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return None
             return body
 
-        def _create(self) -> None:
+        def _create(self, session: Optional[Session]) -> None:
             body = self._read_body()
             if body is None:
                 return
+            if session is not None and body.get("mode") == "verify":
+                # Tenant-gate BEFORE build_spec's disk reads: _verify_spec's
+                # "no assessment" / "finding not found" answers would
+                # otherwise let a session probe whether a foreign tenant's
+                # (guessable) source-job id exists. A foreign tenant's
+                # assessment must answer exactly what a nonexistent one
+                # does. Malformed source_job values fall through to the
+                # ordinary validation 400, which reveals nothing.
+                source = body.get("source_job")
+                if (
+                    isinstance(source, str)
+                    and source.strip()
+                    and not dispatcher.session_sees_job(session, source.strip())
+                ):
+                    self._json(404, {"error": "no assessment for that job"})
+                    return
             try:
                 spec = dispatcher.build_spec(body)
             except ValidationError as exc:
@@ -2412,12 +2783,40 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             except SubmitRejected as exc:
                 self._json(exc.status, {"error": str(exc)})
                 return
+            if session is not None and not self._session_may_target(session, spec):
+                return
             try:
                 job_id, position = dispatcher.submit(spec)
             except QueueFull:
                 self._json(503, {"error": "queue full"})
                 return
             self._json(202, {"id": job_id, "state": "queued", "position": position})
+
+        def _session_may_target(self, session: Session, spec: JobSpec) -> bool:
+            """Gate a signed-in user's submit on their installation set.
+
+            The operator token is never gated (it administers the box); a
+            session may only point work at a repository whose owner is one
+            of the GitHub App installations that user can reach. The check
+            covers every mode uniformly — a verify job's repo was already
+            re-derived from the source job's ``meta.json`` by
+            ``build_spec``, so the same field is authoritative there too. A
+            repo that does not parse answers the same 403 (never a 500):
+            the spec validation already vetted submitted repos, so an
+            unparseable one here can only be a corrupt verify ``meta.json``.
+            """
+
+            try:
+                ref = parse_repo(spec.repo)
+            except SourceError:
+                self._json(403, {"error": "repository not in your installations"})
+                return False
+            if dispatcher.oauth is not None and dispatcher.oauth.authorises_repo(
+                session, ref
+            ):
+                return True
+            self._json(403, {"error": "repository not in your installations"})
+            return False
 
         def _job(self, job_id: str) -> None:
             record = dispatcher.get(job_id)
@@ -2459,6 +2858,9 @@ class DispatchServer:
         dashboard_workspace: Optional[Workspace] = None,
         record_transcripts: bool = False,
         job_timeout: float = _JOB_TIMEOUT_SECONDS,
+        oauth: Optional[GitHubOAuth] = None,
+        max_workers: int = 1,
+        checks_reader: Optional[Callable[[RepoRef], ChecksReader]] = None,
         sandbox: Optional[SandboxConfig] = None,
     ) -> None:
         self.dispatcher = Dispatcher(
@@ -2471,6 +2873,9 @@ class DispatchServer:
             dashboard_workspace=dashboard_workspace,
             record_transcripts=record_transcripts,
             job_timeout=job_timeout,
+            oauth=oauth,
+            max_workers=max_workers,
+            checks_reader=checks_reader,
             sandbox=sandbox,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))

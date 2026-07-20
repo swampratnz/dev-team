@@ -70,12 +70,14 @@ from .report import (
 )
 from .sandbox import SandboxConfig
 from .sdk import AgentRunner, ChatBackend, ClaudeAgentRunner, ClaudeChatBackend
+from .githubapp import GitHubAppError, resolve_token_provider
+from .oauth import GitHubOAuth, resolve_oauth_config
 from .sources import (
     RepoRef,
+    TokenProvider,
     clone_or_update,
     default_env_file,
     parse_repo,
-    resolve_github_token,
 )
 from .team import DevTeam
 from .trace import Tracer
@@ -370,6 +372,16 @@ def build_parser() -> argparse.ArgumentParser:
         "its events here (shown as its own run) and mirrors its assess "
         "report under audit/<job-id>/, so dispatched runs are visible on the "
         "dashboard. Each job still runs in its own isolated workspace.",
+    )
+    serving.add_argument(
+        "--max-concurrent-jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="With --dispatch: how many jobs may run at once (default 1, the "
+        "classic single-flight queue). Jobs on the same repository always "
+        "serialise regardless; every concurrent job draws on the one shared "
+        "Claude subscription, so keep this small.",
     )
     serving.add_argument(
         "--dispatch-url",
@@ -1260,7 +1272,7 @@ async def _deliver(
     *,
     budget: Budget,
     repo_ref: Optional[RepoRef] = None,
-    github_token: Optional[str] = None,
+    token_provider: Optional[TokenProvider] = None,
 ) -> int:
     """Run real delivery and print the result; returns the exit code."""
 
@@ -1302,9 +1314,9 @@ async def _deliver(
     # is reflected in the exit code but never masks the delivery result itself.
     pr_ok = True
     if args.pull_request:
-        pr_ok = _open_pull_request(outcome, args, repo_ref, github_token)
+        pr_ok = _open_pull_request(outcome, args, repo_ref, token_provider)
         if pr_ok and args.watch_fix_rounds > 0:
-            await _run_ci_fix_loop(engine, team, outcome, args, repo_ref, github_token)
+            await _run_ci_fix_loop(engine, team, outcome, args, repo_ref, token_provider)
     if args.json:
         print(json.dumps(delivery_to_dict(outcome), indent=2))
     else:
@@ -1316,7 +1328,7 @@ async def _deliver(
 
 
 def _open_pull_request(
-    outcome, args, ref: Optional[RepoRef], token: Optional[str]
+    outcome, args, ref: Optional[RepoRef], provider: Optional[TokenProvider]
 ) -> bool:
     """Push the delivered branch and open its pull request; return success.
 
@@ -1329,13 +1341,14 @@ def _open_pull_request(
     """
 
     git = GitRepo(SubprocessCommandRunner(cwd=args.workspace), cwd=args.workspace)
+    token = _mint_token(provider, ref)
     try:
         pull_request = publish_pull_request(
             outcome,
             ref=ref,
-            token=token or "",
+            token=token,
             git=git,
-            publisher=GitHubPullRequestPublisher(token=token or ""),
+            publisher=GitHubPullRequestPublisher(token=token),
             base=args.pr_base or "main",
             draft=args.pr_draft,
         )
@@ -1346,8 +1359,26 @@ def _open_pull_request(
     outcome.pull_request_number = pull_request.number
     print(f"opened pull request: {pull_request.url}", file=sys.stderr)
     if args.watch_checks:
-        _watch_pr_checks(outcome, args, ref, token or "")
+        _watch_pr_checks(outcome, args, ref, token)
     return True
+
+
+def _mint_token(provider: Optional[TokenProvider], ref: "RepoRef") -> str:
+    """A fresh GitHub credential for ``ref``, or ``""`` with a clean note.
+
+    Post-delivery consumers (PR publish, checks watch, the CI-fix loop) mint
+    at each use so a short-lived App token cannot die mid-run; a minting
+    failure degrades that one consumer to anonymous access with a stderr
+    note instead of sinking a delivery that already succeeded.
+    """
+
+    if provider is None:
+        return ""
+    try:
+        return provider.token_for(ref) or ""
+    except GitHubAppError as exc:
+        print(f"could not mint a GitHub App token: {exc}", file=sys.stderr)
+        return ""
 
 
 #: Fixed poll cadence for --watch-checks; --watch-timeout sets how many polls.
@@ -1401,7 +1432,7 @@ def _pr_comment_channel(outcome, args, ref: "RepoRef", token: str) -> Optional[G
     )
 
 
-async def _run_ci_fix_loop(engine, team, outcome, args, ref, token) -> None:
+async def _run_ci_fix_loop(engine, team, outcome, args, ref, provider) -> None:
     """Close the loop: fix a failed PR watch, re-push, and re-watch, bounded.
 
     Only failed watches are chased — a ``pending``/``timeout`` state is left
@@ -1415,7 +1446,7 @@ async def _run_ci_fix_loop(engine, team, outcome, args, ref, token) -> None:
     """
 
     asked_by = team.roster.display_name("engineer")
-    pr_channel = _pr_comment_channel(outcome, args, ref, token or "")
+    pr_channel = _pr_comment_channel(outcome, args, ref, _mint_token(provider, ref))
     channel = pr_channel if pr_channel is not None else team.interaction
     for round_num in range(1, args.watch_fix_rounds + 1):
         checks = outcome.checks
@@ -1440,11 +1471,14 @@ async def _run_ci_fix_loop(engine, team, outcome, args, ref, token) -> None:
         if not result.fixed:
             print(f"CI fix round {round_num}: no fix applied ({result.summary})", file=sys.stderr)
             return
+        # Re-mint per round: a fix round can start long after the loop did,
+        # and an App installation token lives only an hour.
+        token = _mint_token(provider, ref)
         try:
             push_branch(
                 outcome.branch,
                 ref=ref,
-                token=token or "",
+                token=token,
                 git=GitRepo(SubprocessCommandRunner(cwd=args.workspace), cwd=args.workspace),
                 force_with_lease=True,
             )
@@ -1452,7 +1486,7 @@ async def _run_ci_fix_loop(engine, team, outcome, args, ref, token) -> None:
             print(f"CI fix round {round_num}: could not push the fix: {exc}", file=sys.stderr)
             return
         print(f"CI fix round {round_num}: pushed a fix; re-watching checks", file=sys.stderr)
-        _watch_pr_checks(outcome, args, ref, token or "")
+        _watch_pr_checks(outcome, args, ref, token)
 
 
 async def _assess(
@@ -1540,7 +1574,7 @@ async def _chat(
     *,
     budget: Budget,
     repo_ref: Optional[RepoRef] = None,
-    github_token: Optional[str] = None,
+    token_provider: Optional[TokenProvider] = None,
 ) -> int:
     """Run the ``--chat`` session; returns the last run's exit code."""
 
@@ -1562,7 +1596,7 @@ async def _chat(
             # clone time and cannot be re-resolved) — mirroring the direct path.
             return await _deliver(
                 team, request, args, budget=budget,
-                repo_ref=repo_ref, github_token=github_token,
+                repo_ref=repo_ref, token_provider=token_provider,
             )
         return await _simulate(team, request, args, budget=budget)
 
@@ -1668,22 +1702,26 @@ def _materialise_repo(args, default_workspace: str) -> Tuple[RepoRef, Optional[s
     is the clone destination; otherwise each repository gets its own
     directory under the default workspace root.
 
-    Returns the resolved ``(ref, token)`` so a later ``--pull-request`` can push
-    and open the PR without re-resolving — ``resolve_github_token`` *pops* the
-    token out of the process env, so a second call would come back empty.
+    Returns the resolved ``(ref, provider)`` so a later ``--pull-request`` can
+    mint a fresh credential at push time — the provider is resolved exactly
+    once because resolution *pops* credentials out of the process env, so a
+    second resolve would come back empty. A static PAT provider returns the
+    same token every mint; a GitHub App provider re-mints near expiry, so
+    long deliveries never publish with a dead credential.
     """
 
     ref = parse_repo(args.repo)
     env_file = args.env_file if args.env_file is not None else default_env_file()
-    token = resolve_github_token(env_file)
+    provider = resolve_token_provider(env_file)
     via = f" (env file: {env_file})" if env_file is not None else ""
     if args.workspace == default_workspace:
         args.workspace = str(Path(default_workspace) / ref.workspace_name)
     print(f"fetching {ref.slug} into {args.workspace}{via}", file=sys.stderr)
     clone_or_update(
-        ref, args.workspace, runner=SubprocessCommandRunner(), token=token
+        ref, args.workspace, runner=SubprocessCommandRunner(),
+        token=provider.token_for(ref),
     )
-    return ref, token
+    return ref, provider
 
 
 #: The dashboard lists ``.dev_team/transcripts/`` to surface transcripts, so
@@ -1892,6 +1930,15 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
             "set it in the environment (or the service's EnvironmentFile) and "
             "share it only with the authorised caller"
         )
+    if args.max_concurrent_jobs < 1:
+        raise DevTeamError("--max-concurrent-jobs must be at least 1")
+    # GitHub OAuth sign-in is wired only when configured (same env-file
+    # search as every other credential); unconfigured keeps the classic
+    # single-token service with no new routes.
+    oauth_config = resolve_oauth_config(
+        args.env_file if args.env_file is not None else default_env_file()
+    )
+    oauth = GitHubOAuth(oauth_config) if oauth_config is not None else None
     server = DispatchServer(
         token,
         host=args.host if args.host is not None else "127.0.0.1",
@@ -1906,10 +1953,13 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
             args.record_transcripts
             or _env_truthy(os.environ.get(RECORD_TRANSCRIPTS_ENV))
         ),
+        oauth=oauth,
+        max_workers=args.max_concurrent_jobs,
         sandbox=_sandbox_config(args),
     )
     print(
-        f"dev-team dispatch service at {server.url} (Ctrl-C to stop)",
+        f"dev-team dispatch service at {server.url} (Ctrl-C to stop)"
+        + (" — GitHub sign-in enabled" if oauth is not None else ""),
         file=sys.stderr,
     )
     try:
@@ -1957,9 +2007,9 @@ def _run(
         )
 
     repo_ref: Optional[RepoRef] = None
-    github_token: Optional[str] = None
+    token_provider: Optional[TokenProvider] = None
     if args.repo is not None:
-        repo_ref, github_token = _materialise_repo(args, parser.get_default("workspace"))
+        repo_ref, token_provider = _materialise_repo(args, parser.get_default("workspace"))
 
     config = TeamConfig(
         model=args.model,
@@ -2024,7 +2074,7 @@ def _run(
         return asyncio.run(
             _chat(
                 team, args, chat_backend,
-                budget=budget, repo_ref=repo_ref, github_token=github_token,
+                budget=budget, repo_ref=repo_ref, token_provider=token_provider,
             )
         )
     if args.assess:
@@ -2039,7 +2089,7 @@ def _run(
         return asyncio.run(
             _deliver(
                 team, request, args, run_id,
-                budget=budget, repo_ref=repo_ref, github_token=github_token,
+                budget=budget, repo_ref=repo_ref, token_provider=token_provider,
             )
         )
     return asyncio.run(_simulate(team, request, args, budget=budget))

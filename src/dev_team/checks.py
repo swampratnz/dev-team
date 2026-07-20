@@ -22,6 +22,7 @@ injectable (so tests never touch the network), the token rides only in the
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -47,6 +48,22 @@ _OUTPUT_CHARS = 500
 
 class ChecksError(DevTeamError):
     """Reading the pull request's checks failed (auth, validation, transport)."""
+
+
+#: The shape a git ref/SHA must have before it may be spliced into an API
+#: path: slash-separated segments of ``[A-Za-z0-9._-]`` (covers SHAs, tags,
+#: and branch names like ``dev-team/feature-x``), with no empty segments and
+#: no leading/trailing slash. Everything URL-significant (``?``, ``#``,
+#: ``%``, spaces, backslashes) is excluded by construction; ``..`` is
+#: rejected separately so a caller-supplied ref can never traverse the
+#: request to a different API path (and a different repository's data).
+_REF_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+
+
+def valid_ref(ref: str) -> bool:
+    """Whether ``ref`` is safe to embed in a GitHub API request path."""
+
+    return ".." not in ref and bool(_REF_RE.match(ref))
 
 
 @dataclass(frozen=True)
@@ -140,6 +157,12 @@ class GitHubChecksReader:
     http: Optional[Http] = field(default=None, repr=False)  # a bound fake may capture secrets
 
     def status(self, owner: str, name: str, ref: str) -> ChecksOutcome:
+        # Refuse a URL-hostile ref outright: callers with external input
+        # (the dispatch /checks route) validate first and answer 400, so
+        # this guard is defence in depth for every future caller — the
+        # authenticated request must never be re-targetable via the path.
+        if not valid_ref(ref):
+            raise ChecksError(f"invalid ref {ref!r}")
         runs = self._all_check_runs(owner, name, ref)
         combined = self._get(f"/repos/{owner}/{name}/commits/{ref}/status")
         return _classify(runs, str(combined.get("state") or ""))
