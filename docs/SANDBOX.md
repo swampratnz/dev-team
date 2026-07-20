@@ -96,6 +96,11 @@ dev-team --assess --workspace /path/to/repo --build-probe \
 `--sandbox-image` / `--sandbox-network` / `--sandbox-engine` override the
 matching `SandboxConfig` field; everything else keeps its secure default.
 
+`--dispatch --sandbox` boxes every dispatched job's gates/build-probe the
+same way `--deliver`/`--assess --sandbox` do — see
+[`DISPATCH.md`](DISPATCH.md#sandboxing) for the server-start-time-only
+posture (not a per-request `POST /jobs` option).
+
 Notes and gotchas:
 
 - **Rootless is the model.** `user` is unset by default; a rootless engine
@@ -118,11 +123,15 @@ Notes and gotchas:
 - **(a) primitive** — shipped: `ContainerCommandRunner` + `SandboxConfig`.
 - **(b) wiring** — shipped: `EngineConfig.sandbox` / `AssessConfig.sandbox` and
   the `--sandbox` CLI opt-in box the delivery gates and the assessment build
-  probe. Because git self-delegates to the host inside the runner, no separate
-  gate/git runner split was needed. Two guardrails from review are in place:
-  the program name reaching the runner is engine/profile-controlled (never
-  repo-derived, so a repo script named `git` cannot slip onto the host), and the
-  mount source is `realpath`-resolved.
+  probe, for `--deliver`/`--assess` **and** `--dispatch` (`--dispatch
+  --sandbox` boxes every dispatched job's gates/build-probe the same way, as
+  a server-start-time operator choice — see
+  [`DISPATCH.md`](DISPATCH.md#sandboxing)). Because git self-delegates to the
+  host inside the runner, no separate gate/git runner split was needed. Two
+  guardrails from review are in place: the program name reaching the runner
+  is engine/profile-controlled (never repo-derived, so a repo script named
+  `git` cannot slip onto the host), and the mount source is
+  `realpath`-resolved.
 - **(c) process-level** — shipped as deployment guidance: run the whole
   dev-team process in a container/VM to contain the engineer's own SDK tool loop
   (which bypasses the `CommandRunner`). A hardened `docker run` recipe and the

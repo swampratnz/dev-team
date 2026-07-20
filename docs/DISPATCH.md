@@ -64,6 +64,20 @@ deliberate exception — see `backlog` below). Point the dashboard and the
 dispatcher at the same `DIR` (e.g. `/opt/dev-team/workspace`) to watch
 dispatched runs live.
 
+## Sandboxing
+
+`--dispatch --sandbox` (with the matching `--sandbox-image`/`--sandbox-network`/
+`--sandbox-engine` overrides) boxes every dispatched job's gates/build-probe
+commands inside a rootless, no-network, capability-dropped container — the
+same containment `--deliver`/`--assess --sandbox` already give a single run
+(see [`SANDBOX.md`](SANDBOX.md)). It is a **server-start-time** choice made
+once by the operator launching `dev-team --dispatch`, applied uniformly to
+every job the service ever runs; it is **not** a per-request option. There is
+no `sandbox` field on `JobSpec` or the `POST /jobs` body, and none is read
+from it — a submitted job cannot enable, disable, or redirect the operator's
+sandbox choice, so a caller can never weaken containment the operator turned
+on (or force it on when the operator left it off).
+
 ## API
 
 Base `http://<host>:<port>`. All bodies are JSON.
