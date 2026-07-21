@@ -9,24 +9,34 @@ turns that description into actual writes/deletes against a
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import List
 
 from .execution import Workspace
 from .models import ChangeType, Implementation
 
-#: Directory GitHub Actions reads workflow definitions from. Shared by the
+#: The segments identifying GitHub Actions' workflow directory once a path is
+#: split the same way ``execution._normalise`` splits it. Shared by the
 #: DevOps artifact filter (default-deny CI workflow authorship,
 #: ``EngineConfig.allow_ci_workflows``) and the push step's PAT-scope
 #: warning, which both need to recognise the identical path shape.
-CI_WORKFLOW_DIR = ".github/workflows/"
+CI_WORKFLOW_SEGMENTS = (".github", "workflows")
 
 
 def is_ci_workflow_path(path: str) -> bool:
-    """Whether ``path`` names a GitHub Actions workflow file."""
+    """Whether ``path`` names a GitHub Actions workflow file.
 
-    normalized = path[2:] if path.startswith("./") else path
-    return normalized.startswith(CI_WORKFLOW_DIR)
+    Splits on both ``/`` and ``\\`` and drops empty/``.`` segments — the same
+    normalisation ``execution._normalise`` applies before a write actually
+    lands — so this check agrees with the real write target on path variants
+    like ``.github//workflows/x``, ``.github/./workflows/x``, or
+    Windows-style ``.github\\workflows\\x``, none of which a literal
+    string-prefix check would catch.
+    """
+
+    parts = [part for part in re.split(r"[\\/]", path) if part not in ("", ".")]
+    return tuple(parts[:2]) == CI_WORKFLOW_SEGMENTS
 
 
 @dataclass

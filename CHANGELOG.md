@@ -96,7 +96,13 @@ sections below are reconstructed from the repository history.
   `warn` callable) about the `workflow`-scope requirement before attempting
   the push, rather than relying on git's own rejection message reaching the
   operator. `dev_team.changes.is_ci_workflow_path` is the shared path rule
-  both sites use.
+  both sites use — it compares the same normalised segments
+  `execution._normalise` produces (splitting on both `/` and `\`, dropping
+  empty/`.` segments) rather than a literal string prefix, so a differently
+  spelled but equivalent path (`.github//workflows/x`,
+  `.github/./workflows/x`, or Windows-style `.github\workflows\x`) can't
+  disagree with the workspace about what counts as "in `.github/workflows/`"
+  and slip an unauthorized workflow file past the default-deny filter.
 - **Every agent call now produces a retained, reviewable log, closing a
   CLAUDE.md section 7 gap.** `Tracer` (`dev_team.trace`) gains an optional
   `sink` invoked once per finalised span; the new `dev_team.tracelog.TraceLog`
