@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import builtins
 import json
+import os
+import subprocess
 
 from dev_team.depscan import (
     Dependency,
@@ -12,6 +15,8 @@ from dev_team.depscan import (
     _MAX_DEPENDENCIES,
     collect_dependencies,
     parse_cargo_toml,
+    parse_gemfile_lock,
+    parse_go_mod,
     parse_package_json,
     parse_packages_config,
     parse_pyproject_toml,
@@ -695,3 +700,198 @@ def test_collect_dependencies_pyproject_toml_dedupes_against_poetry_lock():
     assert [(d.ecosystem, d.name, d.version) for d in deps] == [
         ("PyPI", "requests", "2.31.0"),
     ]
+
+
+# --- go.mod / Gemfile.lock parsers -------------------------------------------------
+
+
+def test_parse_go_mod_single_line_and_block():
+    text = """\
+module example.com/mymod
+
+go 1.21
+
+require example.com/x v1.2.3
+
+require (
+\texample.com/y v2.0.0 // indirect
+\texample.com/z v3.1.4
+)
+"""
+    deps = parse_go_mod(text, "go.mod")
+    assert [(d.name, d.version, d.ecosystem) for d in deps] == [
+        ("example.com/x", "v1.2.3", "Go"),
+        ("example.com/y", "v2.0.0", "Go"),
+        ("example.com/z", "v3.1.4", "Go"),
+    ]
+
+
+def test_parse_go_mod_no_require_yields_empty():
+    assert parse_go_mod("module example.com/mymod\n\ngo 1.21\n", "go.mod") == []
+
+
+def test_parse_go_mod_malformed_or_empty():
+    assert parse_go_mod("", "go.mod") == []
+    assert parse_go_mod("not a go.mod at all\nrandom junk\n", "go.mod") == []
+
+
+def test_parse_go_mod_skips_entries_missing_a_version():
+    text = """\
+require example.com/noversion
+
+require (
+\texample.com/alsonoversion
+\texample.com/notv 1.2.3
+)
+"""
+    assert parse_go_mod(text, "go.mod") == []
+
+
+def test_parse_gemfile_lock_top_level_specs_only():
+    text = """\
+GEM
+  remote: https://rubygems.org/
+  specs:
+    rack (2.2.3)
+    rack-test (1.1.0)
+      rack (>= 1.0, < 3)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  rack-test
+"""
+    deps = parse_gemfile_lock(text, "Gemfile.lock")
+    assert [(d.name, d.version, d.ecosystem) for d in deps] == [
+        ("rack", "2.2.3", "RubyGems"),
+        ("rack-test", "1.1.0", "RubyGems"),
+    ]
+
+
+def test_parse_gemfile_lock_no_gem_section_yields_empty():
+    text = """\
+GIT
+  remote: https://github.com/foo/bar.git
+  revision: abcdef1234567890
+  specs:
+    foo (1.0)
+
+PLATFORMS
+  ruby
+"""
+    assert parse_gemfile_lock(text, "Gemfile.lock") == []
+
+
+def test_parse_gemfile_lock_malformed_or_empty():
+    assert parse_gemfile_lock("", "Gemfile.lock") == []
+    assert parse_gemfile_lock("not a lockfile\n", "Gemfile.lock") == []
+
+
+def test_parse_gemfile_lock_skips_unparseable_top_level_lines():
+    text = """\
+GEM
+  specs:
+    no-parens-here
+    unterminated (1.0
+    name ()
+"""
+    assert parse_gemfile_lock(text, "Gemfile.lock") == []
+
+
+def test_parsers_registered_in_parsers_table():
+    from dev_team.depscan import _PARSERS
+
+    assert _PARSERS["go.mod"] is parse_go_mod
+    assert _PARSERS["Gemfile.lock"] is parse_gemfile_lock
+
+
+def test_collect_dependencies_reads_go_mod_and_gemfile_lock():
+    ws = InMemoryWorkspace(
+        {
+            "go.mod": "require example.com/x v1.2.3\n",
+            "backend/Gemfile.lock": (
+                "GEM\n  specs:\n    rack (2.2.3)\n"
+            ),
+            "requirements.txt": "requests==2.31.0\n",
+        }
+    )
+    deps = collect_dependencies(ws)
+    assert {(d.ecosystem, d.name, d.version) for d in deps} == {
+        ("Go", "example.com/x", "v1.2.3"),
+        ("RubyGems", "rack", "2.2.3"),
+        ("PyPI", "requests", "2.31.0"),
+    }
+
+
+def test_collect_dependencies_dedupes_go_mod_and_gemfile_lock():
+    ws = InMemoryWorkspace(
+        {
+            "a/go.mod": "require example.com/x v1.2.3\n",
+            "b/go.mod": "require example.com/x v1.2.3\n",
+            "a/Gemfile.lock": "GEM\n  specs:\n    rack (2.2.3)\n",
+            "b/Gemfile.lock": "GEM\n  specs:\n    rack (2.2.3)\n",
+        }
+    )
+    deps = collect_dependencies(ws)
+    assert len(deps) == 2
+
+
+def test_scan_dependencies_go_and_rubygems_vulnerabilities():
+    ws = InMemoryWorkspace(
+        {
+            "go.mod": "require example.com/x v1.2.3\n",
+            "Gemfile.lock": "GEM\n  specs:\n    rack (2.2.3)\n",
+        }
+    )
+    scan = scan_dependencies(
+        ws,
+        # collect_dependencies sorts by path; "Gemfile.lock" < "go.mod" (ASCII
+        # 'G' < 'g'), so the RubyGems query lands at index 0, Go at index 1.
+        fetch=_fake_fetch({0: ["GHSA-rb-5678"], 1: ["GHSA-go-1234"]}),
+    )
+    assert scan.queried is True
+    assert scan.error is None
+    assert {(v.id, v.dependency.name, v.dependency.ecosystem) for v in scan.vulnerabilities} == {
+        ("GHSA-go-1234", "example.com/x", "Go"),
+        ("GHSA-rb-5678", "rack", "RubyGems"),
+    }
+    rendered = scan.render()
+    assert "GHSA-go-1234" in rendered
+    assert "GHSA-rb-5678" in rendered
+
+
+# --- security: crafted go.mod/Gemfile.lock content never reaches subprocess/eval ---
+
+
+def test_crafted_manifest_content_never_raises():
+    # Shell-metacharacter- and path-traversal-shaped content parses to plain
+    # strings (or is skipped) — never raises, regardless of shape.
+    malicious = ["; rm -rf /", "../../etc/passwd", "$(whoami)", "`id`"]
+    for content in malicious:
+        parse_go_mod(f"require {content} v1.0.0\n", "go.mod")
+        parse_gemfile_lock(f"GEM\n  specs:\n    {content} (1.0)\n", "Gemfile.lock")
+
+
+def test_crafted_manifest_content_causes_no_subprocess_or_eval(monkeypatch):
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("depscan must never invoke a subprocess or eval/exec")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    monkeypatch.setattr(os, "system", _boom)
+    monkeypatch.setattr(builtins, "eval", _boom)
+    monkeypatch.setattr(builtins, "exec", _boom)
+
+    ws = InMemoryWorkspace(
+        {
+            "go.mod": "require example.com/x $(whoami) v1.0.0\n\nrequire (\n\t; rm -rf / v1.0.0\n)\n",
+            "Gemfile.lock": (
+                "GEM\n  specs:\n    `id` (1.0)\n"
+                "    ../../etc/passwd (1.0)\n"
+            ),
+        }
+    )
+    scan = scan_dependencies(ws, fetch=_fake_fetch({}))
+    # None of these crash, and the module never touched subprocess/os.system
+    # or eval/exec — verified by the monkeypatched raisers above.
+    assert isinstance(scan, DependencyScan)
