@@ -3686,6 +3686,21 @@ def test_maybe_refresh_profile_detects_nested_manifest_with_no_root_change():
     assert engine._profile.locally_runnable is False
 
 
+def test_maybe_refresh_profile_detects_nested_maven_manifest_with_no_root_change():
+    # Same re-detection trigger as go/node above, exercised for one of the
+    # three newly recognised kinds (maven) to prove _manifest_signature
+    # picks up pom.xml the same way it already picks up go.mod.
+    engine = _engine(ScriptedRunner([]))
+    assert engine._resolve_gates() is None
+    assert engine._profile.kind == "unknown"
+
+    engine.workspace.write_text("backend/pom.xml", "<project></project>\n")
+    engine._maybe_refresh_profile()
+
+    assert engine._profile.kind == "maven"
+    assert engine._profile.locally_runnable is False
+
+
 def test_manifest_signature_noop_when_nested_manifest_set_is_unchanged():
     # No redundant re-detection when the nested manifest set didn't change
     # between calls (reuses the existing signature-equality short-circuit).
