@@ -12,6 +12,7 @@ from helpers import (
     GateCycleRunner,
     engine_responses,
     impl_dict,
+    plan_dict,
     qa_suite_dict,
     review_dict,
     run,
@@ -982,6 +983,72 @@ def test_without_a_reserve_task_work_starves_the_security_review():
     outcome = run(_budget_reserve_engine(0.0).deliver(_request()))
     assert outcome.budget_exhausted is True
     assert outcome.security is None
+
+
+# --- regression: issue #150 (a non-budget task failure must not be silently
+# folded into the "cascade-skipped by the scheduler" fallback and reported as
+# 0 attempts) -------------------------------------------------------------
+
+
+def test_last_independent_task_survives_a_non_budget_failure_with_real_attempts():
+    # A 3-task, all-independent plan with ample budget (no reserve pressure
+    # at all): T1 and T2 succeed; T3 (last in schedule order) gets an
+    # unparseable engineer response on every attempt, which previously
+    # propagated an uncaught AgentResponseError straight through worker() and
+    # out of results — surfacing as "failed, 0 attempts" and misreported as a
+    # scheduler cascade-skip, indistinguishable from a dependency failure.
+    base = engine_responses()
+    mapping = {k: [v] for k, v in base.items()}
+    mapping["product manager"] = [json_response(plan_dict(3))]
+    mapping["senior software engineer"] = [
+        base["senior software engineer"],
+        base["senior software engineer"],
+        "not valid JSON, sorry",
+    ]
+    engine = _engine(
+        KeyedQueueRunner(mapping),
+        budget=Budget(limit_usd=1000.0),
+        config=EngineConfig(finalization_reserve_fraction=0.10, max_concurrency=1),
+    )
+    events = []
+    engine.listener = events.append
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.budget_exhausted is False  # budget was never the limiter
+    by_id = {tr.task.id: tr for tr in outcome.task_results}
+    assert by_id["T1"].succeeded is True
+    assert by_id["T2"].succeeded is True
+    t3 = by_id["T3"]
+    # exhausted every real attempt, not silently discarded as "0 attempts"
+    assert t3.attempts == engine.config.max_task_attempts
+    assert t3.task.status is TaskStatus.FAILED
+    assert t3.succeeded is False
+    # the failure was surfaced as a real error, not swallowed into an
+    # unlabeled scheduler cascade-skip
+    assert any(e.stage == "engineer" and "T3" in e.message for e in events)
+
+
+def test_worker_backstop_records_an_arbitrary_task_exception_instead_of_dropping_it(
+    monkeypatch,
+):
+    # Defense in depth for anything that still escapes _develop_task's own
+    # per-attempt handling (e.g. a failure in the human-escalation path):
+    # worker() itself must never let a started task vanish from `results`.
+    engine = _engine(ScriptedRunner(by_system_prompt=engine_responses()))
+
+    async def explode(task, design):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(engine, "_develop_task", explode)
+    events = []
+    engine.listener = events.append
+    outcome = run(engine.deliver(_request()))
+
+    assert len(outcome.task_results) == 1
+    tr = outcome.task_results[0]
+    assert tr.task.status is TaskStatus.FAILED
+    assert tr.succeeded is False
+    assert any(e.stage == "error" and "unexpectedly" in e.message for e in events)
 
 
 def test_deliver_agentic_engineer_raise_discards_dirty_tree(tmp_path, monkeypatch):
@@ -2623,6 +2690,59 @@ def test_worktree_no_commit_without_baseline_sha(tmp_path):
     outcome = run(engine.deliver(_request()))
     assert outcome.tasks_complete is True
     assert outcome.committed is False
+
+
+def test_worktree_non_budget_failure_counts_as_a_failed_attempt_and_retries(tmp_path):
+    # Regression for issue #150 in the worktree-mode counterpart of
+    # _attempt_task: a non-budget failure on the first attempt (here, the
+    # engineer's response never parses as JSON) must not crash the task and
+    # drop it from results — it must count as a failed attempt, like a
+    # rejected review, and retry.
+    class FlakyOnceRunner(ScriptedRunner):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._engineer_calls = 0
+
+        async def run(self, prompt, *, system_prompt=None, **kwargs):
+            if system_prompt and "senior software engineer" in system_prompt:
+                self._engineer_calls += 1
+                if self._engineer_calls == 1:
+                    return AgentResult(text="not valid JSON, sorry", num_turns=1)
+            return await super().run(prompt, system_prompt=system_prompt, **kwargs)
+
+    cmd = DispatchCommandRunner(rev_shas=["BASE", "TIP"])
+    runner = FlakyOnceRunner(by_system_prompt=engine_responses())
+    engine = _worktree_engine(tmp_path, runner, cmd, max_task_attempts=2, json_retries=0)
+    events = []
+    engine.listener = events.append
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.task_results[0].attempts == 2
+    assert any(e.stage == "engineer" and "T1" in e.message for e in events)
+
+
+def test_worktree_budget_exceeded_still_propagates_and_stops_the_task(tmp_path):
+    # BudgetExceededError must keep its existing, distinct handling (stop the
+    # task and record the run as budget-limited) rather than being folded
+    # into the new "count it as a failed attempt and retry" path.
+    class BudgetDeathRunner(ScriptedRunner):
+        async def run(self, prompt, *, system_prompt=None, **kwargs):
+            if system_prompt and "senior software engineer" in system_prompt:
+                raise BudgetExceededError(999.0, 1.0)
+            return await super().run(prompt, system_prompt=system_prompt, **kwargs)
+
+    cmd = DispatchCommandRunner(rev_shas=["BASE", "TIP"])
+    runner = BudgetDeathRunner(by_system_prompt=engine_responses())
+    engine = _worktree_engine(tmp_path, runner, cmd, max_task_attempts=2)
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.budget_exhausted is True
+    assert outcome.task_results[0].succeeded is False
+    # the worktree is still torn down (the `finally` teardown ran)
+    calls = [c for c, _ in cmd.calls]
+    wt_path = f"{engine.workdir}/.dev_team/worktrees/t1"
+    assert ("git", "worktree", "remove", "--force", wt_path) in calls
 
 
 def test_worktree_review_reject_then_approve(tmp_path):

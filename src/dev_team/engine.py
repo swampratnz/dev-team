@@ -1169,6 +1169,21 @@ class DeliveryEngine:
                 task.status = TaskStatus.FAILED
                 outcome = TaskResult(task=task, attempts=0)
                 self._event("budget", f"Budget exhausted during {task.id}")
+            except Exception as exc:  # noqa: BLE001 - a started task must never
+                # vanish from `results`: _attempt_task/_develop_task_in_worktree
+                # already convert known failure modes into a failed attempt, but
+                # this is the backstop for anything else that still escapes
+                # (e.g. from _escalate_failure). Without it, the task would
+                # fall through to the "cascade-skipped by the scheduler"
+                # fallback below and misreport a real failure as a
+                # dependency-driven skip with 0 attempts.
+                task.status = TaskStatus.FAILED
+                outcome = TaskResult(task=task, attempts=0)
+                self._event(
+                    "error",
+                    f"{task.id} failed unexpectedly",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
             results[task.id] = outcome
             return outcome.succeeded
 
@@ -2173,32 +2188,51 @@ class DeliveryEngine:
                 task.status = TaskStatus.IN_PROGRESS
                 span = self.tracer.start("task", task.id, attempt=str(attempts))
 
-                if self.agentic:
-                    # The agentic engineer mutates the shared working directory,
-                    # so the whole attempt runs inside the integration lock.
-                    async with self._integration_lock:
-                        try:
-                            implementation, session = await self._engineer_attempt(
-                                task, design, feedback, session,
-                                continued=attempts > 1, model=model,
+                try:
+                    if self.agentic:
+                        # The agentic engineer mutates the shared working
+                        # directory, so the whole attempt runs inside the
+                        # integration lock.
+                        async with self._integration_lock:
+                            try:
+                                implementation, session = await self._engineer_attempt(
+                                    task, design, feedback, session,
+                                    continued=attempts > 1, model=model,
+                                )
+                            except BaseException:
+                                # The engineer edits the shared workdir directly. A
+                                # raising call (AgentResponseError, budget, cancel)
+                                # leaves those edits on disk outside any rollback
+                                # scope — _integrate never runs. Discard them here,
+                                # or the next task's _commit_wip banks this failed
+                                # task's half-written changes as gated work.
+                                self._rollback(None, self.git)
+                                raise
+                            done, review, test_report, feedback = await self._integrate(
+                                task, implementation, span
                             )
-                        except BaseException:
-                            # The engineer edits the shared workdir directly. A
-                            # raising call (AgentResponseError, budget, cancel)
-                            # leaves those edits on disk outside any rollback
-                            # scope — _integrate never runs. Discard them here,
-                            # or the next task's _commit_wip banks this failed
-                            # task's half-written changes as gated work.
-                            self._rollback(None, self.git)
-                            raise
-                        done, review, test_report, feedback = await self._integrate(
-                            task, implementation, span
+                            if done:
+                                self._commit_wip(task)
+                    else:
+                        implementation, done, review, test_report, feedback = (
+                            await self._attempt_described(task, design, feedback, model, span)
                         )
-                        if done:
-                            self._commit_wip(task)
-                else:
-                    implementation, done, review, test_report, feedback = (
-                        await self._attempt_described(task, design, feedback, model, span)
+                except BudgetExceededError:
+                    raise
+                except DevTeamError as exc:
+                    # A known failure mode (e.g. AgentResponseError: the agent
+                    # never returned parseable JSON) must not crash the whole
+                    # task and vanish it from the scheduler's `results` — that
+                    # would fall through to the "cascade-skipped by the
+                    # scheduler" fallback and misreport a real, attempted
+                    # failure as 0 attempts. Count it as a failed attempt, like
+                    # a rejected review, and retry if attempts remain.
+                    done = False
+                    self.tracer.end(span, "error")
+                    self._event(
+                        "engineer",
+                        f"{task.id} attempt {attempts} failed unexpectedly",
+                        detail=f"{type(exc).__name__}: {exc}",
                     )
 
                 if done:
@@ -2362,19 +2396,34 @@ class DeliveryEngine:
                 task.status = TaskStatus.IN_PROGRESS
                 span = self.tracer.start("task", task.id, attempt=str(attempts))
 
-                implementation, session = await self._engineer_attempt(
-                    task, design, feedback, session,
-                    continued=attempts > 1, model=self._attempt_model(attempts),
-                    cwd=wt_path,
-                )
-                done, review, test_report, feedback = await self._integrate(
-                    task,
-                    implementation,
-                    span,
-                    workspace=arena_ws,
-                    git=arena_git,
-                    cwd=wt_path,
-                )
+                try:
+                    implementation, session = await self._engineer_attempt(
+                        task, design, feedback, session,
+                        continued=attempts > 1, model=self._attempt_model(attempts),
+                        cwd=wt_path,
+                    )
+                    done, review, test_report, feedback = await self._integrate(
+                        task,
+                        implementation,
+                        span,
+                        workspace=arena_ws,
+                        git=arena_git,
+                        cwd=wt_path,
+                    )
+                except BudgetExceededError:
+                    raise
+                except DevTeamError as exc:
+                    # See the mirrored catch in _attempt_task: a known failure
+                    # mode must not crash the task and vanish it from the
+                    # scheduler's `results` (misreported as 0 attempts). Count
+                    # it as a failed attempt and retry if attempts remain.
+                    done = False
+                    self.tracer.end(span, "error")
+                    self._event(
+                        "engineer",
+                        f"{task.id} attempt {attempts} failed unexpectedly",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
                 if not done:
                     continue
 
