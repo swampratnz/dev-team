@@ -294,6 +294,49 @@ def test_dashboard_html_calibration_panel_escapes_and_handles_empty():
     assert 'calibrationRow("overall", cal.overall)' in DASHBOARD_HTML
 
 
+def test_dashboard_html_report_meta_chips_render_independently():
+    """Static desk-check of the Reports panel's blind-spot/broken-citation chips.
+
+    Pins: each metric's chip visibility is its own ``> 0`` condition (not a
+    single paired toggle), so a report with only one of the two signals
+    renders exactly one chip — never both or neither — and a report with
+    neither signal (or absent from ``report_meta`` entirely) renders none,
+    matching the existing archived-chip-only behavior unchanged.
+    """
+
+    assert "function reportMetaChips(meta)" in DASHBOARD_HTML
+    assert "if (meta.blind_spot_count > 0)" in DASHBOARD_HTML
+    assert 'chip(meta.blind_spot_count + " blind spots", "idle")' in DASHBOARD_HTML
+    assert "if (meta.broken_citation_count > 0)" in DASHBOARD_HTML
+    assert 'chip(meta.broken_citation_count + " broken citations", "blocked")' in DASHBOARD_HTML
+    assert "const reportMeta = s.report_meta || {};" in DASHBOARD_HTML
+    assert "reportMetaChips(jobId ? reportMeta[jobId] : null)" in DASHBOARD_HTML
+
+
+def test_dashboard_html_report_modal_audit_quality_block_escapes_model_output():
+    """Static desk-check of the report modal's "Audit quality" detail block.
+
+    SECURITY (AC7): ``broken_citations`` values are a finding's own claimed
+    evidence string a *model* wrote, not a deterministic path like
+    ``blind_spots`` — so both must go through ``esc()`` before touching
+    ``innerHTML``, matching the access-log panel's precedent for any
+    caller/model-influenced text.
+    """
+
+    assert "function auditQualityBlock(meta)" in DASHBOARD_HTML
+    assert "<li>blind spot: ${esc(dir)}</li>" in DASHBOARD_HTML
+    assert (
+        "<li>broken citation (${esc(phase)}): ${esc(citation)}</li>"
+        in DASHBOARD_HTML
+    )
+    assert '<div class="audit-quality">' in DASHBOARD_HTML
+    assert (
+        "$(\"modal-body\").innerHTML = auditQualityBlock(meta) + renderMarkdown(text);"
+        in DASHBOARD_HTML
+    )
+    assert "const meta = jobId && state ? state.report_meta[jobId] : null;" in DASHBOARD_HTML
+
+
 def test_collect_state_empty_workspace_is_all_absent():
     state = collect_state(InMemoryWorkspace())
     assert state["backlog"]["present"] is False
@@ -614,6 +657,98 @@ def test_collect_state_calibration_key_matches_calibration_state():
         assert state["calibration"] == _calibration_state(
             ws, include_archived=include_archived
         )
+
+
+# --- report meta (blind spots / broken citations) ---------------------------------
+
+
+def test_report_meta_state_counts_blind_spots_and_broken_citations():
+    from dev_team.dashboard import _report_meta_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/assess-a/assessment.md", "# report")
+    ws.write_text(
+        "audit/assess-a/assessment.json",
+        json.dumps(
+            {
+                "blind_spots": ["legacy/", "vendor/"],
+                "broken_citations": {"security": ["Web.config"], "qa": []},
+            }
+        ),
+    )
+    meta = _report_meta_state(ws)
+    assert meta["assess-a"]["blind_spot_count"] == 2
+    assert meta["assess-a"]["broken_citation_count"] == 1
+    assert meta["assess-a"]["blind_spots"] == ["legacy/", "vendor/"]
+    assert meta["assess-a"]["broken_citations"] == {"security": ["Web.config"], "qa": []}
+
+
+def test_report_meta_state_missing_assessment_json_omits_job():
+    from dev_team.dashboard import _report_meta_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/assess-a/assessment.md", "# report")
+    assert _report_meta_state(ws) == {}
+
+
+def test_report_meta_state_tolerates_malformed_or_wrong_typed_json():
+    from dev_team.dashboard import _report_meta_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/bad-json/assessment.md", "# report")
+    ws.write_text("audit/bad-json/assessment.json", "{not json")
+
+    ws.write_text("audit/not-a-dict/assessment.md", "# report")
+    ws.write_text("audit/not-a-dict/assessment.json", json.dumps(["nope"]))
+
+    ws.write_text("audit/bad-blind-spots/assessment.md", "# report")
+    ws.write_text(
+        "audit/bad-blind-spots/assessment.json",
+        json.dumps({"blind_spots": "not a list", "broken_citations": {}}),
+    )
+
+    ws.write_text("audit/bad-broken-citations-type/assessment.md", "# report")
+    ws.write_text(
+        "audit/bad-broken-citations-type/assessment.json",
+        json.dumps({"blind_spots": [], "broken_citations": "not a dict"}),
+    )
+
+    ws.write_text("audit/bad-broken-citations-value/assessment.md", "# report")
+    ws.write_text(
+        "audit/bad-broken-citations-value/assessment.json",
+        json.dumps({"blind_spots": [], "broken_citations": {"qa": "not a list"}}),
+    )
+
+    assert _report_meta_state(ws) == {}
+
+
+def test_report_meta_state_ignores_report_paths_with_no_job_id():
+    from dev_team.dashboard import _report_meta_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/assessment.md", "# bare, non-dispatch report")
+    # Even though a same-named assessment.json exists elsewhere in the
+    # workspace, a report path with no owning job id must never pick it up.
+    ws.write_text(
+        "audit/assess-elsewhere/assessment.json",
+        json.dumps({"blind_spots": ["x/"], "broken_citations": {}}),
+    )
+    meta = _report_meta_state(ws)
+    assert meta == {}
+
+
+def test_collect_state_report_meta_key_matches_report_meta_state_and_is_additive():
+    from dev_team.dashboard import _report_meta_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/assess-a/assessment.md", "# report")
+    ws.write_text(
+        "audit/assess-a/assessment.json",
+        json.dumps({"blind_spots": ["legacy/"], "broken_citations": {}}),
+    )
+    state = collect_state(ws)
+    assert state["report_meta"] == _report_meta_state(ws)
+    assert state["reports"] == ["audit/assess-a/assessment.md"]
 
 
 # --- agent history -----------------------------------------------------------------
