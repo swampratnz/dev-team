@@ -294,6 +294,26 @@ def test_dashboard_html_calibration_panel_escapes_and_handles_empty():
     assert 'calibrationRow("overall", cal.overall)' in DASHBOARD_HTML
 
 
+def test_dashboard_html_calibration_summary_renders_report_quality_totals():
+    """Static desk-check of the new blind-spot/broken-citation summary line.
+
+    Pins: the summary line's visibility is its own ``blind_spot_total ||
+    broken_citation_total`` check (AC6) — independent of ``cal.overall.total``,
+    so it must still render when there are zero verifications recorded but
+    non-zero report-quality totals; and it must render nothing when both new
+    totals are zero, matching the existing zero-count-suppression precedent.
+    """
+
+    assert "function calibrationSummary(cal)" in DASHBOARD_HTML
+    assert "if (!cal.blind_spot_total && !cal.broken_citation_total) return" in DASHBOARD_HTML
+    assert "const summary = calibrationSummary(cal);" in DASHBOARD_HTML
+    assert (
+        "if (!cal.overall.total) return summary || "
+        '\'<span class="muted">no verifications recorded yet</span>\';'
+    ) in DASHBOARD_HTML
+    assert "return summary + `<table class=\"cal-table\">" in DASHBOARD_HTML
+
+
 def test_dashboard_html_report_meta_chips_render_independently():
     """Static desk-check of the Reports panel's blind-spot/broken-citation chips.
 
@@ -521,6 +541,9 @@ def test_calibration_state_empty_workspace():
             "total": 0, "confirm_rate": None,
         },
         "jobs_counted": 0,
+        "blind_spot_total": 0,
+        "broken_citation_total": 0,
+        "report_quality_jobs_counted": 0,
     }
 
 
@@ -657,6 +680,137 @@ def test_collect_state_calibration_key_matches_calibration_state():
         assert state["calibration"] == _calibration_state(
             ws, include_archived=include_archived
         )
+
+
+def test_calibration_state_sums_blind_spots_and_broken_citations():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/assessment.json",
+        json.dumps(
+            {
+                "blind_spots": ["legacy/", "vendor/"],
+                "broken_citations": {"security": ["Web.config"], "qa": []},
+            }
+        ),
+    )
+    ws.write_text(
+        "audit/assess-b/assessment.json",
+        json.dumps({"blind_spots": ["docs/"], "broken_citations": {}}),
+    )
+    state = _calibration_state(ws)
+    assert state["blind_spot_total"] == 3
+    assert state["broken_citation_total"] == 1
+    assert state["report_quality_jobs_counted"] == 2
+
+
+def test_calibration_state_report_quality_excludes_jobs_with_no_assessment_json():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/deliver-a/meta.json", json.dumps({"mode": "deliver"}))
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        _verification_line("risk.secrets[0]", "confirmed") + "\n",
+    )
+    state = _calibration_state(ws)
+    assert state["blind_spot_total"] == 0
+    assert state["broken_citation_total"] == 0
+    assert state["report_quality_jobs_counted"] == 0
+    assert state["jobs_counted"] == 1
+
+
+def test_calibration_state_report_quality_tolerates_malformed_or_wrong_typed_json():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/bad-json/assessment.json", "{not json")
+    ws.write_text("audit/not-a-dict/assessment.json", json.dumps(["nope"]))
+    ws.write_text(
+        "audit/bad-blind-spots/assessment.json",
+        json.dumps({"blind_spots": "not a list", "broken_citations": {}}),
+    )
+    ws.write_text(
+        "audit/bad-broken-citations-type/assessment.json",
+        json.dumps({"blind_spots": [], "broken_citations": "not a dict"}),
+    )
+    ws.write_text(
+        "audit/bad-broken-citations-value/assessment.json",
+        json.dumps({"blind_spots": [], "broken_citations": {"qa": "not a list"}}),
+    )
+    state = _calibration_state(ws)
+    assert state["blind_spot_total"] == 0
+    assert state["broken_citation_total"] == 0
+    assert state["report_quality_jobs_counted"] == 0
+
+
+def test_calibration_state_report_quality_excludes_archived_job_and_reappears():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"id": "assess-a", "archived": True}),
+    )
+    ws.write_text(
+        "audit/assess-a/assessment.json",
+        json.dumps({"blind_spots": ["legacy/"], "broken_citations": {"qa": ["x.py"]}}),
+    )
+    ws.write_text(
+        "audit/assess-b/assessment.json",
+        json.dumps({"blind_spots": ["docs/"], "broken_citations": {}}),
+    )
+
+    state = _calibration_state(ws)
+    assert state["blind_spot_total"] == 1
+    assert state["broken_citation_total"] == 0
+    assert state["report_quality_jobs_counted"] == 1
+
+    state = _calibration_state(ws, include_archived=True)
+    assert state["blind_spot_total"] == 2
+    assert state["broken_citation_total"] == 1
+    assert state["report_quality_jobs_counted"] == 2
+
+
+def test_dispatcher_calibration_and_calibration_state_parity():
+    """AC5: Dispatcher.calibration() and _calibration_state() must agree
+    over the same on-disk workspace fixture — the two hand-duplicated
+    implementations must not drift on the new report-quality fields."""
+
+    from dev_team.dashboard import _calibration_state
+    from dev_team.dispatch import Dispatcher
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"id": "assess-a", "archived": True}),
+    )
+    ws.write_text(
+        "audit/assess-a/assessment.json",
+        json.dumps({"blind_spots": ["legacy/"], "broken_citations": {"qa": ["x.py"]}}),
+    )
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        _verification_line("risk.secrets[0]", "confirmed") + "\n",
+    )
+    ws.write_text(
+        "audit/assess-b/assessment.json",
+        json.dumps({"blind_spots": ["docs/"], "broken_citations": {}}),
+    )
+    ws.write_text(
+        "audit/assess-b/verifications.jsonl",
+        _verification_line("risk.secrets[1]", "refuted") + "\n",
+    )
+
+    disp = Dispatcher(token="x", dashboard_workspace=ws)
+    _, dispatcher_payload = disp.calibration()
+    dashboard_payload = _calibration_state(ws)
+
+    for key in (
+        "blind_spot_total", "broken_citation_total", "report_quality_jobs_counted",
+    ):
+        assert dispatcher_payload[key] == dashboard_payload[key]
 
 
 # --- report meta (blind spots / broken citations) ---------------------------------
@@ -837,7 +991,11 @@ def test_server_serves_the_page_and_state(server):
     assert headers["Content-Type"].startswith("application/json")
     state = json.loads(body)
     assert state["activity"][0]["message"] == "building"
-    assert set(state["calibration"]) == {"phases", "overall", "jobs_counted"}
+    assert set(state["calibration"]) == {
+        "phases", "overall", "jobs_counted",
+        "blind_spot_total", "broken_citation_total",
+        "report_quality_jobs_counted",
+    }
 
 
 def test_server_serves_known_reports_only(server):

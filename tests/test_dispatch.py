@@ -842,6 +842,9 @@ def test_calibration_with_no_verification_files_is_zeroed():
             "total": 0, "confirm_rate": None,
         },
         "jobs_counted": 0,
+        "blind_spot_total": 0,
+        "broken_citation_total": 0,
+        "report_quality_jobs_counted": 0,
     }
 
 
@@ -901,6 +904,107 @@ def test_calibration_only_counts_files_that_contributed_a_parseable_line():
     assert status == 200
     assert payload["jobs_counted"] == 1
     assert payload["overall"]["total"] == 1
+
+
+def test_calibration_sums_blind_spots_and_broken_citations_across_jobs():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-a/assessment.json",
+        json.dumps(
+            {
+                "blind_spots": ["legacy/", "vendor/"],
+                "broken_citations": {"security": ["Web.config"], "qa": []},
+            }
+        ),
+    )
+    dash.write_text(
+        "audit/assess-b/assessment.json",
+        json.dumps({"blind_spots": ["docs/"], "broken_citations": {}}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload["blind_spot_total"] == 3
+    assert payload["broken_citation_total"] == 1
+    assert payload["report_quality_jobs_counted"] == 2
+
+
+def test_calibration_report_quality_excludes_jobs_with_no_assessment_json():
+    dash = InMemoryWorkspace()
+    # deliver job: neither assessment.json nor verifications.jsonl
+    dash.write_text("audit/deliver-a/meta.json", json.dumps({"mode": "deliver"}))
+    # assess job with only verifications.jsonl (no assessment.json yet)
+    dash.write_text(
+        "audit/assess-a/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[0]", "verdict": "confirmed"}) + "\n",
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload["blind_spot_total"] == 0
+    assert payload["broken_citation_total"] == 0
+    assert payload["report_quality_jobs_counted"] == 0
+    # the verdict rollup is unaffected by the report-quality population
+    assert payload["jobs_counted"] == 1
+
+
+def test_calibration_report_quality_tolerates_malformed_or_wrong_typed_json():
+    dash = InMemoryWorkspace()
+    dash.write_text("audit/bad-json/assessment.json", "{not json")
+    dash.write_text("audit/not-a-dict/assessment.json", json.dumps(["nope"]))
+    dash.write_text(
+        "audit/bad-blind-spots/assessment.json",
+        json.dumps({"blind_spots": "not a list", "broken_citations": {}}),
+    )
+    dash.write_text(
+        "audit/bad-broken-citations-type/assessment.json",
+        json.dumps({"blind_spots": [], "broken_citations": "not a dict"}),
+    )
+    dash.write_text(
+        "audit/bad-broken-citations-value/assessment.json",
+        json.dumps({"blind_spots": [], "broken_citations": {"qa": "not a list"}}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload["blind_spot_total"] == 0
+    assert payload["broken_citation_total"] == 0
+    assert payload["report_quality_jobs_counted"] == 0
+
+
+def test_calibration_report_quality_excludes_archived_job_and_reappears_after_unarchive():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-a"}),
+    )
+    dash.write_text(
+        "audit/assess-a/assessment.json",
+        json.dumps({"blind_spots": ["legacy/"], "broken_citations": {"qa": ["x.py"]}}),
+    )
+    dash.write_text(
+        "audit/assess-b/assessment.json",
+        json.dumps({"blind_spots": ["docs/"], "broken_citations": {}}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload["blind_spot_total"] == 2
+    assert payload["broken_citation_total"] == 1
+    assert payload["report_quality_jobs_counted"] == 2
+
+    disp.archive_job("assess-a")
+    status, payload = disp.calibration()
+    assert payload["blind_spot_total"] == 1
+    assert payload["broken_citation_total"] == 0
+    assert payload["report_quality_jobs_counted"] == 1
+
+    disp.unarchive_job("assess-a")
+    status, payload = disp.calibration()
+    assert payload["blind_spot_total"] == 2
+    assert payload["broken_citation_total"] == 1
+    assert payload["report_quality_jobs_counted"] == 2
 
 
 # --- costs rollup ---------------------------------------------------------
@@ -1941,7 +2045,11 @@ def test_calibration_http_route_end_to_end():
             401, {"error": "unauthorized"})
         status, payload = _call(server, "/calibration")
         assert status == 200
-        assert set(payload) == {"phases", "overall", "jobs_counted"}
+        assert set(payload) == {
+            "phases", "overall", "jobs_counted",
+            "blind_spot_total", "broken_citation_total",
+            "report_quality_jobs_counted",
+        }
         assert payload["jobs_counted"] == 1
 
 
