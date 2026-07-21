@@ -1817,6 +1817,215 @@ def test_dashboard_html_access_log_panel():
     assert "\nloadAccessLog();" in DASHBOARD_HTML
 
 
+# --- the foreman plan proxy (GET /api/foreman/plan → dispatch GET /foreman/plan) --
+
+
+def test_foreman_plan_proxy_forwards_and_relays_verbatim(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch,
+        status=200,
+        body=b'{"ready_total": 2, "max_stories": 3, "plan": ['
+        b'{"story_id": "S1", "title": "Remove hardcoded secret", "estimate": 1,'
+        b' "repo": "acme/rota", "eligible": true, "reason": null}]}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/foreman/plan", headers=AUTH
+    )
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {
+        "ready_total": 2,
+        "max_stories": 3,
+        "plan": [
+            {
+                "story_id": "S1",
+                "title": "Remove hardcoded secret",
+                "estimate": 1,
+                "repo": "acme/rota",
+                "eligible": True,
+                "reason": None,
+            }
+        ],
+    }
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/foreman/plan"
+    assert request.get_method() == "GET"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.data is None
+
+
+def test_foreman_plan_proxy_unconfigured_is_501(token_server, monkeypatch):
+    # token_server has dashboard auth but no dispatch_url/dispatch_token wired
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "GET", "/api/foreman/plan", headers=AUTH
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "foreman plan not configured"}
+    assert seen == []
+
+
+def test_foreman_plan_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    # the reverse of the case above: dispatch IS configured (proxy_server),
+    # but the caller never authenticated to the dashboard — 401 first, and
+    # nothing is ever forwarded to the dispatch service.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(proxy_server, "GET", "/api/foreman/plan")
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+def test_foreman_plan_proxy_url_without_token_stays_unconfigured(monkeypatch):
+    # A dispatch URL alone (no dispatch token) must not forward: still 501,
+    # matching every other proxy's own behaviour.
+    seen = _capture_urlopen(monkeypatch)
+    srv = DashboardServer(
+        InMemoryWorkspace(), port=0, token=TOKEN, dispatch_url=DISPATCH_URL
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, body = _request(srv, "GET", "/api/foreman/plan", headers=AUTH)
+        assert status == 501
+        assert json.loads(body) == {"error": "foreman plan not configured"}
+        assert seen == []
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
+
+
+def test_foreman_plan_proxy_forwards_max_stories_unchanged(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch, body=b'{"ready_total": 0, "max_stories": 7, "plan": []}'
+    )
+    status, _, _ = _request(
+        proxy_server, "GET", "/api/foreman/plan?max_stories=7", headers=AUTH
+    )
+    assert status == 200
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/foreman/plan?max_stories=7"
+
+
+def test_foreman_plan_proxy_without_max_stories_forwards_no_query_string(
+    proxy_server, monkeypatch
+):
+    seen = _capture_urlopen(
+        monkeypatch, body=b'{"ready_total": 0, "max_stories": 3, "plan": []}'
+    )
+    status, _, _ = _request(proxy_server, "GET", "/api/foreman/plan", headers=AUTH)
+    assert status == 200
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/foreman/plan"
+
+
+def test_foreman_plan_proxy_forwards_an_out_of_range_max_stories_as_is(
+    proxy_server, monkeypatch
+):
+    # No dashboard-side validation duplicated: a non-numeric or out-of-range
+    # value is passed through unchanged, letting the dispatch service's own
+    # [1, 10] clamp handle it.
+    seen = _capture_urlopen(
+        monkeypatch, body=b'{"ready_total": 0, "max_stories": 3, "plan": []}'
+    )
+    status, _, _ = _request(
+        proxy_server, "GET", "/api/foreman/plan?max_stories=not-a-number", headers=AUTH
+    )
+    assert status == 200
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/foreman/plan?max_stories=not-a-number"
+
+
+def test_foreman_plan_proxy_unreachable_dispatch_is_502(proxy_server, monkeypatch):
+    _capture_urlopen(monkeypatch, error=urllib.error.URLError("refused"))
+    status, _, body = _request(proxy_server, "GET", "/api/foreman/plan", headers=AUTH)
+    assert status == 502
+    assert json.loads(body) == {"error": "dispatch service unreachable"}
+    assert "refused" not in body  # no internals leak
+
+
+def test_foreman_plan_proxy_relays_a_dispatch_rejection_verbatim(
+    proxy_server, monkeypatch
+):
+    # e.g. the dashboard workspace isn't configured dispatch-side: the
+    # dispatch service's own 409, never swallowed or translated.
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/foreman/plan", 409, "Conflict", None,
+        io.BytesIO(b'{"error": "the foreman needs a dashboard workspace"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(proxy_server, "GET", "/api/foreman/plan", headers=AUTH)
+    assert status == 409
+    assert json.loads(body) == {"error": "the foreman needs a dashboard workspace"}
+
+
+def test_foreman_plan_proxy_never_echoes_the_dispatch_token(proxy_server, monkeypatch):
+    # SECURITY: the dispatch bearer token must never reach the browser, in
+    # the response body or in any header.
+    _capture_urlopen(
+        monkeypatch,
+        body=b'{"ready_total": 1, "max_stories": 3, "plan": []}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/foreman/plan", headers=AUTH
+    )
+    assert status == 200
+    assert DISPATCH_TOKEN not in body
+    assert DISPATCH_TOKEN not in str(headers)
+
+
+def test_foreman_plan_route_scope_is_exact_match_only(proxy_server, monkeypatch):
+    # SECURITY/scope: only exactly /api/foreman/plan is this route — a path
+    # that merely starts with it, and in particular /api/foreman/run, falls
+    # through to the ordinary 404, never forwarded to the dispatch service
+    # (no /foreman/run wiring, no general dispatch passthrough).
+    seen = _capture_urlopen(monkeypatch)
+    for path in (
+        "/api/foreman/plan/",
+        "/api/foreman/plan/extra",
+        "/api/foreman/plan2",
+        "/api/foreman/run",
+        "/api/foreman",
+        "/api/foreman/",
+    ):
+        status, _, _ = _request(proxy_server, "GET", path, headers=AUTH)
+        assert status == 404
+    assert seen == []
+
+
+def test_dashboard_html_foreman_plan_panel():
+    # AC5/AC6/AC9: fetched once on load plus manual refresh only — never
+    # inside the setInterval-driven refresh() poll (same load-multiplication
+    # reason as Spend/Access log) — and every rendered field flows through
+    # esc() before innerHTML: story_id/title/repo/reason can originate from
+    # an LLM assessment finding (same provenance as the Story-detail panel),
+    # so they must always render as inert text.
+    assert 'id="foreman-plan-refresh"' in DASHBOARD_HTML
+    assert '<div class="panel" id="foreman-plan">' in DASHBOARD_HTML
+    assert 'fetch("/api/foreman/plan")' in DASHBOARD_HTML
+    assert "foreman plan not configured" in DASHBOARD_HTML
+    assert "failed to load foreman plan" in DASHBOARD_HTML
+    assert "nothing ready to deliver" in DASHBOARD_HTML
+    assert (
+        '$("foreman-plan-refresh").addEventListener("click", loadForemanPlan)'
+        in DASHBOARD_HTML
+    )
+    assert "${esc(entry.story_id)}" in DASHBOARD_HTML
+    assert "${esc(entry.title)}" in DASHBOARD_HTML
+    assert "${esc(entry.repo)}" in DASHBOARD_HTML
+    assert "${esc(entry.reason)}" in DASHBOARD_HTML
+    assert "${esc(data.ready_total)}" in DASHBOARD_HTML
+    assert "${esc(data.max_stories)}" in DASHBOARD_HTML
+
+    refresh_start = DASHBOARD_HTML.index("async function refresh()")
+    refresh_end = DASHBOARD_HTML.index("refresh();", refresh_start)
+    assert "/api/foreman/plan" not in DASHBOARD_HTML[refresh_start:refresh_end]
+    assert "setInterval(loadForemanPlan" not in DASHBOARD_HTML
+    assert "\nloadForemanPlan();" in DASHBOARD_HTML
+
+
 # --- the pending-question proxy (GET /api/jobs/{id}/question → dispatch) -----
 
 
