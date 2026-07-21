@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
-from dev_team.changes import ChangeApplier
+from dev_team.changes import ChangeApplier, is_ci_workflow_path
 from dev_team.execution import InMemoryWorkspace
 from dev_team.models import ChangeType, FileChange, Implementation
 
 
 def _impl(files):
     return Implementation(task_id="T1", summary="s", files=files)
+
+
+def test_is_ci_workflow_path_matches_the_workflows_directory():
+    assert is_ci_workflow_path(".github/workflows/ci.yml") is True
+    assert is_ci_workflow_path("./.github/workflows/ci.yml") is True
+
+
+def test_is_ci_workflow_path_rejects_other_paths():
+    assert is_ci_workflow_path("Dockerfile") is False
+    assert is_ci_workflow_path(".github/ISSUE_TEMPLATE/bug.md") is False
 
 
 def test_apply_create_and_modify():

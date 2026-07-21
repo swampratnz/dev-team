@@ -81,6 +81,22 @@ sections below are reconstructed from the repository history.
   contents: read` unchanged.
 
 ### Security hardening
+- **A delivery no longer authors `.github/workflows/*` files by default**
+  (issue #151): the DevOps agent's prompt still allows it to propose a CI
+  workflow, but `DeliveryEngine._provision_deployment` now drops any
+  `.github/workflows/*` file from its artifacts before they reach the
+  workspace unless the new `EngineConfig.allow_ci_workflows` /
+  `--allow-ci-workflows` opt-in is set (off by default), emitting a
+  `deployment-artifacts-blocked` event when it does. This closes a
+  push-breaking failure mode: a fine-grained GitHub PAT lacks the separate
+  `workflow` scope needed to push such a file, so an uninvited workflow could
+  turn a fully-committed delivery into a rejected push with no PR opened.
+  When the opt-in *is* set, `dev_team.delivery_target.push_branch` /
+  `publish_pull_request` now warn (`stderr` by default, overridable via a new
+  `warn` callable) about the `workflow`-scope requirement before attempting
+  the push, rather than relying on git's own rejection message reaching the
+  operator. `dev_team.changes.is_ci_workflow_path` is the shared path rule
+  both sites use.
 - **Every agent call now produces a retained, reviewable log, closing a
   CLAUDE.md section 7 gap.** `Tracer` (`dev_team.trace`) gains an optional
   `sink` invoked once per finalised span; the new `dev_team.tracelog.TraceLog`

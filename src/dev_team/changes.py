@@ -15,6 +15,19 @@ from typing import List
 from .execution import Workspace
 from .models import ChangeType, Implementation
 
+#: Directory GitHub Actions reads workflow definitions from. Shared by the
+#: DevOps artifact filter (default-deny CI workflow authorship,
+#: ``EngineConfig.allow_ci_workflows``) and the push step's PAT-scope
+#: warning, which both need to recognise the identical path shape.
+CI_WORKFLOW_DIR = ".github/workflows/"
+
+
+def is_ci_workflow_path(path: str) -> bool:
+    """Whether ``path`` names a GitHub Actions workflow file."""
+
+    normalized = path[2:] if path.startswith("./") else path
+    return normalized.startswith(CI_WORKFLOW_DIR)
+
 
 @dataclass
 class AppliedChange:

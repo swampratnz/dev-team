@@ -288,6 +288,23 @@ def test_engine_config_threads_require_recognised_project():
     assert _engine_config(off).require_recognised_project is False
 
 
+def test_main_allow_ci_workflows_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--allow-ci-workflows"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--allow-ci-workflows" in err and "--deliver" in err
+
+
+def test_engine_config_threads_allow_ci_workflows():
+    from dev_team.cli import _engine_config, build_parser
+
+    on = build_parser().parse_args(["T", "D", "--deliver", "--allow-ci-workflows"])
+    assert _engine_config(on).allow_ci_workflows is True
+    off = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(off).allow_ci_workflows is False
+
+
 def test_main_finalization_reserve_rejected_without_deliver(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["Login", "Add login", "--finalization-reserve", "0.2"], runner=ScriptedRunner([]))

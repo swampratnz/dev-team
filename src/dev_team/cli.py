@@ -632,6 +632,16 @@ def build_parser() -> argparse.ArgumentParser:
         "greenfield pytest fallback runs, but announces itself loudly.",
     )
     delivery.add_argument(
+        "--allow-ci-workflows",
+        action="store_true",
+        help="Let the DevOps agent's artifacts include .github/workflows/* "
+        "files (with --deliver). Off by default: a fine-grained GitHub PAT "
+        "lacks the separate 'workflow' scope needed to push one, so an "
+        "uninvited CI workflow turns a fully-built delivery into a rejected "
+        "push; any such file is dropped before it reaches the workspace "
+        "unless this is set.",
+    )
+    delivery.add_argument(
         "--finalization-reserve",
         type=float,
         default=0.10,
@@ -1108,6 +1118,7 @@ def _reject_deliver_only_flags(
         ("--allow-dirty-baseline", args.allow_dirty_baseline),
         ("--proceed-on-red-baseline", args.proceed_on_red_baseline),
         ("--require-recognised-project", args.require_recognised_project),
+        ("--allow-ci-workflows", args.allow_ci_workflows),
         (
             "--finalization-reserve",
             args.finalization_reserve != parser.get_default("finalization_reserve"),
@@ -1192,6 +1203,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         allow_dirty_baseline=args.allow_dirty_baseline,
         require_green_baseline=not args.proceed_on_red_baseline,
         require_recognised_project=args.require_recognised_project,
+        allow_ci_workflows=args.allow_ci_workflows,
         finalization_reserve_fraction=args.finalization_reserve,
         frontend_craft=not args.no_frontend_craft,
         visual_review=args.visual_review,
