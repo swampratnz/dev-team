@@ -608,6 +608,17 @@ sections below are reconstructed from the repository history.
   keep the heuristic false-positive-free.
 
 ### Documentation
+- **Invalid-JSON detection in shipped docs** (`doc_claim_issues`,
+  `techwriter.py`): fenced `json` blocks are now parsed with stdlib
+  `json.loads`, and a malformed example (trailing comma, unbalanced brace,
+  etc.) is surfaced as an advisory finding naming the doc's path — the JSON
+  half of #48's "bash/JSON" growth path, completing it alongside the
+  bash-fence CLI-flag check below. `json.loads` only ever parses; unlike
+  `pickle`/`yaml.load` it has no code-execution surface, so this is a
+  strictly lower-risk check than the Python-fence `ast.parse` check #48
+  already shipped. Advisory only, same `Documentation.unverified_claims`
+  surface; an unterminated fence is skipped exactly like the Python/shell
+  branches.
 - **Hallucinated CLI-flag detection in shipped docs** (`doc_claim_issues`,
   `techwriter.py`): fenced `bash`/`sh`/`shell`/`console`/`zsh` blocks are
   now scanned line-by-line for `dev-team`/`python -m dev_team` invocations,

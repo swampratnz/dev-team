@@ -351,6 +351,75 @@ def test_doc_claim_issues_other_fence_languages_unaffected_by_cli_check():
     assert doc_claim_issues([doc], []) == []
 
 
+# --- doc_claim_issues: JSON fence validity ---------------------------------
+
+
+def test_doc_claim_issues_valid_json_object_fence_has_no_finding():
+    doc = _doc('```json\n{"a": 1, "b": [1, 2, 3]}\n```\n')
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_doc_claim_issues_valid_json_array_fence_has_no_finding():
+    doc = _doc('```json\n[{"id": 1}, {"id": 2}]\n```\n')
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_doc_claim_issues_flags_json_fence_with_trailing_comma():
+    doc = _doc('```json\n{"a": 1,}\n```\n')
+    issues = doc_claim_issues([doc], [])
+    assert len(issues) == 1
+    assert "docs/feature.md" in issues[0]
+    assert "json fence is not valid JSON" in issues[0]
+
+
+def test_doc_claim_issues_flags_json_fence_with_unbalanced_brace():
+    doc = _doc('```json\n{"a": 1\n```\n')
+    issues = doc_claim_issues([doc], [])
+    assert len(issues) == 1
+    assert "json fence is not valid JSON" in issues[0]
+
+
+def test_doc_claim_issues_handles_unterminated_json_fence_without_raising():
+    doc = _doc('```json\n{"a": 1\nno closing fence here')
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_doc_claim_issues_json_fence_never_executes_content():
+    import os
+    import subprocess
+    from unittest.mock import patch
+
+    doc = _doc(
+        '```json\n'
+        '{"__reduce__": "os.system(\'id\')", "cmd": "\'; rm -rf /\'"\n'
+        "```\n"
+    )
+    with patch.object(
+        subprocess, "run", side_effect=AssertionError("must not run")
+    ) as mock_run, patch.object(
+        os, "system", side_effect=AssertionError("must not run")
+    ) as mock_system, patch("builtins.eval", side_effect=AssertionError("must not run")) as mock_eval, patch(
+        "builtins.exec", side_effect=AssertionError("must not run")
+    ) as mock_exec:
+        issues = doc_claim_issues([doc], [])
+    mock_run.assert_not_called()
+    mock_system.assert_not_called()
+    mock_eval.assert_not_called()
+    mock_exec.assert_not_called()
+    assert len(issues) == 1
+    assert "json fence is not valid JSON" in issues[0]
+
+
+def test_doc_claim_issues_non_json_fences_unaffected_by_json_check():
+    doc = _doc("```python\ndef add(a, b):\n    return a + b\n```\n")
+    assert doc_claim_issues([doc], []) == []
+
+
+def test_doc_claim_issues_unrecognised_fence_language_is_left_unchecked():
+    doc = _doc('```yaml\na: [1, 2\n```\n')
+    assert doc_claim_issues([doc], []) == []
+
+
 def test_techwriter_import_does_not_trigger_cli_import():
     import subprocess
     import sys
