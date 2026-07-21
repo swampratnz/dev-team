@@ -3283,6 +3283,64 @@ def test_devops_artifacts_are_written_and_committed():
     assert "deployment-artifacts" in kinds
 
 
+def _devops_response_with_workflow_file():
+    return json_response(
+        {
+            "environment": "production",
+            "summary": "containerised",
+            "steps": ["build image"],
+            "rollback": ["previous tag"],
+            "files": [
+                {
+                    "path": "Dockerfile",
+                    "change_type": "create",
+                    "summary": "app image",
+                    "content": "FROM python:3.12-slim\n",
+                },
+                {
+                    "path": ".github/workflows/ci.yml",
+                    "change_type": "create",
+                    "summary": "CI",
+                    "content": "on: push\n",
+                },
+            ],
+        }
+    )
+
+
+def test_devops_ci_workflow_file_is_dropped_by_default():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_workflow_file()
+    ws = InMemoryWorkspace()
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(runner, workspace=ws, listener=events.append)
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    # The Dockerfile (unaffected) landed; the workflow file was filtered out
+    # before it ever reached the workspace.
+    assert ws.read_text("Dockerfile").startswith("FROM python")
+    assert not ws.exists(".github/workflows/ci.yml")
+    assert ".github/workflows/ci.yml" not in outcome.workspace_files
+    blocked = [e for e in events if e.stage == "deployment-artifacts-blocked"]
+    assert len(blocked) == 1
+    assert ".github/workflows/ci.yml" in blocked[0].detail
+
+
+def test_devops_ci_workflow_file_is_kept_when_opted_in():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_workflow_file()
+    ws = InMemoryWorkspace()
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(runner, workspace=ws, config=EngineConfig(allow_ci_workflows=True))
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert ws.read_text(".github/workflows/ci.yml") == "on: push\n"
+    assert ".github/workflows/ci.yml" in outcome.workspace_files
+
+
 def test_writer_docs_are_written_to_workspace():
     responses = engine_responses()
     responses["technical writer"] = json_response(

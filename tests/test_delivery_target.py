@@ -140,6 +140,75 @@ def test_publish_requires_a_token():
         )
 
 
+def test_push_branch_warns_before_pushing_a_ci_workflow_file():
+    from dev_team.delivery_target import push_branch
+
+    cmd = FakeCommandRunner()
+    warnings = []
+    push_branch(
+        "dev-team/health",
+        ref=_ref(),
+        token="TOK",
+        git=GitRepo(cmd),
+        workspace_files=["src/x.py", ".github/workflows/ci.yml"],
+        warn=warnings.append,
+    )
+    assert len(warnings) == 1
+    assert ".github/workflows/ci.yml" in warnings[0]
+    assert "workflow" in warnings[0]
+    # The push still went through — this is advisory, not a block.
+    assert cmd.calls[-1] == ["git", "push", "origin", "dev-team/health"]
+
+
+def test_push_branch_default_warn_prints_to_stderr(capsys):
+    from dev_team.delivery_target import push_branch
+
+    push_branch(
+        "dev-team/health",
+        ref=_ref(),
+        token="TOK",
+        git=GitRepo(FakeCommandRunner()),
+        workspace_files=[".github/workflows/ci.yml"],
+    )
+    err = capsys.readouterr().err
+    assert ".github/workflows/ci.yml" in err
+    assert "workflow" in err
+
+
+def test_push_branch_does_not_warn_without_a_workflow_file():
+    from dev_team.delivery_target import push_branch
+
+    cmd = FakeCommandRunner()
+    warnings = []
+    push_branch(
+        "dev-team/health",
+        ref=_ref(),
+        token="TOK",
+        git=GitRepo(cmd),
+        workspace_files=["src/x.py", "Dockerfile"],
+        warn=warnings.append,
+    )
+    assert warnings == []
+
+
+def test_publish_warns_before_pushing_a_workflow_file_in_the_outcome():
+    ref = _ref()
+    outcome = _outcome(workspace_files=["src/x.py", ".github/workflows/ci.yml"])
+    warnings = []
+
+    publish_pull_request(
+        outcome,
+        ref=ref,
+        token="TOK",
+        git=GitRepo(FakeCommandRunner()),
+        publisher=FakePullRequestPublisher(),
+        warn=warnings.append,
+    )
+
+    assert len(warnings) == 1
+    assert ".github/workflows/ci.yml" in warnings[0]
+
+
 def test_publish_scrubs_the_auth_header_from_a_push_failure():
     # The push carries the AUTHORIZATION: basic <base64> header in env; a
     # verbose/GIT_TRACE git can echo it back into its output. The scrub baked

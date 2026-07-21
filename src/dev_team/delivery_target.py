@@ -17,8 +17,10 @@ pairs the two for the clone path. A caller cannot opt out of the redaction.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import sys
+from typing import TYPE_CHECKING, Callable, Sequence
 
+from .changes import is_ci_workflow_path
 from .errors import DevTeamError
 from .git import GitRepo
 from .pullrequest import PullRequest, PullRequestPublisher, PullRequestRequest
@@ -33,6 +35,35 @@ class DeliveryTargetError(DevTeamError):
     """The delivery could not be published as a pull request."""
 
 
+def _default_warn(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def _warn_ci_workflow_push_risk(
+    paths: Sequence[str], warn: Callable[[str], None]
+) -> None:
+    """Surface the PAT ``workflow``-scope requirement before it bites.
+
+    A fine-grained GitHub PAT needs the separate ``workflow`` scope to push a
+    ``.github/workflows/*`` change; without it git rejects the push outright.
+    Warning here — rather than relying on that rejection reaching the
+    operator — names the fix before the push is even attempted. Only reached
+    via the ``allow_ci_workflows`` opt-in (default-off filters these files out
+    of a delivery before they ever get this far); see ``dev_team.changes``.
+    """
+
+    matched = sorted({p for p in paths if is_ci_workflow_path(p)})
+    if not matched:
+        return
+    warn(
+        "warning: about to push CI workflow file(s) ("
+        + ", ".join(matched)
+        + "): pushing .github/workflows/* requires a GitHub credential with "
+        "the 'workflow' scope — a fine-grained PAT without it will have this "
+        "push rejected."
+    )
+
+
 def push_branch(
     branch: str,
     *,
@@ -42,6 +73,8 @@ def push_branch(
     remote: str = "origin",
     set_upstream: bool = False,
     force_with_lease: bool = False,
+    workspace_files: Sequence[str] = (),
+    warn: Callable[[str], None] = _default_warn,
 ) -> None:
     """Push ``branch`` to ``remote`` with token hygiene baked in.
 
@@ -49,6 +82,11 @@ def push_branch(
     scrubbed from any error — never left to the caller to remember. Used both
     for the initial publish push and for re-pushing a CI fix to an open PR's
     branch (``force_with_lease``, never a bare ``--force``).
+
+    ``workspace_files`` is the delivery's file listing; when it contains a
+    ``.github/workflows/*`` path, ``warn`` is called with the PAT-scope risk
+    before the push is attempted (defaults to a ``stderr`` print). Empty by
+    default — callers that don't have a listing simply skip the check.
     """
 
     if not token:
@@ -56,6 +94,7 @@ def push_branch(
             "a GitHub token is required to push the branch; none was resolved "
             "(set --env-file or GITHUB_TOKEN)"
         )
+    _warn_ci_workflow_push_risk(workspace_files, warn)
     git.push(
         branch,
         remote=remote,
@@ -77,6 +116,7 @@ def publish_pull_request(
     draft: bool = False,
     remote: str = "origin",
     force_with_lease: bool = False,
+    warn: Callable[[str], None] = _default_warn,
 ) -> PullRequest:
     """Push ``outcome``'s branch to ``remote`` and open a PR for it.
 
@@ -89,7 +129,10 @@ def publish_pull_request(
 
     The push always carries the auth env and a scrub redactor, so a verbose /
     ``GIT_TRACE`` failure cannot leak the ``AUTHORIZATION: basic <base64>``
-    header into the raised error.
+    header into the raised error. If ``outcome.workspace_files`` holds a
+    ``.github/workflows/*`` path (only possible under the
+    ``allow_ci_workflows`` opt-in), the PAT-scope risk is warned via ``warn``
+    before the push is attempted.
     """
 
     if not outcome.committed or not outcome.branch:
@@ -111,6 +154,8 @@ def publish_pull_request(
         remote=remote,
         set_upstream=True,
         force_with_lease=force_with_lease,
+        workspace_files=outcome.workspace_files,
+        warn=warn,
     )
     request = PullRequestRequest(
         owner=ref.owner,

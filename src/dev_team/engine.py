@@ -60,7 +60,7 @@ from .visualreview import (
     VisualReport,
     VisualReviewer,
 )
-from .changes import ChangeApplier
+from .changes import ChangeApplier, is_ci_workflow_path
 from .context import build_repo_context
 from .conventions import ConventionsStore
 from .agents.engineer import TOOLS as ENGINEER_TOOLS
@@ -161,6 +161,11 @@ class EngineConfig:
       ``dev-team/<feature>`` branch (never the caller's current branch).
     - ``allow_dirty_baseline``: by default a dirty working tree halts the run
       instead of being silently swept into a baseline commit.
+    - ``allow_ci_workflows``: off by default, so the DevOps agent's proposed
+      ``.github/workflows/*`` files are dropped rather than committed — a
+      fine-grained PAT without the ``workflow`` scope cannot push one, which
+      otherwise turns a fully-built delivery into a rejected push at the end
+      of the run.
     - ``engineer_tools``: override the agentic engineer's tool allowlist.
     - ``worktrees``: give each task its own git worktree so implementation
       *and* gate runs proceed in parallel; tasks are squash-merged into the
@@ -209,6 +214,14 @@ class EngineConfig:
     #: Ignored when ``verify_command`` / ``remote_verify_status`` is set (the
     #: caller already chose the gate). See ``docs/ROADMAP.md``.
     require_recognised_project: bool = False
+    #: Let the DevOps agent's artifacts include ``.github/workflows/*`` files.
+    #: Off by default: a fine-grained GitHub PAT lacks the separate
+    #: ``workflow`` scope needed to push such a file, so an uninvited CI
+    #: workflow silently turns a fully-committed delivery into a rejected
+    #: push at the very end of the run. When off, any workflow file the agent
+    #: proposes is dropped before it reaches the workspace (Dockerfiles and
+    #: service configs are unaffected).
+    allow_ci_workflows: bool = False
     #: Fraction of the cost budget held back during task work so the security
     #: review that authorises the commit can still run — otherwise task work can
     #: spend the whole ceiling and leave a fully built delivery unable to bank
@@ -3063,6 +3076,18 @@ class DeliveryEngine:
             workspace_listing=listing,
             project_kind=self._profile.kind if self._profile else None,
         )
+        if not self.config.allow_ci_workflows:
+            blocked = [c for c in artifacts.files if is_ci_workflow_path(c.path)]
+            if blocked:
+                artifacts.files = [
+                    c for c in artifacts.files if not is_ci_workflow_path(c.path)
+                ]
+                self._event(
+                    "deployment-artifacts-blocked",
+                    f"dropped {len(blocked)} CI workflow file(s) "
+                    "(allow_ci_workflows is off by default)",
+                    detail=", ".join(c.path for c in blocked if c.path),
+                )
         if artifacts.files:
             ChangeApplier(self.workspace).apply(artifacts)
             self.blackboard.post_artifact(
