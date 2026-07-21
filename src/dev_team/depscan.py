@@ -276,30 +276,37 @@ def _pep508_pin(spec: str) -> Optional[tuple]:
 
 
 def parse_pyproject_toml(text: str, manifest: str) -> List[Dependency]:
-    """PEP 621 ``pyproject.toml``: ``==`` pins from ``[project.dependencies]``
-    and ``[project.optional-dependencies]``.
+    """PEP 621 ``pyproject.toml``: ``==`` pins from ``[project.dependencies]``,
+    ``[project.optional-dependencies]``, and PEP 735 ``[dependency-groups]``.
 
-    Ranges, unpinned entries, and PEP 735 ``[dependency-groups]`` are out of
-    scope for v1 (see the module docstring's honest-limitations note) — only
-    exact pins are live-scanned, everything else stays model knowledge.
+    Ranges and unpinned entries are out of scope for v1 (see the module
+    docstring's honest-limitations note) — only exact pins are live-scanned,
+    everything else stays model knowledge. A ``[dependency-groups]`` entry
+    that is a table (PEP 735's ``{include-group = "..."}`` composition
+    reference, not a package) is skipped rather than resolved: v1 only scans
+    a group's own directly-listed packages.
     """
 
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError:
         return []
-    project = data.get("project")
-    if not isinstance(project, dict):
-        return []
     specs: List[str] = []
-    direct = project.get("dependencies")
-    if isinstance(direct, list):
-        specs.extend(spec for spec in direct if isinstance(spec, str))
-    optional = project.get("optional-dependencies")
-    if isinstance(optional, dict):
-        for group in optional.values():
+    project = data.get("project")
+    if isinstance(project, dict):
+        direct = project.get("dependencies")
+        if isinstance(direct, list):
+            specs.extend(spec for spec in direct if isinstance(spec, str))
+        optional = project.get("optional-dependencies")
+        if isinstance(optional, dict):
+            for group in optional.values():
+                if isinstance(group, list):
+                    specs.extend(spec for spec in group if isinstance(spec, str))
+    groups = data.get("dependency-groups")
+    if isinstance(groups, dict):
+        for group in groups.values():
             if isinstance(group, list):
-                specs.extend(spec for spec in group if isinstance(spec, str))
+                specs.extend(entry for entry in group if isinstance(entry, str))
     deps = []
     for spec in specs:
         pin = _pep508_pin(spec)

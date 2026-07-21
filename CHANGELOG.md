@@ -5,6 +5,19 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Assessment
+- **Dependency scan now parses PEP 735 `[dependency-groups]`** (`depscan.py`),
+  completing the growth path #125 named for itself. `parse_pyproject_toml`
+  reads the top-level `[dependency-groups]` table alongside the existing
+  `[project.dependencies]`/`[project.optional-dependencies]` handling,
+  reusing the same `_pep508_pin` `==`-only helper — a group's `str` entries
+  are scanned exactly like every other manifest spec; `{include-group =
+  "..."}` composition-reference entries are skipped, not resolved, so a
+  composition-only group is never misreported as scanned. Every malformed
+  shape (a non-table `dependency-groups`, a non-list group value, a list
+  entry that's neither `str` nor `dict`) degrades to a skip, never raises.
+  `docs/ASSESSMENT.md`'s honest-limitations note is updated accordingly.
+
 ### Orchestration
 - **A backlog foreman turns ready stories into deliver jobs** (ROADMAP #9's
   second half, completing the item; see `docs/DISPATCH.md`). `GET

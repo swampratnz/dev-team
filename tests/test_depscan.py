@@ -202,6 +202,102 @@ dependencies = ["==1.0", "[extra]==1.0"]
     assert parse_pyproject_toml(text, "pyproject.toml") == []
 
 
+def test_parse_pyproject_toml_dependency_groups_exact_pins():
+    text = """
+[dependency-groups]
+test = ["pytest==8.0.0"]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version, d.ecosystem) for d in deps] == [
+        ("pytest", "8.0.0", "PyPI"),
+    ]
+
+
+def test_parse_pyproject_toml_dependency_groups_multiple_groups():
+    text = """
+[dependency-groups]
+test = ["pytest==8.0.0"]
+docs = ["sphinx==7.0.0"]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version) for d in deps] == [
+        ("pytest", "8.0.0"),
+        ("sphinx", "7.0.0"),
+    ]
+
+
+def test_parse_pyproject_toml_dependency_groups_strips_extras_and_markers():
+    text = """
+[dependency-groups]
+test = ["httpx[http2]==0.27.0; python_version >= \\"3.8\\""]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version) for d in deps] == [("httpx", "0.27.0")]
+
+
+def test_parse_pyproject_toml_dependency_groups_skips_non_exact_specs():
+    text = """
+[dependency-groups]
+test = ["foo>=1.0", "bar", "baz~=2.0", "pytest==8.0.0"]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version) for d in deps] == [("pytest", "8.0.0")]
+
+
+def test_parse_pyproject_toml_dependency_groups_include_group_skipped():
+    text = """
+[dependency-groups]
+test = ["pytest==8.0.0"]
+all = [{include-group = "test"}]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    # The "all" group's include-group reference is not resolved — only
+    # "test"'s own directly-listed package is scanned.
+    assert [(d.name, d.version) for d in deps] == [("pytest", "8.0.0")]
+
+
+def test_parse_pyproject_toml_dependency_groups_adversarial_shapes():
+    # dependency-groups present but not a table
+    assert (
+        parse_pyproject_toml(
+            'dependency-groups = ["test"]\n', "pyproject.toml"
+        )
+        == []
+    )
+    # a group's value not a list
+    assert (
+        parse_pyproject_toml(
+            '[dependency-groups]\ntest = "pytest==8.0.0"\n', "pyproject.toml"
+        )
+        == []
+    )
+    # a list entry that is neither str nor dict, and a malformed include-group
+    text = """
+[dependency-groups]
+test = [42, true, {not-include-group = "x"}, {include-group = 1}]
+"""
+    assert parse_pyproject_toml(text, "pyproject.toml") == []
+
+
+def test_parse_pyproject_toml_dependency_groups_union_with_project_tables():
+    text = """
+[project]
+dependencies = ["requests==2.31.0"]
+
+[project.optional-dependencies]
+dev = ["pytest==8.0.0"]
+
+[dependency-groups]
+test = ["sphinx==7.0.0"]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version) for d in deps] == [
+        ("requests", "2.31.0"),
+        ("pytest", "8.0.0"),
+        ("sphinx", "7.0.0"),
+    ]
+
+
 def test_collect_dependencies_dedupes_across_manifests():
     ws = InMemoryWorkspace(
         {
