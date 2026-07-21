@@ -105,6 +105,45 @@ def test_main_json_verbose_keeps_stdout_parseable(capsys):
     assert "[workflow/" in captured.err
 
 
+def test_progress_printer_without_detail_matches_prior_output(capsys):
+    # issue #152 AC4: an event with detail=None prints exactly as before the
+    # detail suffix was added — no crash, no empty parenthetical.
+    import dev_team.cli as cli_module
+    from dev_team.budget import Budget
+    from dev_team.events import AgentEvent
+
+    budget = Budget()
+    printer = cli_module._progress_printer(budget)
+    printer(AgentEvent(role="engineer", stage="build", message="working"))
+    err = capsys.readouterr().err
+    assert err == "[engineer/build] working ($0.0000)\n"
+
+
+def test_progress_printer_includes_detail_when_present(capsys):
+    # issue #152 AC1: event.detail is surfaced in the default progress stream
+    # (previously only visible via the full -v event log), e.g. the redacted
+    # reason behind "Visual critique failed; skipping".
+    import dev_team.cli as cli_module
+    from dev_team.budget import Budget
+    from dev_team.events import AgentEvent
+
+    budget = Budget()
+    printer = cli_module._progress_printer(budget)
+    printer(
+        AgentEvent(
+            role="workflow",
+            stage="visual",
+            message="Visual critique failed; skipping",
+            detail="RuntimeError: connection reset",
+        )
+    )
+    err = capsys.readouterr().err
+    assert err == (
+        "[workflow/visual] Visual critique failed; skipping "
+        "(RuntimeError: connection reset) ($0.0000)\n"
+    )
+
+
 def test_main_failure_exit_code(capsys):
     responses = [json_response(plan_dict(1)), json_response(design_dict())]
     for _ in range(2):

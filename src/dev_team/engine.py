@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import os
 from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -685,6 +686,34 @@ def _render_visual_findings(report: VisualReport) -> str:
         issue = defuse(finding.issue, "visual-findings")
         lines.append(f"- [{finding.severity.value}] {route}: {issue}")
     return "\n".join(lines)
+
+
+# The Anthropic credential env vars the orchestrator's own SDK calls (including
+# AnthropicVisualReviewer) authenticate with. A subset of execution.SECRET_ENV_KEYS:
+# GITHUB_TOKEN/GH_TOKEN can't appear in an Anthropic SDK exception, so they're
+# left out rather than scrubbed for no reason.
+_ANTHROPIC_CREDENTIAL_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
+
+def _scrub_anthropic_credentials(text: str) -> str:
+    """Redact any live Anthropic credential value out of ``text``.
+
+    Mirrors :func:`dev_team.sources.scrub_credentials`'s by-known-value
+    approach (redact the process's actual credential, not a generic
+    secret-pattern guess) so an SDK exception surfaced via ``event.detail``
+    (now printed by the default progress stream) can never leak the bearer
+    credential it was raised while using.
+    """
+
+    for key in _ANTHROPIC_CREDENTIAL_ENV_KEYS:
+        value = os.environ.get(key)
+        if value:
+            text = text.replace(value, "***")
+    return text
 
 
 def _branch_slug(title: str) -> str:
@@ -1700,7 +1729,11 @@ class DeliveryEngine:
         except BudgetExceededError:
             raise  # let _specialist record the exhaustion; it never crashes the run
         except Exception as exc:  # noqa: BLE001 - a model/transport failure degrades, never crashes
-            self._event("visual", "Visual critique failed; skipping", detail=str(exc))
+            self._event(
+                "visual",
+                "Visual critique failed; skipping",
+                detail=_scrub_anthropic_credentials(str(exc)),
+            )
             return None
         self._event(
             "visual",
