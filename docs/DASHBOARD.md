@@ -29,7 +29,7 @@ workspace on every request.
 | **Verdict calibration** — per-phase and overall confirmed/refuted/needs-context counts and confirm rate | `audit/<id>/verifications.jsonl` (same aggregate as `GET /calibration`) |
 | **Spend** — total spend and a per-mode breakdown, fetched on demand | the dispatch service's `GET /costs` (proxied, see *Spend* below) |
 | **Access log** — recent dispatch HTTP requests (method/path/status), fetched on demand | the dispatch service's `GET /access-log` (proxied, see *Access log* below) |
-| **Reports** — every `audit/*.md`, viewable in place | the workspace tree |
+| **Reports** — every `audit/*.md`, viewable in place, with blind-spot/broken-citation count chips (see *Report quality chips* below) | the workspace tree |
 
 Runs, Reports, and the Kanban board all exclude **archived** jobs by
 default (see *Archived jobs* below) — a "show archived" toggle above the
@@ -137,6 +137,27 @@ it works even when the dashboard is running standalone. It respects the
 same archived-job exclusion and "show archived" toggle as the rest of the
 page, and renders a muted empty state until the first verification is
 recorded.
+
+### Report quality chips
+
+Each row in the **Reports** panel additionally shows up to two chips, read
+straight from the mirrored `audit/<id>/assessment.json` next to the report
+itself (no dispatch call, same in-process pattern as calibration above):
+a muted **"N blind spots"** chip when the audit's `blind_spots` list is
+non-empty (top-level directories no phase finding ever cited), and a
+critical **"N broken citations"** chip when `broken_citations` totals
+above zero across phases (a citation naming a file path not actually
+present in the repo). The two chips are independent — a report can show
+either, both, or neither depending on its own counts — and a clean audit's
+row renders with no chips at all, same as today.
+
+Opening a report also prepends a small **"Audit quality"** block above the
+rendered markdown, listing each blind-spot directory and each broken
+citation verbatim. `broken_citations` values are a finding's own claimed
+evidence string a *model* wrote, not a deterministic path like
+`blind_spots`, so both are escaped through `esc()` before touching
+`innerHTML` — the same precedent the Access log panel's `path` field
+already established for caller/model-influenced text.
 
 ### Spend
 

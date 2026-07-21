@@ -419,6 +419,20 @@ sections below are reconstructed from the repository history.
   reaches the browser. Without `--dispatch-url`/`DEV_TEAM_DISPATCH_TOKEN`
   configured both answer `501` and the panel renders nothing, matching
   Spend/Calibration's degrade-gracefully contract.
+- **Report quality chips** (`docs/DASHBOARD.md`): the Reports panel now
+  surfaces each audit's already-computed `blind_spots`/`broken_citations`
+  counts (`assessment.py`) as chips, instead of leaving them buried in
+  report prose — a new `_report_meta_state` reads `audit/<id>/
+  assessment.json` in-process (same "no dispatch proxy" pattern as
+  calibration) and folds an additive `report_meta` key into
+  `collect_state`/`GET /api/state`, no new HTTP route or write. Each
+  metric's chip renders independently (a report can have one signal
+  without the other); a missing or malformed `assessment.json` omits the
+  job from the map rather than fabricating a misleading "0". The report
+  modal also prepends an "Audit quality" block listing each blind spot and
+  broken citation verbatim — `broken_citations` values are a model's own
+  claimed evidence string, so both fields go through `esc()` before
+  `innerHTML`, same as the Access log panel's precedent.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /

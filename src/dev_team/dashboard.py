@@ -263,6 +263,52 @@ def _calibration_state(workspace: Workspace, *, include_archived: bool = False) 
     return {**calibration_summary(entries), "jobs_counted": jobs_counted}
 
 
+def _report_meta_state(workspace: Workspace) -> Dict[str, Dict]:
+    """Per-report blind-spot / broken-citation metadata, keyed by job id.
+
+    Reads ``audit/<job_id>/assessment.json`` straight off the shared
+    workspace tree — the same "no dispatch proxy needed" pattern
+    :func:`_calibration_state` already uses. A job id is present in the
+    returned map only when its ``assessment.json`` exists, parses, and has
+    the expected shapes; anything else (missing file, malformed JSON,
+    wrong-typed fields) omits that job id entirely rather than fabricating
+    a misleading ``0`` that could read as "clean". Each entry carries both
+    the ``*_count`` fields the Reports panel's chips need and the raw
+    ``blind_spots``/``broken_citations`` values the report modal's "Audit
+    quality" detail block renders — riding the same already-fetched
+    ``/api/state`` payload rather than a second request.
+    """
+
+    meta: Dict[str, Dict] = {}
+    job_ids = {
+        job_id
+        for job_id in (_report_job_id(path) for path in _report_paths(workspace))
+        if job_id is not None
+    }
+    for job_id in job_ids:
+        try:
+            data = json.loads(workspace.read_text(f"audit/{job_id}/assessment.json"))
+        except (OSError, ValueError, WorkspaceError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        blind_spots = data.get("blind_spots")
+        broken_citations = data.get("broken_citations")
+        if not isinstance(blind_spots, list):
+            continue
+        if not isinstance(broken_citations, dict) or not all(
+            isinstance(v, list) for v in broken_citations.values()
+        ):
+            continue
+        meta[job_id] = {
+            "blind_spot_count": len(blind_spots),
+            "broken_citation_count": sum(len(v) for v in broken_citations.values()),
+            "blind_spots": blind_spots,
+            "broken_citations": broken_citations,
+        }
+    return meta
+
+
 def collect_state(
     workspace: Workspace,
     *,
@@ -299,6 +345,7 @@ def collect_state(
         "conventions": _conventions_state(workspace),
         "calibration": _calibration_state(workspace, include_archived=include_archived),
         "reports": reports,
+        "report_meta": _report_meta_state(workspace),
         "archived_jobs": sorted(archived),
         "include_archived": include_archived,
     }
@@ -1172,6 +1219,11 @@ details[open] summary .preview { display: none; }
 .modal-head button:hover { color: var(--ink); border-color: var(--ink-3); }
 .modal-body { overflow-y: auto; padding: 16px 20px 24px; }
 
+.audit-quality { font-size: 13px; color: var(--ink-2); border: 1px solid var(--line);
+                 border-radius: 8px; padding: 8px 12px; margin-bottom: 16px; }
+.audit-quality h4 { margin: 0 0 6px; color: var(--ink); font-size: 13px; }
+.audit-quality ul { margin: 0; padding-left: 20px; }
+
 .md { font-size: 14px; color: var(--ink-2); }
 .md h1, .md h2, .md h3, .md h4 { color: var(--ink); margin: 18px 0 8px;
                                  text-transform: none; letter-spacing: 0; }
@@ -1861,28 +1913,58 @@ function reportJobId(path) {
   return null;
 }
 
+// Blind-spot / broken-citation chips, independently: a report can have one
+// signal without the other, so each chip's visibility is its own condition
+// rather than a single paired on/off toggle.
+function reportMetaChips(meta) {
+  if (!meta) return "";
+  const parts = [];
+  if (meta.blind_spot_count > 0) parts.push(chip(meta.blind_spot_count + " blind spots", "idle"));
+  if (meta.broken_citation_count > 0) parts.push(chip(meta.broken_citation_count + " broken citations", "blocked"));
+  return parts.length ? " " + parts.join(" ") : "";
+}
+
 function reports(s) {
   if (!s.reports.length) { put($("reports"), '<span class="muted">no assessment reports</span>'); return; }
   const archivedSet = new Set(s.archived_jobs || []);
+  const reportMeta = s.report_meta || {};
   put($("reports"), s.reports.map(p => {
     const jobId = reportJobId(p);
     const isArchived = jobId && archivedSet.has(jobId);
+    const metaChips = reportMetaChips(jobId ? reportMeta[jobId] : null);
     return `<div class="report-row">
-      <button class="report" data-path="${esc(p)}" title="open ${esc(p)}">${esc(p)}${isArchived ? " " + chip("archived", "archived") : ""}</button>
+      <button class="report" data-path="${esc(p)}" title="open ${esc(p)}">${esc(p)}${isArchived ? " " + chip("archived", "archived") : ""}${metaChips}</button>
       ${jobId ? archiveButton(jobId, isArchived) : ""}
     </div>`;
   }).join(""));
 }
 
 // ---- report modal ----
+// SECURITY: blind_spots is a deterministic list of directory paths, but
+// broken_citations values are a finding's own claimed evidence string — a
+// model wrote it, so it is untrusted exactly like any other repo-influenced
+// text. Both go through esc() before touching innerHTML, no exception.
+function auditQualityBlock(meta) {
+  if (!meta || (!meta.blind_spot_count && !meta.broken_citation_count)) return "";
+  const items = [];
+  for (const dir of meta.blind_spots || []) items.push(`<li>blind spot: ${esc(dir)}</li>`);
+  for (const [phase, citations] of Object.entries(meta.broken_citations || {})) {
+    for (const citation of citations) items.push(`<li>broken citation (${esc(phase)}): ${esc(citation)}</li>`);
+  }
+  if (!items.length) return "";
+  return `<div class="audit-quality"><h4>Audit quality</h4><ul>${items.join("")}</ul></div>`;
+}
+
 function openModal(path) {
   $("modal-title").textContent = path;
   $("modal-body").innerHTML = '<p class="muted">loading\\u2026</p>';
   $("overlay").hidden = false;
   $("modal-close").focus();
+  const jobId = reportJobId(path);
+  const meta = jobId && state ? state.report_meta[jobId] : null;
   fetch("/api/report?path=" + encodeURIComponent(path))
     .then(res => { if (!res.ok) throw new Error(String(res.status)); return res.text(); })
-    .then(text => { $("modal-body").innerHTML = renderMarkdown(text); })
+    .then(text => { $("modal-body").innerHTML = auditQualityBlock(meta) + renderMarkdown(text); })
     .catch(() => { $("modal-body").innerHTML = '<p class="muted">failed to load report</p>'; });
 }
 
