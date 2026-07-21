@@ -286,6 +286,19 @@ case-insensitive substring of the claim text (first match wins). Each
 enumerated finding carries a short content hash of its claim so callers can
 detect a claim drifting between enumeration and verification.
 
+**`--verify-expected-hash HASH`** (CLI) / **`expected_hash`** (dispatch's
+verify SUBMIT body) puts that hash to use: pass the hash a caller saw
+against the finding it means to re-check, and the mismatch is caught
+*before* the (budget-spending) agent ever runs — either because
+`.dev_team/assessment.json` was re-run in between (a fresh single-slot
+overwrite, no versioning) and a different finding now sits at that id, or
+because `--finding`'s substring match landed on a different finding than
+the one the caller read. Omitting it is a no-op — byte-identical to
+today's behaviour. On mismatch the CLI raises the same "no matching
+finding" error class (exit code `2`); dispatch rejects the SUBMIT with the
+same `404 finding not found` a genuinely-missing finding gets, and the job
+never reaches the queue.
+
 **Scope: LLM phases only.** Only the model-authored claim lists are
 re-verifiable. The deterministic outputs (`dead_code`, `dependency_scan`)
 are exact program results, not claims — re-checking them with a model would
@@ -295,8 +308,8 @@ Unlike `--make-backlog`, `--verify` **runs an agent**, so it needs Claude
 credentials and accepts `--budget-usd`. It is standalone (not combined with
 other modes) and requires `--finding`. Exit codes: `0` a verdict was
 produced (`refuted` is a *successful* verification), `1` the verifier
-itself failed (budget, unusable response), `2` no persisted assessment or
-no matching finding.
+itself failed (budget, unusable response), `2` no persisted assessment, no
+matching finding, or a `--verify-expected-hash` mismatch.
 
 **`--skip-broken-citations`** short-circuits the agent call entirely — $0 —
 when the finding's cited evidence is already known, at $0, to not resolve

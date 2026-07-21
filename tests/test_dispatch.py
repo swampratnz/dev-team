@@ -3568,6 +3568,54 @@ def test_build_spec_verify_resolves_repo_and_finding_from_disk():
     assert exact.budget_usd is None
 
 
+# --- verify SUBMIT: expected_hash --------------------------------------------------
+
+
+def test_build_spec_verify_expected_hash_must_be_a_string():
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    with pytest.raises(ValidationError):
+        disp.build_spec(
+            {"mode": "verify", "source_job": "assess-old",
+             "finding_id": "recommendation.plan[0]", "expected_hash": 12345}
+        )
+
+
+def test_build_spec_verify_expected_hash_matching_is_unchanged_regression():
+    from dev_team.assessment import find_finding
+
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    finding = find_finding(_assessment_payload(), "recommendation.plan[0]")
+    spec = disp.build_spec(
+        {"mode": "verify", "source_job": "assess-old",
+         "finding_id": "recommendation.plan[0]",
+         "expected_hash": finding["hash"]}
+    )
+    assert spec.finding_id == "recommendation.plan[0]"
+    assert spec.finding["claim"] == "Pin build chain"
+
+
+def test_build_spec_verify_expected_hash_mismatch_is_404_queue_never_touched():
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    with pytest.raises(SubmitRejected) as excinfo:
+        disp.build_spec(
+            {"mode": "verify", "source_job": "assess-old",
+             "finding_id": "recommendation.plan[0]",
+             "expected_hash": "0" * 12}
+        )
+    assert excinfo.value.status == 404
+    assert str(excinfo.value) == "finding not found"
+    assert disp._registry == {}  # the job never entered the queue
+
+
+def test_build_spec_verify_expected_hash_omitted_is_unchanged_regression():
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    spec = disp.build_spec(
+        {"mode": "verify", "source_job": "assess-old",
+         "finding_id": "recommendation.plan[0]"}
+    )
+    assert spec.finding_id == "recommendation.plan[0]"
+
+
 def test_run_job_assess_mirrors_meta_json():
     dash = InMemoryWorkspace()
     disp = Dispatcher(

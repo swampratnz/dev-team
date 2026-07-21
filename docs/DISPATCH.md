@@ -536,17 +536,30 @@ malformed data (including assessments persisted before this field existed).
 
 `{"mode":"verify","source_job":<assess job id>,"finding_id":<finding id or
 case-insensitive claim substring>,"budget_usd":number|null,
-"skip_broken_citations":bool|omitted,"votes":int|omitted}` →
+"skip_broken_citations":bool|omitted,"votes":int|omitted,
+"expected_hash":string|omitted}` →
 `202 {"id":"verify-…","state":"queued","position":n}`. The finding is
 resolved synchronously at submit time; unless `skip_broken_citations`
 short-circuits the job (below), it re-clones the repo named by the source
 job's `meta.json`. Errors: `400` (missing/blank `source_job`/`finding_id`,
-`skip_broken_citations` present and not a bool, or `votes` present and not
+`skip_broken_citations` present and not a bool, `votes` present and not
 an integer in `[1, 5]` — a bool, string, float, or out-of-range value is
-rejected, never coerced),
+rejected, never coerced — or `expected_hash` present and not a string),
 `404 {"error":"no assessment for that job"}`,
 `404 {"error":"finding not found"}`,
 `409 {"error":"verify needs a dashboard workspace"}`.
+
+`expected_hash` (omitted by default — byte-identical to today) asserts the
+resolved finding's content `hash` (the same field `GET
+/jobs/{id}/findings` and every verify result already carry) equals the
+given value, checked immediately after resolution and before any clone or
+agent call. A caller who enumerated findings, noted one's `hash`, and later
+submits a verify against a *stale* mirror (re-assessed since) or a
+`finding_id` that resolves — via the claim-substring fallback — to a
+*different* finding than intended gets the same
+`404 {"error":"finding not found"}` a genuinely missing finding gets,
+rather than a real (budget-spending) verification silently running against
+the wrong claim; the job never reaches the queue.
 
 `skip_broken_citations` (default `false`) mirrors `dev-team --verify
 --skip-broken-citations`: when `true` and the resolved finding's

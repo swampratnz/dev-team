@@ -481,6 +481,18 @@ def build_parser() -> argparse.ArgumentParser:
         "substring of its claim text (first match wins).",
     )
     assessment.add_argument(
+        "--verify-expected-hash",
+        default=None,
+        metavar="HASH",
+        help="With --verify: assert the resolved finding's content hash "
+        "equals HASH (the 'hash' field from a prior --assess --json / "
+        "--verify --json read) BEFORE spending an agent call. A mismatch "
+        "means the assessment was re-run since, or --finding's substring "
+        "matched a different claim than intended — refuses to verify "
+        "rather than silently checking the wrong finding. Omit to keep "
+        "today's behaviour (no cross-check).",
+    )
+    assessment.add_argument(
         "--skip-broken-citations",
         action="store_true",
         help="With --verify: if the finding's cited evidence is already "
@@ -904,6 +916,8 @@ def _validate_args(
         parser.error("--finding: only valid with --verify")
     if args.skip_broken_citations and args.verify is None:
         parser.error("--skip-broken-citations: only valid with --verify")
+    if args.verify_expected_hash is not None and args.verify is None:
+        parser.error("--verify-expected-hash: only valid with --verify")
     if args.verify_votes != 1 and args.verify is None:
         parser.error("--verify-votes: only valid with --verify")
     if args.verify_votes < 1:
@@ -1861,8 +1875,9 @@ async def _verify_one(args, runner: AgentRunner) -> int:
 
     Exit code ``0``: a verdict was produced (``refuted`` is a *successful*
     verification); ``1``: the verifier itself failed (budget, unusable
-    response); ``2`` (raised): no persisted assessment or no matching
-    finding.
+    response); ``2`` (raised): no persisted assessment, no matching finding,
+    or (with ``--verify-expected-hash``) the resolved finding's hash doesn't
+    match — checked BEFORE the agent runs, so a mismatch costs nothing.
     """
 
     workspace = LocalWorkspace(args.verify)
@@ -1877,6 +1892,17 @@ async def _verify_one(args, runner: AgentRunner) -> int:
         raise DevTeamError(
             f"no finding matches {args.finding!r}; pass an id like "
             "'risk.secrets[0]' or a substring of the claim text"
+        )
+    if (
+        args.verify_expected_hash is not None
+        and finding["hash"] != args.verify_expected_hash
+    ):
+        raise DevTeamError(
+            f"{finding['id']} hash mismatch: expected "
+            f"{args.verify_expected_hash!r}, got {finding['hash']!r} — the "
+            "assessment may have been re-run, or another finding's claim "
+            "matched your search text; re-fetch the finding list and "
+            "confirm before verifying"
         )
     result = await verify_finding(
         runner,
