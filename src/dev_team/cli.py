@@ -1252,14 +1252,17 @@ def _progress_printer(budget: Budget) -> Listener:
     still show which phase/agent is active and how much it has spent. The
     running cost is read live off the shared budget meter, so it climbs as the
     agents work.
+
+    Renders via ``AgentEvent.__str__`` (``[who/stage] message`` plus a
+    ``(detail)`` suffix when one is present) so ``event.detail`` — e.g. the
+    redacted exception behind "Visual critique failed; skipping" — is no
+    longer invisible in the default stream; previously only the full ``-v``
+    event log surfaced it. An event with no detail renders identically to
+    before this suffix was added.
     """
 
     def printer(event: AgentEvent) -> None:
-        who = f"{event.name} ({event.role})" if event.name else event.role
-        print(
-            f"[{who}/{event.stage}] {event.message} (${budget.spent:.4f})",
-            file=sys.stderr,
-        )
+        print(f"{event} (${budget.spent:.4f})", file=sys.stderr)
 
     return printer
 

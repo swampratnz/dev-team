@@ -759,6 +759,62 @@ def test_visual_review_degrades_when_critique_fails():
     assert any("critique failed" in e.message.lower() for e in events)
 
 
+@pytest.mark.parametrize(
+    "env_key", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]
+)
+def test_visual_review_critique_failure_redacts_live_credential(monkeypatch, env_key):
+    # issue #152 AC2/AC3: a credential value present in the environment is
+    # redacted out of the exception text before it lands in event.detail —
+    # the same by-known-value approach as sources.scrub_credentials, applied
+    # to the Anthropic credentials the orchestrator's own SDK calls use.
+    from dev_team.visualreview import FakeAppServer, FakePageCapturer
+
+    monkeypatch.setenv(env_key, "sk-ant-secret-value")
+
+    class BoomReviewer:
+        async def critique(self, screenshots, rubric):
+            raise RuntimeError("vision model rejected credential sk-ant-secret-value")
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True),
+        app_server=FakeAppServer(),
+        page_capturer=FakePageCapturer(),
+        visual_reviewer=BoomReviewer(),
+        listener=events.append,
+    )
+    assert run(engine._visual_review()) is None
+    visual_events = [e for e in events if "critique failed" in e.message.lower()]
+    assert len(visual_events) == 1
+    assert "sk-ant-secret-value" not in visual_events[0].detail
+    assert "***" in visual_events[0].detail
+
+
+def test_visual_review_critique_failure_detail_untouched_without_a_live_credential():
+    # No ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN/CLAUDE_CODE_OAUTH_TOKEN set ->
+    # nothing to redact, so the exception text passes through unchanged (the
+    # scrub is a no-op, not a generic secret-pattern heuristic).
+    from dev_team.visualreview import FakeAppServer, FakePageCapturer
+
+    class BoomReviewer:
+        async def critique(self, screenshots, rubric):
+            raise RuntimeError("vision model down")
+
+    events = []
+    engine = _engine(
+        ScriptedRunner([]),
+        config=EngineConfig(visual_review=True),
+        app_server=FakeAppServer(),
+        page_capturer=FakePageCapturer(),
+        visual_reviewer=BoomReviewer(),
+        listener=events.append,
+    )
+    assert run(engine._visual_review()) is None
+    visual_events = [e for e in events if "critique failed" in e.message.lower()]
+    assert visual_events[0].detail == "vision model down"
+
+
 def test_visual_review_propagates_budget_exhaustion_from_critique():
     from dev_team.visualreview import FakeAppServer, FakePageCapturer
 

@@ -39,6 +39,24 @@ sections below are reconstructed from the repository history.
   decision document instead of the text proposal.
 
 ### Delivery
+- **A visual-critique failure is now diagnosable instead of a bare "skipping"**
+  (#152, root-cause corrected by adversarial review). The default `--deliver`/
+  `--assess` progress stream (`cli.py`'s `_progress_printer`) now renders
+  `AgentEvent.detail` when present — previously only the full `-v` event log
+  ever surfaced it, so `Visual critique failed; skipping` showed no reason at
+  all in the default stream even though `engine.py` was already capturing the
+  exception into `detail`. This is a general printer fix (every event's
+  detail is now visible), not special-cased to visual review. Because an
+  `anthropic` SDK exception could in principle echo credential material, and
+  `detail` is now operator/log-visible in the default stream, the visual
+  critique's exception text is redacted first
+  (`engine._scrub_anthropic_credentials`) against any live
+  `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`/`CLAUDE_CODE_OAUTH_TOKEN` value —
+  the same by-known-value approach `sources.scrub_credentials` already
+  established for git output, not a generic secret-pattern heuristic. No
+  change to `AnthropicVisualReviewer._make_client()` or credential
+  resolution: the evidence traced the original report to the printer gap, not
+  a client-construction defect.
 - **Project detection now recognises Maven, Gradle, and Composer manifests**
   (#145, the "smarter unknown fallback" ④ deferred by #133/#135): root
   `pom.xml` (`kind="maven"`, `mvn test`), root `build.gradle`/
