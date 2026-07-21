@@ -753,11 +753,15 @@ class Dispatcher:
         finding from ``audit/<source>/assessment.json``.
 
         Raises:
-            ValidationError: missing/blank ``source_job``/``finding_id``
-                (→ 400).
+            ValidationError: missing/blank ``source_job``/``finding_id``, or
+                a non-string ``expected_hash`` (→ 400).
             SubmitRejected: no dashboard workspace to read from (409); the
-                source assessment/meta was never mirrored, or the finding
-                resolves to nothing (404).
+                source assessment/meta was never mirrored, the finding
+                resolves to nothing, or (when ``expected_hash`` is given) the
+                resolved finding's hash doesn't match it — a caller-supplied
+                identity check that fails the same way "not found" does,
+                since either way the finding the caller meant isn't there
+                (404).
         """
 
         source_job = body.get("source_job")
@@ -777,6 +781,9 @@ class Dispatcher:
             raise ValidationError("votes must be an integer")
         if votes < 1 or votes > MAX_VERIFY_VOTES:
             raise ValidationError(f"votes must be between 1 and {MAX_VERIFY_VOTES}")
+        expected_hash = body.get("expected_hash")
+        if expected_hash is not None and not isinstance(expected_hash, str):
+            raise ValidationError("expected_hash must be a string")
         source_job = source_job.strip()
         if self._dashboard_workspace is None:
             raise SubmitRejected(409, "verify needs a dashboard workspace")
@@ -795,6 +802,13 @@ class Dispatcher:
             raise SubmitRejected(404, "no assessment for that job")
         finding = find_finding(data, finding_id.strip())
         if finding is None:
+            raise SubmitRejected(404, "finding not found")
+        if expected_hash is not None and finding["hash"] != expected_hash:
+            # Same 404 bucket as "not found": the caller's original intent
+            # (the specific claim they meant) resolved to nothing, whether
+            # find_finding matched nothing at all or matched a drifted/wrong
+            # claim (see the module docstring's staleness/substring-ambiguity
+            # failure modes).
             raise SubmitRejected(404, "finding not found")
         try:
             meta = json.loads(self._dashboard_workspace.read_text(meta_path))

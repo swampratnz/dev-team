@@ -370,6 +370,27 @@ sections below are reconstructed from the repository history.
   starting many calls at once). Dispatch validation rejects a non-integer
   (including a bool, since `bool` is an `int` subtype in Python) or
   out-of-range `votes` with `400`, never coerced.
+- **Opt-in `--verify-expected-hash` / `expected_hash` guards against
+  verifying the wrong finding** (`docs/ASSESSMENT.md`, `docs/DISPATCH.md`):
+  `list_findings` already mints a short content hash per finding
+  specifically so a caller can detect a claim drifting between enumeration
+  and verification, but nothing read it back — `find_finding` (exact id,
+  else first case-insensitive claim-substring match) was simply trusted.
+  Two silent-misverification paths this closes: a re-run `--assess`
+  overwriting `.dev_team/assessment.json` (no versioning, single path)
+  between a caller noting a finding's hash and later verifying by that id;
+  and two findings sharing claim wording, where a remembered substring
+  silently resolves to the *other* one. A caller who has a hash to assert
+  now gets a fail-secure mismatch check — raised *before* the
+  budget-spending agent call — instead of a real verdict for a claim they
+  never meant to check. Omitting it (the default) is byte-identical to
+  today. CLI: `--verify-expected-hash HASH` (only valid with `--verify`),
+  raising the same "no matching finding" error class on mismatch. Dispatch:
+  optional `expected_hash` string on the verify `POST /jobs` body,
+  rejected with `400` if non-string and `404 {"error":"finding not
+  found"}` on mismatch — the same bucket a genuinely-missing finding gets,
+  since either way the finding the caller meant isn't there; the job never
+  reaches the queue.
 
 ### Dashboard
 - **`dev-team --dashboard` serves a local web dashboard over the

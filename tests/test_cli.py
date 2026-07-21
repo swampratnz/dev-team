@@ -1856,6 +1856,127 @@ def test_main_verify_unmatched_finding_exits_2(tmp_path, capsys):
     assert "risk.secrets[0]" in captured.err  # the error teaches the id shape
 
 
+# --- --verify-expected-hash --------------------------------------------------------
+
+
+def _persisted_assessment_with_two_similar_secrets(tmp_path):
+    """Two risk.secrets findings sharing a claim substring ('hardcoded
+    secret in ...') — the fixture proving the substring-ambiguity failure
+    mode --verify-expected-hash is meant to close (see #149)."""
+
+    ws = tmp_path / "repo"
+    (ws / ".dev_team").mkdir(parents=True)
+    payload = {
+        "classification": "dependency-surgery",
+        "phases": {
+            "risk": {
+                "role": "security-engineer",
+                "ok": True,
+                "error": None,
+                "data": {
+                    "secrets": [
+                        {"claim": "hardcoded secret in config"},
+                        {"claim": "hardcoded secret in test fixture"},
+                    ]
+                },
+            }
+        },
+        "dead_code": {"findings": []},
+        "dependency_scan": {"vulnerabilities": []},
+    }
+    (ws / ".dev_team" / "assessment.json").write_text(json.dumps(payload))
+    return ws
+
+
+def test_main_verify_expected_hash_matches_runs_normally(tmp_path, capsys):
+    from dev_team.assessment import find_finding
+
+    ws = _persisted_assessment(tmp_path)
+    data = json.loads((ws / ".dev_team" / "assessment.json").read_text())
+    finding_hash = find_finding(data, "recommendation.plan[0]")["hash"]
+    runner = _verify_runner()
+    code = main(
+        [
+            "--verify", str(ws), "--finding", "recommendation.plan[0]",
+            "--verify-expected-hash", finding_hash,
+        ],
+        runner=runner,
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert len(runner.calls) == 1
+    assert "recommendation.plan[0] — confirmed" in out
+
+
+def test_main_verify_expected_hash_mismatch_exits_2_without_running_agent(
+    tmp_path, capsys
+):
+    ws = _persisted_assessment(tmp_path)
+    runner = ScriptedRunner()  # raises if .run() is ever invoked
+    code = main(
+        [
+            "--verify", str(ws), "--finding", "recommendation.plan[0]",
+            "--verify-expected-hash", "0" * 12,
+        ],
+        runner=runner,
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert runner.calls == []  # no budget-spending agent call happened
+    assert "recommendation.plan[0]" in captured.err
+    assert "hash mismatch" in captured.err
+    assert "0" * 12 in captured.err
+
+
+def test_main_verify_expected_hash_omitted_is_byte_identical_to_today(tmp_path):
+    # Regression (acceptance criterion 4): omitting the flag behaves exactly
+    # like test_main_verify_text_output / _json_output_and_claim_substring,
+    # for both an exact-id and a substring resolution.
+    ws = _persisted_assessment(tmp_path)
+    code = main(
+        ["--verify", str(ws), "--finding", "recommendation.plan[0]"],
+        runner=_verify_runner(),
+    )
+    assert code == 0
+    code = main(
+        ["--verify", str(ws), "--finding", "pin BUILD"],
+        runner=_verify_runner(),
+    )
+    assert code == 0
+
+
+def test_main_verify_expected_hash_closes_substring_ambiguity(tmp_path, capsys):
+    # Acceptance criterion 5: two findings share the substring "hardcoded
+    # secret in "; find_finding's first-match-wins would silently resolve
+    # to risk.secrets[0], but asserting risk.secrets[1]'s hash must refuse
+    # rather than verify the wrong (first-matched) finding.
+    from dev_team.assessment import find_finding
+
+    ws = _persisted_assessment_with_two_similar_secrets(tmp_path)
+    data = json.loads((ws / ".dev_team" / "assessment.json").read_text())
+    other_hash = find_finding(data, "risk.secrets[1]")["hash"]
+    runner = ScriptedRunner()  # raises if .run() is ever invoked
+    code = main(
+        [
+            "--verify", str(ws), "--finding", "hardcoded secret in",
+            "--verify-expected-hash", other_hash,
+        ],
+        runner=runner,
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert runner.calls == []
+    assert "risk.secrets[0]" in captured.err  # the first-match id, named in error
+    assert "hash mismatch" in captured.err
+
+
+def test_main_help_documents_verify_expected_hash(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "--verify-expected-hash" in out
+
+
 def test_main_verify_missing_directory_exits_2(tmp_path, capsys):
     # F5: a mistyped --verify path must fail loudly, not silently mkdir an
     # empty workspace and then report a misleading "no assessment" error.
@@ -1877,6 +1998,7 @@ def test_main_verify_flag_validation():
         ["--verify", ".", "--finding", "x", "--make-backlog", "."],
         ["--verify", "."],                       # --finding is required
         ["T", "D", "--finding", "x"],            # --finding needs --verify
+        ["T", "D", "--verify-expected-hash", "abc"],  # needs --verify too
     ):
         with pytest.raises(SystemExit) as excinfo:
             main(argv, runner=ScriptedRunner([]))
