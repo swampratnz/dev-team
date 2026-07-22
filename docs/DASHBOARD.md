@@ -210,6 +210,33 @@ before `innerHTML` — a logged `path` is arbitrary caller-supplied input (an
 external caller can hit `/whatever<script>` and have it logged verbatim, by
 design), so it must always render as inert text.
 
+### Foreman plan
+
+The **Foreman plan** panel (next to Access log) shows the backlog foreman's
+$0 dry-run — the same dependency-ready-stories preview `GET /foreman/plan`
+computes (see [`docs/DISPATCH.md`](DISPATCH.md)): each `todo` story whose
+dependencies are all `done`/`declined`, the repo it resolves to, and (for an
+ineligible story) why not. It answers "what would `/foreman/run` enqueue
+right now" without spending anything or enqueueing anything — `POST
+/foreman/run` itself is **not** wired to the dashboard; that write stays a
+future, separate slice (its own budget/max-stories form and confirm step).
+
+Same proxy shape and the same on-demand-only discipline as Spend/Access log:
+`GET /api/foreman/plan` forwards to the dispatch service's `GET
+/foreman/plan` (`?max_stories=` passed through unchanged, letting the
+dispatch service's own `[1, 10]` clamp handle an out-of-range or non-numeric
+value), fetched **once on page load plus a manual refresh button**, never
+part of the 2.5s `/api/state` poll (a proxied dispatch hop must not
+multiply by open tabs × poll cadence). Without a dispatch URL/token
+configured, `GET /api/foreman/plan` answers `501` and the panel renders a
+muted "not configured" state; a `plan: []` response (nothing ready to
+deliver) renders a muted empty state rather than an empty table. An
+ineligible story (`eligible: false`) shows its `reason` in place of a repo.
+Every rendered field (`story_id`, `title`, `repo`, `reason`) goes through
+`esc()` before `innerHTML` — a story's title can trace to an LLM assessment
+finding per the existing Story-detail provenance model, so it is treated as
+untrusted exactly like every other panel's caller- or model-derived text.
+
 ### Pending questions
 
 An `interactive: true` deliver job (see [`docs/DISPATCH.md`](DISPATCH.md))
@@ -348,6 +375,14 @@ browser ──(dashboard token)──▶ dashboard GET /api/jobs/{id}/question �
 browser ──(dashboard token)──▶ dashboard POST /api/jobs/{id}/answer ──(dispatch token)──▶ dispatch POST /jobs/{id}/answer
 ```
 
+The Foreman plan panel's `GET /api/foreman/plan` (above) is a sixth,
+read-only proxy of the same shape — and, deliberately, `POST /foreman/run`
+is **not** wired to any dashboard route:
+
+```
+browser ──(dashboard token)──▶ dashboard GET /api/foreman/plan ──(dispatch token)──▶ dispatch GET /foreman/plan
+```
+
 - **The proxy** (`--dashboard` with `--dispatch-url`, default
   `http://127.0.0.1:8738`): authorised `POST`/`PATCH`/`DELETE` requests
   under `/api/backlog/` are forwarded — same method, same JSON body — to
@@ -387,6 +422,13 @@ browser ──(dashboard token)──▶ dashboard POST /api/jobs/{id}/answer �
   job action). Scope is **exactly `.../question` and `.../answer`** — a
   path that merely starts with the jobs prefix but doesn't match either
   suffix exactly is the ordinary `404`, never forwarded.
+- Last, `GET /api/foreman/plan`: forwarded to `<dispatch-url>/foreman/plan`
+  (including the dispatch service's own `409` when its dashboard workspace
+  isn't configured), with `?max_stories=` passed through unchanged (the
+  dispatch service itself clamps it to `[1, 10]`), and without a token it
+  answers `501 {"error": "foreman plan not configured"}`. Scope is
+  **exactly `/api/foreman/plan`** — no path parameter, and in particular
+  never `/api/foreman/run`, which stays unreachable through the dashboard.
 - **Auth is layered**: the browser authenticates to the dashboard
   (dashboard token / cookie, checked first); the dashboard process — not
   the browser — holds the dispatch bearer token. Both comparisons are
@@ -443,3 +485,6 @@ the bearer header when a token is set):
 - `GET /api/jobs/{id}/question` / `POST /api/jobs/{id}/answer` — the
   pending-question proxy described above (same auth and `501` gating;
   requires dashboard auth).
+- `GET /api/foreman/plan` — the foreman-plan proxy described above
+  (`?max_stories=` passed through unchanged; same auth and `501` gating;
+  requires dashboard auth). `POST /api/foreman/run` does not exist.

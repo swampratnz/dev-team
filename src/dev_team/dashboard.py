@@ -512,9 +512,11 @@ def _make_handler(
     /api/access-log`` is forwarded to the dispatch service's ``GET
     /access-log`` recent-requests page; ``GET /api/jobs/{id}/question`` and
     ``POST /api/jobs/{id}/answer`` are forwarded to the matching
-    ``/jobs/{id}/question|answer`` interactive deliver routes; with either
-    unset all six stay unavailable and answer ``501``. The dispatch token is
-    only ever sent to ``dispatch_url`` — never logged or reflected.
+    ``/jobs/{id}/question|answer`` interactive deliver routes; ``GET
+    /api/foreman/plan`` is forwarded to the dispatch service's ``GET
+    /foreman/plan`` backlog-foreman dry-run (never ``/foreman/run``); with
+    either unset all seven stay unavailable and answer ``501``. The dispatch
+    token is only ever sent to ``dispatch_url`` — never logged or reflected.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -767,6 +769,8 @@ def _make_handler(
                 self._costs(parts.query)
             elif parts.path == "/api/access-log":
                 self._access_log(parts.query)
+            elif parts.path == "/api/foreman/plan":
+                self._foreman_plan(parts.query)
             elif parts.path.startswith(_JOBS_PROXY_PREFIX):
                 self._question(parts.path)
             else:
@@ -830,6 +834,31 @@ def _make_handler(
             # absent limit forwards no query string at all.
             limit = parse_qs(query).get("limit", [""])[0]
             suffix = f"/access-log?limit={quote(limit, safe='')}" if limit else "/access-log"
+            self._proxy("GET", suffix, None)
+
+        # -- foreman plan: a fifth narrow read-only proxy, same shape as the
+        # spend rollup/access log above. Scope is exactly this one path (see
+        # do_GET's exact-match dispatch above) — in particular, never
+        # /api/foreman/run, which stays unreachable through the dashboard.
+
+        def _foreman_plan(self, query: str) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "foreman plan not configured"}),
+                )
+                return
+            # ?max_stories= is forwarded unchanged (the dispatch service
+            # itself clamps it to [1, 10]) — an absent value forwards no
+            # query string at all, same "forward as-is" contract as
+            # ?limit= above.
+            max_stories = parse_qs(query).get("max_stories", [""])[0]
+            suffix = (
+                f"/foreman/plan?max_stories={quote(max_stories, safe='')}"
+                if max_stories
+                else "/foreman/plan"
+            )
             self._proxy("GET", suffix, None)
 
         # -- pending question: a narrow read-only proxy, same shape as the
@@ -1361,6 +1390,11 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
       <button id="access-log-refresh" class="ghost">refresh</button>
     </div>
     <div class="panel" id="access-log"><span class="muted">loading&hellip;</span></div>
+    <div class="section-head">
+      <h2>Foreman plan</h2>
+      <button id="foreman-plan-refresh" class="ghost">refresh</button>
+    </div>
+    <div class="panel" id="foreman-plan"><span class="muted">loading&hellip;</span></div>
     <h2>Reports</h2>
     <div class="panel" id="reports"><span class="muted">no assessment reports</span></div>
   </div>
@@ -1921,6 +1955,45 @@ async function loadAccessLog() {
     put($("access-log"), accessLogPanel(await res.json()));
   } catch (err) {
     put($("access-log"), '<span class="muted">failed to load access log</span>');
+  }
+}
+
+// The Foreman plan panel: the backlog foreman's dry-run from GET
+// /api/foreman/plan (never /api/foreman/run — that write stays unwired).
+// Same on-demand-only discipline as Spend/Access log above (fetched once on
+// load plus manual refresh only, never the setInterval poll) for the same
+// reason: a proxied dispatch hop must not multiply by open tabs x poll
+// cadence. SECURITY: story_id/title/repo/reason can originate from an LLM
+// assessment finding (see the Story-detail provenance model) — esc() before
+// innerHTML, same discipline as every other panel.
+function foremanPlanRow(entry) {
+  const target = entry.eligible
+    ? `<td>${esc(entry.repo)}</td>`
+    : `<td class="muted">${esc(entry.reason)}</td>`;
+  return `<tr><td>${esc(entry.story_id)}</td><td>${esc(entry.title)}</td>${target}</tr>`;
+}
+
+function foremanPlanPanel(data) {
+  const plan = data.plan || [];
+  const summary = `<div class="muted" style="margin-bottom:6px">${esc(data.ready_total)}`
+    + ` ready, showing up to ${esc(data.max_stories)}</div>`;
+  if (!plan.length) return summary + '<span class="muted">nothing ready to deliver</span>';
+  const rows = plan.map(foremanPlanRow).join("");
+  return summary + `<table class="cal-table"><thead><tr><th>story</th><th>title</th>`
+    + `<th>repo / reason</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function loadForemanPlan() {
+  try {
+    const res = await fetch("/api/foreman/plan");
+    if (res.status === 501) {
+      put($("foreman-plan"), '<span class="muted">foreman plan not configured</span>');
+      return;
+    }
+    if (!res.ok) throw new Error(String(res.status));
+    put($("foreman-plan"), foremanPlanPanel(await res.json()));
+  } catch (err) {
+    put($("foreman-plan"), '<span class="muted">failed to load foreman plan</span>');
   }
 }
 
@@ -2490,6 +2563,7 @@ $("story-close").addEventListener("click", closeStory);
 $("story-overlay").addEventListener("click", e => { if (e.target === $("story-overlay")) closeStory(); });
 $("spend-refresh").addEventListener("click", loadSpend);
 $("access-log-refresh").addEventListener("click", loadAccessLog);
+$("foreman-plan-refresh").addEventListener("click", loadForemanPlan);
 document.addEventListener("keydown", e => { if (e.key === "Escape") { closeModal(); closeAgent(); closeStory(); } });
 
 // ---- poll loop ----
@@ -2528,6 +2602,7 @@ refresh();
 setInterval(refresh, 2500);
 loadSpend();
 loadAccessLog();
+loadForemanPlan();
 pollQuestions();
 setInterval(pollQuestions, 5000);
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") pollQuestions(); });

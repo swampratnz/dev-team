@@ -549,6 +549,20 @@ sections below are reconstructed from the repository history.
   one-line summary above the verdict table whenever either total is
   non-zero, even with zero verifications recorded; renders nothing when
   both are zero. No new route, no new write path.
+- **Foreman plan panel** (`docs/DASHBOARD.md`): a new `GET /api/foreman/plan`
+  route proxies the dispatch service's `GET /foreman/plan` backlog-foreman
+  dry-run (see the Orchestration entry above) — the fifth read-only proxy of
+  this shape, closing the one gap where a shipped aggregate dispatch route
+  had no dashboard panel. Renders ready-story count and one row per
+  candidate story (repo, or its ineligibility reason) next to Access log,
+  fetched once on page load and on manual refresh only — kept out of the
+  2.5s `/api/state` poll for the same load-multiplication reason Spend/Access
+  log are. `?max_stories=` is forwarded unchanged, letting the dispatch
+  service's own `[1, 10]` clamp handle it; without a dispatch token wired it
+  answers `501 {"error": "foreman plan not configured"}` and the panel shows
+  a muted "not configured" state. `POST /foreman/run` remains deliberately
+  unwired — a spend-multiplying write that needs its own budget/confirm-step
+  design, not bundled into this read-only visibility slice.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /
