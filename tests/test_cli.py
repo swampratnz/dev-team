@@ -2889,7 +2889,7 @@ def test_main_dashboard_serves_workspace(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("DEV_TEAM_DASHBOARD_TOKEN", raising=False)
     code = main(
         ["--dashboard", "--workspace", str(tmp_path), "--port", "9000",
-         "--host", "0.0.0.0"],
+         "--host", "0.0.0.0", "--allow-unauthenticated-dashboard"],
         runner=ScriptedRunner([]),
     )
     assert code == 0
@@ -2936,9 +2936,11 @@ def test_main_dashboard_token_env_is_wired(tmp_path, monkeypatch, capsys):
     assert "dash-tok" not in err  # the token itself is never printed
 
 
-def test_main_dashboard_warns_on_nonlocal_bind_without_token(
+def test_main_dashboard_fails_closed_on_nonlocal_bind_without_token(
     tmp_path, monkeypatch, capsys
 ):
+    # Fail-closed default (CLAUDE.md sec. 4): an unauthenticated non-loopback
+    # bind is refused, not just warned about — no server is ever constructed.
     monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
     _FakeDashboardServer.instances.clear()
     monkeypatch.delenv("DEV_TEAM_DASHBOARD_TOKEN", raising=False)
@@ -2946,12 +2948,56 @@ def test_main_dashboard_warns_on_nonlocal_bind_without_token(
         ["--dashboard", "--workspace", str(tmp_path), "--host", "0.0.0.0"],
         runner=None,
     )
-    assert code == 0  # a nudge, not a hard failure (back-compat)
+    assert code == 2
+    assert _FakeDashboardServer.instances == []  # raised before any bind attempt
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert "DEV_TEAM_DASHBOARD_TOKEN" in err
+    assert "--allow-unauthenticated-dashboard" in err
+    # the token is empty/absent by construction; the error text must not
+    # somehow carry a token value (there is none — the substring "tok" only
+    # ever appears inside the env-var name itself)
+    assert "tok=" not in err and "token=" not in err.lower()
+
+
+def test_main_dashboard_allow_unauthenticated_flag_opts_back_in(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    monkeypatch.delenv("DEV_TEAM_DASHBOARD_TOKEN", raising=False)
+    code = main(
+        ["--dashboard", "--workspace", str(tmp_path), "--host", "0.0.0.0",
+         "--allow-unauthenticated-dashboard"],
+        runner=None,
+    )
+    assert code == 0
     (server,) = _FakeDashboardServer.instances
     assert server.token is None
     err = capsys.readouterr().err
     assert "UNAUTHENTICATED" in err
     assert "DEV_TEAM_DASHBOARD_TOKEN" in err
+
+
+def test_main_dashboard_allow_unauthenticated_flag_is_noop_with_token(
+    tmp_path, monkeypatch, capsys
+):
+    # A token set makes --allow-unauthenticated-dashboard a harmless no-op:
+    # no error, no warning, regardless of the flag.
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DASHBOARD_TOKEN", "dash-tok")
+    code = main(
+        ["--dashboard", "--workspace", str(tmp_path), "--host", "0.0.0.0",
+         "--allow-unauthenticated-dashboard"],
+        runner=None,
+    )
+    assert code == 0
+    (server,) = _FakeDashboardServer.instances
+    assert server.token == "dash-tok"
+    err = capsys.readouterr().err
+    assert "UNAUTHENTICATED" not in err
+    assert "dash-tok" not in err
 
 
 def test_main_dashboard_local_bind_without_token_is_quiet(
@@ -3009,6 +3055,8 @@ def test_main_dashboard_flag_validation():
         ["T", "D", "--host", "0.0.0.0"],
         ["T", "D", "--dispatch-url", "http://127.0.0.1:8738"],
         ["--dispatch", "--dispatch-url", "http://127.0.0.1:8738"],
+        ["T", "D", "--allow-unauthenticated-dashboard"],
+        ["--dispatch", "--allow-unauthenticated-dashboard"],
     ):
         with pytest.raises(SystemExit) as excinfo:
             main(argv, runner=ScriptedRunner([]))

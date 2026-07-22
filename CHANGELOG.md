@@ -179,6 +179,20 @@ sections below are reconstructed from the repository history.
   scanner output, planner prior-context and replan evidence, architect
   repo-context, retrospector evidence, assessment repo-context and
   finding-claim) are covered.
+- **The dashboard now fails closed on an unauthenticated non-loopback bind**
+  (issue #169), closing the exact gap `docs/SECURITY.md` named under "What
+  this does NOT protect against": binding `--dashboard` beyond
+  `127.0.0.1`/`localhost` with no `DEV_TEAM_DASHBOARD_TOKEN` set used to only
+  print a stderr warning and start the server anyway. `_serve_dashboard` now
+  raises `DevTeamError` in that case instead — the server is never
+  constructed, matching `--dispatch`'s existing hard-fail-on-missing-token
+  posture — surfacing via `main()` as exit code 2 with a message naming both
+  remediations. The new `--allow-unauthenticated-dashboard` flag (only valid
+  with `--dashboard`) opts back into the old warn-and-serve behavior for an
+  operator who has already secured the network another way. The loopback
+  case, and the loopback-with-transcripts warning, are unchanged — this is
+  scoped strictly to the one branch SECURITY.md flagged as unhardened.
+  `docs/SECURITY.md` and `docs/DASHBOARD.md` are updated to match.
 
 ### Self-improvement pipeline
 - **A supervised multi-loop development pipeline now extends this repo
