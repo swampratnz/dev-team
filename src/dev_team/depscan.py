@@ -4,9 +4,9 @@ The risk phase's CVE claims otherwise come from model knowledge — plausible,
 stale, and unverifiable. This module is the deterministic counterpart: exact
 pins are parsed straight out of the manifests (NuGet ``packages.config``,
 ``package.json``, ``requirements.txt``, PEP 621 ``pyproject.toml``,
-``Cargo.toml``) *and* the lockfiles
+``Cargo.toml``, Go ``go.mod``) *and* the lockfiles
 (``package-lock.json``, ``poetry.lock``, ``Cargo.lock``, NuGet
-``packages.lock.json``) and checked against
+``packages.lock.json``, Ruby ``Gemfile.lock``) and checked against
 the OSV.dev batch API, which covers every major
 ecosystem through one endpoint. Lockfiles matter on range-specified projects:
 a ``package.json`` full of ``^`` ranges yields nothing scannable, but its
@@ -437,6 +437,62 @@ def parse_packages_lock_json(text: str, manifest: str) -> List[Dependency]:
     return deps
 
 
+def parse_go_mod(text: str, manifest: str) -> List[Dependency]:
+    """Go ``go.mod``: every ``require`` entry is already an exact pin.
+
+    Go's module resolution (MVS) has no version-range syntax — a ``require``
+    line always names one concrete version — so, uniquely among this
+    module's ecosystems, no separate lockfile is needed for an exact pin.
+    """
+
+    deps = []
+    in_block = False
+    for raw_line in text.splitlines():
+        line = raw_line.split("//", 1)[0].strip()  # drop "// indirect" etc.
+        if not line:
+            continue
+        if line == "require (":
+            in_block = True
+            continue
+        if in_block:
+            if line == ")":
+                in_block = False
+                continue
+            parts = line.split()
+        elif line.startswith("require "):
+            parts = line[len("require "):].split()
+        else:
+            continue
+        if len(parts) >= 2 and parts[1].startswith("v"):
+            deps.append(Dependency(parts[0], parts[1], "Go", manifest))
+    return deps
+
+
+def parse_gemfile_lock(text: str, manifest: str) -> List[Dependency]:
+    """Ruby ``Gemfile.lock``: top-level ``GEM``/``specs:`` entries are exact
+    resolved pins; deeper-indented lines are a gem's own dependency
+    *constraints* on its neighbours, not pins, and are skipped.
+    """
+
+    deps = []
+    in_specs = False
+    for raw_line in text.splitlines():
+        if not raw_line.startswith(" "):
+            in_specs = raw_line.strip() == "GEM"
+            continue
+        if not in_specs or raw_line.strip() == "specs:":
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        stripped = raw_line.strip()
+        if indent != 4 or "(" not in stripped or not stripped.endswith(")"):
+            continue
+        name, _, rest = stripped.partition(" (")
+        version = rest[:-1]
+        if name and version:
+            deps.append(Dependency(name, version, "RubyGems", manifest))
+    return deps
+
+
 _PARSERS = {
     "packages.config": parse_packages_config,
     "package.json": parse_package_json,
@@ -447,6 +503,8 @@ _PARSERS = {
     "poetry.lock": parse_poetry_lock,
     "Cargo.lock": parse_cargo_lock,
     "packages.lock.json": parse_packages_lock_json,
+    "go.mod": parse_go_mod,
+    "Gemfile.lock": parse_gemfile_lock,
 }
 
 

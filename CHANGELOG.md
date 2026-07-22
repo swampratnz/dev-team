@@ -6,6 +6,17 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Assessment
+- **Dependency scan now covers Go (`go.mod`) and Ruby (`Gemfile.lock`)**
+  (`depscan.py`), closing the "verified EOL, model-knowledge CVE" asymmetry
+  #117 left open on these two ecosystems. `parse_go_mod` reads every
+  top-level and `require (...)` block entry — Go's module resolution has no
+  version-range syntax, so a `require` line is always an exact pin and no
+  lockfile is needed; `parse_gemfile_lock` reads `GEM`/`specs:` top-level
+  (4-space indented) entries as exact resolved pins, skipping deeper-indented
+  dependency-constraint lines. Both register in `_PARSERS` and feed the
+  existing `collect_dependencies`/`scan_dependencies`/OSV batch pipeline
+  unchanged — no new credential, endpoint, or config. `docs/ASSESSMENT.md`'s
+  honest-limitations note is updated accordingly.
 - **Dependency scan now parses PEP 735 `[dependency-groups]`** (`depscan.py`),
   completing the growth path #125 named for itself. `parse_pyproject_toml`
   reads the top-level `[dependency-groups]` table alongside the existing
