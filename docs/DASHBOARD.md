@@ -138,6 +138,15 @@ same archived-job exclusion and "show archived" toggle as the rest of the
 page, and renders a muted empty state until the first verification is
 recorded.
 
+Above the verdict table, a one-line summary folds in the same blind-spot
+and broken-citation totals `GET /calibration` now returns (see
+[`docs/DISPATCH.md`](DISPATCH.md)): e.g. *"5 blind spots · 2 broken
+citations across 2 audits"*. This line renders whenever either total is
+non-zero — including when there are zero verifications recorded yet, so a
+fresh assessment's report-quality signals are never hidden behind the
+verdict table's own empty state — and renders nothing when both totals are
+zero, keeping a clean run's panel uncluttered.
+
 ### Report quality chips
 
 Each row in the **Reports** panel additionally shows up to two chips, read

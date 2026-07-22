@@ -523,6 +523,21 @@ sections below are reconstructed from the repository history.
   broken citation verbatim — `broken_citations` values are a model's own
   claimed evidence string, so both fields go through `esc()` before
   `innerHTML`, same as the Access log panel's precedent.
+- **`GET /calibration` and the Verdict calibration panel fold in
+  report-quality totals**, completing the "Natural follow-ups" aggregate
+  the Report quality chips (above) explicitly deferred: `blind_spot_total`,
+  `broken_citation_total`, and `report_quality_jobs_counted` are summed
+  across every non-archived job's `audit/<id>/assessment.json`, kept
+  separate from the existing `jobs_counted` (a freshly-assessed job may
+  have zero verifications yet, and a `deliver` job has neither file). A job
+  with no `assessment.json`, malformed JSON, or wrong-typed
+  `blind_spots`/`broken_citations` contributes `0` and is excluded from
+  `report_quality_jobs_counted`, never fabricating a misleading "0" —
+  `dashboard.py`'s `_calibration_state` gains the identical fields so the
+  API and its in-process dashboard mirror never drift. The panel renders a
+  one-line summary above the verdict table whenever either total is
+  non-zero, even with zero verifications recorded; renders nothing when
+  both are zero. No new route, no new write path.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /
