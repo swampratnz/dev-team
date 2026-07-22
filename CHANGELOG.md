@@ -563,6 +563,22 @@ sections below are reconstructed from the repository history.
   a muted "not configured" state. `POST /foreman/run` remains deliberately
   unwired — a spend-multiplying write that needs its own budget/confirm-step
   design, not bundled into this read-only visibility slice.
+- **Score history panel** (`docs/DASHBOARD.md`): the dashboard now surfaces
+  ROADMAP #6's `dev_team.scores.ScoreHistory` trail, wiring the last
+  mechanism it built ("are deliveries getting better over time") into the
+  operator dashboard for the first time — previously only visible via a
+  shell on the box. A new `_score_history_state` reads
+  `.dev_team/score-history.json` in-process (same pattern as
+  Memory/Conventions/Calibration, no dispatch proxy) and folds an additive
+  `score_history` key into `collect_state`/`GET /api/state`; no new HTTP
+  route, and only `ScoreHistory.load()` is ever called, never `.record()`,
+  so the dashboard cannot create or mutate score-history entries. Renders
+  the last 8 runs, newest first, next to Verdict calibration in the Memory
+  & conventions panel — each with its success/failure, task count, attempt
+  count, cost, and a signed delta against the run before it in the trail.
+  `feature` is the one caller-influenced field (the delivered feature's
+  free-text name), rendered through `esc()` before `innerHTML` like every
+  other panel; a workspace with no recorded runs shows a muted empty state.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /

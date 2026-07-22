@@ -27,6 +27,7 @@ workspace on every request.
 | **Memory** — run count, recent retrospectives, ADR titles | `.dev_team/memory.json` |
 | **House conventions** — the captured style summary | `.dev_team/conventions.json` |
 | **Verdict calibration** — per-phase and overall confirmed/refuted/needs-context counts and confirm rate | `audit/<id>/verifications.jsonl` (same aggregate as `GET /calibration`) |
+| **Score history** — the last 8 delivery runs with headline metrics and signed deltas from the run before | `.dev_team/score-history.json` |
 | **Spend** — total spend and a per-mode breakdown, fetched on demand | the dispatch service's `GET /costs` (proxied, see *Spend* below) |
 | **Access log** — recent dispatch HTTP requests (method/path/status), fetched on demand | the dispatch service's `GET /access-log` (proxied, see *Access log* below) |
 | **Reports** — every `audit/*.md`, viewable in place, with blind-spot/broken-citation count chips (see *Report quality chips* below) | the workspace tree |
@@ -146,6 +147,20 @@ non-zero — including when there are zero verifications recorded yet, so a
 fresh assessment's report-quality signals are never hidden behind the
 verdict table's own empty state — and renders nothing when both totals are
 zero, keeping a clean run's panel uncluttered.
+
+### Score history
+
+The **Score history** block (in the Memory & conventions panel, next to
+Verdict calibration) shows the last 8 recorded runs from
+`dev_team.scores.ScoreHistory`, newest first: each run's success/failure,
+task count, attempt count, and cost, annotated with a signed delta against
+the run immediately before it in the trail — the same headline
+`ScoreHistory.render()` already produces for the CLI, now visible without a
+shell on the box. It is read-only: the dashboard only ever calls
+`ScoreHistory.load()`, never `.record()`, so it cannot create or mutate
+score-history entries, and it rides the existing `/api/state` poll like
+Memory/Conventions/Calibration — no new HTTP route. Renders a muted empty
+state until the first delivery run is recorded.
 
 ### Report quality chips
 
