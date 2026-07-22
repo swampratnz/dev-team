@@ -44,19 +44,23 @@ It does **not** drop anything already persisted to disk under
 
 **Before resubmitting**, check whether the job's directory already has a
 completed result on disk — if it does, resubmitting duplicates work instead
-of recovering it. There is no "cancel a queued job" workaround short of a
-full restart in v1; that trade-off (and Cancel, the narrower fix) is
-described in [`docs/DISPATCH.md`](DISPATCH.md)'s *Cancel* section.
+of recovering it. If the job is still `queued`, cancel just that one with
+`POST /jobs/{id}/cancel` (auth) instead of restarting the whole service —
+see [`docs/DISPATCH.md`](DISPATCH.md)'s *Cancel* section. A full service
+restart is only necessary for a job that has already moved to `running`,
+which Cancel does not cover.
 
 ## "I need to see the access/request log"
 
 Every HTTP request the dispatch service receives — successful, a `401` auth
 miss, or a `404` — is appended to a bounded JSONL log at
 `<jobs_root>/access.jsonl` (default `/opt/dev-team/jobs/access.jsonl`,
-relative to `--jobs-root`). There is **no HTTP route** to read this log in
-v1 (see [`docs/DISPATCH.md`](DISPATCH.md)'s *Access log* section) — it is
-reviewed the same way as the event journal, via direct filesystem access to
-the deployment host:
+relative to `--jobs-root`). The primary, documented way to read it remotely
+is `GET /access-log` (auth) — see [`docs/DISPATCH.md`](DISPATCH.md)'s
+*Access log* section — which returns a newest-first page of the journal
+from the dashboard without requiring an SSH session onto the deployment
+host. An operator who already has host access, or wants to watch the raw
+file grow, can use direct filesystem access as an alternative:
 
 ```bash
 # Tail the dispatch service's access log as it grows:
