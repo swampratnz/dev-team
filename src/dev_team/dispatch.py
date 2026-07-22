@@ -1584,6 +1584,18 @@ class Dispatcher:
         rollup — and reappears once unarchived. ``jobs_counted`` is the
         number of files that contributed at least one parseable line — a
         pure, $0, disk-only aggregate, like :meth:`make_backlog`.
+
+        Additionally walks every ``audit/*/assessment.json`` — a separate
+        population from the ``verifications.jsonl`` walk above (a freshly
+        assessed job may have an ``assessment.json`` with zero verifications
+        yet, and a ``deliver`` job has neither file) — summing
+        ``blind_spot_total`` and ``broken_citation_total`` the same way
+        :func:`dev_team.dashboard._report_meta_state` already does per job.
+        A job with no ``assessment.json``, malformed JSON, or wrong-typed
+        ``blind_spots``/``broken_citations`` fields contributes ``0`` to
+        both totals and is excluded from ``report_quality_jobs_counted`` —
+        never a fabricated ``0`` presented as "clean". Archived jobs are
+        excluded exactly as they already are from the verdict rollup.
         """
 
         if self._dashboard_workspace is None:
@@ -1609,7 +1621,43 @@ class Dispatcher:
                 contributed = True
             if contributed:
                 jobs_counted += 1
-        return 200, {**calibration_summary(entries), "jobs_counted": jobs_counted}
+
+        blind_spot_total = 0
+        broken_citation_total = 0
+        report_quality_jobs_counted = 0
+        for path in self._dashboard_workspace.list_files():
+            if not path.startswith("audit/") or not path.endswith(
+                "/assessment.json"
+            ):
+                continue
+            parts = path.split("/")
+            if len(parts) == 3 and self._is_archived(parts[1]):
+                continue
+            try:
+                data = json.loads(self._dashboard_workspace.read_text(path))
+            except (OSError, ValueError, WorkspaceError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            blind_spots = data.get("blind_spots")
+            broken_citations = data.get("broken_citations")
+            if not isinstance(blind_spots, list):
+                continue
+            if not isinstance(broken_citations, dict) or not all(
+                isinstance(v, list) for v in broken_citations.values()
+            ):
+                continue
+            blind_spot_total += len(blind_spots)
+            broken_citation_total += sum(len(v) for v in broken_citations.values())
+            report_quality_jobs_counted += 1
+
+        return 200, {
+            **calibration_summary(entries),
+            "jobs_counted": jobs_counted,
+            "blind_spot_total": blind_spot_total,
+            "broken_citation_total": broken_citation_total,
+            "report_quality_jobs_counted": report_quality_jobs_counted,
+        }
 
     def costs(self, *, include_archived: bool = False) -> Tuple[int, Dict[str, Any]]:
         """The ``GET /costs`` core: total spend rollup across every job.

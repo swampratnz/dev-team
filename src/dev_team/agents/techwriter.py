@@ -9,6 +9,7 @@ documentation that describes imagined behaviour is worse than none.
 from __future__ import annotations
 
 import ast
+import json
 import re
 from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -210,7 +211,7 @@ def doc_claim_issues(
     """Advisory findings where a shipped doc's claims don't check out.
 
     Deterministic and $0: no LLM call, no subprocess, no network, no I/O.
-    Three checks, mirroring ``assessment.broken_citations``' precedent:
+    Four checks, mirroring ``assessment.broken_citations``' precedent:
 
     - a bare-path-shaped citation absent from ``known_files``;
     - a ```python``` fenced block that fails ``ast.parse`` (parse-only —
@@ -219,6 +220,8 @@ def doc_claim_issues(
       invokes this project's own CLI and cites a ``--flag`` not recognised
       by ``dev_team.cli.build_parser()`` (regex-scanned only — never passed
       to ``subprocess``, ``os.system``, ``eval``, or ``exec``).
+    - a ```json``` fenced block that fails ``json.loads`` (parse-only —
+      ``json.loads`` has no code-execution surface to begin with).
 
     Fences in any other language (or unlabelled) are left unchecked; a
     malformed, unterminated fence is silently skipped, not raised.
@@ -259,4 +262,9 @@ def doc_claim_issues(
                         issues.append(
                             f"{doc.path}: cites CLI flag {flag!r}, not a recognised dev-team option"
                         )
+            elif lang == "json":
+                try:
+                    json.loads(block)
+                except ValueError as exc:
+                    issues.append(f"{doc.path}: json fence is not valid JSON ({exc})")
     return issues

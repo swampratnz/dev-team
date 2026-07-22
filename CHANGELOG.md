@@ -6,6 +6,17 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Assessment
+- **Dependency scan now covers Go (`go.mod`) and Ruby (`Gemfile.lock`)**
+  (`depscan.py`), closing the "verified EOL, model-knowledge CVE" asymmetry
+  #117 left open on these two ecosystems. `parse_go_mod` reads every
+  top-level and `require (...)` block entry — Go's module resolution has no
+  version-range syntax, so a `require` line is always an exact pin and no
+  lockfile is needed; `parse_gemfile_lock` reads `GEM`/`specs:` top-level
+  (4-space indented) entries as exact resolved pins, skipping deeper-indented
+  dependency-constraint lines. Both register in `_PARSERS` and feed the
+  existing `collect_dependencies`/`scan_dependencies`/OSV batch pipeline
+  unchanged — no new credential, endpoint, or config. `docs/ASSESSMENT.md`'s
+  honest-limitations note is updated accordingly.
 - **Dependency scan now parses PEP 735 `[dependency-groups]`** (`depscan.py`),
   completing the growth path #125 named for itself. `parse_pyproject_toml`
   reads the top-level `[dependency-groups]` table alongside the existing
@@ -523,6 +534,21 @@ sections below are reconstructed from the repository history.
   broken citation verbatim — `broken_citations` values are a model's own
   claimed evidence string, so both fields go through `esc()` before
   `innerHTML`, same as the Access log panel's precedent.
+- **`GET /calibration` and the Verdict calibration panel fold in
+  report-quality totals**, completing the "Natural follow-ups" aggregate
+  the Report quality chips (above) explicitly deferred: `blind_spot_total`,
+  `broken_citation_total`, and `report_quality_jobs_counted` are summed
+  across every non-archived job's `audit/<id>/assessment.json`, kept
+  separate from the existing `jobs_counted` (a freshly-assessed job may
+  have zero verifications yet, and a `deliver` job has neither file). A job
+  with no `assessment.json`, malformed JSON, or wrong-typed
+  `blind_spots`/`broken_citations` contributes `0` and is excluded from
+  `report_quality_jobs_counted`, never fabricating a misleading "0" —
+  `dashboard.py`'s `_calibration_state` gains the identical fields so the
+  API and its in-process dashboard mirror never drift. The panel renders a
+  one-line summary above the verdict table whenever either total is
+  non-zero, even with zero verifications recorded; renders nothing when
+  both are zero. No new route, no new write path.
 - **Foreman plan panel** (`docs/DASHBOARD.md`): a new `GET /api/foreman/plan`
   route proxies the dispatch service's `GET /foreman/plan` backlog-foreman
   dry-run (see the Orchestration entry above) — the fifth read-only proxy of
@@ -622,6 +648,17 @@ sections below are reconstructed from the repository history.
   keep the heuristic false-positive-free.
 
 ### Documentation
+- **Invalid-JSON detection in shipped docs** (`doc_claim_issues`,
+  `techwriter.py`): fenced `json` blocks are now parsed with stdlib
+  `json.loads`, and a malformed example (trailing comma, unbalanced brace,
+  etc.) is surfaced as an advisory finding naming the doc's path — the JSON
+  half of #48's "bash/JSON" growth path, completing it alongside the
+  bash-fence CLI-flag check below. `json.loads` only ever parses; unlike
+  `pickle`/`yaml.load` it has no code-execution surface, so this is a
+  strictly lower-risk check than the Python-fence `ast.parse` check #48
+  already shipped. Advisory only, same `Documentation.unverified_claims`
+  surface; an unterminated fence is skipped exactly like the Python/shell
+  branches.
 - **Hallucinated CLI-flag detection in shipped docs** (`doc_claim_issues`,
   `techwriter.py`): fenced `bash`/`sh`/`shell`/`console`/`zsh` blocks are
   now scanned line-by-line for `dev-team`/`python -m dev_team` invocations,

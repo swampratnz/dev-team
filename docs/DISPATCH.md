@@ -623,7 +623,9 @@ resumes contributing the moment it is unarchived.
                      "total":8,"confirm_rate":0.75}},
  "overall":{"confirmed":6,"refuted":1,"needs_context":1,
             "total":8,"confirm_rate":0.75},
- "jobs_counted":3}
+ "jobs_counted":3,
+ "blind_spot_total":5,"broken_citation_total":2,
+ "report_quality_jobs_counted":2}
 ```
 
 `confirm_rate` is `confirmed / total` (`null` when `total` is 0). An entry
@@ -635,6 +637,22 @@ tolerant parse as `GET /jobs/{id}/verifications`. `jobs_counted` is the
 number of `verifications.jsonl` files that contributed at least one
 parseable line. `409 {"error":"calibration needs a dashboard workspace"}`
 when the service was started without `--dashboard-workspace`.
+
+`blind_spot_total` and `broken_citation_total` fold in the same $0,
+deterministic report-quality signals the dashboard's Reports panel already
+surfaces per report (`blind_spots`/`broken_citations` in
+`audit/<id>/assessment.json`, see docs/ASSESSMENT.md), summed across every
+non-archived job with a parseable `assessment.json`: `blind_spot_total` is
+the sum of `len(blind_spots)`, `broken_citation_total` is the sum of
+`sum(len(v) for v in broken_citations.values())`. `report_quality_jobs_counted`
+counts only the jobs that actually contributed — kept separate from
+`jobs_counted` because the two populations differ (a freshly-assessed job
+may have an `assessment.json` with zero verifications yet, and a `deliver`
+job has neither file). A job with no `assessment.json`, malformed JSON, or
+wrong-typed `blind_spots`/`broken_citations` fields contributes `0` to both
+totals and is excluded from `report_quality_jobs_counted` — never a
+fabricated `0` presented as "clean". Archived jobs are excluded from these
+totals exactly as they already are from the verdict rollup.
 
 ### `GET /costs` (auth) — total spend rollup, across every job
 

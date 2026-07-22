@@ -238,6 +238,12 @@ def _calibration_state(workspace: Workspace, *, include_archived: bool = False) 
     A job in :func:`_archived_job_ids` is excluded unless
     ``include_archived`` is set, mirroring the flag :func:`collect_state`
     threads through every other panel.
+
+    Also walks ``audit/<id>/assessment.json`` — the same population
+    :func:`_report_meta_state` reads, but summed rather than kept per-job —
+    for ``blind_spot_total``/``broken_citation_total``/
+    ``report_quality_jobs_counted``, identical field-for-field to
+    :meth:`Dispatcher.calibration`'s own copy so the two never drift.
     """
 
     archived = frozenset() if include_archived else _archived_job_ids(workspace)
@@ -260,7 +266,41 @@ def _calibration_state(workspace: Workspace, *, include_archived: bool = False) 
             contributed = True
         if contributed:
             jobs_counted += 1
-    return {**calibration_summary(entries), "jobs_counted": jobs_counted}
+
+    blind_spot_total = 0
+    broken_citation_total = 0
+    report_quality_jobs_counted = 0
+    for path in workspace.list_files():
+        if not path.startswith("audit/") or not path.endswith("/assessment.json"):
+            continue
+        parts = path.split("/")
+        if len(parts) == 3 and parts[1] in archived:
+            continue
+        try:
+            data = json.loads(workspace.read_text(path))
+        except (OSError, ValueError, WorkspaceError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        blind_spots = data.get("blind_spots")
+        broken_citations = data.get("broken_citations")
+        if not isinstance(blind_spots, list):
+            continue
+        if not isinstance(broken_citations, dict) or not all(
+            isinstance(v, list) for v in broken_citations.values()
+        ):
+            continue
+        blind_spot_total += len(blind_spots)
+        broken_citation_total += sum(len(v) for v in broken_citations.values())
+        report_quality_jobs_counted += 1
+
+    return {
+        **calibration_summary(entries),
+        "jobs_counted": jobs_counted,
+        "blind_spot_total": blind_spot_total,
+        "broken_citation_total": broken_citation_total,
+        "report_quality_jobs_counted": report_quality_jobs_counted,
+    }
 
 
 def _report_meta_state(workspace: Workspace) -> Dict[str, Dict]:
@@ -1219,6 +1259,7 @@ details[open] summary .preview { display: none; }
 .cal-table th, .cal-table td { text-align: left; padding: 4px 6px; border-top: 1px solid var(--line-soft); }
 .cal-table th { color: var(--ink-3); font-weight: 600; }
 .cal-table .cal-overall { font-weight: 600; }
+.cal-summary { font-size: 12px; color: var(--ink-3); }
 .al-status { font-weight: 600; }
 .al-status.al-bad { color: var(--critical); }
 .al-status.al-warn { color: var(--warning); }
@@ -1826,11 +1867,22 @@ function calibrationRow(phase, b) {
     + `<td>${esc(b.total)}</td><td>${esc(rate)}</td></tr>`;
 }
 
+// Report-quality summary line: integers only (never model-authored strings,
+// unlike the per-citation-string modal detail #147 already shipped), so
+// esc() here is defensive rather than strictly load-bearing.
+function calibrationSummary(cal) {
+  if (!cal.blind_spot_total && !cal.broken_citation_total) return "";
+  return `<div class="cal-summary">${esc(cal.blind_spot_total)} blind spots \\u00b7 `
+    + `${esc(cal.broken_citation_total)} broken citations across `
+    + `${esc(cal.report_quality_jobs_counted)} audits</div>`;
+}
+
 function calibrationPanel(cal) {
-  if (!cal.overall.total) return '<span class="muted">no verifications recorded yet</span>';
+  const summary = calibrationSummary(cal);
+  if (!cal.overall.total) return summary || '<span class="muted">no verifications recorded yet</span>';
   const rows = Object.keys(cal.phases).sort().map(p => calibrationRow(p, cal.phases[p])).join("")
     + calibrationRow("overall", cal.overall);
-  return `<table class="cal-table"><thead><tr><th>phase</th><th>confirmed</th><th>refuted</th>`
+  return summary + `<table class="cal-table"><thead><tr><th>phase</th><th>confirmed</th><th>refuted</th>`
     + `<th>needs context</th><th>total</th><th>confirm rate</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
