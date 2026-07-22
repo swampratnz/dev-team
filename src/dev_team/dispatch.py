@@ -2380,6 +2380,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             """
 
             self._access_log_status: Optional[int] = None
+            self._access_log_job_id: Optional[str] = None
             try:
                 super().handle_one_request()
             finally:
@@ -2390,6 +2391,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                             method=getattr(self, "command", None) or "-",
                             request_path=urlsplit(getattr(self, "path", "") or "").path,
                             status=status,
+                            job_id=self._access_log_job_id,
                         )
                     except OSError:
                         pass
@@ -2882,6 +2884,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             except QueueFull:
                 self._json(503, {"error": "queue full"})
                 return
+            self._access_log_job_id = job_id
             self._json(202, {"id": job_id, "state": "queued", "position": position})
 
         def _session_may_target(self, session: Session, spec: JobSpec) -> bool:

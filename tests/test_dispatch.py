@@ -4280,6 +4280,7 @@ def test_access_log_records_unauthenticated_health_get(tmp_path):
         _call(server, "/health", token=None)
     records = _access_records(tmp_path, expect=1)
     assert records[-1] == {**records[-1], "method": "GET", "path": "/health", "status": 200}
+    assert set(records[-1].keys()) == {"ts", "method", "path", "status"}
 
 
 def test_access_log_records_authorised_get_jobs(tmp_path):
@@ -4287,6 +4288,7 @@ def test_access_log_records_authorised_get_jobs(tmp_path):
         _call(server, "/jobs")
     records = _access_records(tmp_path, expect=1)
     assert records[-1] == {**records[-1], "method": "GET", "path": "/jobs", "status": 200}
+    assert set(records[-1].keys()) == {"ts", "method", "path", "status"}
 
 
 def test_access_log_records_401_and_never_leaks_the_bad_token(tmp_path):
@@ -4318,6 +4320,123 @@ def test_access_log_records_404_for_an_unknown_path(tmp_path):
         _call(server, "/nope")
     records = _access_records(tmp_path, expect=1)
     assert records[-1] == {**records[-1], "method": "GET", "path": "/nope", "status": 404}
+    assert set(records[-1].keys()) == {"ts", "method", "path", "status"}
+
+
+# --- access log job-id correlation (#167) ----------------------------------
+
+
+def test_access_log_records_job_id_for_successful_deliver_post(tmp_path):
+    with running(
+        runner=_deliver_runner(), materialise=_mem_materialise, jobs_root=str(tmp_path)
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "deliver", "repo": "acme/mono", "title": "t", "description": "d"},
+        )
+        assert status == 202
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/jobs" and r["status"] == 202)
+    assert entry["job_id"] == payload["id"]
+
+
+def test_access_log_records_job_id_for_successful_assess_post(tmp_path):
+    with running(
+        runner=_assess_runner(), materialise=_mem_materialise, jobs_root=str(tmp_path)
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST", body={"mode": "assess", "repo": "acme/mono"},
+        )
+        assert status == 202
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/jobs" and r["status"] == 202)
+    assert entry["job_id"] == payload["id"]
+
+
+def test_access_log_records_job_id_for_successful_verify_post(tmp_path):
+    # SECURITY (AC6): the logged job_id must exactly equal the 202 response
+    # body's "id" — proves the correlation can't drift from what was
+    # actually created.
+    dash = _seeded_dash()
+    with running(
+        runner=_verifier_runner(), materialise=_mem_materialise, dashboard_workspace=dash,
+        jobs_root=str(tmp_path),
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]"},
+        )
+        assert status == 202
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/jobs" and r["status"] == 202)
+    assert entry["job_id"] == payload["id"]
+
+
+def test_access_log_omits_job_id_for_a_validation_error(tmp_path):
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        status, _ = _call(
+            server, "/jobs", method="POST", body={"mode": "nope", "repo": "a/b"},
+        )
+        assert status == 400
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/jobs")
+    assert "job_id" not in entry
+
+
+def test_access_log_omits_job_id_for_a_rejected_submission(tmp_path):
+    with running(materialise=_mem_materialise, jobs_root=str(tmp_path)) as server:
+        status, _ = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "a", "finding_id": "b"},
+        )
+        assert status == 409  # SubmitRejected: no dashboard workspace configured
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/jobs")
+    assert "job_id" not in entry
+
+
+def test_access_log_omits_job_id_when_the_queue_is_full(tmp_path):
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    with running(
+        runner=_assess_runner(), materialise=materialise, queue_cap=1,
+        jobs_root=str(tmp_path),
+    ) as server:
+        _call(server, "/jobs", method="POST", body={"mode": "assess", "repo": "a/one"})
+        assert first_in.wait(5)
+        assert _call(server, "/jobs", method="POST",
+                     body={"mode": "assess", "repo": "a/two"})[0] == 202
+        status, _ = _call(server, "/jobs", method="POST",
+                           body={"mode": "assess", "repo": "a/three"})
+        assert status == 503
+        release.set()
+    records = _access_records(tmp_path, expect=3)
+    entry = next(r for r in records if r["status"] == 503)
+    assert "job_id" not in entry
+
+
+def test_access_log_job_scoped_route_has_no_job_id_field(tmp_path):
+    # Job-scoped routes already carry the id in `path` — the new field is
+    # only ever set on the creation route, never duplicated here.
+    with running(
+        runner=_assess_runner(), materialise=_mem_materialise, jobs_root=str(tmp_path)
+    ) as server:
+        _, payload = _call(
+            server, "/jobs", method="POST", body={"mode": "assess", "repo": "a/one"},
+        )
+        job_id = payload["id"]
+        server.dispatcher.wait(job_id, 5)
+        _call(server, f"/jobs/{job_id}/result")
+    records = _access_records(tmp_path, expect=2)
+    entry = next(r for r in records if r["path"] == f"/jobs/{job_id}/result")
+    assert "job_id" not in entry
 
 
 def test_access_log_write_failure_never_breaks_the_response(tmp_path, monkeypatch):
