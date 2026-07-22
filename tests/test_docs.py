@@ -35,9 +35,23 @@ _BEARER_SECRET_RE = re.compile(
     r"(?!<token>\b|<TOKEN>\b|\$TOKEN\b|YOUR_TOKEN\b)[A-Za-z0-9_\-\.]{16,}"
 )
 
+_DISPATCH = _REPO_ROOT / "docs" / "DISPATCH.md"
+
+# Drift-check: every backtick-fenced `GET|POST /...` route TROUBLESHOOTING.md
+# cites, to verify against docs/DISPATCH.md's text.
+_ROUTE_RE = re.compile(r"`((?:GET|POST) /[\w{}/-]+)`")
+
 
 def _troubleshooting_text() -> str:
     return _TROUBLESHOOTING.read_text(encoding="utf-8")
+
+
+def _dispatch_text() -> str:
+    return _DISPATCH.read_text(encoding="utf-8")
+
+
+def _routes_cited_in(text: str) -> set[str]:
+    return set(_ROUTE_RE.findall(text))
 
 
 def test_troubleshooting_doc_exists():
@@ -70,3 +84,40 @@ def test_deployment_gotcha_callouts_both_cross_reference_troubleshooting():
 def test_changelog_mentions_troubleshooting_runbook():
     changelog_text = (_REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert "docs/TROUBLESHOOTING.md" in changelog_text
+
+
+def test_access_log_section_documents_the_shipped_route():
+    text = _troubleshooting_text()
+    assert "GET /access-log" in text
+    assert "no HTTP route" not in text
+
+
+def test_job_vanished_section_documents_the_shipped_cancel_route():
+    text = _troubleshooting_text()
+    assert "POST /jobs/{id}/cancel" in text
+    assert 'cancel a queued job" workaround' not in text
+
+
+def test_routes_cited_in_ignores_unfenced_prose():
+    text = "We use GET and POST verbs for HTTP requests, but not shown here."
+    assert _routes_cited_in(text) == set()
+
+
+def test_routes_cited_in_deduplicates():
+    text = (
+        "See `GET /access-log` for the log, and again `GET /access-log`. "
+        "Also `POST /jobs/{id}/cancel` to cancel a queued job."
+    )
+    assert _routes_cited_in(text) == {"GET /access-log", "POST /jobs/{id}/cancel"}
+
+
+def test_troubleshooting_routes_are_documented_in_dispatch():
+    routes = _routes_cited_in(_troubleshooting_text())
+    dispatch_text = _dispatch_text()
+    assert {"GET /access-log", "POST /jobs/{id}/cancel"} <= routes
+    for route in routes:
+        assert route in dispatch_text, route
+
+
+def test_a_bogus_route_is_not_documented_in_dispatch():
+    assert "GET /not-a-real-route" not in _dispatch_text()
