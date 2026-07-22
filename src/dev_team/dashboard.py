@@ -46,6 +46,7 @@ from .eventlog import read_events
 from .execution import Workspace, WorkspaceError
 from .memory import ProjectMemory
 from .persona import DEFAULT_CAST
+from .scores import ScoreHistory, _score_deltas
 from .transcripts import list_transcripts, read_transcript
 
 #: Engine-level event roles that are not agents (they feed the feed, not cards).
@@ -177,6 +178,39 @@ def _conventions_state(workspace: Workspace) -> Dict:
     if profile is None:
         return {"present": False, "summary": ""}
     return {"present": True, "summary": profile.summary}
+
+
+def _score_history_state(workspace: Workspace) -> Dict:
+    """The last 8 recorded delivery runs, newest first, with run-over-run deltas.
+
+    Mirrors ``ScoreHistory.render()``'s own delta computation (each entry
+    compared against the run immediately before it in the *full* trail, via
+    :func:`_score_deltas`), then trims to the newest 8 the same way
+    :func:`_memory_state` caps retrospectives/decisions to a recent slice —
+    so a run at the newest-8 boundary still gets a correct delta against a
+    run that isn't itself shown.
+    """
+
+    history = ScoreHistory(workspace).load()
+    if not history:
+        return {"present": False, "runs": []}
+    runs = [
+        {
+            "feature": score.feature,
+            "success": score.success,
+            "tasks_succeeded": score.tasks_succeeded,
+            "tasks_total": score.tasks_total,
+            "total_attempts": score.total_attempts,
+            "cost_usd": score.cost_usd,
+            "delta": (
+                ", ".join(_score_deltas(history[i - 1], score)) or None
+                if i > 0
+                else None
+            ),
+        }
+        for i, score in enumerate(history)
+    ]
+    return {"present": True, "runs": list(reversed(runs))[:8]}
 
 
 def _report_paths(workspace: Workspace) -> List[str]:
@@ -384,6 +418,7 @@ def collect_state(
         "memory": _memory_state(workspace),
         "conventions": _conventions_state(workspace),
         "calibration": _calibration_state(workspace, include_archived=include_archived),
+        "score_history": _score_history_state(workspace),
         "reports": reports,
         "report_meta": _report_meta_state(workspace),
         "archived_jobs": sorted(archived),
@@ -1998,6 +2033,22 @@ async function loadForemanPlan() {
   }
 }
 
+// One score-history row: a run's headline metrics plus its delta from the
+// run before it. SECURITY: feature is the delivered feature's free-text
+// name (ultimately CLI/dispatch-supplied, untrusted) — esc() before
+// innerHTML, same discipline as every other panel.
+function scoreHistoryRow(r) {
+  const headline = `${r.success ? "ok" : "FAILED"}, ${esc(r.tasks_succeeded)}/${esc(r.tasks_total)} tasks, `
+    + `${esc(r.total_attempts)} attempt(s), $${esc(r.cost_usd.toFixed(4))}`;
+  const delta = r.delta ? ` <span class="muted">| delta ${esc(r.delta)}</span>` : "";
+  return `<li><b>${esc(r.feature)}</b>: ${headline}${delta}</li>`;
+}
+
+function scoreHistoryPanel(sh) {
+  if (!sh.runs.length) return '<span class="muted">no delivery runs recorded yet</span>';
+  return `<ul class="list">${sh.runs.map(scoreHistoryRow).join("")}</ul>`;
+}
+
 function memory(s) {
   const el = $("memory");
   const parts = [];
@@ -2019,6 +2070,9 @@ function memory(s) {
   }
   if (s.calibration) {
     parts.push(details("calibration", "Verdict calibration", calibrationPanel(s.calibration), false));
+  }
+  if (s.score_history.present) {
+    parts.push(details("score-history", "Score history", scoreHistoryPanel(s.score_history), false));
   }
   const html = parts.join("") || '<span class="muted">no cross-run memory yet</span>';
   const open = {};
