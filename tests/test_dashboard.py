@@ -1968,6 +1968,15 @@ def test_dashboard_html_access_log_panel():
     assert "${esc(e.path)}" in DASHBOARD_HTML
     assert "${esc(e.status)}" in DASHBOARD_HTML
 
+    # #167: job_id (only present for a successful POST /jobs) renders as an
+    # esc()-escaped tag next to path; absent, the path cell is unchanged —
+    # no empty tag or placeholder.
+    assert (
+        'const jobId = e.job_id ? ` <span class="al-jobid">${esc(e.job_id)}'
+        '</span>` : "";' in DASHBOARD_HTML
+    )
+    assert "${esc(e.path)}${jobId}" in DASHBOARD_HTML
+
     refresh_start = DASHBOARD_HTML.index("async function refresh()")
     refresh_end = DASHBOARD_HTML.index("refresh();", refresh_start)
     assert "/api/access-log" not in DASHBOARD_HTML[refresh_start:refresh_end]

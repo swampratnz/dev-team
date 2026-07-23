@@ -11,9 +11,11 @@ not a hit on an unknown path.
 pattern :class:`~dev_team.eventlog.EventLog` already uses for job progress
 (``.dev_team/events.jsonl``), applied one layer up: at the HTTP handler
 rather than the job runner. Logged fields are deliberately minimal —
-``ts``/``method``/``path``/``status`` — and deliberately exclude the
-``Authorization`` header value and any request or response body, so the log
-itself can never become a new credential- or payload-leak surface.
+``ts``/``method``/``path``/``status``, plus an optional ``job_id`` recorded
+only for the ``POST /jobs`` request that created it — and deliberately
+exclude the ``Authorization`` header value and any request or response
+body, so the log itself can never become a new credential- or payload-leak
+surface.
 
 Unlike :class:`~dev_team.eventlog.EventLog`, this journal is not backed by a
 :class:`~dev_team.execution.Workspace`: the dispatch service's ``jobs_root``
@@ -34,7 +36,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 #: Filename (relative to the dispatch service's jobs root) the access log
 #: journal lives at.
@@ -96,15 +98,24 @@ class AccessLog:
         self.filename = filename
         self._lock = threading.Lock()
 
-    def append(self, *, method: str, request_path: str, status: int) -> None:
+    def append(
+        self,
+        *,
+        method: str,
+        request_path: str,
+        status: int,
+        job_id: Optional[str] = None,
+    ) -> None:
         """Append one record. Raises ``OSError`` on a filesystem failure."""
 
-        record = {
+        record: Dict[str, Any] = {
             "ts": self.clock(),
             "method": method,
             "path": _truncate_path(request_path),
             "status": status,
         }
+        if job_id is not None:
+            record["job_id"] = job_id
         target = Path(self.root) / self.filename
         with self._lock:
             target.parent.mkdir(parents=True, exist_ok=True)

@@ -25,6 +25,36 @@ def test_append_writes_a_timestamped_record(tmp_path):
     assert records[1] == {"ts": 101.5, "method": "POST", "path": "/jobs", "status": 202}
 
 
+def test_append_omits_job_id_when_not_given(tmp_path):
+    log = AccessLog(str(tmp_path), clock=lambda: 1.0)
+    log.append(method="GET", request_path="/jobs", status=200)
+    record = json.loads((tmp_path / ACCESS_LOG_FILENAME).read_text().splitlines()[0])
+    assert record == {"ts": 1.0, "method": "GET", "path": "/jobs", "status": 200}
+    assert "job_id" not in record
+
+
+def test_append_includes_job_id_when_given(tmp_path):
+    log = AccessLog(str(tmp_path), clock=lambda: 1.0)
+    log.append(method="POST", request_path="/jobs", status=202, job_id="deliver-1")
+    record = json.loads((tmp_path / ACCESS_LOG_FILENAME).read_text().splitlines()[0])
+    assert record == {
+        "ts": 1.0,
+        "method": "POST",
+        "path": "/jobs",
+        "status": 202,
+        "job_id": "deliver-1",
+    }
+
+
+def test_read_access_log_round_trips_a_job_id_bearing_record(tmp_path):
+    log = AccessLog(str(tmp_path), clock=lambda: 1.0)
+    log.append(method="POST", request_path="/jobs", status=202, job_id="deliver-1")
+    records = read_access_log(str(tmp_path))
+    assert records == [
+        {"ts": 1.0, "method": "POST", "path": "/jobs", "status": 202, "job_id": "deliver-1"}
+    ]
+
+
 def test_append_creates_the_jobs_root_lazily(tmp_path):
     root = tmp_path / "jobs" / "nested"
     assert not root.exists()
