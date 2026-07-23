@@ -1968,7 +1968,10 @@ async function loadSpend() {
 function accessLogRow(e) {
   const cls = e.status >= 400 ? "al-bad" : e.status >= 300 ? "al-warn" : "";
   const jobId = e.job_id ? ` <span class="al-jobid">${esc(e.job_id)}</span>` : "";
-  return `<tr><td>${esc(e.method)}</td><td>${esc(e.path)}${jobId}</td>`
+  const jobIds = e.job_ids
+    ? e.job_ids.map((id) => ` <span class="al-jobid">${esc(id)}</span>`).join("")
+    : "";
+  return `<tr><td>${esc(e.method)}</td><td>${esc(e.path)}${jobId}${jobIds}</td>`
     + `<td class="al-status ${cls}">${esc(e.status)}</td></tr>`;
 }
 

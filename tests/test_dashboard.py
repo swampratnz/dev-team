@@ -2079,7 +2079,18 @@ def test_dashboard_html_access_log_panel():
         'const jobId = e.job_id ? ` <span class="al-jobid">${esc(e.job_id)}'
         '</span>` : "";' in DASHBOARD_HTML
     )
-    assert "${esc(e.path)}${jobId}" in DASHBOARD_HTML
+
+    # #180: job_ids (the POST /foreman/run batch sibling of #167's job_id)
+    # renders one esc()-escaped al-jobid tag per id when present; absent, no
+    # tag/placeholder is added — the single-job_id rendering above is
+    # untouched.
+    assert (
+        "const jobIds = e.job_ids\n"
+        '    ? e.job_ids.map((id) => ` <span class="al-jobid">${esc(id)}'
+        '</span>`).join("")\n'
+        '    : "";' in DASHBOARD_HTML
+    )
+    assert "${esc(e.path)}${jobId}${jobIds}" in DASHBOARD_HTML
 
     refresh_start = DASHBOARD_HTML.index("async function refresh()")
     refresh_end = DASHBOARD_HTML.index("refresh();", refresh_start)
