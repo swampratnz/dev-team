@@ -25,6 +25,7 @@ from dev_team.events import AgentEvent
 from dev_team.execution import InMemoryWorkspace, LocalWorkspace
 from dev_team.memory import Blackboard, DecisionRecord, ProjectMemory
 from dev_team.persona import DEFAULT_CAST
+from dev_team.scores import RunScore, ScoreHistory
 
 
 def _journal(ws, *events, run="deliver-1"):
@@ -314,6 +315,44 @@ def test_dashboard_html_calibration_summary_renders_report_quality_totals():
     assert "return summary + `<table class=\"cal-table\">" in DASHBOARD_HTML
 
 
+def test_dashboard_html_score_history_wired_into_memory_panel():
+    """Static desk-check of the score-history JS (CI has no browser).
+
+    Pins: the block is wired into the memory column next to Verdict
+    calibration, gated on ``s.score_history.present`` (so an absent trail
+    renders nothing for this block rather than an empty list), and every
+    numeric/string field flows through ``esc()`` before ``innerHTML``.
+    """
+
+    assert (
+        'if (s.score_history.present) {\n'
+        '    parts.push(details("score-history", "Score history", scoreHistoryPanel(s.score_history), false));'
+    ) in DASHBOARD_HTML
+    assert "function scoreHistoryPanel(sh)" in DASHBOARD_HTML
+    assert "no delivery runs recorded yet" in DASHBOARD_HTML
+    assert "function scoreHistoryRow(r)" in DASHBOARD_HTML
+    assert "<li><b>${esc(r.feature)}</b>: ${headline}${delta}</li>" in DASHBOARD_HTML
+    assert (
+        '`${r.success ? "ok" : "FAILED"}, ${esc(r.tasks_succeeded)}/${esc(r.tasks_total)} tasks, `'
+    ) in DASHBOARD_HTML
+    assert "${esc(r.total_attempts)} attempt(s), $${esc(r.cost_usd.toFixed(4))}" in DASHBOARD_HTML
+    assert 'r.delta ? ` <span class="muted">| delta ${esc(r.delta)}</span>` : ""' in DASHBOARD_HTML
+
+
+def test_dashboard_html_score_history_feature_is_escaped_before_innerhtml():
+    """SECURITY (AC6): a ``RunScore.feature`` value is caller/dispatch-supplied,
+
+    ultimately free-text, untrusted content — the one field in a score-history
+    row that isn't a deterministic number. Pins that it renders through
+    ``esc()`` (never raw) before reaching ``innerHTML``, so a feature name
+    like ``<img src=x onerror=alert(1)>`` renders as inert escaped text
+    rather than executing.
+    """
+
+    assert "<li><b>${esc(r.feature)}</b>:" in DASHBOARD_HTML
+    assert "<b>${r.feature}</b>" not in DASHBOARD_HTML
+
+
 def test_dashboard_html_report_meta_chips_render_independently():
     """Static desk-check of the Reports panel's blind-spot/broken-citation chips.
 
@@ -405,6 +444,71 @@ def test_memory_state_filters_non_dict_decisions():
     assert memory["runs"] == 2
     assert memory["decisions"] == []
     assert memory["retrospectives"] == []
+
+
+def _run_score(feature="F", *, success=True, attempts=1, cost=0.0, scorecard=None):
+    return RunScore(
+        feature=feature,
+        success=success,
+        tasks_total=1,
+        tasks_succeeded=1 if success else 0,
+        total_attempts=attempts,
+        cost_usd=cost,
+        committed=success,
+        scorecard=scorecard or {},
+    )
+
+
+def test_score_history_state_absent_is_not_present():
+    state = collect_state(InMemoryWorkspace())["score_history"]
+    assert state == {"present": False, "runs": []}
+
+
+def test_score_history_state_orders_newest_first_with_deltas():
+    ws = InMemoryWorkspace()
+    hist = ScoreHistory(ws)
+    hist.record(_run_score("First", attempts=1, cost=0.01))
+    hist.record(_run_score("Second", attempts=2, cost=0.03))
+    state = collect_state(ws)["score_history"]
+    assert state["present"] is True
+    assert [r["feature"] for r in state["runs"]] == ["Second", "First"]
+    # newest-first: the oldest entry shown has no prior run to diff against
+    assert state["runs"][1]["delta"] is None
+    # the newer entry's delta matches _score_deltas against the run before it
+    assert state["runs"][0]["delta"] == "attempts +1, cost +$0.0200"
+    assert state["runs"][0]["success"] is True
+    assert state["runs"][0]["tasks_succeeded"] == 1
+    assert state["runs"][0]["tasks_total"] == 1
+    assert state["runs"][0]["total_attempts"] == 2
+    assert state["runs"][0]["cost_usd"] == 0.03
+
+
+def test_score_history_state_caps_at_newest_eight():
+    ws = InMemoryWorkspace()
+    hist = ScoreHistory(ws)
+    for i in range(10):
+        hist.record(_run_score(f"run-{i}"))
+    state = collect_state(ws)["score_history"]
+    assert len(state["runs"]) == 8
+    # newest 8 (run-2 .. run-9), newest first — run-0/run-1 dropped
+    assert [r["feature"] for r in state["runs"]] == [f"run-{i}" for i in range(9, 1, -1)]
+
+
+def test_score_history_state_no_delta_when_nothing_changed():
+    ws = InMemoryWorkspace()
+    hist = ScoreHistory(ws)
+    hist.record(_run_score("First", attempts=1, cost=0.01))
+    hist.record(_run_score("Second", attempts=1, cost=0.01))
+    state = collect_state(ws)["score_history"]
+    assert state["runs"][0]["delta"] is None
+
+
+def test_collect_state_score_history_key_matches_score_history_state():
+    from dev_team.dashboard import _score_history_state
+
+    ws = InMemoryWorkspace()
+    ScoreHistory(ws).record(_run_score("Solo"))
+    assert collect_state(ws)["score_history"] == _score_history_state(ws)
 
 
 # --- archived jobs: excluded from activity/reports/backlog by default --------
@@ -1967,6 +2071,15 @@ def test_dashboard_html_access_log_panel():
     assert "${esc(e.method)}" in DASHBOARD_HTML
     assert "${esc(e.path)}" in DASHBOARD_HTML
     assert "${esc(e.status)}" in DASHBOARD_HTML
+
+    # #167: job_id (only present for a successful POST /jobs) renders as an
+    # esc()-escaped tag next to path; absent, the path cell is unchanged —
+    # no empty tag or placeholder.
+    assert (
+        'const jobId = e.job_id ? ` <span class="al-jobid">${esc(e.job_id)}'
+        '</span>` : "";' in DASHBOARD_HTML
+    )
+    assert "${esc(e.path)}${jobId}" in DASHBOARD_HTML
 
     refresh_start = DASHBOARD_HTML.index("async function refresh()")
     refresh_end = DASHBOARD_HTML.index("refresh();", refresh_start)
