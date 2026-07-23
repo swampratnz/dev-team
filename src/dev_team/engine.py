@@ -1149,6 +1149,9 @@ class DeliveryEngine:
             consequences=design.rationale,
         )
         self._event("designed", "Design ready")
+        self._scorecard["design_components_count"] = len(design.components)
+        self._scorecard["design_risks_count"] = len(design.risks)
+        self._scorecard["design_alternatives_count"] = len(design.alternatives)
 
         if self.config.frontend_craft and looks_like_frontend(request, design):
             # A web UI delivery: fold the design baseline into the conventions

@@ -59,8 +59,17 @@ beat either alone, and false-positive suppression is a first-class metric.**
 - **Adopted:** prior-ADR context (3–5 recent decisions — "context engineering
   beats model scale", arXiv 2604.03826) ✅; alternatives-and-tradeoffs
   required in every design (ATAM-lite) with rationale persisted into the ADR ✅;
-  anti-pattern self-check ✅. In-house downstream metric (attempts-per-task
-  per design) → roadmap; this pipeline can measure what academia can't.
+  anti-pattern self-check ✅. **In-house downstream metric, shipped at
+  run-level ✅:** `design_components_count`/`design_risks_count`/
+  `design_alternatives_count` scorecard keys, set right after each successful
+  design, trended run-over-run via the existing `ScoreHistory` delta
+  mechanism alongside `total_attempts`. This is *not yet* the per-task
+  with/without-design attribution the original gap named: the architect runs
+  exactly once per whole plan today (no opt-out), and `Design` carries no
+  task-linkage field, so only a run-level signal is buildable now. A true
+  per-task comparison remains future work pending an architect opt-out flag
+  that would create a genuine "without design" population to compare
+  against.
 
 ## Product manager / planner
 - **Benchmarks:** PlanBench/ACPBench (formal planning), INVEST-based

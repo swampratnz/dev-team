@@ -63,6 +63,21 @@ sections below are reconstructed from the repository history.
   decision document instead of the text proposal.
 
 ### Delivery
+- **A run-level design-thoroughness signal is now trended in the score
+  history** (#178, closing `docs/BENCHMARKS.md`'s named "in-house downstream
+  metric (attempts-per-task per design) → roadmap" gap). Right after a
+  successful `architect.design()` call, three scorecard keys —
+  `design_components_count`, `design_risks_count`,
+  `design_alternatives_count` — are set to the `len()` of the corresponding
+  list on that run's `Design`, reusing 100% of the existing
+  `ScoreHistory`/`_score_deltas` machinery (no changes to `scores.py`: its
+  generic key-union already trends any new scorecard key). A run halted
+  before design completes never gets these keys (matching the existing
+  "absent, not zero" convention for not-applicable metrics), while a design
+  with empty lists correctly gets explicit zeros. This is honestly scoped as
+  run-level only: the architect runs once per whole plan with no task
+  linkage in the data model, so a true per-task with/without-design
+  attempts comparison remains future work pending an architect opt-out flag.
 - **A visual-critique failure is now diagnosable instead of a bare "skipping"**
   (#152, root-cause corrected by adversarial review). The default `--deliver`/
   `--assess` progress stream (`cli.py`'s `_progress_printer`) now renders
