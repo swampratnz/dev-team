@@ -259,9 +259,14 @@ label states the exact values about to be submitted (e.g. "confirm: enqueue
 up to 3 stories at $5/story?"), and only the second click issues `POST
 /api/foreman/run` — the same two-step arm/confirm pattern as the archived-job
 purge button, so a spend-multiplying action never fires on a single,
-un-confirmed click (CLAUDE.md §1). The dashboard route forwards the JSON
-body verbatim to the dispatch service's `POST /foreman/run` and relays its
-response — `202`/`200` success (`jobs`/`skipped`), `400` validation
+un-confirmed click (CLAUDE.md §1). Editing *either* `budget_usd` or
+`max_stories` after arming disarms the button back to a plain "run" label,
+so the confirm text on screen always states the values a click is about to
+submit — it can never go stale and understate the spend. The button is also
+disabled for the duration of the in-flight request, so a rapid double-click
+cannot fire two overlapping enqueue calls. The dashboard route forwards the
+JSON body verbatim to the dispatch service's `POST /foreman/run` and relays
+its response — `202`/`200` success (`jobs`/`skipped`), `400` validation
 rejection, `500` compensated-cancel, `502` unreachable — unchanged; without
 a dispatch URL/token configured it answers `501` and no outbound call is
 attempted. The result (enqueued job id/story/title/position, or a skip/error
