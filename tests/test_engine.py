@@ -33,6 +33,7 @@ from dev_team.engine import (
     _prior_context,
     _review_from_dod,
     _run_evidence,
+    _StashRestoreFailed,
     _summarise_artifacts,
 )
 from dev_team.execution import (
@@ -3372,6 +3373,398 @@ def test_fail_to_pass_keeps_engineer_authored_tests(tmp_path):
     for push in stash_pushes:
         assert "src/x.py" in push
         assert "tests/test_x.py" not in push
+
+
+# --- mutation-lite check (issue #176) -----------------------------------
+
+
+def _mutation_impl(path: str = "src/x.py") -> Implementation:
+    from dev_team.models import ChangeType, FileChange
+
+    return Implementation(
+        task_id="T1",
+        summary="s",
+        files=[FileChange(path=path, change_type=ChangeType.CREATE, summary="s")],
+    )
+
+
+def test_mutation_check_defaults_to_false():
+    assert EngineConfig().mutation_check is False
+
+
+def test_mutation_check_skipped_when_disabled():
+    ws = InMemoryWorkspace({"src/x.py": "def f(a, b):\n    return a == b\n"})
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(mutation_check=False, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
+    assert engine._scorecard == {}
+    assert cmd.calls == []
+    assert ws.read_text("src/x.py") == "def f(a, b):\n    return a == b\n"
+
+
+def test_mutation_check_skipped_for_dry_runs():
+    engine = DeliveryEngine(
+        ScriptedRunner([]),
+        budget=Budget(),
+        tracer=Tracer(clock=_Clock()),
+        config=EngineConfig(mutation_check=True),
+    )  # in-memory + DryRunCommandRunner defaults
+    engine.workspace.write_text("src/x.py", "def f(a, b):\n    return a == b\n")
+    run(engine._mutation_check(_mutation_impl(), engine.workspace, engine.git, None))
+    assert engine._scorecard == {}
+
+
+def test_mutation_check_skipped_without_local_verification():
+    ws = InMemoryWorkspace({"x.py": "def f(a, b):\n    return a == b\n"})
+    engine = DeliveryEngine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, remote_verify_status=("ci", "status")),
+    )
+    run(engine._mutation_check(_mutation_impl("x.py"), ws, engine.git, None))
+    assert engine._scorecard == {}
+
+
+def test_mutation_check_skipped_with_no_product_files():
+    ws = InMemoryWorkspace()
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    impl = Implementation(task_id="T1", summary="s", files=[])
+    run(engine._mutation_check(impl, ws, engine.git, None))
+    assert engine._scorecard == {}
+    assert cmd.calls == []
+
+
+def test_mutation_check_skipped_with_multiple_product_files():
+    from dev_team.models import ChangeType, FileChange
+
+    ws = InMemoryWorkspace(
+        {
+            "src/a.py": "def f(a, b):\n    return a == b\n",
+            "src/b.py": "def g(a, b):\n    return a == b\n",
+        }
+    )
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[
+            FileChange(path="src/a.py", change_type=ChangeType.CREATE, summary="s"),
+            FileChange(path="src/b.py", change_type=ChangeType.CREATE, summary="s"),
+        ],
+    )
+    run(engine._mutation_check(impl, ws, engine.git, None))
+    assert engine._scorecard == {}
+    assert cmd.calls == []
+
+
+def test_mutation_check_skipped_for_non_python_file():
+    ws = InMemoryWorkspace({"src/x.ts": "function f(a, b) { return a === b; }\n"})
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl("src/x.ts"), ws, engine.git, None))
+    assert engine._scorecard == {}
+    assert cmd.calls == []
+
+
+def test_mutation_check_skipped_when_no_mutable_comparison():
+    ws = InMemoryWorkspace({"src/x.py": "def f(a, b):\n    return a + b\n"})
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
+    assert engine._scorecard == {}
+    assert cmd.calls == []
+
+
+def test_mutation_check_records_survived_when_gates_still_pass():
+    ws = InMemoryWorkspace({"src/x.py": "def f(a, b):\n    return a == b\n"})
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert "mutation_killed" not in engine._scorecard
+    # the mutated write is always restored
+    assert ws.read_text("src/x.py") == "def f(a, b):\n    return a == b\n"
+
+
+def test_mutation_check_records_killed_when_gates_fail():
+    ws = InMemoryWorkspace({"src/x.py": "def f(a, b):\n    return a == b\n"})
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(default_exit_code=1),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
+    assert engine._scorecard.get("mutation_killed") == 1
+    assert "mutation_survived" not in engine._scorecard
+    assert ws.read_text("src/x.py") == "def f(a, b):\n    return a == b\n"
+
+
+class _RaisingGate:
+    """A gate whose evaluation blows up mid-check (simulates a hard failure)."""
+
+    name = "boom"
+
+    def evaluate(self, context):
+        raise RuntimeError("boom")
+
+
+def test_mutation_check_restores_file_when_gate_evaluation_raises():
+    ws = InMemoryWorkspace({"src/x.py": "def f(a, b):\n    return a == b\n"})
+    dod = DefinitionOfDone(gates=[_RaisingGate()])
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True),
+        definition_of_done=dod,
+    )
+    with pytest.raises(RuntimeError):
+        run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
+    # fail-secure: the original content is restored even though evaluation blew up
+    assert ws.read_text("src/x.py") == "def f(a, b):\n    return a == b\n"
+    assert "mutation_survived" not in engine._scorecard
+    assert "mutation_killed" not in engine._scorecard
+
+
+class _FlakyRestoreWorkspace:
+    """Wraps a workspace whose Nth write (the restore) fails to simulate a
+    disk fault, mirroring how ``_tests_are_vacuous`` tests a failed stash pop.
+    """
+
+    def __init__(self, inner, fail_on_write: int):
+        self._inner = inner
+        self._fail_on_write = fail_on_write
+        self._writes = 0
+
+    def read_text(self, path):
+        return self._inner.read_text(path)
+
+    def write_text(self, path, content):
+        self._writes += 1
+        if self._writes == self._fail_on_write:
+            raise OSError("disk full")
+        self._inner.write_text(path, content)
+
+    def exists(self, path):
+        return self._inner.exists(path)
+
+
+def test_mutation_check_agentic_stash_restore_failure_is_a_hard_stop():
+    inner = InMemoryWorkspace({"src/x.py": "def f(a, b):\n    return a == b\n"})
+    flaky = _FlakyRestoreWorkspace(inner, fail_on_write=2)  # 1st write mutates, 2nd restores
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=InMemoryWorkspace(),
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    engine.agentic = True  # force the stash-locked agentic path
+    with pytest.raises(_StashRestoreFailed):
+        run(engine._mutation_check(_mutation_impl(), flaky, engine.git, None))
+
+
+def test_mutation_check_integrate_rejects_on_restore_failure(tmp_path):
+    # End-to-end: a mutation-restore failure surfaces through _integrate as a
+    # rejected attempt (gate failure), never a silently-accepted DONE task.
+    ws = LocalWorkspace(str(tmp_path))
+
+    class AgenticRunner(ScriptedRunner):
+        async def run(self, prompt, *, system_prompt=None, **kwargs):
+            if system_prompt and "senior software engineer" in system_prompt:
+                (tmp_path / "src").mkdir(exist_ok=True)
+                (tmp_path / "src" / "x.py").write_text("def f(a, b):\n    return a == b\n")
+            return await super().run(prompt, system_prompt=system_prompt, **kwargs)
+
+    mapping = engine_responses()
+    mapping["senior software engineer"] = json_response(
+        {
+            "summary": "impl",
+            "files": [{"path": "src/x.py", "change_type": "create", "summary": "s"}],
+        }
+    )
+    runner = AgenticRunner(by_system_prompt=mapping)
+    cmd = GateCycleRunner()
+
+    real_write = ws.write_text
+    write_calls = {"n": 0}
+
+    def flaky_write_text(path, content):
+        if path == "src/x.py":
+            write_calls["n"] += 1
+            if write_calls["n"] == 2:
+                raise OSError("disk full")
+        real_write(path, content)
+
+    ws.write_text = flaky_write_text  # type: ignore[method-assign]
+
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(
+            mutation_check=True, fail_to_pass_check=False, max_task_attempts=1
+        ),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is False
+    assert outcome.task_results[0].task.status is TaskStatus.FAILED
+    assert outcome.scorecard["gate_failures"] >= 1
+    assert "could not be restored" in outcome.task_results[0].test_report.summary
+
+
+def test_mutation_check_and_fail_to_pass_check_are_independent():
+    for fail_to_pass in (False, True):
+        for mutation in (False, True):
+            ws = InMemoryWorkspace({"src/x.py": "def f(a, b):\n    return a == b\n"})
+            engine = _engine(
+                ScriptedRunner([]),
+                workspace=ws,
+                command_runner=FakeCommandRunner(),
+                config=EngineConfig(
+                    fail_to_pass_check=fail_to_pass,
+                    mutation_check=mutation,
+                    verify_command=("pytest",),
+                ),
+            )
+            impl = _mutation_impl()
+            vacuous = run(
+                engine._tests_are_vacuous(impl, engine.workspace, engine.git, None, {})
+            )
+            run(engine._mutation_check(impl, engine.workspace, engine.git, None))
+
+            assert vacuous is fail_to_pass
+            if mutation:
+                assert engine._scorecard.get("mutation_survived") == 1
+                assert "mutation_killed" not in engine._scorecard
+            else:
+                assert "mutation_survived" not in engine._scorecard
+                assert "mutation_killed" not in engine._scorecard
+
+
+def _impl_response_with_comparison():
+    return json_response(
+        {
+            "summary": "impl",
+            "files": [
+                {
+                    "path": "src/x.py",
+                    "change_type": "create",
+                    "summary": "s",
+                    "content": "def f(a, b):\n    return a == b\n",
+                }
+            ],
+            "notes": "",
+        }
+    )
+
+
+def test_mutation_check_survived_leaves_task_outcome_unchanged():
+    mapping = engine_responses()
+    mapping["senior software engineer"] = _impl_response_with_comparison()
+
+    def _deliver(mutation_check):
+        eng = _engine(
+            ScriptedRunner(by_system_prompt=mapping),
+            command_runner=FakeCommandRunner(),
+            config=EngineConfig(
+                mutation_check=mutation_check,
+                fail_to_pass_check=False,
+                max_task_attempts=1,
+            ),
+        )
+        return run(eng.deliver(_request())), eng
+
+    baseline, base_engine = _deliver(False)
+    mutated, mut_engine = _deliver(True)
+
+    assert baseline.success is True
+    assert mutated.success is True
+    assert mutated.task_results[0].attempts == baseline.task_results[0].attempts
+    assert mutated.task_results[0].task.status is TaskStatus.DONE
+    assert baseline.task_results[0].task.status is TaskStatus.DONE
+    assert "mutation_survived" not in base_engine._scorecard
+    assert mut_engine._scorecard.get("mutation_survived") == 1
+    assert mutated.scorecard.get("mutation_survived") == 1
+
+
+def test_mutation_check_killed_leaves_task_outcome_unchanged():
+    mapping = engine_responses()
+    mapping["senior software engineer"] = _impl_response_with_comparison()
+
+    class _SecondGateCallFails:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, command, *, cwd=None, timeout=None):
+            args = list(command)
+            self.calls.append(args)
+            if len(self.calls) == 2:
+                return CommandResult(args, 1, "FAILED: mutant caught", "")
+            return CommandResult(args, 0, "ok", "")
+
+    def _deliver(mutation_check):
+        eng = _engine(
+            ScriptedRunner(by_system_prompt=mapping),
+            command_runner=_SecondGateCallFails(),
+            config=EngineConfig(
+                mutation_check=mutation_check,
+                fail_to_pass_check=False,
+                max_task_attempts=1,
+            ),
+        )
+        return run(eng.deliver(_request())), eng
+
+    baseline, base_engine = _deliver(False)
+    mutated, mut_engine = _deliver(True)
+
+    assert baseline.success is True
+    assert mutated.success is True
+    assert mutated.task_results[0].attempts == baseline.task_results[0].attempts
+    assert mutated.task_results[0].task.status is TaskStatus.DONE
+    assert "mutation_killed" not in base_engine._scorecard
+    assert mut_engine._scorecard.get("mutation_killed") == 1
+    assert mutated.scorecard.get("mutation_killed") == 1
+
+
+def test_run_evidence_surfaces_mutation_scorecard_keys():
+    scorecard = {"mutation_survived": 2, "mutation_killed": 1}
+    text = _run_evidence([], None, scorecard, [], None)
+    assert "mutation_survived=2" in text
+    assert "mutation_killed=1" in text
 
 
 def test_devops_artifacts_are_written_and_committed():

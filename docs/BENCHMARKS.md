@@ -36,7 +36,13 @@ beat either alone, and false-positive suppression is a first-class metric.**
 - **Adopted:** fail-to-pass validation ✅ — after gates pass, the engine
   reruns them with the implementation reverted (snapshot restore or
   `git stash -u`); a suite that still passes is rejected as vacuous
-  (`EngineConfig.fail_to_pass_check`). Mutation-lite scoring → roadmap.
+  (`EngineConfig.fail_to_pass_check`). Mutation-lite scoring ✅ — opt-in,
+  Python-only v1: flips the first comparison operator (`==`/`!=`/`<`/`>=`/
+  `>`/`<=`) in the task's one product file and reruns the gates; a
+  surviving mutant is an advisory `mutation_survived` scorecard signal only
+  (never a rejection, unlike fail-to-pass) (`EngineConfig.mutation_check`,
+  off by default). Additional mutation operators and per-profile mutators
+  for other languages remain future work.
 
 ## Security
 - **Benchmarks:** CWE-Bench-Java/IRIS (neurosymbolic LLM+CodeQL found 2× the

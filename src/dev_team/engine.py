@@ -95,6 +95,7 @@ from .memory import (
     RunCheckpoint,
     task_fingerprint,
 )
+from .mutation import mutate_first_comparison
 from .scores import RunScore, ScoreHistory
 from .models import (
     ChangeType,
@@ -185,6 +186,15 @@ class EngineConfig:
       the change, and the attempt is rejected as vacuous (SWT-bench logic).
       Skipped for dry runs, and whenever verification is remote or degraded
       (re-running those "gates" on reverted code proves nothing).
+    - ``mutation_check``: after gates pass, flip the first comparison
+      operator (``==``/``!=``/``<``/``>=``/``>``/``<=``) in the task's one
+      Python product file and re-run the gates; a mutant that still passes
+      is an advisory ``mutation_survived`` scorecard signal, never a
+      rejection (unlike ``fail_to_pass_check``, this never gates, retries,
+      or rolls back the task). Off by default — a new, less-proven signal,
+      matching ``visual_review``'s "off by default, advisory-only" opt-in.
+      Skipped for dry runs, non-local verification, non-Python or
+      multi-file changes, and when the file has no mutable comparison.
     - ``remote_verify_status`` / ``remote_verify_trigger``: delegate
       verification to an external CI system (see
       :class:`~dev_team.verification.RemoteCIGate`) — the escape hatch for
@@ -297,6 +307,14 @@ class EngineConfig:
     lint_command: Optional[Sequence[str]] = None
     security_scan_command: Optional[Sequence[str]] = None
     fail_to_pass_check: bool = True
+    #: Advisory-only mutation-lite signal: flip the first comparison operator
+    #: in the task's one Python product file and re-run the gates. A
+    #: surviving mutant only increments a scorecard counter — it never
+    #: rejects, retries, or rolls back the task. Off by default: a new,
+    #: less-proven signal that should earn a default separately (mirrors
+    #: ``visual_review``'s off-by-default, never-blocks-the-commit stance).
+    #: See ``docs/BENCHMARKS.md`` ("Mutation-lite scoring") and ROADMAP.
+    mutation_check: bool = False
     remote_verify_status: Optional[Sequence[str]] = None
     remote_verify_trigger: Optional[Sequence[str]] = None
     remote_verify_max_polls: int = 30
@@ -2738,6 +2756,46 @@ class DeliveryEngine:
                 )
                 return False, review, test_report, feedback
 
+            try:
+                await self._mutation_check(implementation, ws, repo, cwd)
+            except _StashRestoreFailed:
+                # Mirrors the fail-to-pass stash-restore hard-stop: the
+                # mutated write could not be restored, so the workspace can no
+                # longer be trusted. Reject rather than bank a task over a
+                # tree that may still hold mutated code.
+                self._scorecard["gate_failures"] = (
+                    self._scorecard.get("gate_failures", 0) + 1
+                )
+                self._rollback(snapshot, repo)
+                task.status = TaskStatus.CHANGES_REQUESTED
+                self._journal_rejection(
+                    task,
+                    span,
+                    "verification",
+                    "restoring the workspace after the mutation-lite check "
+                    "failed (mutation restore conflict)",
+                )
+                self.tracer.end(span, "stash-restore-failed")
+                feedback = Review(
+                    approved=False,
+                    summary="The implementation could not be verified: restoring "
+                    "the workspace after the mutation-lite check failed.",
+                    comments=[
+                        ReviewComment(
+                            severity=Severity.MAJOR,
+                            message="Re-run the task; the working tree could not be "
+                            "restored after the advisory mutation-lite check.",
+                        )
+                    ],
+                )
+                test_report = TestReport(
+                    passed=False,
+                    coverage=0.0,
+                    summary="rejected: the workspace could not be restored after "
+                    "the mutation-lite check",
+                )
+                return False, review, test_report, feedback
+
             return True, review, test_report, None
         except Exception:
             # An attempt that dies mid-integration (budget, agent error) must
@@ -2908,6 +2966,83 @@ class DeliveryEngine:
                 for path, content in current.items():
                     ws.write_text(path, content)
         return dod.passed or self._inherited_failures_only(dod)
+
+    async def _mutation_check(
+        self,
+        implementation: Implementation,
+        ws: Workspace,
+        repo: GitRepo,
+        cwd: Optional[str],
+    ) -> None:
+        """Advisory mutation-lite signal: does one flipped comparison survive?
+
+        Flips the first comparison operator (see :mod:`dev_team.mutation`) in
+        the task's one Python product file, re-runs the gates, and records a
+        ``mutation_survived``/``mutation_killed`` scorecard counter —
+        **never** a rejection, retry, or rollback (unlike
+        :meth:`_tests_are_vacuous`). Skipped, with no scorecard change, no
+        gate re-run, and no file written to disk, when: disabled; a dry run;
+        verification is remote or degraded; ``impl_paths`` holds zero or more
+        than one non-test product file; that one file is not Python; or it
+        has no mutable comparison.
+
+        The mutated write is always restored, success or failure — mirroring
+        :meth:`_tests_are_vacuous`'s fail-secure guarantee — via a ``finally``
+        block; a restore that itself fails raises :class:`_StashRestoreFailed`
+        (the same hard-stop class, handled by the caller) rather than risking
+        mutated code left on disk or, worse, committed.
+        """
+
+        if not self.config.mutation_check:
+            return
+        if not self._local_verification:
+            return
+        if isinstance(self.command_runner.inner, DryRunCommandRunner):
+            return
+        impl_paths = [
+            c.path
+            for c in implementation.files
+            if c.path and ws.exists(c.path) and not _is_test_path(c.path)
+        ]
+        if len(impl_paths) != 1:
+            return
+        path = impl_paths[0]
+        if not path.endswith(".py"):
+            return
+        original = ws.read_text(path)
+        mutated = mutate_first_comparison(original)
+        if mutated is None:
+            return
+
+        async def _evaluate_mutant() -> DoDReport:
+            ws.write_text(path, mutated)
+            try:
+                return await asyncio.to_thread(
+                    self.definition_of_done.evaluate, self._gate_context(cwd=cwd)
+                )
+            finally:
+                try:
+                    ws.write_text(path, original)
+                except Exception as exc:
+                    raise _StashRestoreFailed from exc
+
+        if self.agentic:
+            # Shares the vacuous check's lock: the workspace is not
+            # task-private in agentic non-worktree mode, so concurrent tasks
+            # mutating/restoring the same files must be serialised.
+            async with self._stash_lock:
+                dod = await _evaluate_mutant()
+        else:
+            dod = await _evaluate_mutant()
+
+        if dod.passed or self._inherited_failures_only(dod):
+            self._scorecard["mutation_survived"] = (
+                self._scorecard.get("mutation_survived", 0) + 1
+            )
+        else:
+            self._scorecard["mutation_killed"] = (
+                self._scorecard.get("mutation_killed", 0) + 1
+            )
 
     def _inherited_failures_only(self, dod: DoDReport) -> bool:
         """Whether every failing test in ``dod`` was already failing at baseline.

@@ -63,6 +63,28 @@ sections below are reconstructed from the repository history.
   decision document instead of the text proposal.
 
 ### Delivery
+- **A new opt-in mutation-lite check surfaces weak tests as an advisory
+  scorecard signal** (#176, closing `docs/BENCHMARKS.md`'s named
+  "Mutation-lite scoring → roadmap" gap next to the adopted fail-to-pass
+  check). `dev_team.mutation.mutate_first_comparison` is a pure, dependency-
+  free AST transform: it flips the first single-operator comparison
+  (`==`↔`!=`, `<`↔`>=`, `>`↔`<=`) found in a source string and returns the
+  unparsed mutated source, or `None` when nothing parses or no mutable
+  comparison exists. `DeliveryEngine._mutation_check` (a new sibling to
+  `_tests_are_vacuous`, called right after it in `_integrate`) applies this
+  to the task's one Python product file, reruns the gates, and records
+  `mutation_survived`/`mutation_killed` in the run scorecard —
+  **advisory-only**: unlike `fail_to_pass_check`, a surviving mutant never
+  rejects, retries, or rolls back the task. Gated on
+  `EngineConfig.mutation_check` (off by default, matching `visual_review`'s
+  earn-the-default stance) plus the same dry-run/remote-verification skips
+  `fail_to_pass_check` already has, and further scoped to exactly one
+  non-test `.py` product file. The mutated write is always restored via a
+  `finally` block, success or failure; a restore that itself fails raises
+  the same `_StashRestoreFailed` hard-stop class `_tests_are_vacuous` uses,
+  rejecting the attempt rather than risking mutated code left on disk or
+  committed. No new dependency, subprocess shape, or credential — reuses
+  the existing gate-evaluation path every other check already calls.
 - **A visual-critique failure is now diagnosable instead of a bare "skipping"**
   (#152, root-cause corrected by adversarial review). The default `--deliver`/
   `--assess` progress stream (`cli.py`'s `_progress_printer`) now renders
