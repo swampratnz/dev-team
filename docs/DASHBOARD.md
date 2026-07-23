@@ -304,8 +304,9 @@ dashboard is read-only but exposes the event journal, backlog, memory, any
 markdown report — and, when recording is enabled, the raw
 [agent transcripts](TRANSCRIPTS.md) — to whoever can reach it. **Set a
 token whenever the bind is non-local or transcripts are enabled.** Binding
-beyond loopback without one prints a stderr warning (it does not refuse, so
-existing localhost-adjacent setups keep working).
+beyond loopback without one now fails closed (the server refuses to start);
+pass `--allow-unauthenticated-dashboard` to opt back into the old
+warn-and-serve behavior on a network you already trust another way.
 
 ## Authentication (opt-in token)
 

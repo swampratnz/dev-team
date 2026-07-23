@@ -358,10 +358,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ADDR",
         help="Bind address for --dashboard or --dispatch (default 127.0.0.1). "
         "The dashboard can read any file the workspace holds — set "
-        "DEV_TEAM_DASHBOARD_TOKEN when widening the bind (unauthenticated "
-        "non-local binds get a stderr warning); the dispatch service "
-        "authenticates but runs agent code — only widen this on a trusted "
-        "network.",
+        "DEV_TEAM_DASHBOARD_TOKEN when widening the bind; an unauthenticated "
+        "non-local bind is refused unless --allow-unauthenticated-dashboard "
+        "is also passed. The dispatch service authenticates but runs agent "
+        "code — only widen this on a trusted network.",
+    )
+    serving.add_argument(
+        "--allow-unauthenticated-dashboard",
+        action="store_true",
+        help="With --dashboard: opt into starting an unauthenticated "
+        "dashboard on a non-loopback --host with no DEV_TEAM_DASHBOARD_TOKEN "
+        "set. Without this flag, that combination is refused (the dashboard "
+        "exposes the whole workspace read surface, including recorded "
+        "transcripts, to anyone who can reach the port). Has no effect when "
+        "a token is set or the bind is loopback.",
     )
     serving.add_argument(
         "--dashboard-workspace",
@@ -938,6 +948,10 @@ def _validate_args(
         parser.error("--port: only valid with --dashboard or --dispatch")
     if args.host is not None and not (args.dashboard or args.dispatch):
         parser.error("--host: only valid with --dashboard or --dispatch")
+    if args.allow_unauthenticated_dashboard and not args.dashboard:
+        parser.error(
+            "--allow-unauthenticated-dashboard: only valid with --dashboard"
+        )
     if args.dashboard_workspace is not None and not args.dispatch:
         parser.error("--dashboard-workspace: only valid with --dispatch")
     if args.dispatch_url is not None and not args.dashboard:
@@ -1770,16 +1784,26 @@ DASHBOARD_TOKEN_ENV = "DEV_TEAM_DASHBOARD_TOKEN"
 def _serve_dashboard(args) -> int:
     """Serve the workspace dashboard until interrupted; returns exit code.
 
-    Unlike --dispatch, a missing token is not an error (localhost dev must
-    keep working), but binding beyond loopback without one earns a stderr
-    warning: the workspace — including any recorded transcripts — would be
-    readable by anyone who can reach the port.
+    Unlike --dispatch, a missing token is not an error on loopback (localhost
+    dev must keep working). Binding beyond loopback without one is refused
+    (DevTeamError) — the workspace, including any recorded transcripts, would
+    be readable by anyone who can reach the port — unless the operator opts
+    in with --allow-unauthenticated-dashboard, in which case the previous
+    stderr warning still fires and the server starts as before.
     """
 
     token = os.environ.get(DASHBOARD_TOKEN_ENV, "")
     host = args.host if args.host is not None else "127.0.0.1"
     workspace = LocalWorkspace(args.workspace, excluded_dirs=_DASHBOARD_EXCLUDED_DIRS)
     if not token and host not in ("127.0.0.1", "localhost"):
+        if not args.allow_unauthenticated_dashboard:
+            raise DevTeamError(
+                f"the dashboard on {host} would be UNAUTHENTICATED - anyone "
+                "who can reach it can read the whole workspace (events, "
+                f"reports, transcripts). Set ${DASHBOARD_TOKEN_ENV} to "
+                "require a token, or pass --allow-unauthenticated-dashboard "
+                "to start it unauthenticated anyway."
+            )
         print(
             f"WARNING: the dashboard on {host} is UNAUTHENTICATED - anyone "
             "who can reach it can read the whole workspace (events, reports, "

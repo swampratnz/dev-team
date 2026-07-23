@@ -133,10 +133,12 @@ production alone:
   event journal, backlog, memory, and any markdown report, plus recorded
   agent transcripts if enabled — stays open with no login and no bearer
   check. That is an intentional default for local, loopback-only development,
-  not a hardened one: binding beyond `127.0.0.1` (`--host 0.0.0.0` or a
-  routable address) without setting a token only prints a stderr warning; it
-  does not refuse to start. Treat an unauthenticated dashboard as safe only on
-  localhost.
+  not a hardened one — but it is the *only* case that stays that way: binding
+  beyond `127.0.0.1` (`--host 0.0.0.0` or a routable address) without setting
+  a token now fails closed (`DevTeamError`, the server never starts) unless
+  the operator explicitly passes `--allow-unauthenticated-dashboard` to opt
+  back into the old warn-and-serve behavior. Treat an unauthenticated
+  dashboard as safe only on localhost.
 
 This doc reflects the mechanisms as of this writing; if it and the code it
 cites ever disagree, trust the code and file a correction here.
