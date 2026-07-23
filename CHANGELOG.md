@@ -609,7 +609,12 @@ sections below are reconstructed from the repository history.
   starts with it falls through to the ordinary `404`, mirroring the plan
   route's own exact-match discipline. The enqueued jobs/skips (or an error)
   render inline, every field escaped before `innerHTML` like the rest of
-  the panel.
+  the panel. Editing `max_stories` after arming disarms the confirm button
+  back to a plain "run" label, mirroring the existing `budget_usd` listener,
+  so the on-screen confirm text can never go stale relative to what a click
+  would submit; the button is also disabled for the duration of an
+  in-flight request so a rapid double-click can't fire two overlapping
+  enqueue calls.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /

@@ -2522,6 +2522,21 @@ def test_dashboard_html_foreman_run_form():
         '$("foreman-run-budget").addEventListener("input"' in DASHBOARD_HTML
     )
     assert "btn.disabled = !$(\"foreman-run-budget\").value" in DASHBOARD_HTML
+
+    # Regression: changing max_stories after arming must also disarm the
+    # button, so the on-screen confirm label (which states the exact
+    # max_stories value) can never go stale relative to what a click would
+    # submit. Mirrors the budget listener above.
+    max_stories_listener = DASHBOARD_HTML.index(
+        '$("foreman-run-max-stories").addEventListener("input"'
+    )
+    max_stories_listener_end = DASHBOARD_HTML.index("});", max_stories_listener)
+    max_stories_listener_body = DASHBOARD_HTML[
+        max_stories_listener:max_stories_listener_end
+    ]
+    assert 'btn.dataset.armed = "";' in max_stories_listener_body
+    assert 'btn.textContent = "run";' in max_stories_listener_body
+
     assert (
         '$("foreman-run-btn").addEventListener("click"' in DASHBOARD_HTML
     )
@@ -2545,6 +2560,16 @@ def test_dashboard_html_foreman_run_form():
     assert "${esc(j.position)}" in DASHBOARD_HTML
     assert "${esc(s.story_id)}" in DASHBOARD_HTML
     assert "${esc(s.reason)}" in DASHBOARD_HTML
+
+    # Minor/double-click guard: the button is disabled for the duration of
+    # the in-flight request, so a rapid double-click on an already-armed
+    # button cannot fire two overlapping POSTs, and is re-enabled afterwards
+    # based on whether budget_usd still has a value.
+    foreman_run_fn = DASHBOARD_HTML.index("async function foremanRun()")
+    foreman_run_fn_end = DASHBOARD_HTML.index("\n}\n", foreman_run_fn)
+    foreman_run_fn_body = DASHBOARD_HTML[foreman_run_fn:foreman_run_fn_end]
+    assert "btn.disabled = true;" in foreman_run_fn_body
+    assert 'btn.disabled = !$("foreman-run-budget").value;' in foreman_run_fn_body
 
 
 # --- the pending-question proxy (GET /api/jobs/{id}/question → dispatch) -----

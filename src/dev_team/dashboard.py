@@ -2110,6 +2110,7 @@ async function foremanRun() {
   const maxStories = $("foreman-run-max-stories").value;
   const body = { budget_usd: Number(budget) };
   if (maxStories) body.max_stories = Number(maxStories);
+  btn.disabled = true;
   try {
     const res = await fetch("/api/foreman/run", {
       method: "POST",
@@ -2123,6 +2124,7 @@ async function foremanRun() {
   }
   btn.dataset.armed = "";
   btn.textContent = "run";
+  btn.disabled = !$("foreman-run-budget").value;
   loadForemanPlan();
 }
 
@@ -2715,6 +2717,11 @@ $("foreman-plan-refresh").addEventListener("click", loadForemanPlan);
 $("foreman-run-budget").addEventListener("input", () => {
   const btn = $("foreman-run-btn");
   btn.disabled = !$("foreman-run-budget").value;
+  btn.dataset.armed = "";
+  btn.textContent = "run";
+});
+$("foreman-run-max-stories").addEventListener("input", () => {
+  const btn = $("foreman-run-btn");
   btn.dataset.armed = "";
   btn.textContent = "run";
 });
