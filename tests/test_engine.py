@@ -2927,6 +2927,73 @@ def test_design_rationale_lands_in_adr():
     assert outcome.blackboard.decisions[0].consequences == "THE-RATIONALE"
 
 
+# --- design-thoroughness scorecard signal (issue #178) ---------------------
+
+
+def test_design_thoroughness_scorecard_counts_distinct_list_lengths():
+    responses = engine_responses()
+    responses["software architect"] = json_response(
+        {
+            "overview": "o",
+            "components": [
+                {"name": "A", "responsibility": "a"},
+                {"name": "B", "responsibility": "b"},
+            ],
+            "risks": ["r1", "r2", "r3"],
+            "alternatives": ["alt1"],
+        }
+    )
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(runner)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.scorecard["design_components_count"] == 2
+    assert outcome.scorecard["design_risks_count"] == 3
+    assert outcome.scorecard["design_alternatives_count"] == 1
+
+
+def test_design_thoroughness_scorecard_zero_for_empty_design_lists():
+    responses = engine_responses()
+    responses["software architect"] = json_response(
+        {"overview": "o", "components": [], "risks": [], "alternatives": []}
+    )
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(runner)
+    outcome = run(engine.deliver(_request()))
+    # the design phase ran, so these are legitimate zeros, not absent keys
+    assert outcome.scorecard["design_components_count"] == 0
+    assert outcome.scorecard["design_risks_count"] == 0
+    assert outcome.scorecard["design_alternatives_count"] == 0
+
+
+def test_design_thoroughness_scorecard_absent_when_halted_before_design():
+    mapping = engine_responses()
+    mapping["software architect"] = "utter garbage, no JSON here"
+    runner = ScriptedRunner(by_system_prompt=mapping)
+    engine = _engine(runner, config=EngineConfig(json_retries=0))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.halted_reason is not None
+    assert "design_components_count" not in outcome.scorecard
+    assert "design_risks_count" not in outcome.scorecard
+    assert "design_alternatives_count" not in outcome.scorecard
+
+
+def test_design_thoroughness_scorecard_leaves_other_keys_unaffected():
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner)
+    outcome = run(engine.deliver(_request()))
+    # pins the full scorecard: the three new design_* keys are additive, and
+    # every pre-existing counter is untouched by this change.
+    assert outcome.scorecard == {
+        "plan_lint_issues": 0,
+        "review_rejections": 0,
+        "gate_failures": 0,
+        "vacuous_test_rejections": 0,
+        "design_components_count": 1,
+        "design_risks_count": 1,
+        "design_alternatives_count": 0,
+    }
+
+
 def test_reviewer_receives_lint_findings():
     cmd = GateCycleRunner()
     cmd.add_rule("ruff", CommandResult(["ruff"], 1, "src/x.py:1:1 F401 unused import", ""))
