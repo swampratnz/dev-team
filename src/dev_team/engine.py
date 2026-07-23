@@ -3026,10 +3026,13 @@ class DeliveryEngine:
                 except Exception as exc:
                     raise _StashRestoreFailed from exc
 
-        if self.agentic:
+        if self.agentic and not self._use_worktrees:
             # Shares the vacuous check's lock: the workspace is not
             # task-private in agentic non-worktree mode, so concurrent tasks
-            # mutating/restoring the same files must be serialised.
+            # mutating/restoring the same files must be serialised. Worktree
+            # mode gives each task its own private Workspace directory (no
+            # shared mutable resource like the stash ref), so locking there
+            # would only serialise gate re-runs across tasks for no reason.
             async with self._stash_lock:
                 dod = await _evaluate_mutant()
         else:

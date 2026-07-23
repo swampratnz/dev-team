@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 
 import pytest
 
@@ -3627,6 +3628,42 @@ def test_mutation_check_agentic_stash_restore_failure_is_a_hard_stop():
     engine.agentic = True  # force the stash-locked agentic path
     with pytest.raises(_StashRestoreFailed):
         run(engine._mutation_check(_mutation_impl(), flaky, engine.git, None))
+
+
+def test_mutation_check_worktree_mode_skips_the_shared_stash_lock():
+    """Worktree tasks each get a private Workspace (no shared mutable
+    resource like the stash ref), so the mutation check must not funnel
+    their gate re-runs through the shared stash lock — doing so would
+    serialise _develop_task_in_worktree's whole-suite gate reruns across
+    every concurrently-running worktree task.
+    """
+
+    barrier = threading.Barrier(2, timeout=2)
+
+    class BarrierCommandRunner:
+        def run(self, command, *, cwd=None, timeout=None):
+            barrier.wait()  # only returns once both tasks arrive concurrently
+            return CommandResult(list(command), 0, "", "")
+
+    ws_a = InMemoryWorkspace({"src/a.py": "def f(a, b):\n    return a == b\n"})
+    ws_b = InMemoryWorkspace({"src/b.py": "def f(a, b):\n    return a == b\n"})
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=InMemoryWorkspace(),
+        command_runner=BarrierCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    engine.agentic = True
+    engine._use_worktrees = True
+
+    async def _both():
+        await asyncio.gather(
+            engine._mutation_check(_mutation_impl("src/a.py"), ws_a, engine.git, None),
+            engine._mutation_check(_mutation_impl("src/b.py"), ws_b, engine.git, None),
+        )
+
+    run(_both())  # hangs (then BrokenBarrierError) if the shared lock still serialises these
+    assert engine._scorecard.get("mutation_survived") == 2
 
 
 def test_mutation_check_integrate_rejects_on_restore_failure(tmp_path):
