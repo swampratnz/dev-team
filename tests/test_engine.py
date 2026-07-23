@@ -3475,6 +3475,39 @@ def test_mutation_check_skipped_with_multiple_product_files():
     assert cmd.calls == []
 
 
+def test_mutation_check_excludes_engineer_authored_test_files():
+    # Mirrors test_fail_to_pass_keeps_engineer_authored_tests: the agentic
+    # engineer reports its own test file in implementation.files alongside
+    # the product file. That test file must be filtered out of the product
+    # count (not_is_test_path's False arm) so it doesn't push impl_paths
+    # past the "exactly one" requirement.
+    from dev_team.models import ChangeType, FileChange
+
+    ws = InMemoryWorkspace(
+        {
+            "src/x.py": "def f(a, b):\n    return a == b\n",
+            "tests/test_x.py": "def test_f():\n    assert True\n",
+        }
+    )
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[
+            FileChange(path="src/x.py", change_type=ChangeType.CREATE, summary="s"),
+            FileChange(path="tests/test_x.py", change_type=ChangeType.CREATE, summary="s"),
+        ],
+    )
+    run(engine._mutation_check(impl, ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert ws.read_text("src/x.py") == "def f(a, b):\n    return a == b\n"
+
+
 def test_mutation_check_skipped_for_non_python_file():
     ws = InMemoryWorkspace({"src/x.ts": "function f(a, b) { return a === b; }\n"})
     cmd = FakeCommandRunner()
