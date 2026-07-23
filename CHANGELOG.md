@@ -361,6 +361,19 @@ sections below are reconstructed from the repository history.
   returned entry carries exactly the four fields the write path persists —
   never an `Authorization` header or a request/response body, since #54
   never wrote those in the first place.
+- **Access log batch correlation for `POST /foreman/run`** (#180,
+  `docs/DISPATCH.md`): `AccessLog.append` gains a `job_ids` field, the list-
+  valued sibling of #167's single-job `job_id`. A `POST /foreman/run` call
+  that creates jobs now has its access-log record carry every `job_id` it
+  produced, in order — including the save-failed/compensated-cancel case
+  (`cancelled` then `uncancellable`), where the jobs genuinely existed and
+  could have started spending before being rolled back, so the audit trail
+  still shows they existed even though the API reported a `500`. A rejected
+  call (400/409, no job created) omits the field, same fail-secure
+  discipline `job_id` already established. Job ids are server-generated and
+  already returned in `/foreman/run`'s own response body, so this is not a
+  new payload-leak surface. The dashboard's Access log panel renders one
+  tag per id, mirroring the existing single-`job_id` tag.
 - **`citation_broken` on every enumerated finding** (`docs/DISPATCH.md`):
   the follow-up the $0 `broken_citations` check (above) named and deferred
   on purpose — `list_findings` now joins its own already-persisted

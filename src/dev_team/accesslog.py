@@ -12,10 +12,11 @@ pattern :class:`~dev_team.eventlog.EventLog` already uses for job progress
 (``.dev_team/events.jsonl``), applied one layer up: at the HTTP handler
 rather than the job runner. Logged fields are deliberately minimal —
 ``ts``/``method``/``path``/``status``, plus an optional ``job_id`` recorded
-only for the ``POST /jobs`` request that created it — and deliberately
-exclude the ``Authorization`` header value and any request or response
-body, so the log itself can never become a new credential- or payload-leak
-surface.
+only for the ``POST /jobs`` request that created it, and an optional
+``job_ids`` recorded only for the ``POST /foreman/run`` request that
+created a batch of them — and deliberately exclude the ``Authorization``
+header value and any request or response body, so the log itself can never
+become a new credential- or payload-leak surface.
 
 Unlike :class:`~dev_team.eventlog.EventLog`, this journal is not backed by a
 :class:`~dev_team.execution.Workspace`: the dispatch service's ``jobs_root``
@@ -105,6 +106,7 @@ class AccessLog:
         request_path: str,
         status: int,
         job_id: Optional[str] = None,
+        job_ids: Optional[List[str]] = None,
     ) -> None:
         """Append one record. Raises ``OSError`` on a filesystem failure."""
 
@@ -116,6 +118,8 @@ class AccessLog:
         }
         if job_id is not None:
             record["job_id"] = job_id
+        if job_ids:
+            record["job_ids"] = job_ids
         target = Path(self.root) / self.filename
         with self._lock:
             target.parent.mkdir(parents=True, exist_ok=True)
