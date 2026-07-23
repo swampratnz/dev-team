@@ -593,6 +593,23 @@ sections below are reconstructed from the repository history.
   `feature` is the one caller-influenced field (the delivered feature's
   free-text name), rendered through `esc()` before `innerHTML` like every
   other panel; a workspace with no recorded runs shows a muted empty state.
+- **Foreman run wired to the dashboard** (`docs/DASHBOARD.md`): a new
+  `POST /api/foreman/run` route — the write half #165 named as "a future,
+  separate slice" — proxies the dispatch service's `POST /foreman/run`
+  (above), the seventh proxy of this shape. The Foreman plan panel gains a
+  `budget_usd`/`max_stories` form with a two-step arm/confirm button
+  (mirroring the archived-job purge button's confirm pattern), so a
+  spend-multiplying batch enqueue always needs an explicit second click
+  (CLAUDE.md §1) — no prefilled `budget_usd`, no auto-submit. The dashboard
+  forwards the JSON body verbatim and relays the dispatch response
+  unchanged (`202`/`200` success, `400` validation, `500`
+  compensated-cancel, `502` unreachable); without a dispatch token wired it
+  answers `501 {"error": "foreman run not configured"}`, no outbound call
+  attempted. Scope is exactly `/api/foreman/run` — a path that merely
+  starts with it falls through to the ordinary `404`, mirroring the plan
+  route's own exact-match discipline. The enqueued jobs/skips (or an error)
+  render inline, every field escaped before `innerHTML` like the rest of
+  the panel.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /

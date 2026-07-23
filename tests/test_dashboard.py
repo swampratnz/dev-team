@@ -2248,10 +2248,11 @@ def test_foreman_plan_proxy_never_echoes_the_dispatch_token(proxy_server, monkey
 
 
 def test_foreman_plan_route_scope_is_exact_match_only(proxy_server, monkeypatch):
-    # SECURITY/scope: only exactly /api/foreman/plan is this route — a path
-    # that merely starts with it, and in particular /api/foreman/run, falls
-    # through to the ordinary 404, never forwarded to the dispatch service
-    # (no /foreman/run wiring, no general dispatch passthrough).
+    # SECURITY/scope: only exactly /api/foreman/plan is a GET route — a path
+    # that merely starts with it falls through to the ordinary 404, never
+    # forwarded to the dispatch service. /api/foreman/run is a POST-only
+    # route (see the foreman-run proxy tests below), so a GET to it also
+    # falls through here, never forwarded.
     seen = _capture_urlopen(monkeypatch)
     for path in (
         "/api/foreman/plan/",
@@ -2264,6 +2265,215 @@ def test_foreman_plan_route_scope_is_exact_match_only(proxy_server, monkeypatch)
         status, _, _ = _request(proxy_server, "GET", path, headers=AUTH)
         assert status == 404
     assert seen == []
+
+
+# --- the foreman run proxy (POST /api/foreman/run → dispatch POST /foreman/run) --
+
+
+def test_foreman_run_proxy_forwards_body_and_relays_202(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch,
+        status=202,
+        body=b'{"jobs": [{"job_id": "deliver-1", "story_id": "S1",'
+        b' "title": "Remove hardcoded secret", "position": 0}],'
+        b' "skipped": [], "budget_usd_per_story": 5.0}',
+    )
+    payload = json.dumps({"budget_usd": 5, "max_stories": 2})
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/foreman/run",
+        headers={**AUTH, "Content-Type": "application/json"}, body=payload,
+    )
+    assert status == 202
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {
+        "jobs": [
+            {
+                "job_id": "deliver-1",
+                "story_id": "S1",
+                "title": "Remove hardcoded secret",
+                "position": 0,
+            }
+        ],
+        "skipped": [],
+        "budget_usd_per_story": 5.0,
+    }
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/foreman/run"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.data == payload.encode()
+
+
+def test_foreman_run_proxy_relays_200_when_nothing_ready(proxy_server, monkeypatch):
+    _capture_urlopen(
+        monkeypatch, status=200,
+        body=b'{"jobs": [], "skipped": [], "budget_usd_per_story": 5.0}',
+    )
+    status, _, body = _request(
+        proxy_server, "POST", "/api/foreman/run",
+        headers=AUTH, body=json.dumps({"budget_usd": 5}),
+    )
+    assert status == 200
+    assert json.loads(body)["jobs"] == []
+
+
+def test_foreman_run_proxy_relays_a_400_validation_rejection(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/foreman/run", 400, "Bad Request", None,
+        io.BytesIO(b'{"error": "budget_usd must be positive"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(
+        proxy_server, "POST", "/api/foreman/run",
+        headers=AUTH, body=json.dumps({"budget_usd": -1}),
+    )
+    assert status == 400
+    assert json.loads(body) == {"error": "budget_usd must be positive"}
+
+
+def test_foreman_run_proxy_relays_a_500_compensated_cancel(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/foreman/run", 500, "Internal Server Error", None,
+        io.BytesIO(
+            b'{"error": "backlog write failed; enqueued jobs were cancelled",'
+            b' "cancelled": [{"job_id": "deliver-1", "story_id": "S1"}],'
+            b' "uncancellable": []}'
+        ),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(
+        proxy_server, "POST", "/api/foreman/run",
+        headers=AUTH, body=json.dumps({"budget_usd": 5}),
+    )
+    assert status == 500
+    assert json.loads(body) == {
+        "error": "backlog write failed; enqueued jobs were cancelled",
+        "cancelled": [{"job_id": "deliver-1", "story_id": "S1"}],
+        "uncancellable": [],
+    }
+
+
+def test_foreman_run_proxy_unreachable_dispatch_is_502(proxy_server, monkeypatch):
+    _capture_urlopen(monkeypatch, error=urllib.error.URLError("refused"))
+    status, _, body = _request(
+        proxy_server, "POST", "/api/foreman/run",
+        headers=AUTH, body=json.dumps({"budget_usd": 5}),
+    )
+    assert status == 502
+    assert json.loads(body) == {"error": "dispatch service unreachable"}
+    assert "refused" not in body  # no internals leak
+
+
+def test_foreman_run_proxy_tolerates_no_body(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch, status=400, body=b'{"error": "budget_usd is required"}'
+    )
+    status, _, body = _request(
+        proxy_server, "POST", "/api/foreman/run", headers=AUTH
+    )
+    assert status == 400
+    assert json.loads(body) == {"error": "budget_usd is required"}
+    (request,) = seen
+    assert request.data is None  # no body sent → none forwarded
+
+
+def test_foreman_run_proxy_tolerates_a_malformed_content_length(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch, status=202, body=b'{"jobs": [], "skipped": []}')
+    status, _, _ = _request(
+        proxy_server, "POST", "/api/foreman/run",
+        headers={**AUTH, "Content-Length": "xyz"},
+    )
+    assert status == 202
+    (request,) = seen
+    assert request.data is None  # unreadable length → treated as no body
+
+
+def test_foreman_run_proxy_unconfigured_is_501(token_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "POST", "/api/foreman/run",
+        headers=AUTH, body=json.dumps({"budget_usd": 5}),
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "foreman run not configured"}
+    assert seen == []
+
+
+def test_foreman_run_proxy_url_without_token_stays_unconfigured(monkeypatch):
+    # A dispatch URL alone (no dispatch token) must not forward: still 501,
+    # matching every other proxy's own behaviour.
+    seen = _capture_urlopen(monkeypatch)
+    srv = DashboardServer(
+        InMemoryWorkspace(), port=0, token=TOKEN, dispatch_url=DISPATCH_URL
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, body = _request(
+            srv, "POST", "/api/foreman/run",
+            headers=AUTH, body=json.dumps({"budget_usd": 5}),
+        )
+        assert status == 501
+        assert json.loads(body) == {"error": "foreman run not configured"}
+        assert seen == []
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
+
+
+def test_foreman_run_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    # dispatch IS configured, but the caller never authenticated to the
+    # dashboard — 401 first, and nothing is ever forwarded.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/foreman/run", body=json.dumps({"budget_usd": 5}),
+    )
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+def test_foreman_run_proxy_never_echoes_the_dispatch_token(proxy_server, monkeypatch):
+    # SECURITY: the dispatch bearer token must never reach the browser, in
+    # the response body or in any header.
+    _capture_urlopen(
+        monkeypatch, status=202,
+        body=b'{"jobs": [], "skipped": [], "budget_usd_per_story": 5.0}',
+    )
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/foreman/run",
+        headers=AUTH, body=json.dumps({"budget_usd": 5}),
+    )
+    assert status == 202
+    assert DISPATCH_TOKEN not in body
+    assert DISPATCH_TOKEN not in str(headers)
+
+
+def test_foreman_run_route_scope_is_exact_match_only(proxy_server, monkeypatch):
+    # SECURITY/scope: only exactly /api/foreman/run is this route — a path
+    # that merely starts with it falls through to the ordinary 404, never
+    # forwarded to the dispatch service.
+    seen = _capture_urlopen(monkeypatch)
+    for path in ("/api/foreman/run/extra", "/api/foreman/running"):
+        status, _, body = _request(
+            proxy_server, "POST", path,
+            headers=AUTH, body=json.dumps({"budget_usd": 5}),
+        )
+        assert status == 404
+    assert seen == []
+
+
+def test_foreman_run_regression_get_plan_still_works(proxy_server, monkeypatch):
+    # AC7: adding the write proxy must not disturb GET /api/foreman/plan's
+    # existing behaviour, response shape, or routing.
+    _capture_urlopen(
+        monkeypatch, body=b'{"ready_total": 0, "max_stories": 3, "plan": []}'
+    )
+    status, _, body = _request(proxy_server, "GET", "/api/foreman/plan", headers=AUTH)
+    assert status == 200
+    assert json.loads(body) == {"ready_total": 0, "max_stories": 3, "plan": []}
 
 
 def test_dashboard_html_foreman_plan_panel():
@@ -2295,6 +2505,46 @@ def test_dashboard_html_foreman_plan_panel():
     assert "/api/foreman/plan" not in DASHBOARD_HTML[refresh_start:refresh_end]
     assert "setInterval(loadForemanPlan" not in DASHBOARD_HTML
     assert "\nloadForemanPlan();" in DASHBOARD_HTML
+
+
+def test_dashboard_html_foreman_run_form():
+    # AC5: the "Run" control is disabled until budget_usd has a value, the
+    # first click arms a confirm state whose label states the exact
+    # budget_usd/max_stories values about to be submitted, and only the
+    # second click issues the POST.
+    assert '<input type="number" id="foreman-run-budget"' in DASHBOARD_HTML
+    assert '<input type="number" id="foreman-run-max-stories"' in DASHBOARD_HTML
+    assert 'value="3"' in DASHBOARD_HTML  # max_stories UX default, per-story budget stays blank
+    assert '<button id="foreman-run-btn" class="ghost" disabled>run</button>' in DASHBOARD_HTML
+    assert '<div class="panel" id="foreman-run-result"></div>' in DASHBOARD_HTML
+
+    assert (
+        '$("foreman-run-budget").addEventListener("input"' in DASHBOARD_HTML
+    )
+    assert "btn.disabled = !$(\"foreman-run-budget\").value" in DASHBOARD_HTML
+    assert (
+        '$("foreman-run-btn").addEventListener("click"' in DASHBOARD_HTML
+    )
+    assert "if (btn.dataset.armed) { foremanRun(); return; }" in DASHBOARD_HTML
+    assert (
+        "btn.textContent = `confirm: enqueue up to ${maxStories}"
+        " stories at $${budget}/story?`;" in DASHBOARD_HTML
+    )
+
+    # AC1/AC6: the fetch is a JSON POST, and the result — including any
+    # dispatch-supplied text (job/story ids, titles, skip/error reasons) —
+    # is escaped before touching innerHTML, never a raw dump.
+    assert 'fetch("/api/foreman/run", {' in DASHBOARD_HTML
+    assert 'method: "POST",' in DASHBOARD_HTML
+    assert "body: JSON.stringify(body)," in DASHBOARD_HTML
+    assert "function foremanRunPanel(data, ok) {" in DASHBOARD_HTML
+    assert "if (!ok) return `<span class=\"muted\">${esc(data.error)}</span>`;" in DASHBOARD_HTML
+    assert "${esc(j.job_id)}" in DASHBOARD_HTML
+    assert "${esc(j.story_id)}" in DASHBOARD_HTML
+    assert "${esc(j.title)}" in DASHBOARD_HTML
+    assert "${esc(j.position)}" in DASHBOARD_HTML
+    assert "${esc(s.story_id)}" in DASHBOARD_HTML
+    assert "${esc(s.reason)}" in DASHBOARD_HTML
 
 
 # --- the pending-question proxy (GET /api/jobs/{id}/question → dispatch) -----

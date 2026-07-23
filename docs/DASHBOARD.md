@@ -232,9 +232,7 @@ $0 dry-run — the same dependency-ready-stories preview `GET /foreman/plan`
 computes (see [`docs/DISPATCH.md`](DISPATCH.md)): each `todo` story whose
 dependencies are all `done`/`declined`, the repo it resolves to, and (for an
 ineligible story) why not. It answers "what would `/foreman/run` enqueue
-right now" without spending anything or enqueueing anything — `POST
-/foreman/run` itself is **not** wired to the dashboard; that write stays a
-future, separate slice (its own budget/max-stories form and confirm step).
+right now" without spending anything or enqueueing anything.
 
 Same proxy shape and the same on-demand-only discipline as Spend/Access log:
 `GET /api/foreman/plan` forwards to the dispatch service's `GET
@@ -251,6 +249,24 @@ Every rendered field (`story_id`, `title`, `repo`, `reason`) goes through
 `esc()` before `innerHTML` — a story's title can trace to an LLM assessment
 finding per the existing Story-detail provenance model, so it is treated as
 untrusted exactly like every other panel's caller- or model-derived text.
+
+Below the plan table, a small form wires up the write half: a required
+`budget_usd` number input and an optional `max_stories` input (defaulted to
+3, a client-side UX nicety only — the dispatch service remains the sole
+enforcer of the `[1, 10]` bound). The "run" button is disabled until
+`budget_usd` has a value; the first click **arms** a confirm state whose
+label states the exact values about to be submitted (e.g. "confirm: enqueue
+up to 3 stories at $5/story?"), and only the second click issues `POST
+/api/foreman/run` — the same two-step arm/confirm pattern as the archived-job
+purge button, so a spend-multiplying action never fires on a single,
+un-confirmed click (CLAUDE.md §1). The dashboard route forwards the JSON
+body verbatim to the dispatch service's `POST /foreman/run` and relays its
+response — `202`/`200` success (`jobs`/`skipped`), `400` validation
+rejection, `500` compensated-cancel, `502` unreachable — unchanged; without
+a dispatch URL/token configured it answers `501` and no outbound call is
+attempted. The result (enqueued job id/story/title/position, or a skip/error
+reason) renders inline, every field escaped before `innerHTML` exactly like
+the plan table above.
 
 ### Pending questions
 
@@ -392,11 +408,17 @@ browser ──(dashboard token)──▶ dashboard POST /api/jobs/{id}/answer �
 ```
 
 The Foreman plan panel's `GET /api/foreman/plan` (above) is a sixth,
-read-only proxy of the same shape — and, deliberately, `POST /foreman/run`
-is **not** wired to any dashboard route:
+read-only proxy of the same shape:
 
 ```
 browser ──(dashboard token)──▶ dashboard GET /api/foreman/plan ──(dispatch token)──▶ dispatch GET /foreman/plan
+```
+
+The Foreman plan panel's run form (above) adds a seventh, body-forwarding
+proxy — the write half of the same panel:
+
+```
+browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(dispatch token)──▶ dispatch POST /foreman/run
 ```
 
 - **The proxy** (`--dashboard` with `--dispatch-url`, default
@@ -438,13 +460,22 @@ browser ──(dashboard token)──▶ dashboard GET /api/foreman/plan ──(
   job action). Scope is **exactly `.../question` and `.../answer`** — a
   path that merely starts with the jobs prefix but doesn't match either
   suffix exactly is the ordinary `404`, never forwarded.
-- Last, `GET /api/foreman/plan`: forwarded to `<dispatch-url>/foreman/plan`
+- `GET /api/foreman/plan`: forwarded to `<dispatch-url>/foreman/plan`
   (including the dispatch service's own `409` when its dashboard workspace
   isn't configured), with `?max_stories=` passed through unchanged (the
   dispatch service itself clamps it to `[1, 10]`), and without a token it
   answers `501 {"error": "foreman plan not configured"}`. Scope is
-  **exactly `/api/foreman/plan`** — no path parameter, and in particular
-  never `/api/foreman/run`, which stays unreachable through the dashboard.
+  **exactly `/api/foreman/plan`** — no path parameter.
+- Last, `POST /api/foreman/run`: forwarded verbatim to `<dispatch-url>
+  /foreman/run` (`202`/`200` success, `400` validation rejection, `500`
+  compensated-cancel, `502` unreachable — all relayed unchanged), and
+  without a token it answers `501 {"error": "foreman run not
+  configured"}`, no outbound call attempted. Scope is **exactly
+  `/api/foreman/run`** — a path that merely starts with it (e.g.
+  `/api/foreman/run/extra`, `/api/foreman/running`) is the ordinary `404`,
+  never forwarded. The dashboard adds no validation of its own; the
+  dispatch service remains the sole enforcer of `budget_usd`/`max_stories`
+  bounds.
 - **Auth is layered**: the browser authenticates to the dashboard
   (dashboard token / cookie, checked first); the dashboard process — not
   the browser — holds the dispatch bearer token. Both comparisons are
@@ -503,4 +534,6 @@ the bearer header when a token is set):
   requires dashboard auth).
 - `GET /api/foreman/plan` — the foreman-plan proxy described above
   (`?max_stories=` passed through unchanged; same auth and `501` gating;
-  requires dashboard auth). `POST /api/foreman/run` does not exist.
+  requires dashboard auth).
+- `POST /api/foreman/run` — the foreman-run proxy described above (body
+  forwarded verbatim; same auth and `501` gating; requires dashboard auth).

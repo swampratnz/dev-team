@@ -487,6 +487,12 @@ _JOBS_PROXY_ACTIONS = frozenset({"archive", "unarchive", "purge"})
 #: pure disk transforms, so anything slower means the service is wedged.
 _PROXY_TIMEOUT = 30.0
 
+#: The one exact path the foreman-run proxy answers on — checked with ``==``,
+#: never ``startswith``, so a path that merely starts with it (e.g.
+#: ``/api/foreman/run/extra`` or ``/api/foreman/running``) falls through to
+#: the ordinary 404, same exact-scope discipline as ``/api/foreman/plan``.
+_FOREMAN_RUN_PATH = "/api/foreman/run"
+
 
 def _session_cookie(value: str, *, secure: bool, max_age: Optional[int] = None) -> str:
     """Build the ``Set-Cookie`` header for the session cookie.
@@ -549,9 +555,11 @@ def _make_handler(
     ``POST /api/jobs/{id}/answer`` are forwarded to the matching
     ``/jobs/{id}/question|answer`` interactive deliver routes; ``GET
     /api/foreman/plan`` is forwarded to the dispatch service's ``GET
-    /foreman/plan`` backlog-foreman dry-run (never ``/foreman/run``); with
-    either unset all seven stay unavailable and answer ``501``. The dispatch
-    token is only ever sent to ``dispatch_url`` — never logged or reflected.
+    /foreman/plan`` backlog-foreman dry-run, and ``POST /api/foreman/run`` is
+    forwarded to the dispatch service's ``POST /foreman/run`` enqueue route;
+    with either unset all eight stay unavailable and answer ``501``. The
+    dispatch token is only ever sent to ``dispatch_url`` — never logged or
+    reflected.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -649,6 +657,8 @@ def _make_handler(
                 self._proxy_backlog("POST", path)
             elif path.startswith(_JOBS_PROXY_PREFIX):
                 self._proxy_jobs(path)
+            elif path == _FOREMAN_RUN_PATH:
+                self._foreman_run()
             else:
                 self._send(404, "text/plain", "not found")
 
@@ -873,8 +883,9 @@ def _make_handler(
 
         # -- foreman plan: a fifth narrow read-only proxy, same shape as the
         # spend rollup/access log above. Scope is exactly this one path (see
-        # do_GET's exact-match dispatch above) — in particular, never
-        # /api/foreman/run, which stays unreachable through the dashboard.
+        # do_GET's exact-match dispatch above) — its write sibling is
+        # :meth:`_foreman_run` below, on its own exact ``/api/foreman/run``
+        # path, never a shared prefix.
 
         def _foreman_plan(self, query: str) -> None:
             if not (dispatch_url and dispatch_token):
@@ -895,6 +906,31 @@ def _make_handler(
                 else "/foreman/plan"
             )
             self._proxy("GET", suffix, None)
+
+        # -- foreman run: the write sibling of the plan dry-run above, a
+        # body-forwarding proxy shaped like :meth:`_proxy_answer`. Scope is
+        # exactly ``/api/foreman/run`` (see :data:`_FOREMAN_RUN_PATH` and
+        # ``do_POST``'s exact-match dispatch) — never a prefix, so
+        # ``/api/foreman/run/extra``/``/api/foreman/running`` fall through
+        # to the ordinary 404. The dashboard adds no validation of its own:
+        # the dispatch service remains the sole enforcer of
+        # ``budget_usd``/``max_stories`` bounds, same "thin pass-through"
+        # discipline as every other write proxy above.
+
+        def _foreman_run(self) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "foreman run not configured"}),
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length) if length > 0 else None
+            self._proxy("POST", "/foreman/run", body)
 
         # -- pending question: a narrow read-only proxy, same shape as the
         # spend rollup above. Scope is exactly /api/jobs/{id}/question — any
@@ -1430,6 +1466,14 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
       <button id="foreman-plan-refresh" class="ghost">refresh</button>
     </div>
     <div class="panel" id="foreman-plan"><span class="muted">loading&hellip;</span></div>
+    <div class="filters">
+      <input type="number" id="foreman-run-budget" class="qtext" min="0" step="0.01"
+             placeholder="budget_usd" aria-label="budget per story in USD">
+      <input type="number" id="foreman-run-max-stories" class="qtext" min="1" max="10"
+             value="3" aria-label="max stories to enqueue (1-10)">
+      <button id="foreman-run-btn" class="ghost" disabled>run</button>
+    </div>
+    <div class="panel" id="foreman-run-result"></div>
     <h2>Reports</h2>
     <div class="panel" id="reports"><span class="muted">no assessment reports</span></div>
   </div>
@@ -1995,8 +2039,8 @@ async function loadAccessLog() {
 }
 
 // The Foreman plan panel: the backlog foreman's dry-run from GET
-// /api/foreman/plan (never /api/foreman/run — that write stays unwired).
-// Same on-demand-only discipline as Spend/Access log above (fetched once on
+// /api/foreman/plan; the run form below it is the write half (POST
+// /api/foreman/run). Same on-demand-only discipline as Spend/Access log above (fetched once on
 // load plus manual refresh only, never the setInterval poll) for the same
 // reason: a proxied dispatch hop must not multiply by open tabs x poll
 // cadence. SECURITY: story_id/title/repo/reason can originate from an LLM
@@ -2031,6 +2075,55 @@ async function loadForemanPlan() {
   } catch (err) {
     put($("foreman-plan"), '<span class="muted">failed to load foreman plan</span>');
   }
+}
+
+// The foreman run form: budget_usd/max_stories -> POST /api/foreman/run,
+// forwarded verbatim to the dispatch service (see _foreman_run in
+// dashboard.py) — the dashboard adds no validation of its own. A two-step
+// arm/confirm button (the first click states the exact values about to be
+// submitted; only the second click fires the POST) mirrors the existing
+// purge button's confirm pattern, per CLAUDE.md §1: a spend-multiplying
+// action always needs an explicit human click, never a blind/default one.
+// SECURITY: job_id/story_id/title/reason/error can originate from an LLM
+// assessment finding or the dispatch service's own text — esc() before
+// innerHTML, same discipline as every other panel.
+function foremanRunJobRow(j) {
+  return `<li>job ${esc(j.job_id)}: ${esc(j.story_id)} — ${esc(j.title)}`
+    + ` (position ${esc(j.position)})</li>`;
+}
+
+function foremanRunSkipRow(s) {
+  return `<li class="muted">${esc(s.story_id)}: ${esc(s.reason)}</li>`;
+}
+
+function foremanRunPanel(data, ok) {
+  if (!ok) return `<span class="muted">${esc(data.error)}</span>`;
+  const jobs = (data.jobs || []).map(foremanRunJobRow).join("");
+  const skipped = (data.skipped || []).map(foremanRunSkipRow).join("");
+  if (!jobs && !skipped) return '<span class="muted">nothing enqueued</span>';
+  return `<ul class="list">${jobs}${skipped}</ul>`;
+}
+
+async function foremanRun() {
+  const btn = $("foreman-run-btn");
+  const budget = $("foreman-run-budget").value;
+  const maxStories = $("foreman-run-max-stories").value;
+  const body = { budget_usd: Number(budget) };
+  if (maxStories) body.max_stories = Number(maxStories);
+  try {
+    const res = await fetch("/api/foreman/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    put($("foreman-run-result"), foremanRunPanel(data, res.ok));
+  } catch (err) {
+    put($("foreman-run-result"), '<span class="muted">foreman run failed</span>');
+  }
+  btn.dataset.armed = "";
+  btn.textContent = "run";
+  loadForemanPlan();
 }
 
 // One score-history row: a run's headline metrics plus its delta from the
@@ -2619,6 +2712,21 @@ $("story-overlay").addEventListener("click", e => { if (e.target === $("story-ov
 $("spend-refresh").addEventListener("click", loadSpend);
 $("access-log-refresh").addEventListener("click", loadAccessLog);
 $("foreman-plan-refresh").addEventListener("click", loadForemanPlan);
+$("foreman-run-budget").addEventListener("input", () => {
+  const btn = $("foreman-run-btn");
+  btn.disabled = !$("foreman-run-budget").value;
+  btn.dataset.armed = "";
+  btn.textContent = "run";
+});
+$("foreman-run-btn").addEventListener("click", () => {
+  const btn = $("foreman-run-btn");
+  const budget = $("foreman-run-budget").value;
+  if (!budget) return;
+  if (btn.dataset.armed) { foremanRun(); return; }
+  const maxStories = $("foreman-run-max-stories").value || "3";
+  btn.dataset.armed = "1";
+  btn.textContent = `confirm: enqueue up to ${maxStories} stories at $${budget}/story?`;
+});
 document.addEventListener("keydown", e => { if (e.key === "Escape") { closeModal(); closeAgent(); closeStory(); } });
 
 // ---- poll loop ----
