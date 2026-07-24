@@ -22,6 +22,7 @@ _REQUIRED_HEADINGS = [
     "the queue looks wrong after a restart",
     "access/request log",
     "labelled `needs-human`",
+    "stuck `blocked` and never resumes",
     "HTTP status quick-reference",
 ]
 
@@ -36,9 +37,11 @@ _BEARER_SECRET_RE = re.compile(
 )
 
 _DISPATCH = _REPO_ROOT / "docs" / "DISPATCH.md"
+_DASHBOARD = _REPO_ROOT / "docs" / "DASHBOARD.md"
 
 # Drift-check: every backtick-fenced `GET|POST /...` route TROUBLESHOOTING.md
-# cites, to verify against docs/DISPATCH.md's text.
+# cites, to verify against the union of docs/DISPATCH.md's and
+# docs/DASHBOARD.md's text (TROUBLESHOOTING.md cross-links both).
 _ROUTE_RE = re.compile(r"`((?:GET|POST) /[\w{}/-]+)`")
 
 
@@ -48,6 +51,10 @@ def _troubleshooting_text() -> str:
 
 def _dispatch_text() -> str:
     return _DISPATCH.read_text(encoding="utf-8")
+
+
+def _dashboard_text() -> str:
+    return _DASHBOARD.read_text(encoding="utf-8")
 
 
 def _routes_cited_in(text: str) -> set[str]:
@@ -114,10 +121,31 @@ def test_routes_cited_in_deduplicates():
 def test_troubleshooting_routes_are_documented_in_dispatch():
     routes = _routes_cited_in(_troubleshooting_text())
     dispatch_text = _dispatch_text()
-    assert {"GET /access-log", "POST /jobs/{id}/cancel"} <= routes
+    dashboard_text = _dashboard_text()
+    assert {
+        "GET /access-log",
+        "POST /jobs/{id}/cancel",
+        "POST /backlog/story/{id}/status",
+    } <= routes
     for route in routes:
-        assert route in dispatch_text, route
+        assert route in dispatch_text or route in dashboard_text, route
 
 
 def test_a_bogus_route_is_not_documented_in_dispatch():
     assert "GET /not-a-real-route" not in _dispatch_text()
+    assert "GET /not-a-real-route" not in _dashboard_text()
+
+
+def test_blocked_story_section_documents_the_recovery_route():
+    text = _troubleshooting_text()
+    assert "POST /backlog/story/{id}/status" in text
+
+
+def test_status_table_documents_foreman_500():
+    text = _troubleshooting_text()
+    lines_with_500_and_foreman_run = [
+        line
+        for line in text.splitlines()
+        if "500" in line and "POST /foreman/run" in line
+    ]
+    assert lines_with_500_and_foreman_run
