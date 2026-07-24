@@ -36,6 +36,7 @@ from dev_team.dispatch import (
     SubmitRejected,
     ValidationError,
     _default_materialise,
+    sweep_expired_archives,
 )
 from dev_team.dashboard import agent_history, collect_state
 from dev_team.eventlog import EVENTS_PATH, read_events
@@ -1786,6 +1787,430 @@ def test_purge_backlog_removal_shares_the_lock_with_concurrent_writes(tmp_path):
     ids = [s["id"] for s in board["stories"]]
     assert len(set(ids)) == len(ids)  # no corruption / duplicate ids under the race
     assert len(board["stories"]) == 2 * per_thread  # the 5 purged stories are gone
+
+
+# --- purge: registry-miss disk-first fallback (#184, resubmit of #173) -------
+#
+# A service restart drops the in-memory registry entirely; the tests below
+# never insert a registry record (unlike _seed_terminal_job above), simulating
+# exactly that. purge_job must fall back to reading audit/<id>/meta.json
+# directly rather than answering a blanket 404.
+
+
+def test_purge_registry_miss_no_meta_at_all_is_404(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    assert disp.purge_job("ghost") == (404, {"error": "unknown job"})
+
+
+def test_purge_registry_miss_meta_not_archived_is_409(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-notarchived-norecord"
+    dash.write_text(f"audit/{job_id}/meta.json", json.dumps({"id": job_id}))
+    assert disp.purge_job(job_id) == (409, {"error": "job is not archived"})
+    assert dash.exists(f"audit/{job_id}/meta.json")
+
+
+def test_purge_registry_miss_meta_archived_purges_like_the_registry_present_path(
+    tmp_path,
+):
+    # The exact restart-survival scenario #173 was rejected for not proving:
+    # the outcome must be identical to the registry-present path.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    jobs_root = tmp_path / "jobs"
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(jobs_root))
+    job_id = "assess-restart-survivor"
+    clone_dir = jobs_root / job_id
+    clone_dir.mkdir(parents=True)
+    (clone_dir / "marker.txt").write_text("clone contents")
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": True, "archived_at": 1.0}),
+    )
+    dash.write_text(f"audit/{job_id}/assessment.md", "# report")
+    dash.write_text(f"{TRANSCRIPTS_DIR}/{job_id}/agent-001.json", "{}")
+
+    assert job_id not in disp._registry  # no registry record at all
+
+    status, payload = disp.purge_job(job_id)
+    assert (status, payload) == (
+        200,
+        {
+            "id": job_id,
+            "purged": True,
+            "removed": {
+                "workspace": True, "audit": True, "transcripts": True,
+                "events": 0, "backlog_stories": 0,
+            },
+        },
+    )
+    assert not clone_dir.exists()
+    assert not dash.exists(f"audit/{job_id}/meta.json")
+    # gone for good: a second call finds nothing left and 404s, never 200
+    assert disp.purge_job(job_id) == (404, {"error": "unknown job"})
+
+
+def test_purge_registry_miss_concurrent_calls_only_one_claims_the_job(
+    tmp_path, monkeypatch
+):
+    # Regression for the review on #184: a second, truly concurrent
+    # purge_job call on a registry-less job must be refused even while the
+    # first call's deletion is still in flight (meta.json still on disk) --
+    # never both pass eligibility and both return 200.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-concurrent-claim"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
+    )
+
+    claimed = threading.Event()
+    release = threading.Event()
+    real_finish_purge = disp._finish_purge
+
+    def blocking_finish_purge(job_id_arg):
+        claimed.set()
+        assert release.wait(timeout=5)
+        return real_finish_purge(job_id_arg)
+
+    monkeypatch.setattr(disp, "_finish_purge", blocking_finish_purge)
+
+    results = {}
+    first = threading.Thread(
+        target=lambda: results.__setitem__("first", disp.purge_job(job_id))
+    )
+    first.start()
+    assert claimed.wait(timeout=5)
+
+    # The first call has claimed the job but not yet deleted meta.json --
+    # a second call racing it right now must not also pass eligibility.
+    second = disp.purge_job(job_id)
+    assert second == (404, {"error": "unknown job"})
+    assert dash.exists(f"audit/{job_id}/meta.json")
+
+    release.set()
+    first.join(timeout=5)
+    assert results["first"][0] == 200
+    assert not dash.exists(f"audit/{job_id}/meta.json")
+
+
+def test_purge_registry_present_racing_a_concurrent_registry_miss_call_is_404(
+    tmp_path, monkeypatch
+):
+    # Regression for the second review on #184: the registry-present branch
+    # deletes the registry record but never claimed `_purging`, so a second,
+    # truly concurrent call -- which now sees no registry record either --
+    # took the registry-miss branch, found meta.json still on disk (its
+    # deletion happens later, inside `_finish_purge`, outside the lock), and
+    # ran a second concurrent deletion. Both must never return 200.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-present-vs-miss-race"
+    _seed_terminal_job(disp, job_id, archived=True)
+    assert job_id in disp._registry  # the racing call starts registry-present
+
+    claimed = threading.Event()
+    release = threading.Event()
+    real_finish_purge = disp._finish_purge
+
+    def blocking_finish_purge(job_id_arg):
+        claimed.set()
+        assert release.wait(timeout=5)
+        return real_finish_purge(job_id_arg)
+
+    monkeypatch.setattr(disp, "_finish_purge", blocking_finish_purge)
+
+    results = {}
+    first = threading.Thread(
+        target=lambda: results.__setitem__("first", disp.purge_job(job_id))
+    )
+    first.start()
+    assert claimed.wait(timeout=5)
+
+    # The first call already deleted the registry record but is still
+    # blocked before deleting meta.json -- a second, concurrent call now
+    # sees no registry record (the registry-miss branch) and must still be
+    # refused, not re-decide eligibility from the still-present meta.json.
+    assert job_id not in disp._registry
+    assert dash.exists(f"audit/{job_id}/meta.json")
+    second = disp.purge_job(job_id)
+    assert second == (404, {"error": "unknown job"})
+
+    release.set()
+    first.join(timeout=5)
+    assert results["first"][0] == 200
+    assert not dash.exists(f"audit/{job_id}/meta.json")
+
+
+# --- TTL auto-purge sweep over already-archived jobs (#184) -------------------
+
+
+def test_sweep_expired_archives_no_dashboard_workspace_is_noop():
+    calls = []
+
+    def purge_fn(job_id):
+        calls.append(job_id)
+        return 200, {}
+
+    assert sweep_expired_archives(None, 7, purge_fn) == []
+    assert calls == []
+
+
+def test_sweep_expired_archives_ttl_none_is_noop():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-x/meta.json",
+        json.dumps({"archived": True, "archived_at": 0.0}),
+    )
+    calls = []
+
+    def purge_fn(job_id):
+        calls.append(job_id)
+        return 200, {}
+
+    assert sweep_expired_archives(dash, None, purge_fn) == []
+    assert calls == []
+
+
+def test_sweep_expired_archives_purges_only_past_the_ttl_boundary(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    now = 1_000_000.0
+    ttl_days = 5
+    cutoff = now - ttl_days * 86400
+    old_id, young_id = "assess-old-enough", "assess-too-young"
+    dash.write_text(
+        f"audit/{old_id}/meta.json",
+        json.dumps({"id": old_id, "archived": True, "archived_at": cutoff - 1}),
+    )
+    dash.write_text(
+        f"audit/{young_id}/meta.json",
+        json.dumps({"id": young_id, "archived": True, "archived_at": cutoff + 1}),
+    )
+
+    purged = sweep_expired_archives(dash, ttl_days, disp.purge_job, clock=lambda: now)
+
+    assert purged == [old_id]
+    assert not dash.exists(f"audit/{old_id}/meta.json")
+    assert dash.exists(f"audit/{young_id}/meta.json")
+
+
+def test_sweep_expired_archives_at_the_exact_cutoff_is_purged_inclusive(tmp_path):
+    # Pins the inclusive boundary flagged in the #184 review: only
+    # `archived_at > cutoff` is skipped, so a job archived at exactly the
+    # cutoff (not one second past it) is treated as expired and purged.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    now = 1_000_000.0
+    ttl_days = 5
+    cutoff = now - ttl_days * 86400
+    job_id = "assess-exactly-on-cutoff"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": True, "archived_at": cutoff}),
+    )
+
+    purged = sweep_expired_archives(dash, ttl_days, disp.purge_job, clock=lambda: now)
+
+    assert purged == [job_id]
+    assert not dash.exists(f"audit/{job_id}/meta.json")
+
+
+def test_sweep_expired_archives_never_force_purges_a_running_registry_job(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-still-running"
+    spec = JobSpec(
+        mode="assess", repo="acme/mono", title="t", description="",
+        budget_usd=None, id=job_id,
+    )
+    disp._registry[job_id] = JobRecord(spec=spec, state="running")
+    disp._order.append(job_id)
+    disp._events[job_id] = threading.Event()
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
+    )
+
+    purged = sweep_expired_archives(dash, 1, disp.purge_job, clock=lambda: 10_000_000.0)
+
+    assert purged == []
+    assert dash.exists(f"audit/{job_id}/meta.json")
+
+
+def test_sweep_expired_archives_never_sweeps_a_non_archived_job(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-not-archived-old"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": False, "archived_at": 0.0}),
+    )
+
+    purged = sweep_expired_archives(dash, 1, disp.purge_job, clock=lambda: 10_000_000.0)
+
+    assert purged == []
+    assert dash.exists(f"audit/{job_id}/meta.json")
+
+
+def test_sweep_expired_archives_malformed_or_missing_fields_never_raise(tmp_path):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    dash.write_text("audit/bad-json/meta.json", "{not json")
+    dash.write_text("audit/no-timestamp/meta.json", json.dumps({"archived": True}))
+    dash.write_text(
+        "audit/string-timestamp/meta.json",
+        json.dumps({"archived": True, "archived_at": "yesterday"}),
+    )
+    dash.write_text(
+        "audit/bool-timestamp/meta.json",
+        json.dumps({"archived": True, "archived_at": True}),
+    )
+    dash.write_text(
+        "audit/nested/extra/meta.json",
+        json.dumps({"archived": True, "archived_at": 0.0}),
+    )
+    dash.write_text("audit/unrelated/assessment.md", "# report")
+
+    purged = sweep_expired_archives(dash, 1, disp.purge_job, clock=lambda: 10_000_000.0)
+
+    assert purged == []
+
+
+def test_sweep_expired_archives_ignores_a_symlinked_audit_escape(tmp_path):
+    # SECURITY: job ids come only from real list_files()-enumerated audit/
+    # entries. LocalWorkspace.list_files() already skips symlinks, so a
+    # symlinked escape planted under audit/ is never surfaced to purge_fn at
+    # all -- never resolved outside the dashboard workspace root.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "meta.json").write_text(
+        json.dumps({"archived": True, "archived_at": 0.0})
+    )
+    dash_root = tmp_path / "dash"
+    (dash_root / "audit").mkdir(parents=True)
+    (dash_root / "audit" / "evil").symlink_to(outside, target_is_directory=True)
+    dash = LocalWorkspace(str(dash_root))
+    calls = []
+
+    def purge_fn(job_id):
+        calls.append(job_id)
+        return 200, {}
+
+    purged = sweep_expired_archives(dash, 1, purge_fn, clock=lambda: 10_000_000.0)
+
+    assert purged == []
+    assert calls == []
+
+
+def test_sweep_expired_archives_second_racing_pass_finds_nothing_left_to_purge(
+    tmp_path,
+):
+    # CONCURRENCY: two sweep passes racing over the same eligible expired job
+    # (simulating two --max-concurrent-jobs workers) -- the first purges it,
+    # the second finds meta.json already gone and no-ops safely.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-race"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
+    )
+
+    first = sweep_expired_archives(dash, 1, disp.purge_job, clock=lambda: 10_000_000.0)
+    second = sweep_expired_archives(dash, 1, disp.purge_job, clock=lambda: 10_000_000.0)
+
+    assert first == [job_id]
+    assert second == []
+
+
+def test_purge_ttl_none_default_never_invokes_the_sweep(monkeypatch, tmp_path):
+    calls = []
+    real_sweep = dispatch_mod.sweep_expired_archives
+
+    def spying_sweep(*args, **kwargs):
+        calls.append(1)
+        return real_sweep(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch_mod, "sweep_expired_archives", spying_sweep)
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=_mem_materialise,
+        dashboard_workspace=InMemoryWorkspace(), jobs_root=str(tmp_path),
+    )
+    disp.start()
+    try:
+        job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert disp.wait(job_id, 5)
+    finally:
+        disp.stop()
+    assert calls == []
+
+
+def test_worker_loop_sweeps_expired_archives_before_the_next_job(tmp_path):
+    # Worker-loop integration (#184 criterion 13): purge_ttl_days set, one
+    # eligible expired archived job present with no registry entry at all
+    # (simulating a post-restart state) -- the sweep purges it without ever
+    # needing a queued job to trigger it.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    jobs_root = tmp_path / "jobs"
+    expired_id = "assess-expired-on-restart"
+    dash.write_text(
+        f"audit/{expired_id}/meta.json",
+        json.dumps({"id": expired_id, "archived": True, "archived_at": 0.0}),
+    )
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=_mem_materialise,
+        dashboard_workspace=dash, jobs_root=str(jobs_root),
+        purge_ttl_days=1, clock=lambda: 10_000_000.0,
+    )
+    disp.start()
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and dash.exists(f"audit/{expired_id}/meta.json"):
+            time.sleep(0.01)
+        assert not dash.exists(f"audit/{expired_id}/meta.json")
+
+        # The worker still serves real jobs afterwards -- the sweep never
+        # wedges the loop.
+        job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert disp.wait(job_id, 5)
+    finally:
+        disp.stop()
+
+
+def test_worker_loop_sweep_is_wall_clock_periodic_when_idle(monkeypatch, tmp_path):
+    # Regression for the review on #184: prior to the fix, sweep_expired_
+    # archives only ran when the worker loop came back around to dequeue or
+    # park a job -- an idle service (no jobs ever submitted) would sweep
+    # exactly once at startup and never again. Shrink the interval/poll
+    # constants so a real, idle worker demonstrably re-sweeps on its own.
+    monkeypatch.setattr(dispatch_mod, "_SWEEP_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(dispatch_mod, "_SWEEP_POLL_SECONDS", 0.02)
+    calls = []
+    real_sweep = dispatch_mod.sweep_expired_archives
+
+    def spying_sweep(*args, **kwargs):
+        calls.append(1)
+        return real_sweep(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch_mod, "sweep_expired_archives", spying_sweep)
+
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"),
+        purge_ttl_days=1,
+    )
+    disp.start()
+    try:
+        deadline = time.time() + 3
+        while time.time() < deadline and len(calls) < 3:
+            time.sleep(0.02)
+        assert len(calls) >= 3, "idle worker never re-swept on a wall-clock timer"
+    finally:
+        disp.stop()
 
 
 # --- cancel (job lifecycle) ----------------------------------------------

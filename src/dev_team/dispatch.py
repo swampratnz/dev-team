@@ -148,6 +148,16 @@ _ACCESS_LOG_LIMIT_MAX = 1000
 #: and moves on. Injectable via the ``job_timeout`` constructor param for tests.
 _JOB_TIMEOUT_SECONDS = 3600.0
 
+#: How often (seconds) an idle worker re-runs the TTL auto-purge sweep, and
+#: the ``queue.Queue.get`` poll timeout that makes that possible. Only paid
+#: when ``--purge-ttl-days`` is set (see :meth:`Dispatcher._worker_loop`) —
+#: without it, waking up on a timer rather than blocking indefinitely on the
+#: queue would be pure overhead for the common case. A queued job is still
+#: served immediately; this only bounds how long an *idle* worker can go
+#: without re-checking the clock.
+_SWEEP_INTERVAL_SECONDS = 3600.0
+_SWEEP_POLL_SECONDS = 60.0
+
 #: Default :class:`~dev_team.interaction.QueueChannel` timeout (seconds) an
 #: interactive deliver job's ``interactive_timeout_seconds`` resolves to when
 #: omitted, and the floor/ceiling every requested value is clamped to before
@@ -440,6 +450,7 @@ class Dispatcher:
         max_workers: int = 1,
         checks_reader: Optional[Callable[[RepoRef], ChecksReader]] = None,
         sandbox: Optional[SandboxConfig] = None,
+        purge_ttl_days: Optional[int] = None,
     ) -> None:
         self.token = token
         # Injectable factory for GET /checks (tests never touch the network);
@@ -478,6 +489,11 @@ class Dispatcher:
         # is the one deliberate exception (the dashboard workspace owns the
         # cross-job backlog).
         self._dashboard_workspace = dashboard_workspace
+        # Off by default (None): a scheduled auto-purge of already-archived
+        # jobs past this many days old, swept once per worker-loop iteration
+        # (see _worker_loop). Reuses purge_job unchanged as the deletion
+        # primitive via sweep_expired_archives — see docs/DISPATCH.md.
+        self._purge_ttl_days = purge_ttl_days
         # Guards every read-modify-write of the dashboard workspace's shared
         # events.jsonl: a live job's EventLog append (dispatch is
         # single-flight for execution, but the HTTP server thread can purge
@@ -515,6 +531,14 @@ class Dispatcher:
         # with a job mid-run, and jobs parked because their repo was busy.
         self._active_repos: set = set()
         self._deferred: Dict[str, List[str]] = {}
+        # purge_job's claim marker for the registry-miss fallback (guarded by
+        # self._lock): the registry-present path claims a job by deleting its
+        # registry entry inside the lock, but a registry-less job (post
+        # restart) has no registry entry to delete, so without this set two
+        # truly concurrent purge_job calls on the same id would both pass
+        # eligibility and both run the deletion path. Membership here is the
+        # claim; discarded once the claiming call's deletion has completed.
+        self._purging: set = set()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -568,12 +592,47 @@ class Dispatcher:
 
         The shutdown sentinel is re-enqueued before a worker exits, so one
         :meth:`stop` drains the whole pool.
+
+        When ``--purge-ttl-days`` is set, the TTL sweep (see
+        :func:`sweep_expired_archives`) needs to fire on a **wall-clock**
+        schedule (:data:`_SWEEP_INTERVAL_SECONDS`), not merely "once per loop
+        iteration" — an idle service with no queue activity would otherwise
+        sweep exactly once at startup and never again, silently defeating
+        the whole point of an automatic TTL purge. So in that mode the
+        blocking ``self._queue.get()`` below becomes a bounded
+        ``get(timeout=_SWEEP_POLL_SECONDS)`` poll: an idle worker wakes on
+        its own every :data:`_SWEEP_POLL_SECONDS` to re-check the clock and
+        re-sweep once :data:`_SWEEP_INTERVAL_SECONDS` has elapsed, entirely
+        independent of whether a job ever gets queued. A real queued job is
+        still picked up immediately (``queue.Empty`` just loops back around,
+        it never delays a genuine ``get()`` hit). Off by default
+        (``purge_ttl_days=None``): the blocking ``get()`` and its zero
+        wakeup overhead are unchanged from before this feature existed.
         """
 
         loop = asyncio.new_event_loop()
+        last_swept: Optional[float] = None
         try:
             while True:
-                item = self._queue.get()
+                if self._purge_ttl_days is not None:
+                    now = self._clock()
+                    if (
+                        last_swept is None
+                        or now - last_swept >= _SWEEP_INTERVAL_SECONDS
+                    ):
+                        sweep_expired_archives(
+                            self._dashboard_workspace,
+                            self._purge_ttl_days,
+                            self.purge_job,
+                            clock=self._clock,
+                        )
+                        last_swept = now
+                    try:
+                        item = self._queue.get(timeout=_SWEEP_POLL_SECONDS)
+                    except queue.Empty:
+                        continue
+                else:
+                    item = self._queue.get()
                 if item is _SHUTDOWN:
                     self._queue.put(_SHUTDOWN)
                     return
@@ -1463,19 +1522,67 @@ class Dispatcher:
         single-flight dispatcher). The registry entry is deleted in that same
         block, so a purged job is gone for good: a second call finds no
         record and answers 404, never an idempotent 200.
+
+        **Registry-miss fallback:** a service restart drops the in-memory
+        registry entirely, but ``audit/<id>/meta.json`` (this method's own
+        archive marker, written by :meth:`_set_archived`) survives on disk —
+        so when there is no registry record, the eligibility decision falls
+        back to :meth:`_read_meta` directly instead of answering a blanket
+        404. The rest of this method — the workspace, audit-file,
+        transcripts, events and backlog-story deletion below — is identical
+        either way, since it already only ever reads ``job_id`` and
+        ``self._dashboard_workspace``, never ``record``.
+
+        **Why both branches share one claim set.** The actual disk deletion
+        (``_finish_purge``, including the ``meta.json`` removal inside the
+        ``_AUDIT_FILES`` loop) always runs **outside** ``self._lock`` — it has
+        to, since it does real I/O and calling it while holding the lock
+        would freeze the whole single-flight dispatcher. That leaves a real
+        window, after a registry-present call deletes the registry entry but
+        before ``meta.json`` is gone, where a *second, concurrent* call for
+        the same id would see no registry record either and — if eligibility
+        were decided independently per branch — would re-read a ``meta.json``
+        that still says ``archived: true`` and start a second, concurrent
+        deletion. ``self._purging`` closes that window for both branches at
+        once: membership is checked unconditionally at the very top of the
+        locked block, before either branch runs, and added before the lock is
+        released regardless of which branch found the job eligible. A second
+        call — whether it would have taken the registry-present or the
+        registry-miss branch — always finds the id already claimed and
+        answers 404, never a redundant 200. It is discarded once this call's
+        deletion completes, by which point ``meta.json`` is gone too, so a
+        later call 404s from :meth:`_read_meta` alone; the discard is just
+        hygiene against an unbounded set.
         """
 
         with self._lock:
-            record = self._registry.get(job_id)
-            if record is None:
+            if job_id in self._purging:
                 return 404, {"error": "unknown job"}
-            if record.state not in _TERMINAL:
-                return 409, {"error": "job is running"}
-            if not self._is_archived(job_id):
-                return 409, {"error": "job is not archived"}
-            del self._registry[job_id]
-            self._order.remove(job_id)
-            self._events.pop(job_id, None)
+            record = self._registry.get(job_id)
+            if record is not None:
+                if record.state not in _TERMINAL:
+                    return 409, {"error": "job is running"}
+                if not self._is_archived(job_id):
+                    return 409, {"error": "job is not archived"}
+                del self._registry[job_id]
+                self._order.remove(job_id)
+                self._events.pop(job_id, None)
+            else:
+                meta = self._read_meta(job_id)
+                if meta is None:
+                    return 404, {"error": "unknown job"}
+                if not meta.get("archived", False):
+                    return 409, {"error": "job is not archived"}
+            self._purging.add(job_id)
+
+        try:
+            return self._finish_purge(job_id)
+        finally:
+            with self._lock:
+                self._purging.discard(job_id)
+
+    def _finish_purge(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The deletion half of :meth:`purge_job`, shared by both eligibility branches."""
 
         workspace_dir = Path(self._jobs_root) / job_id
         removed_workspace = workspace_dir.exists()
@@ -2354,6 +2461,66 @@ class Dispatcher:
         return 200, {"kind": "deliver", **delivery_to_dict(outcome)}
 
 
+def sweep_expired_archives(
+    dashboard_workspace: Optional[Workspace],
+    purge_ttl_days: Optional[int],
+    purge_fn: Callable[[str], Tuple[int, Dict[str, Any]]],
+    *,
+    clock: Callable[[], float] = time.time,
+) -> List[str]:
+    """Purge every archived job whose ``archived_at`` is past ``purge_ttl_days``.
+
+    Walks ``audit/*/meta.json`` via ``dashboard_workspace.list_files()`` —
+    the same disk-first enumeration :meth:`Dispatcher.calibration` already
+    uses, so a job id is never taken from anything but a real, enumerated
+    ``audit/`` entry (a crafted ``../``-shaped subdirectory name is simply
+    never returned by ``list_files()``, so it can never reach ``purge_fn``).
+    Eligibility (archived, TTL-expired) is decided here; the actual deletion,
+    and every existence/running/idempotency check, stays entirely inside
+    ``purge_fn`` (:meth:`Dispatcher.purge_job` in production) — this
+    function has no independent deletion logic of its own. That means a job
+    still ``queued``/``running`` in the registry is never force-purged even
+    if its mirrored ``meta.json`` says ``archived: true`` (``purge_fn``
+    itself refuses it), and two overlapping sweeps (one per
+    ``--max-concurrent-jobs`` worker) racing the same expired job are safe:
+    the second call's ``purge_fn`` finds nothing left to purge and answers
+    a non-200 without raising.
+
+    A missing or malformed ``meta.json``, or a non-numeric ``archived_at``,
+    is treated as not-eligible rather than raising — the same fail-closed
+    posture as :meth:`Dispatcher._read_meta`.
+
+    Returns the ids actually purged (``purge_fn`` returned ``200``).
+    """
+
+    if dashboard_workspace is None or purge_ttl_days is None:
+        return []
+    cutoff = clock() - purge_ttl_days * 86400
+    purged: List[str] = []
+    for path in dashboard_workspace.list_files():
+        if not path.startswith("audit/") or not path.endswith("/meta.json"):
+            continue
+        parts = path.split("/")
+        if len(parts) != 3:
+            continue
+        job_id = parts[1]
+        try:
+            meta = json.loads(dashboard_workspace.read_text(path))
+        except (OSError, ValueError, WorkspaceError):
+            continue
+        if not isinstance(meta, dict) or not meta.get("archived", False):
+            continue
+        archived_at = meta.get("archived_at")
+        if not isinstance(archived_at, (int, float)) or isinstance(archived_at, bool):
+            continue
+        if archived_at > cutoff:
+            continue
+        status, _ = purge_fn(job_id)
+        if status == 200:
+            purged.append(job_id)
+    return purged
+
+
 def _make_handler(dispatcher: Dispatcher) -> type:
     """A request handler class bound to ``dispatcher``."""
 
@@ -2957,6 +3124,7 @@ class DispatchServer:
         max_workers: int = 1,
         checks_reader: Optional[Callable[[RepoRef], ChecksReader]] = None,
         sandbox: Optional[SandboxConfig] = None,
+        purge_ttl_days: Optional[int] = None,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -2972,6 +3140,7 @@ class DispatchServer:
             max_workers=max_workers,
             checks_reader=checks_reader,
             sandbox=sandbox,
+            purge_ttl_days=purge_ttl_days,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()
