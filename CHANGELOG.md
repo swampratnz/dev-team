@@ -17,6 +17,19 @@ sections below are reconstructed from the repository history.
   existing `collect_dependencies`/`scan_dependencies`/OSV batch pipeline
   unchanged — no new credential, endpoint, or config. `docs/ASSESSMENT.md`'s
   honest-limitations note is updated accordingly.
+- **Dependency scan now covers PHP (`composer.lock`)** (`depscan.py`),
+  closing the same "verified profile, model-knowledge CVE" asymmetry #145
+  (Composer profile detection) left open. `parse_composer_lock` reads the
+  `packages` and `packages-dev` JSON arrays as exact resolved pins under the
+  `Packagist` OSV ecosystem, mirroring `parse_package_lock`'s flat-array
+  shape; malformed entries (non-dict, missing `name`/`version`) are skipped,
+  and a non-JSON or non-object `composer.lock` degrades to an empty parse
+  rather than raising. `composer.json`'s version-range constraints remain
+  out of scope, same as Ruby's bare `Gemfile` — only the lockfile's resolved
+  pins are scanned. Registers in `_PARSERS` and feeds the existing
+  `collect_dependencies`/`scan_dependencies`/OSV batch pipeline unchanged —
+  no new credential, endpoint, or config. `docs/ASSESSMENT.md`'s
+  honest-limitations note is updated accordingly.
 - **Dependency scan now parses PEP 735 `[dependency-groups]`** (`depscan.py`),
   completing the growth path #125 named for itself. `parse_pyproject_toml`
   reads the top-level `[dependency-groups]` table alongside the existing

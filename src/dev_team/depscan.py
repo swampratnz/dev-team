@@ -6,7 +6,7 @@ pins are parsed straight out of the manifests (NuGet ``packages.config``,
 ``package.json``, ``requirements.txt``, PEP 621 ``pyproject.toml``,
 ``Cargo.toml``, Go ``go.mod``) *and* the lockfiles
 (``package-lock.json``, ``poetry.lock``, ``Cargo.lock``, NuGet
-``packages.lock.json``, Ruby ``Gemfile.lock``) and checked against
+``packages.lock.json``, Ruby ``Gemfile.lock``, PHP ``composer.lock``) and checked against
 the OSV.dev batch API, which covers every major
 ecosystem through one endpoint. Lockfiles matter on range-specified projects:
 a ``package.json`` full of ``^`` ranges yields nothing scannable, but its
@@ -493,6 +493,36 @@ def parse_gemfile_lock(text: str, manifest: str) -> List[Dependency]:
     return deps
 
 
+def parse_composer_lock(text: str, manifest: str) -> List[Dependency]:
+    """PHP ``composer.lock``: ``packages``/``packages-dev`` are exact resolved
+    pins, mirroring ``package-lock.json``'s flat-array shape.
+
+    ``composer.json`` itself is out of scope: its ``^``/``~``/``.*`` version
+    constraints don't resolve to an exact pin without running Composer's
+    dependency resolver, so — like a bare Ruby ``Gemfile`` — only the
+    lockfile is scanned.
+    """
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    deps = []
+    for section in ("packages", "packages-dev"):
+        entries = data.get(section)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name, version = entry.get("name"), entry.get("version")
+            if name and version:
+                deps.append(Dependency(str(name), str(version), "Packagist", manifest))
+    return deps
+
+
 _PARSERS = {
     "packages.config": parse_packages_config,
     "package.json": parse_package_json,
@@ -505,6 +535,7 @@ _PARSERS = {
     "packages.lock.json": parse_packages_lock_json,
     "go.mod": parse_go_mod,
     "Gemfile.lock": parse_gemfile_lock,
+    "composer.lock": parse_composer_lock,
 }
 
 

@@ -15,6 +15,7 @@ from dev_team.depscan import (
     _MAX_DEPENDENCIES,
     collect_dependencies,
     parse_cargo_toml,
+    parse_composer_lock,
     parse_gemfile_lock,
     parse_go_mod,
     parse_package_json,
@@ -799,11 +800,67 @@ GEM
     assert parse_gemfile_lock(text, "Gemfile.lock") == []
 
 
+def test_parse_composer_lock_packages_and_packages_dev():
+    text = json.dumps(
+        {
+            "packages": [
+                {"name": "monolog/monolog", "version": "2.9.1"},
+                {"name": "symfony/console", "version": "6.3.0"},
+            ],
+            "packages-dev": [
+                {"name": "phpunit/phpunit", "version": "10.1.0"},
+            ],
+        }
+    )
+    deps = parse_composer_lock(text, "composer.lock")
+    assert [(d.name, d.version, d.ecosystem, d.manifest, d.approximate) for d in deps] == [
+        ("monolog/monolog", "2.9.1", "Packagist", "composer.lock", False),
+        ("symfony/console", "6.3.0", "Packagist", "composer.lock", False),
+        ("phpunit/phpunit", "10.1.0", "Packagist", "composer.lock", False),
+    ]
+
+
+def test_parse_composer_lock_skips_malformed_entries():
+    text = json.dumps(
+        {
+            "packages": [
+                {"name": "vendor/good", "version": "1.0.0"},
+                "not-a-dict",
+                {"name": "vendor/no-version"},
+                {"version": "1.0.0"},
+            ],
+            "packages-dev": [
+                {"name": "vendor/dev-good", "version": "2.0.0"},
+                42,
+            ],
+        }
+    )
+    deps = parse_composer_lock(text, "composer.lock")
+    assert [(d.name, d.version) for d in deps] == [
+        ("vendor/good", "1.0.0"),
+        ("vendor/dev-good", "2.0.0"),
+    ]
+
+
+def test_parse_composer_lock_rejects_adversarial_json():
+    assert parse_composer_lock("not json at all", "composer.lock") == []
+    assert parse_composer_lock('"a string"', "composer.lock") == []
+    assert parse_composer_lock("[]", "composer.lock") == []
+    assert parse_composer_lock("{}", "composer.lock") == []
+    assert parse_composer_lock(
+        json.dumps({"packages": "not-a-list"}), "composer.lock"
+    ) == []
+    assert parse_composer_lock(
+        json.dumps({"packages-dev": "not-a-list"}), "composer.lock"
+    ) == []
+
+
 def test_parsers_registered_in_parsers_table():
     from dev_team.depscan import _PARSERS
 
     assert _PARSERS["go.mod"] is parse_go_mod
     assert _PARSERS["Gemfile.lock"] is parse_gemfile_lock
+    assert _PARSERS["composer.lock"] is parse_composer_lock
 
 
 def test_collect_dependencies_reads_go_mod_and_gemfile_lock():
@@ -835,6 +892,37 @@ def test_collect_dependencies_dedupes_go_mod_and_gemfile_lock():
     )
     deps = collect_dependencies(ws)
     assert len(deps) == 2
+
+
+def test_collect_dependencies_reads_composer_lock():
+    ws = InMemoryWorkspace(
+        {
+            "composer.lock": json.dumps(
+                {"packages": [{"name": "monolog/monolog", "version": "2.9.1"}]}
+            ),
+            "requirements.txt": "requests==2.31.0\n",
+        }
+    )
+    deps = collect_dependencies(ws)
+    assert {(d.ecosystem, d.name, d.version) for d in deps} == {
+        ("Packagist", "monolog/monolog", "2.9.1"),
+        ("PyPI", "requests", "2.31.0"),
+    }
+
+
+def test_collect_dependencies_dedupes_composer_lock():
+    ws = InMemoryWorkspace(
+        {
+            "a/composer.lock": json.dumps(
+                {"packages": [{"name": "monolog/monolog", "version": "2.9.1"}]}
+            ),
+            "b/composer.lock": json.dumps(
+                {"packages": [{"name": "monolog/monolog", "version": "2.9.1"}]}
+            ),
+        }
+    )
+    deps = collect_dependencies(ws)
+    assert len(deps) == 1
 
 
 def test_scan_dependencies_go_and_rubygems_vulnerabilities():
@@ -871,6 +959,10 @@ def test_crafted_manifest_content_never_raises():
     for content in malicious:
         parse_go_mod(f"require {content} v1.0.0\n", "go.mod")
         parse_gemfile_lock(f"GEM\n  specs:\n    {content} (1.0)\n", "Gemfile.lock")
+        parse_composer_lock(
+            json.dumps({"packages": [{"name": content, "version": "1.0.0"}]}),
+            "composer.lock",
+        )
 
 
 def test_crafted_manifest_content_causes_no_subprocess_or_eval(monkeypatch):
