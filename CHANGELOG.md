@@ -15,9 +15,16 @@ sections below are reconstructed from the repository history.
   (the winning tally's size) on a multi-vote verification's
   `verifications.jsonl` entry — re-tallied from the already-returned
   `votes` list, no new agent call; a `votes=1` entry is byte-identical to
-  today. `calibration_summary` rolls these into `multi_vote_total`/
-  `unanimous_total` per phase and overall, additive-only against every
-  existing field. See `docs/DISPATCH.md` and `docs/ASSESSMENT.md`.
+  today. Gated on every requested pass having completed
+  (`vote_count == spec.votes`): a budget-exhausted call that only
+  completed 1 of N requested passes is *not* persisted with these keys,
+  since its `max_agreement` would trivially equal its own `vote_count` and
+  misread as a genuine unanimous result. `calibration_summary` rolls the
+  gated fields into `multi_vote_total`/`unanimous_total` per phase and
+  overall, additive-only against every existing field; its `vote_count`/
+  `max_agreement` guard now also rejects `bool` (an `int` subclass in
+  Python), so a hand-edited `"vote_count": true` line can't slip through.
+  See `docs/DISPATCH.md` and `docs/ASSESSMENT.md`.
 - **Dependency scan now covers Go (`go.mod`) and Ruby (`Gemfile.lock`)**
   (`depscan.py`), closing the "verified EOL, model-knowledge CVE" asymmetry
   #117 left open on these two ecosystems. `parse_go_mod` reads every

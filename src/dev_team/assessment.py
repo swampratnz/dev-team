@@ -1636,7 +1636,10 @@ def calibration_summary(entries: List[Dict]) -> Dict:
         }
 
     def _is_positive_int(value: object) -> bool:
-        return isinstance(value, int) and value > 0
+        # `type(value) is int` (not `isinstance`) so a hand-edited
+        # `"vote_count": true` line is rejected — bool is an int subclass in
+        # Python, and isinstance(True, int) is True.
+        return type(value) is int and value > 0
 
     phases: Dict[str, Dict[str, int]] = {}
     overall = _bucket()

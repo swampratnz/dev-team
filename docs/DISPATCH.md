@@ -588,10 +588,15 @@ completed pass) and `"vote_count":int` when `votes > 1`; the top-level
 result as more than one entry. The persisted entry itself (still one line
 per verification) additionally carries `"vote_count":int` and
 `"max_agreement":int` (the size of the winning verdict's tally — e.g. `3`
-of `5` passes) whenever `votes > 1`; a `votes=1` call (the default, and
-every existing caller) writes no such keys, so its entry is unchanged.
-`GET /calibration` rolls these into `multi_vote_total`/`unanimous_total`
-(see below) — see #194.
+of `5` passes) whenever `votes > 1` **and every requested pass actually
+completed** (`result["vote_count"] == votes`); a shared-budget exhaustion
+partway through (see `docs/ASSESSMENT.md`'s `verify_finding`) can return
+fewer completed passes than requested, and persisting that partial tally
+would read as unanimous (`max_agreement` inevitably equals the lone
+completed `vote_count`) — indistinguishable from a genuine N-0 result. A
+`votes=1` call, or a multi-vote call cut short by the budget, writes no
+such keys, so its entry is unchanged. `GET /calibration` rolls the gated
+fields into `multi_vote_total`/`unanimous_total` (see below) — see #194.
 
 The job then flows through the normal machinery: single-flight queue,
 `GET /jobs/{id}` status, and `GET /jobs/{id}/result` (shapes above — a

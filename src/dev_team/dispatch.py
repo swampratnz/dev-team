@@ -1177,7 +1177,15 @@ class Dispatcher:
                 "ts": self._clock(),
             }
             vote_count = result.get("vote_count")
-            if vote_count:
+            # A budget-exhausted multi-vote call can return vote_count < the
+            # requested spec.votes (verify_finding decides on whichever
+            # passes completed rather than failing outright) — persisting
+            # that partial tally here would read as "unanimous" once
+            # max_agreement inevitably equals the lone completed vote_count,
+            # indistinguishable from a genuine N-0 result. Gate on every
+            # requested pass having completed before treating this as a
+            # multi-vote/unanimous signal at all.
+            if vote_count and vote_count == spec.votes:
                 # Re-tally from the votes already in hand (no new agent
                 # call) rather than threading top_count out of
                 # verify_finding — see issue #194's alternatives-considered

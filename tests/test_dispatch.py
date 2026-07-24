@@ -4280,6 +4280,68 @@ def test_verify_job_votes_tie_persists_partial_agreement():
         assert entry["max_agreement"] == 2
 
 
+def test_verify_job_votes_budget_exhaustion_does_not_persist_as_multi_vote():
+    # Review fix on #195: a votes=3 call where the shared budget runs out
+    # after only 1 of 3 requested passes completes (verify_finding still
+    # decides on that 1 surviving vote — see
+    # test_verify_finding_votes_three_partial_budget_exhaustion_still_decides
+    # in test_assessment.py) must NOT be persisted with vote_count/
+    # max_agreement: a partial vote_count trivially equals its own
+    # max_agreement (1 == 1) and would misread as a genuine unanimous
+    # result, exactly the confidence-signal collapse this feature exists to
+    # prevent. The entry is byte-identical to a votes=1 entry instead.
+    from dev_team.testing import json_response
+
+    dash = _seeded_dash()
+    verifier = ScriptedRunner(
+        responses=[
+            AgentResult(
+                text=json_response(
+                    {"verdict": "confirmed", "rationale": "ok", "citations": []}
+                ),
+                cost_usd=0.05,
+            ),
+        ]
+    )
+    with running(
+        runner=verifier, materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        before = _call(server, "/calibration")
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]", "votes": 3,
+                  "budget_usd": 0.05},
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["verdict"] == "confirmed"
+        # the budget cut the other 2 votes short of running at all
+        assert result["vote_count"] == 1
+        assert len(verifier.calls) == 1
+
+        _, verifs = _call(server, "/jobs/assess-old/verifications")
+        (entry,) = verifs["verifications"]
+        assert entry["verdict"] == "confirmed"
+        assert "vote_count" not in entry
+        assert "max_agreement" not in entry
+
+        _, after = _call(server, "/calibration")
+        assert after["overall"]["total"] == before[1]["overall"]["total"] + 1
+        assert (
+            after["overall"]["multi_vote_total"]
+            == before[1]["overall"]["multi_vote_total"]
+        )
+        assert (
+            after["overall"]["unanimous_total"]
+            == before[1]["overall"]["unanimous_total"]
+        )
+
+
 def test_calibration_http_distinguishes_single_vote_from_unanimous_multi_vote():
     # Acceptance criterion 10: one votes=1 and one votes=3 (unanimous)
     # verification against the same source job -> GET /calibration's

@@ -2356,6 +2356,29 @@ def test_calibration_summary_drops_malformed_vote_fields_from_new_counters():
     assert summary["overall"]["unanimous_total"] == 0
 
 
+def test_calibration_summary_rejects_bool_vote_fields():
+    # Review fix on #195: isinstance(True, int) is True in Python, so a
+    # hand-edited `"vote_count": true` line must not slip past the
+    # positive-int guard and get counted as a multi-vote/unanimous entry —
+    # the docstring's fail-secure claim must actually hold for bool, not
+    # just for non-int/negative/zero values.
+    from dev_team.assessment import calibration_summary
+
+    entries = [
+        {"finding_id": "risk.secrets[0]", "verdict": "confirmed",
+         "vote_count": True, "max_agreement": True},
+        {"finding_id": "risk.secrets[1]", "verdict": "confirmed",
+         "vote_count": 5, "max_agreement": True},
+    ]
+    summary = calibration_summary(entries)
+    assert summary["overall"]["confirmed"] == 2
+    assert summary["overall"]["total"] == 2
+    # entry 0: bool vote_count -> not counted as multi-vote at all
+    # entry 1: valid vote_count, bool max_agreement -> counted, not unanimous
+    assert summary["overall"]["multi_vote_total"] == 1
+    assert summary["overall"]["unanimous_total"] == 0
+
+
 def test_calibration_summary_vote_fields_never_inflate_unanimous_beyond_multi_vote():
     # Acceptance criterion 9 (SECURITY): this is a read-only rollup over
     # already-trusted-by-construction disk state, not a new validation
