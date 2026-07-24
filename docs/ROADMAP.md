@@ -49,7 +49,7 @@ has a hardened recipe and the layered model), with matching hardening on the
 standing systemd units. The engineer's own tool loop also now carries an
 in-process filesystem trust boundary — a `PreToolUse` hook
 (`dev_team.agent_sandbox`, see [`docs/SECURITY.md`](SECURITY.md)) that denies
-any Bash/Read/Write/Edit/Glob call resolving outside its workspace root —
+any Bash/Read/Write/Edit/Glob/Grep call resolving outside its workspace root —
 but that is a check inside the same process, not OS-level isolation, so it
 does not close the remaining open edge: a per-job isolation boundary
 (review S4) — one dispatched job's container can still see another's workspace on

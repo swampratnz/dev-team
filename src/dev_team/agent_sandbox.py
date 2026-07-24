@@ -2,7 +2,7 @@
 
 ``ContainerCommandRunner`` (``dev_team.sandbox``) boxes the commands the
 *orchestrator* runs (gates, setup, scans) but never touches the engineer's own
-Bash/Read/Write/Edit/Glob tool loop, which the Claude Agent SDK runs directly
+Bash/Read/Write/Edit/Glob/Grep tool loop, which the Claude Agent SDK runs directly
 on the host, scoped only by ``cwd`` — a working-directory *default*, not an
 access boundary. Nothing stops ``Bash`` from ``cd ../<sibling-job>`` or an
 absolute path, or ``Read``/``Write``/``Edit`` from taking a ``file_path``
@@ -10,15 +10,15 @@ outside the workspace. See ``docs/SECURITY.md``.
 
 :func:`workspace_containment_hook` builds a ``PreToolUse`` hook (the SDK's
 ``ClaudeAgentOptions.hooks`` mechanism) that denies any Bash/Read/Write/Edit/
-Glob call whose target resolves outside a given workspace root, using the
-same real-path/symlink-escape check as ``execution.py``'s
+Glob/Grep call whose target resolves outside a given workspace root, using
+the same real-path/symlink-escape check as ``execution.py``'s
 ``LocalWorkspace._within_root``.
 
-Read/Write/Edit/Glob are checked deterministically against the tool call's
-structured path argument. Bash is checked with a best-effort string scan for
-path-like tokens — this is explicitly defense-in-depth, not a hard guarantee:
-a determined one-liner (env expansion, base64, ``eval``) can still evade it.
-Anything the scan cannot positively resolve as in-root is denied.
+Read/Write/Edit/Glob/Grep are checked deterministically against the tool
+call's structured path argument. Bash is checked with a best-effort string
+scan for path-like tokens — this is explicitly defense-in-depth, not a hard
+guarantee: a determined one-liner (env expansion, base64, ``eval``) can still
+evade it. Anything the scan cannot positively resolve as in-root is denied.
 """
 
 from __future__ import annotations
@@ -30,15 +30,15 @@ from typing import Any, Dict, List, Optional
 from claude_agent_sdk import HookContext, HookMatcher, PreToolUseHookInput
 
 # Tools this hook inspects; the SDK matcher syntax for "any of these names".
-GUARDED_TOOLS = "Bash|Read|Write|Edit|Glob"
+GUARDED_TOOLS = "Bash|Read|Write|Edit|Glob|Grep"
 
 # tool_input keys carrying a filesystem path, by tool name. Read/Write/Edit
 # require it; a missing/malformed value is a malformed call (denied, not
-# ignored). Glob's ``path`` is optional in the tool's own schema — omitting it
-# means "search from cwd", which is already the workspace root, so a missing
-# value there is not an escape and is allowed.
+# ignored). Glob's and Grep's ``path`` is optional in the tools' own schema —
+# omitting it means "search from cwd", which is already the workspace root,
+# so a missing value there is not an escape and is allowed.
 _REQUIRED_PATH_KEYS: Dict[str, str] = {"Read": "file_path", "Write": "file_path", "Edit": "file_path"}
-_OPTIONAL_PATH_KEYS: Dict[str, str] = {"Glob": "path"}
+_OPTIONAL_PATH_KEYS: Dict[str, str] = {"Glob": "path", "Grep": "path"}
 
 # An empty, no-op hook response: the SDK treats it as "no opinion", so the
 # call proceeds exactly as it would with no hook installed at all.
@@ -47,7 +47,11 @@ _ALLOW: Dict[str, Any] = {}
 # Shell metacharacters that separate distinct command tokens. Not a real shell
 # parser (see module docstring) — good enough to pull out path-like tokens
 # from ordinary commands without choking on pipes/redirection/subshells.
-_SHELL_SPLIT = re.compile(r"[\s;&|()]+")
+# Includes ``<``/``>`` so a redirection target glued to its operator (e.g.
+# ``echo x>../out.txt``, no space) still splits into its own token instead of
+# hiding inside a token that never matches the escape check, and a backtick
+# so a `` `cmd ../x` `` substitution's closing token isn't left dangling.
+_SHELL_SPLIT = re.compile(r"[\s;&|()<>`]+")
 
 
 def _deny(reason: str) -> Dict[str, Any]:
@@ -121,7 +125,7 @@ def _check_path_tool(
 
 
 def workspace_containment_hook(root: str) -> HookMatcher:
-    """Build a ``PreToolUse`` hook confining Bash/Read/Write/Edit/Glob to ``root``.
+    """Build a ``PreToolUse`` hook confining Bash/Read/Write/Edit/Glob/Grep to ``root``.
 
     ``root`` is resolved to its real path once, at build time, so every call
     this hook denies or allows is checked against the same fixed boundary —

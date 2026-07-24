@@ -152,6 +152,29 @@ def test_glob_with_out_of_root_path_is_denied(tmp_path):
     assert _is_denied(result)
 
 
+# --- Grep: optional path key ----------------------------------------------
+
+
+def test_grep_without_path_defaults_to_root_and_is_allowed(tmp_path):
+    hook = _hook(str(tmp_path))
+    result = _call(hook, "Grep", {"pattern": "TODO"})
+    assert result == {}
+
+
+def test_grep_with_in_root_path_is_allowed(tmp_path):
+    hook = _hook(str(tmp_path))
+    result = _call(hook, "Grep", {"pattern": "TODO", "path": str(tmp_path)})
+    assert result == {}
+
+
+def test_grep_with_out_of_root_path_is_denied(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    hook = _hook(str(root))
+    result = _call(hook, "Grep", {"pattern": "TODO", "path": str(tmp_path / "sibling")})
+    assert _is_denied(result)
+
+
 # --- Bash: heuristic string scan -----------------------------------------
 
 
@@ -186,6 +209,23 @@ def test_bash_absolute_in_root_token_is_allowed(tmp_path):
     hook = _hook(str(root))
     result = _call(hook, "Bash", {"command": f"cat {root / 'f.py'}"})
     assert result == {}
+
+
+def test_bash_glued_redirection_dotdot_is_denied(tmp_path):
+    # No space before ">" — a plain shell idiom, not adversarial obfuscation.
+    root = tmp_path / "root"
+    root.mkdir()
+    hook = _hook(str(root))
+    result = _call(hook, "Bash", {"command": "echo secret>../out.txt"})
+    assert _is_denied(result)
+
+
+def test_bash_glued_input_redirection_dotdot_is_denied(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    hook = _hook(str(root))
+    result = _call(hook, "Bash", {"command": "cat<../secret.txt"})
+    assert _is_denied(result)
 
 
 def test_bash_missing_command_is_denied(tmp_path):

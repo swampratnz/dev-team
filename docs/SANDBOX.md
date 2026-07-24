@@ -56,7 +56,7 @@ The engineer's tool loop runs via the Claude CLI **on the host**, outside any
 `CommandRunner`, so this primitive cannot box it. It now has its own
 filesystem-level trust boundary — a `PreToolUse` hook
 (`dev_team.agent_sandbox.workspace_containment_hook`) that denies any
-Bash/Read/Write/Edit/Glob call reaching outside the session's workspace root
+Bash/Read/Write/Edit/Glob/Grep call reaching outside the session's workspace root
 — but that is an in-process check, not OS-level isolation, and its Bash side
 is an evadable heuristic (see `docs/SECURITY.md`). Real isolation still means
 running the whole dev-team process inside a container/VM — the phase (c)

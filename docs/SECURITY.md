@@ -80,12 +80,12 @@ resolving a job's on-disk directory before deleting it.
 ## Agent tool-loop containment
 
 The checks above cover the orchestrator's own file I/O; they say nothing
-about the agentic engineer's *own* SDK tool loop (Bash/Read/Write/Edit/Glob
-via the Claude CLI), which runs on the host outside `CommandRunner` and was,
-until now, scoped only by `cwd` — a working-directory default, not an access
-boundary. `dev_team.agent_sandbox.workspace_containment_hook` closes that gap
-with a `PreToolUse` hook (`ClaudeAgentOptions.hooks`) that denies any
-Bash/Read/Write/Edit/Glob call whose target resolves outside the session's
+about the agentic engineer's *own* SDK tool loop (Bash/Read/Write/Edit/Glob/
+Grep via the Claude CLI), which runs on the host outside `CommandRunner` and
+was, until now, scoped only by `cwd` — a working-directory default, not an
+access boundary. `dev_team.agent_sandbox.workspace_containment_hook` closes
+that gap with a `PreToolUse` hook (`ClaudeAgentOptions.hooks`) that denies any
+Bash/Read/Write/Edit/Glob/Grep call whose target resolves outside the session's
 workspace root, reusing the same real-path/symlink-escape check as
 `LocalWorkspace._within_root` above. `dev_team.sdk` wires it automatically
 whenever a call carries a `cwd` — the same condition that turns an SDK call
