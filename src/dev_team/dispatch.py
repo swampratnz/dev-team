@@ -196,6 +196,39 @@ def _valid_budget(value: Any) -> bool:
     return value > 0
 
 
+def _foreman_batch_job_ids(status: int, payload: Dict[str, Any]) -> List[str]:
+    """The job ids a ``foreman_run`` outcome created, for access-log correlation.
+
+    Mirrors ``foreman_run``'s three outcome shapes (see its docstring):
+
+    - success (200/202) — ``payload["jobs"]``, each entry's ``job_id``, in
+      enqueue order.
+    - save-failed compensation (500) — every ``payload["cancelled"]`` entry's
+      ``job_id``, then every ``payload["uncancellable"]`` entry's, in that
+      order. These jobs were genuinely submitted (and could have started
+      spending) before being compensated, so the audit trail must show they
+      existed even though the API ultimately reported failure.
+    - validation rejection (400/409) — neither key is present, so ``[]``: no
+      job was ever created.
+
+    ``status`` is unused directly; the payload shape alone determines the
+    outcome, but it is accepted (and named in the signature) to keep the call
+    site self-documenting about which ``foreman_run`` return value this is
+    for.
+    """
+
+    jobs = payload.get("jobs")
+    if jobs:
+        return [entry["job_id"] for entry in jobs]
+    cancelled = payload.get("cancelled")
+    uncancellable = payload.get("uncancellable")
+    if cancelled or uncancellable:
+        return [entry["job_id"] for entry in (cancelled or [])] + [
+            entry["job_id"] for entry in (uncancellable or [])
+        ]
+    return []
+
+
 class ValidationError(Exception):
     """A bad SUBMIT body — surfaced to the client as ``400``."""
 
@@ -2381,6 +2414,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
 
             self._access_log_status: Optional[int] = None
             self._access_log_job_id: Optional[str] = None
+            self._access_log_job_ids: Optional[List[str]] = None
             try:
                 super().handle_one_request()
             finally:
@@ -2392,6 +2426,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                             request_path=urlsplit(getattr(self, "path", "") or "").path,
                             status=status,
                             job_id=self._access_log_job_id,
+                            job_ids=self._access_log_job_ids,
                         )
                     except OSError:
                         pass
@@ -2692,6 +2727,9 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 if body is None:
                     return
                 status, payload = dispatcher.foreman_run(body)
+                job_ids = _foreman_batch_job_ids(status, payload)
+                if job_ids:
+                    self._access_log_job_ids = job_ids
                 self._json(status, payload)
                 return
             parts = path.strip("/").split("/")

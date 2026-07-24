@@ -55,6 +55,75 @@ def test_read_access_log_round_trips_a_job_id_bearing_record(tmp_path):
     ]
 
 
+def test_append_omits_job_ids_when_not_given(tmp_path):
+    log = AccessLog(str(tmp_path), clock=lambda: 1.0)
+    log.append(method="POST", request_path="/foreman/run", status=200)
+    record = json.loads((tmp_path / ACCESS_LOG_FILENAME).read_text().splitlines()[0])
+    assert "job_ids" not in record
+
+
+def test_append_omits_job_ids_when_given_an_empty_list(tmp_path):
+    log = AccessLog(str(tmp_path), clock=lambda: 1.0)
+    log.append(method="POST", request_path="/foreman/run", status=200, job_ids=[])
+    record = json.loads((tmp_path / ACCESS_LOG_FILENAME).read_text().splitlines()[0])
+    assert "job_ids" not in record
+
+
+def test_append_includes_job_ids_when_given(tmp_path):
+    log = AccessLog(str(tmp_path), clock=lambda: 1.0)
+    log.append(
+        method="POST",
+        request_path="/foreman/run",
+        status=202,
+        job_ids=["deliver-1", "deliver-2"],
+    )
+    record = json.loads((tmp_path / ACCESS_LOG_FILENAME).read_text().splitlines()[0])
+    assert record == {
+        "ts": 1.0,
+        "method": "POST",
+        "path": "/foreman/run",
+        "status": 202,
+        "job_ids": ["deliver-1", "deliver-2"],
+    }
+
+
+def test_append_never_sets_job_id_and_job_ids_together(tmp_path):
+    # No real call site sets both, but the field-omission logic for each is
+    # independent, so a hypothetical caller that passed both would still get
+    # both persisted rather than one silently clobbering the other.
+    log = AccessLog(str(tmp_path), clock=lambda: 1.0)
+    log.append(
+        method="POST",
+        request_path="/x",
+        status=200,
+        job_id="a",
+        job_ids=["b"],
+    )
+    record = json.loads((tmp_path / ACCESS_LOG_FILENAME).read_text().splitlines()[0])
+    assert record["job_id"] == "a"
+    assert record["job_ids"] == ["b"]
+
+
+def test_read_access_log_round_trips_a_job_ids_bearing_record(tmp_path):
+    log = AccessLog(str(tmp_path), clock=lambda: 1.0)
+    log.append(
+        method="POST",
+        request_path="/foreman/run",
+        status=202,
+        job_ids=["deliver-1", "deliver-2"],
+    )
+    records = read_access_log(str(tmp_path))
+    assert records == [
+        {
+            "ts": 1.0,
+            "method": "POST",
+            "path": "/foreman/run",
+            "status": 202,
+            "job_ids": ["deliver-1", "deliver-2"],
+        }
+    ]
+
+
 def test_append_creates_the_jobs_root_lazily(tmp_path):
     root = tmp_path / "jobs" / "nested"
     assert not root.exists()
