@@ -7,8 +7,9 @@ deterministic counterpart, mirroring :mod:`depscan`'s exact shape: runtime
 versions are parsed straight out of a small, fixed set of manifest files
 (``package.json`` ``engines.node``, ``.nvmrc``, ``runtime.txt``,
 ``.python-version``, ``global.json`` ``sdk.version``, ``.ruby-version``,
-``go.mod``) and checked against endoflife.date's public, unauthenticated
-API — one request per *distinct* detected product. No network (or a
+``go.mod``, ``composer.json`` ``require.php``) and checked against
+endoflife.date's public, unauthenticated API — one request per *distinct*
+detected product. No network (or a
 failed/malformed query) degrades gracefully: the detected runtimes still
 feed the report, annotated that the live check was unavailable.
 """
@@ -37,6 +38,7 @@ _DISPLAY_NAMES = {
     "dotnet": ".NET",
     "ruby": "Ruby",
     "go": "Go",
+    "php": "PHP",
 }
 
 #: The only products this module understands (every audited repo has
@@ -229,6 +231,25 @@ def parse_go_mod(text: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def parse_composer_json_php(text: str) -> Optional[Tuple[str, str]]:
+    """Composer ``composer.json``: ``require.php``, if present and version-shaped."""
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    require = data.get("require")
+    if not isinstance(require, dict):
+        return None
+    spec = require.get("php")
+    if not isinstance(spec, str):
+        return None
+    version = _leading_version(spec)
+    return ("php", version) if version else None
+
+
 _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "package.json": parse_package_json_engines,
     ".nvmrc": parse_nvmrc,
@@ -237,6 +258,7 @@ _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "global.json": parse_global_json_sdk,
     ".ruby-version": parse_ruby_version,
     "go.mod": parse_go_mod,
+    "composer.json": parse_composer_json_php,
 }
 
 

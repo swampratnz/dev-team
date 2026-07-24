@@ -6,6 +6,16 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Assessment
+- **Live EOL/support-status scan extended to PHP runtimes** (`eolscan.py`):
+  `composer.json`'s `require.php` key (e.g. `"php": "^8.1"`) is now parsed
+  alongside the existing Node.js/Python/.NET/Ruby/Go manifests and checked
+  against endoflife.date the same way — one request per distinct detected
+  product, degrading to `unknown`/model-knowledge on a malformed manifest
+  or a failed query, never guessed. No change to the scan orchestration,
+  HTTP fetch, cycle-matching, or verdict logic — just one new parser
+  function registered in the existing `_PARSERS` table (issue #192,
+  follow-on to #61/#117). PHP's dependency-CVE scanning (`composer.lock`,
+  #186) is unaffected — separate manifest, separate module.
 - **Dependency scan now covers Go (`go.mod`) and Ruby (`Gemfile.lock`)**
   (`depscan.py`), closing the "verified EOL, model-knowledge CVE" asymmetry
   #117 left open on these two ecosystems. `parse_go_mod` reads every
