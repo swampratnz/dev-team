@@ -107,10 +107,10 @@ machinery understands them now:
 - **Exactly-pinned dependencies get a live OSV.dev scan; everything else
   is model knowledge** — the report footer says which mode produced the
   claims. Lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`,
-  NuGet `packages.lock.json`, Ruby `Gemfile.lock`) are parsed alongside
-  the manifests, so a range-specified project still gets its *resolved*
-  versions scanned; only dependencies with no lockfile and no exact pin
-  fall back to training data. PEP 621 `pyproject.toml`
+  NuGet `packages.lock.json`, Ruby `Gemfile.lock`, PHP `composer.lock`) are
+  parsed alongside the manifests, so a range-specified project still gets
+  its *resolved* versions scanned; only dependencies with no lockfile and no
+  exact pin fall back to training data. PEP 621 `pyproject.toml`
   `[project.dependencies]` and `[project.optional-dependencies]` `==`
   pins are live-scanned too, even with no lockfile present; PEP 735
   `[dependency-groups]` `==` pins are live-scanned the same way, but
@@ -119,7 +119,9 @@ machinery understands them now:
   `require` entries are always exact pins (Go's module resolution has no
   version-range syntax) and are live-scanned with no lockfile needed;
   Ruby's bare `Gemfile` (a range-specified manifest with no lockfile) is
-  not parsed — only `Gemfile.lock`'s resolved pins are.
+  not parsed — only `Gemfile.lock`'s resolved pins are. Likewise PHP's
+  `composer.json` version constraints are not parsed — only
+  `composer.lock`'s resolved pins are.
 - **Detected Node.js/Python/.NET/Ruby/Go runtime versions get a live
   endoflife.date EOL/support-status check; every other EOL/support-status
   judgment (other runtimes, frameworks, libraries) is model knowledge** —
@@ -170,9 +172,9 @@ involved, so their findings are exact and citable:
 - **Live dependency scan** — exact pins from the manifests
   (`packages.config`, `package.json`, `requirements.txt`, `Cargo.toml`,
   Go `go.mod`) and the lockfiles (`package-lock.json`, `poetry.lock`,
-  `Cargo.lock`, NuGet `packages.lock.json`, Ruby `Gemfile.lock`) queried
-  against OSV.dev in one batch (`--no-osv-scan` opts out; offline
-  degrades to a labelled model-knowledge fallback).
+  `Cargo.lock`, NuGet `packages.lock.json`, Ruby `Gemfile.lock`, PHP
+  `composer.lock`) queried against OSV.dev in one batch (`--no-osv-scan`
+  opts out; offline degrades to a labelled model-knowledge fallback).
 - **Live EOL/support-status scan** — Node.js/Python/.NET/Ruby/Go runtime
   versions detected from `package.json`/`.nvmrc`/`runtime.txt`/
   `.python-version`/`global.json`/`.ruby-version`/`go.mod` are checked
