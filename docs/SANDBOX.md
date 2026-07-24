@@ -49,13 +49,18 @@ inner runner's timeout handling and secret-env scrubbing.
 | Gate commands (the verify command / agent-authored tests) | ✅ via `--sandbox` |
 | Build probe / setup / dependency-scan commands | ✅ via `--sandbox` |
 | git porcelain (commit, branch, worktree, `git log`) | ❌ by design — host |
-| The agentic engineer's own SDK tool loop (Bash/Edit via the Claude CLI) | ❌ not by this primitive — needs the outer process container/VM (§5d), see below |
+| The agentic engineer's own SDK tool loop (Bash/Edit via the Claude CLI) | ❌ not by this primitive — see `dev_team.agent_sandbox`'s `PreToolUse` hook (`docs/SECURITY.md`'s *Agent tool-loop containment*) for its own filesystem-level check, and the outer process container/VM (§5d) below for OS-level isolation |
 | Visual review's served app (`SubprocessAppServer`) | ❌ not by `--sandbox` — long-running and needs inbound access from the host's Playwright capturer, a different shape than the boxed one-shot `CommandRunner` contract; the engine logs an advisory warning instead of silently assuming coverage (see `DeliveryEngine._visual_review`) |
 
 The engineer's tool loop runs via the Claude CLI **on the host**, outside any
-`CommandRunner`, so this primitive cannot box it. Containing *that* means running
-the whole dev-team process inside a container/VM — the phase (c) deployment
-model, documented with a hardened recipe in
+`CommandRunner`, so this primitive cannot box it. It now has its own
+filesystem-level trust boundary — a `PreToolUse` hook
+(`dev_team.agent_sandbox.workspace_containment_hook`) that denies any
+Bash/Read/Write/Edit/Glob call reaching outside the session's workspace root
+— but that is an in-process check, not OS-level isolation, and its Bash side
+is an evadable heuristic (see `docs/SECURITY.md`). Real isolation still means
+running the whole dev-team process inside a container/VM — the phase (c)
+deployment model, documented with a hardened recipe in
 [`DEPLOYMENT.md` §5d](../DEPLOYMENT.md#5d-sandboxing-the-whole-process-unattended--untrusted-runs).
 `--sandbox` is the per-command belt; the outer process container is the
 suspenders that also covers the engineer's tool loop and everything else.
