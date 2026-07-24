@@ -478,15 +478,24 @@ for that job), never an error. Errors:
 `archive_job` uses to make that check (which itself acquires the same lock —
 calling it from inside an already-held lock would hang the calling thread
 forever, and because every other mutation in this service shares that lock,
-freeze the entire single-flight dispatcher). The registry entry is deleted
-inside that same locked block, so a second purge call always sees "unknown
-job", never a redundant success. When there is no registry entry at all
-(the registry-miss fallback below), the same lock guards a dedicated
-`_purging` claim set instead, so the "never a redundant success" guarantee
-holds there too — see *registry-miss fallback* for why that separate claim
-is needed. The backlog-story removal is a separate, independent lock — the
-same one `DELETE /backlog/story/{id}` uses — so a purge and a concurrent
-board write can never interleave into a corrupt `backlog.json`.
+freeze the entire single-flight dispatcher). A job's actual deletion (the
+workspace, `meta.json`, transcripts, events and backlog-story removal) runs
+*after* this lock is released — it has to, since it does real I/O and
+holding the lock across it would freeze every other mutation. That leaves a
+window, for either eligibility branch, where a second concurrent call could
+otherwise re-decide eligibility from state the first call hasn't finished
+tearing down yet (the registry entry is gone, but `meta.json` is not, until
+the deletion below completes) and also return `200`. A single in-memory
+`_purging` claim set (guarded by the same lock) closes that window for
+*both* branches at once: membership is checked unconditionally at the top of
+the locked block, before either branch runs, and added — regardless of
+which branch found the job eligible — before the lock is released. A second
+call, whichever branch it would otherwise have taken, always finds the id
+already claimed and answers `404`, never a redundant `200`; the claim is
+released once the first call's deletion completes. The backlog-story
+removal is a separate, independent lock — the same one
+`DELETE /backlog/story/{id}` uses — so a purge and a concurrent board write
+can never interleave into a corrupt `backlog.json`.
 
 ### Registry-miss fallback (disk-first eligibility)
 
@@ -498,21 +507,12 @@ existing `_read_meta` / `_is_archived` helpers `archive_job`/`unarchive_job`
 already use) instead of answering a blanket 404: no `meta.json` → `404`, a
 present-but-not-archived one → `409`, an archived one → the same `200`
 deletion as the registry-present path. The actual deletion logic below the
-eligibility check is identical either way.
-
-This branch still needs its own atomic claim, exactly like the
-registry-present branch's registry-entry deletion: a job's actual deletion
-runs *after* the eligibility lock is released (the workspace, `meta.json`,
-transcripts, events and backlog-story removal all happen outside it), so
-without a claim, two truly concurrent calls on the same registry-less id
-could both read `meta.json` as archived before either finished deleting it,
-and both return a `200`. An in-memory `_purging` set (guarded by the same
-lock) closes that: the first eligible call claims the id inside the lock,
-a concurrent second call sees the claim and answers `404` immediately, and
-the claim is released once the first call's deletion completes. The
-documented contract — a second call is always `404`, never a redundant
-`200` — holds for the registry-miss path exactly as it does for the
-registry-present one.
+eligibility check is identical either way, and it shares the single
+`_purging` claim described above with the registry-present branch — not a
+second, independent claim — so a registry-present call and a concurrent
+registry-miss call racing the *same* id are also mutually exclusive: whichever
+one reaches the lock first claims the id, and the other sees the claim and
+404s, regardless of which branch each would otherwise have taken.
 
 ## TTL auto-purge sweep over already-archived jobs
 

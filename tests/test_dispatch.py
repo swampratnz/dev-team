@@ -1896,6 +1896,54 @@ def test_purge_registry_miss_concurrent_calls_only_one_claims_the_job(
     assert not dash.exists(f"audit/{job_id}/meta.json")
 
 
+def test_purge_registry_present_racing_a_concurrent_registry_miss_call_is_404(
+    tmp_path, monkeypatch
+):
+    # Regression for the second review on #184: the registry-present branch
+    # deletes the registry record but never claimed `_purging`, so a second,
+    # truly concurrent call -- which now sees no registry record either --
+    # took the registry-miss branch, found meta.json still on disk (its
+    # deletion happens later, inside `_finish_purge`, outside the lock), and
+    # ran a second concurrent deletion. Both must never return 200.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-present-vs-miss-race"
+    _seed_terminal_job(disp, job_id, archived=True)
+    assert job_id in disp._registry  # the racing call starts registry-present
+
+    claimed = threading.Event()
+    release = threading.Event()
+    real_finish_purge = disp._finish_purge
+
+    def blocking_finish_purge(job_id_arg):
+        claimed.set()
+        assert release.wait(timeout=5)
+        return real_finish_purge(job_id_arg)
+
+    monkeypatch.setattr(disp, "_finish_purge", blocking_finish_purge)
+
+    results = {}
+    first = threading.Thread(
+        target=lambda: results.__setitem__("first", disp.purge_job(job_id))
+    )
+    first.start()
+    assert claimed.wait(timeout=5)
+
+    # The first call already deleted the registry record but is still
+    # blocked before deleting meta.json -- a second, concurrent call now
+    # sees no registry record (the registry-miss branch) and must still be
+    # refused, not re-decide eligibility from the still-present meta.json.
+    assert job_id not in disp._registry
+    assert dash.exists(f"audit/{job_id}/meta.json")
+    second = disp.purge_job(job_id)
+    assert second == (404, {"error": "unknown job"})
+
+    release.set()
+    first.join(timeout=5)
+    assert results["first"][0] == 200
+    assert not dash.exists(f"audit/{job_id}/meta.json")
+
+
 # --- TTL auto-purge sweep over already-archived jobs (#184) -------------------
 
 
@@ -1947,6 +1995,27 @@ def test_sweep_expired_archives_purges_only_past_the_ttl_boundary(tmp_path):
     assert purged == [old_id]
     assert not dash.exists(f"audit/{old_id}/meta.json")
     assert dash.exists(f"audit/{young_id}/meta.json")
+
+
+def test_sweep_expired_archives_at_the_exact_cutoff_is_purged_inclusive(tmp_path):
+    # Pins the inclusive boundary flagged in the #184 review: only
+    # `archived_at > cutoff` is skipped, so a job archived at exactly the
+    # cutoff (not one second past it) is treated as expired and purged.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    now = 1_000_000.0
+    ttl_days = 5
+    cutoff = now - ttl_days * 86400
+    job_id = "assess-exactly-on-cutoff"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": True, "archived_at": cutoff}),
+    )
+
+    purged = sweep_expired_archives(dash, ttl_days, disp.purge_job, clock=lambda: now)
+
+    assert purged == [job_id]
+    assert not dash.exists(f"audit/{job_id}/meta.json")
 
 
 def test_sweep_expired_archives_never_force_purges_a_running_registry_job(tmp_path):

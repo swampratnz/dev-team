@@ -1533,24 +1533,31 @@ class Dispatcher:
         either way, since it already only ever reads ``job_id`` and
         ``self._dashboard_workspace``, never ``record``.
 
-        This branch still needs its own atomic claim, exactly like the
-        registry-present branch's ``del self._registry[job_id]`` above: two
-        truly concurrent calls on the same registry-less id would otherwise
-        both pass the disk-read eligibility check (the actual ``meta.json``
-        deletion happens further down, **outside** ``self._lock``) and both
-        run the full deletion path, breaking the documented "a second call
-        is always a 404, never a redundant 200" contract. ``self._purging``
-        is that claim: membership is added here, inside the lock, the moment
-        a registry-less job is found eligible, and a concurrent call that
-        finds the id already claimed answers 404 immediately rather than
-        re-deciding eligibility from a ``meta.json`` that may already be
-        mid-deletion. It is discarded once this call's deletion below
-        completes — by then ``meta.json`` is gone, so a later call would 404
-        from :meth:`_read_meta` alone; the discard is just hygiene against an
-        unbounded set.
+        **Why both branches share one claim set.** The actual disk deletion
+        (``_finish_purge``, including the ``meta.json`` removal inside the
+        ``_AUDIT_FILES`` loop) always runs **outside** ``self._lock`` — it has
+        to, since it does real I/O and calling it while holding the lock
+        would freeze the whole single-flight dispatcher. That leaves a real
+        window, after a registry-present call deletes the registry entry but
+        before ``meta.json`` is gone, where a *second, concurrent* call for
+        the same id would see no registry record either and — if eligibility
+        were decided independently per branch — would re-read a ``meta.json``
+        that still says ``archived: true`` and start a second, concurrent
+        deletion. ``self._purging`` closes that window for both branches at
+        once: membership is checked unconditionally at the very top of the
+        locked block, before either branch runs, and added before the lock is
+        released regardless of which branch found the job eligible. A second
+        call — whether it would have taken the registry-present or the
+        registry-miss branch — always finds the id already claimed and
+        answers 404, never a redundant 200. It is discarded once this call's
+        deletion completes, by which point ``meta.json`` is gone too, so a
+        later call 404s from :meth:`_read_meta` alone; the discard is just
+        hygiene against an unbounded set.
         """
 
         with self._lock:
+            if job_id in self._purging:
+                return 404, {"error": "unknown job"}
             record = self._registry.get(job_id)
             if record is not None:
                 if record.state not in _TERMINAL:
@@ -1561,14 +1568,12 @@ class Dispatcher:
                 self._order.remove(job_id)
                 self._events.pop(job_id, None)
             else:
-                if job_id in self._purging:
-                    return 404, {"error": "unknown job"}
                 meta = self._read_meta(job_id)
                 if meta is None:
                     return 404, {"error": "unknown job"}
                 if not meta.get("archived", False):
                     return 409, {"error": "job is not archived"}
-                self._purging.add(job_id)
+            self._purging.add(job_id)
 
         try:
             return self._finish_purge(job_id)
