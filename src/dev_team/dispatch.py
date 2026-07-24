@@ -440,6 +440,7 @@ class Dispatcher:
         max_workers: int = 1,
         checks_reader: Optional[Callable[[RepoRef], ChecksReader]] = None,
         sandbox: Optional[SandboxConfig] = None,
+        purge_ttl_days: Optional[int] = None,
     ) -> None:
         self.token = token
         # Injectable factory for GET /checks (tests never touch the network);
@@ -478,6 +479,11 @@ class Dispatcher:
         # is the one deliberate exception (the dashboard workspace owns the
         # cross-job backlog).
         self._dashboard_workspace = dashboard_workspace
+        # Off by default (None): a scheduled auto-purge of already-archived
+        # jobs past this many days old, swept once per worker-loop iteration
+        # (see _worker_loop). Reuses purge_job unchanged as the deletion
+        # primitive via sweep_expired_archives — see docs/DISPATCH.md.
+        self._purge_ttl_days = purge_ttl_days
         # Guards every read-modify-write of the dashboard workspace's shared
         # events.jsonl: a live job's EventLog append (dispatch is
         # single-flight for execution, but the HTTP server thread can purge
@@ -573,6 +579,18 @@ class Dispatcher:
         loop = asyncio.new_event_loop()
         try:
             while True:
+                if self._purge_ttl_days is not None:
+                    # Off by default (purge_ttl_days=None), so this branch —
+                    # and the redundant N-worker walk it costs when several
+                    # _worker_loop threads all reach it per tick — is only
+                    # ever paid when the operator opts in; see
+                    # docs/DISPATCH.md.
+                    sweep_expired_archives(
+                        self._dashboard_workspace,
+                        self._purge_ttl_days,
+                        self.purge_job,
+                        clock=self._clock,
+                    )
                 item = self._queue.get()
                 if item is _SHUTDOWN:
                     self._queue.put(_SHUTDOWN)
@@ -1463,19 +1481,35 @@ class Dispatcher:
         single-flight dispatcher). The registry entry is deleted in that same
         block, so a purged job is gone for good: a second call finds no
         record and answers 404, never an idempotent 200.
+
+        **Registry-miss fallback:** a service restart drops the in-memory
+        registry entirely, but ``audit/<id>/meta.json`` (this method's own
+        archive marker, written by :meth:`_set_archived`) survives on disk —
+        so when there is no registry record, the eligibility decision falls
+        back to :meth:`_read_meta` directly instead of answering a blanket
+        404. No registry mutation is needed in that branch (there is nothing
+        to remove); the rest of this method — the workspace, audit-file,
+        transcripts, events and backlog-story deletion below — is identical
+        either way, since it already only ever reads ``job_id`` and
+        ``self._dashboard_workspace``, never ``record``.
         """
 
         with self._lock:
             record = self._registry.get(job_id)
-            if record is None:
-                return 404, {"error": "unknown job"}
-            if record.state not in _TERMINAL:
-                return 409, {"error": "job is running"}
-            if not self._is_archived(job_id):
-                return 409, {"error": "job is not archived"}
-            del self._registry[job_id]
-            self._order.remove(job_id)
-            self._events.pop(job_id, None)
+            if record is not None:
+                if record.state not in _TERMINAL:
+                    return 409, {"error": "job is running"}
+                if not self._is_archived(job_id):
+                    return 409, {"error": "job is not archived"}
+                del self._registry[job_id]
+                self._order.remove(job_id)
+                self._events.pop(job_id, None)
+            else:
+                meta = self._read_meta(job_id)
+                if meta is None:
+                    return 404, {"error": "unknown job"}
+                if not meta.get("archived", False):
+                    return 409, {"error": "job is not archived"}
 
         workspace_dir = Path(self._jobs_root) / job_id
         removed_workspace = workspace_dir.exists()
@@ -2354,6 +2388,66 @@ class Dispatcher:
         return 200, {"kind": "deliver", **delivery_to_dict(outcome)}
 
 
+def sweep_expired_archives(
+    dashboard_workspace: Optional[Workspace],
+    purge_ttl_days: Optional[int],
+    purge_fn: Callable[[str], Tuple[int, Dict[str, Any]]],
+    *,
+    clock: Callable[[], float] = time.time,
+) -> List[str]:
+    """Purge every archived job whose ``archived_at`` is past ``purge_ttl_days``.
+
+    Walks ``audit/*/meta.json`` via ``dashboard_workspace.list_files()`` —
+    the same disk-first enumeration :meth:`Dispatcher.calibration` already
+    uses, so a job id is never taken from anything but a real, enumerated
+    ``audit/`` entry (a crafted ``../``-shaped subdirectory name is simply
+    never returned by ``list_files()``, so it can never reach ``purge_fn``).
+    Eligibility (archived, TTL-expired) is decided here; the actual deletion,
+    and every existence/running/idempotency check, stays entirely inside
+    ``purge_fn`` (:meth:`Dispatcher.purge_job` in production) — this
+    function has no independent deletion logic of its own. That means a job
+    still ``queued``/``running`` in the registry is never force-purged even
+    if its mirrored ``meta.json`` says ``archived: true`` (``purge_fn``
+    itself refuses it), and two overlapping sweeps (one per
+    ``--max-concurrent-jobs`` worker) racing the same expired job are safe:
+    the second call's ``purge_fn`` finds nothing left to purge and answers
+    a non-200 without raising.
+
+    A missing or malformed ``meta.json``, or a non-numeric ``archived_at``,
+    is treated as not-eligible rather than raising — the same fail-closed
+    posture as :meth:`Dispatcher._read_meta`.
+
+    Returns the ids actually purged (``purge_fn`` returned ``200``).
+    """
+
+    if dashboard_workspace is None or purge_ttl_days is None:
+        return []
+    cutoff = clock() - purge_ttl_days * 86400
+    purged: List[str] = []
+    for path in dashboard_workspace.list_files():
+        if not path.startswith("audit/") or not path.endswith("/meta.json"):
+            continue
+        parts = path.split("/")
+        if len(parts) != 3:
+            continue
+        job_id = parts[1]
+        try:
+            meta = json.loads(dashboard_workspace.read_text(path))
+        except (OSError, ValueError, WorkspaceError):
+            continue
+        if not isinstance(meta, dict) or not meta.get("archived", False):
+            continue
+        archived_at = meta.get("archived_at")
+        if not isinstance(archived_at, (int, float)) or isinstance(archived_at, bool):
+            continue
+        if archived_at > cutoff:
+            continue
+        status, _ = purge_fn(job_id)
+        if status == 200:
+            purged.append(job_id)
+    return purged
+
+
 def _make_handler(dispatcher: Dispatcher) -> type:
     """A request handler class bound to ``dispatcher``."""
 
@@ -2957,6 +3051,7 @@ class DispatchServer:
         max_workers: int = 1,
         checks_reader: Optional[Callable[[RepoRef], ChecksReader]] = None,
         sandbox: Optional[SandboxConfig] = None,
+        purge_ttl_days: Optional[int] = None,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -2972,6 +3067,7 @@ class DispatchServer:
             max_workers=max_workers,
             checks_reader=checks_reader,
             sandbox=sandbox,
+            purge_ttl_days=purge_ttl_days,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()

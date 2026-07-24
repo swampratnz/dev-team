@@ -459,7 +459,10 @@ for that job), never an error. Errors:
 
 - `404 {"error":"unknown job"}` — no such job (unknown id, or already
   purged: purge is **not idempotent**, unlike unarchive — a second call on
-  the same id is a 404, never a redundant 200).
+  the same id is a 404, never a redundant 200). Also answered when there is
+  no in-memory registry record (e.g. after a service restart) **and** no
+  `audit/{id}/meta.json` on disk either — see *registry-miss fallback*
+  below.
 - `409 {"error":"job is running"}` — the job is `queued` or `running`;
   checked directly against the in-memory record within one locked block
   (never by re-entering the archive check's own lock — see *Concurrency*
@@ -482,9 +485,42 @@ independent lock — the same one `DELETE /backlog/story/{id}` uses — so a
 purge and a concurrent board write can never interleave into a corrupt
 `backlog.json`.
 
+### Registry-miss fallback (disk-first eligibility)
+
+The in-memory registry does not survive a service restart, but
+`audit/{id}/meta.json` does — it's the same archive marker `archive_job` /
+`unarchive_job` already write to disk. So when `purge_job` finds no registry
+record for an id, it falls back to reading `meta.json` directly (reusing the
+existing `_read_meta` / `_is_archived` helpers `archive_job`/`unarchive_job`
+already use) instead of answering a blanket 404: no `meta.json` → `404`, a
+present-but-not-archived one → `409`, an archived one → the same `200`
+deletion as the registry-present path. No registry mutation happens in this
+branch (there's nothing to remove); the actual deletion logic below it is
+identical either way.
+
+## TTL auto-purge sweep over already-archived jobs
+
+`--purge-ttl-days N` (default: off) has the dispatch service purge, on its
+own, any already-archived job whose `archived_at` marker is older than `N`
+days — the automated version of the two-step archive-then-purge flow above,
+still gated on the same prior, explicit human archive action. Each
+`_worker_loop` iteration calls `sweep_expired_archives` once, before
+dequeuing the next queued job: it walks `audit/*/meta.json` (the same
+disk-first enumeration `calibration()` uses), filters to archived entries
+past the TTL, and calls `purge_job` for each — no independent
+existence/eligibility logic of its own, so every one of `purge_job`'s
+guarantees above (registry-miss fallback, running-job refusal, idempotent
+double-purge safety) applies unchanged to a swept job. `--max-concurrent-jobs
+N` runs `N` independent worker-loop threads, so the sweep fires redundantly
+across all of them once per tick when `--purge-ttl-days` is set — each
+redundant call still serialises through `purge_job`'s own lock and simply
+finds nothing left to do, an accepted, documented $0 cost against the shared
+Max pool rather than a bug. Off by default (`purge_ttl_days=None`): with no
+flag, `sweep_expired_archives` is never invoked and behaviour is byte-
+identical to before this feature existed.
+
 ### Natural growth (not in v1)
 
-- A scheduled/TTL auto-purge policy over already-archived jobs past N days.
 - Bulk purge (`?archived_before=`) once the single-job primitive has real
   usage to generalise from.
 
