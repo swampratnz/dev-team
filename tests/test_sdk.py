@@ -9,6 +9,7 @@ from claude_agent_sdk import ProcessError
 from helpers import run
 
 from dev_team import sdk
+from dev_team.agent_sandbox import GUARDED_TOOLS
 from dev_team.sdk import (
     AgentResult,
     AgentRunner,
@@ -17,6 +18,20 @@ from dev_team.sdk import (
     extract_text,
 )
 from dev_team.testing import ScriptedRunner
+
+CONTEXT = {"signal": None}
+
+
+def _permission_decision(output):
+    return output.get("hookSpecificOutput", {}).get("permissionDecision")
+
+
+def _pre_tool_use_hook(options):
+    """Pull the (sole) PreToolUse containment callback out of built options."""
+
+    matcher = options.hooks["PreToolUse"][0]
+    assert matcher.matcher == GUARDED_TOOLS
+    return matcher.hooks[0]
 
 
 # --- fake SDK message objects -------------------------------------------
@@ -77,6 +92,9 @@ def test_build_options_minimal():
     assert options.system_prompt is None
     # None means an explicit empty allowlist, never "no restriction".
     assert options.allowed_tools == []
+    # Omitting hooks (the default) leaves today's behaviour byte-for-byte
+    # unchanged.
+    assert options.hooks is None
 
 
 def test_build_options_full():
@@ -93,6 +111,45 @@ def test_build_options_full():
     assert options.model == "claude-x"
     assert options.cwd == "/tmp"
     assert options.max_turns == 5
+
+
+def test_build_options_hooks_passthrough():
+    from dev_team.agent_sandbox import workspace_containment_hook
+
+    hooks = {"PreToolUse": [workspace_containment_hook("/tmp")]}
+    options = build_options(
+        system_prompt=None,
+        allowed_tools=None,
+        model=None,
+        permission_mode="bypassPermissions",
+        cwd=None,
+        max_turns=None,
+        hooks=hooks,
+    )
+    assert options.hooks is hooks
+
+
+# --- cwd -> containment hook wiring --------------------------------------
+
+
+def test_cwd_containment_hooks_none_without_a_cwd():
+    assert sdk._cwd_containment_hooks(None) is None
+
+
+def test_cwd_containment_hooks_builds_a_matcher_rooted_at_cwd(tmp_path):
+    hooks = sdk._cwd_containment_hooks(str(tmp_path))
+    matcher = hooks["PreToolUse"][0]
+    assert matcher.matcher == GUARDED_TOOLS
+    hook = matcher.hooks[0]
+    inside = run(
+        hook({"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "f.py")}},
+             "t1", CONTEXT)
+    )
+    assert inside == {}
+    outside = run(
+        hook({"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}}, "t1", CONTEXT)
+    )
+    assert _permission_decision(outside) == "deny"
 
 
 def test_extract_text_variants():
@@ -146,6 +203,58 @@ def test_runner_minimal_flow(monkeypatch):
 
 def test_scripted_runner_satisfies_protocol():
     assert isinstance(ScriptedRunner(["x"]), AgentRunner)
+
+
+def test_runner_without_cwd_attaches_no_containment_hook(monkeypatch):
+    messages = [ResultMsg(total_cost_usd=0.0, num_turns=1, is_error=False, result="")]
+    monkeypatch.setattr(sdk, "query", _fake_query(messages))
+
+    runner = ClaudeAgentRunner()
+    run(runner.run("prompt"))
+    assert runner._last_options.hooks is None
+
+
+def test_runner_containment_hook_tracks_the_live_per_call_cwd(tmp_path, monkeypatch):
+    # A per-call cwd override must root the hook at *that* cwd, not the
+    # runner's construction-time default — a stale root would guard the
+    # wrong directory (or nothing at all) for worktree-mode tasks.
+    messages = [ResultMsg(total_cost_usd=0.0, num_turns=1, is_error=False, result="")]
+    monkeypatch.setattr(sdk, "query", _fake_query(messages))
+
+    default_root = tmp_path / "default"
+    override_root = tmp_path / "override"
+    default_root.mkdir()
+    override_root.mkdir()
+
+    runner = ClaudeAgentRunner(cwd=str(default_root))
+
+    run(runner.run("prompt"))
+    default_hook = _pre_tool_use_hook(runner._last_options)
+    outside_default = run(
+        default_hook(
+            {"tool_name": "Read", "tool_input": {"file_path": str(override_root / "f.py")}},
+            "t1", CONTEXT,
+        )
+    )
+    assert _permission_decision(outside_default) == "deny"
+
+    run(runner.run("prompt", cwd=str(override_root)))
+    override_hook = _pre_tool_use_hook(runner._last_options)
+    now_inside = run(
+        override_hook(
+            {"tool_name": "Read", "tool_input": {"file_path": str(override_root / "f.py")}},
+            "t1", CONTEXT,
+        )
+    )
+    assert now_inside == {}
+    # ... and the previously-valid default root is now out of bounds.
+    now_outside = run(
+        override_hook(
+            {"tool_name": "Read", "tool_input": {"file_path": str(default_root / "f.py")}},
+            "t1", CONTEXT,
+        )
+    )
+    assert _permission_decision(now_outside) == "deny"
 
 
 def test_runner_maps_sdk_errors_to_error_result(monkeypatch):
@@ -244,6 +353,33 @@ def test_session_reuses_one_client_across_turns():
     assert client.options.allowed_tools == ["Read", "Write"]
     assert client.options.model == "claude-x"
     assert client.options.cwd == "/work"
+
+
+def test_session_containment_hook_rooted_at_its_cwd():
+    from dev_team.sdk import ClaudeAgentSession
+
+    _SessionClient.instances = []
+    session = ClaudeAgentSession(cwd="/work", client_factory=_SessionClient)
+    run(session.send("go"))
+    options = _SessionClient.instances[0].options
+    hook = _pre_tool_use_hook(options)
+    inside = run(
+        hook({"tool_name": "Read", "tool_input": {"file_path": "/work/f.py"}}, "t1", CONTEXT)
+    )
+    assert inside == {}
+    outside = run(
+        hook({"tool_name": "Read", "tool_input": {"file_path": "/elsewhere/f.py"}}, "t1", CONTEXT)
+    )
+    assert _permission_decision(outside) == "deny"
+
+
+def test_session_without_cwd_attaches_no_containment_hook():
+    from dev_team.sdk import ClaudeAgentSession
+
+    _SessionClient.instances = []
+    session = ClaudeAgentSession(client_factory=_SessionClient)
+    run(session.send("go"))
+    assert _SessionClient.instances[0].options.hooks is None
 
 
 def test_session_aclose_disconnects_and_resets():

@@ -15,6 +15,7 @@ Two engines are available:
 
 from __future__ import annotations
 
+from .agent_sandbox import GUARDED_TOOLS, workspace_containment_hook
 from .approval import (
     ApprovalDecision,
     ApprovalGate,
@@ -292,6 +293,9 @@ __all__ = [
     "ConventionsProfile",
     "ConventionsStore",
     "detect_convention_sources",
+    # agent tool-loop containment
+    "GUARDED_TOOLS",
+    "workspace_containment_hook",
     # sdk boundary
     "AgentEvent",
     "AgentResult",

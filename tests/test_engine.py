@@ -4480,6 +4480,59 @@ def test_open_engineer_session_cwd_override_used_over_workdir(tmp_path):
     assert inner.cwd != str(eng.workdir)
 
 
+def test_open_engineer_session_hook_tracks_the_live_worktree_root(tmp_path, monkeypatch):
+    # Regression for worktree mode: the containment hook must be rooted at
+    # *this task's* worktree, not the engine's own top-level workdir (a
+    # sibling directory from the hook's point of view) or a stale default.
+    from dev_team import sdk as sdk_module
+    from dev_team.sdk import ClaudeAgentSession
+
+    captured = {}
+
+    class _CapturingClient:
+        def __init__(self, options):
+            captured["options"] = options
+
+        async def connect(self):
+            pass
+
+    monkeypatch.setattr(
+        sdk_module, "_default_client_factory", lambda options: _CapturingClient(options)
+    )
+
+    eng = _engine(
+        ScriptedRunner([]),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(reuse_engineer_session=True),
+    )
+    wt_path = str(tmp_path / ".dev_team" / "worktrees" / "t1")
+    inner = eng._open_engineer_session(cwd=wt_path).inner
+    assert isinstance(inner, ClaudeAgentSession)
+    run(inner._ensure_client())
+
+    options = captured["options"]
+    matcher = options.hooks["PreToolUse"][0]
+    hook = matcher.hooks[0]
+
+    allowed = run(
+        hook(
+            {"tool_name": "Read", "tool_input": {"file_path": f"{wt_path}/f.py"}},
+            "t1", {"signal": None},
+        )
+    )
+    assert allowed == {}
+    denied = run(
+        hook(
+            {
+                "tool_name": "Read",
+                "tool_input": {"file_path": str(tmp_path / "other.txt")},
+            },
+            "t1", {"signal": None},
+        )
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
 def test_engineer_attempt_cold_path_uses_cwd_override(tmp_path):
     runner = ScriptedRunner([json_response(impl_dict())])
     eng = _engine(runner, workspace=LocalWorkspace(str(tmp_path)))
