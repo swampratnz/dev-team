@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 
+import pytest
+
 from dev_team.eolscan import (
     EolScan,
     EolStatus,
@@ -14,6 +16,7 @@ from dev_team.eolscan import (
     _http_fetch,
     _match_cycle,
     detect_runtimes,
+    parse_composer_json_php,
     parse_global_json_sdk,
     parse_go_mod,
     parse_nvmrc,
@@ -126,6 +129,40 @@ def test_parse_go_mod_malformed_never_raises():
     assert parse_go_mod("module example.com/foo\n\ngo unknown\n") is None
 
 
+def test_parse_composer_json_php():
+    text = json.dumps({"require": {"php": "^8.1"}})
+    assert parse_composer_json_php(text) == ("php", "8.1")
+
+
+def test_parse_composer_json_php_range_spec_tolerance():
+    assert parse_composer_json_php(
+        json.dumps({"require": {"php": ">=7.4"}})
+    ) == ("php", "7.4")
+    assert parse_composer_json_php(
+        json.dumps({"require": {"php": "8.1.*"}})
+    ) == ("php", "8.1")
+    assert parse_composer_json_php(
+        json.dumps({"require": {"php": "~8.2.0"}})
+    ) == ("php", "8.2.0")
+    assert parse_composer_json_php(
+        json.dumps({"require": {"php": "^8.1 || ^8.2"}})
+    ) == ("php", "8.1")
+
+
+def test_parse_composer_json_php_malformed_never_raises():
+    assert parse_composer_json_php("not json") is None
+    assert parse_composer_json_php("[]") is None
+    assert parse_composer_json_php("{}") is None
+    assert parse_composer_json_php(json.dumps({"require": "nope"})) is None
+    assert parse_composer_json_php(
+        json.dumps({"require": {"ext-mbstring": "*"}})
+    ) is None
+    assert parse_composer_json_php(
+        json.dumps({"require": {"php": 8}})
+    ) is None
+    assert parse_composer_json_php("") is None
+
+
 # --- detect_runtimes ----------------------------------------------------------------
 
 
@@ -152,6 +189,7 @@ def test_detect_runtimes_multiple_products():
             "global.json": json.dumps({"sdk": {"version": "8.0.100"}}),
             ".ruby-version": "3.2.0",
             "go.mod": "module example.com/foo\n\ngo 1.21.3\n",
+            "composer.json": json.dumps({"require": {"php": "^8.1"}}),
         }
     )
     runtimes = detect_runtimes(ws)
@@ -159,8 +197,23 @@ def test_detect_runtimes_multiple_products():
         ("dotnet", "8.0.100"),
         ("go", "1.21.3"),
         ("nodejs", "18.17.0"),
+        ("php", "8.1"),
         ("python", "3.11.4"),
         ("ruby", "3.2.0"),
+    ]
+
+
+def test_detect_runtimes_php_alongside_another_product_no_cross_interference():
+    ws = InMemoryWorkspace(
+        {
+            "composer.json": json.dumps({"require": {"php": "^8.1"}}),
+            "go.mod": "module example.com/foo\n\ngo 1.21\n",
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert sorted((r.product, r.version, r.manifest) for r in runtimes) == [
+        ("go", "1.21", "go.mod"),
+        ("php", "8.1", "composer.json"),
     ]
 
 
@@ -275,8 +328,6 @@ def test_query_eol_unknown_when_cycle_not_in_response():
 
 
 def test_query_eol_raises_on_non_list_response():
-    import pytest
-
     with pytest.raises(ValueError):
         query_eol("nodejs", "18.0.0", fetch=lambda _p: {"not": "a list"})
 
@@ -347,8 +398,50 @@ def test_scan_eol_reports_statuses_for_ruby_and_go():
     assert "END OF LIFE" in rendered
 
 
-def test_scan_eol_degrades_on_fetch_failure():
-    ws = InMemoryWorkspace({".nvmrc": "18.17.0"})
+def test_scan_eol_reports_statuses_for_php():
+    ws = InMemoryWorkspace(
+        {
+            "composer.json": json.dumps({"require": {"php": "^8.1"}}),
+            "go.mod": "module example.com/foo\n\ngo 1.21\n",
+            ".ruby-version": "9.9.9",  # unresolvable cycle -> "unknown" branch
+        }
+    )
+
+    def fetch(product):
+        if product == "php":
+            return [{"cycle": "8.1", "eol": _PAST_EOL}]
+        if product == "go":
+            return [{"cycle": "1.21", "eol": _FUTURE_EOL}]
+        return [{"cycle": "3.2", "eol": _FUTURE_EOL}]  # no cycle "9" -> unmatched
+
+    scan = scan_eol(ws, fetch=fetch)
+    assert scan.queried is True
+    assert scan.error is None
+    by_product = {s.runtime.product: s for s in scan.statuses}
+    assert by_product["php"].end_of_life is True
+    assert by_product["php"].eol_date == _PAST_EOL
+    assert by_product["go"].end_of_life is False
+    assert by_product["ruby"].end_of_life == "unknown"
+    rendered = scan.render()
+    assert "PHP 8.1" in rendered
+    assert "END OF LIFE" in rendered
+    assert "supported" in rendered
+    assert "support status unknown" in rendered
+
+
+@pytest.mark.parametrize(
+    "manifest,contents,product",
+    [
+        (".nvmrc", "18.17.0", "nodejs"),
+        (
+            "composer.json",
+            json.dumps({"require": {"php": "^8.1"}}),
+            "php",
+        ),
+    ],
+)
+def test_scan_eol_degrades_on_fetch_failure(manifest, contents, product):
+    ws = InMemoryWorkspace({manifest: contents})
 
     def broken_fetch(_product):
         raise OSError("network down")
@@ -357,18 +450,30 @@ def test_scan_eol_degrades_on_fetch_failure():
     assert scan.queried is False
     assert "network down" in scan.error
     assert scan.statuses == [EolStatus(scan.runtimes[0], "unknown", None)]
+    assert scan.runtimes[0].product == product
     assert "unavailable" in scan.render()
 
 
-def test_scan_eol_degrades_on_malformed_response():
+@pytest.mark.parametrize(
+    "manifest,contents,malformed_product",
+    [
+        (".nvmrc", "18.17.0", "nodejs"),
+        (
+            "composer.json",
+            json.dumps({"require": {"php": "^8.1"}}),
+            "php",
+        ),
+    ],
+)
+def test_scan_eol_degrades_on_malformed_response(manifest, contents, malformed_product):
     ws = InMemoryWorkspace(
-        {".nvmrc": "18.17.0", "global.json": json.dumps({"sdk": {"version": "8.0.0"}})}
+        {manifest: contents, "global.json": json.dumps({"sdk": {"version": "8.0.0"}})}
     )
 
     def fetch(product):
-        if product == "nodejs":
-            return [{"cycle": "18", "eol": _PAST_EOL}]
-        return {"unexpected": "shape"}  # dotnet: not a list
+        if product == malformed_product:
+            return {"unexpected": "shape"}  # not a list
+        return [{"cycle": "18", "eol": _PAST_EOL}]
 
     scan = scan_eol(ws, fetch=fetch)
     # One product's malformed response invalidates the whole batch: nothing
@@ -456,6 +561,13 @@ def test_crafted_ruby_version_and_go_mod_content_never_parses_to_a_version():
         assert parse_go_mod(f"module x\n\ngo {content}\n") is None
 
 
+def test_crafted_composer_json_php_value_never_parses_to_a_version():
+    malicious = ["$(rm -rf /)", "../../etc/passwd", "; rm -rf /", "`id`"]
+    for spec in malicious:
+        text = json.dumps({"require": {"php": spec}})
+        assert parse_composer_json_php(text) is None
+
+
 def test_crafted_manifest_content_causes_no_subprocess_or_filesystem_writes(
     monkeypatch,
 ):
@@ -475,6 +587,7 @@ def test_crafted_manifest_content_causes_no_subprocess_or_filesystem_writes(
             "package.json": json.dumps({"engines": {"node": ">=1 && curl evil.sh"}}),
             ".ruby-version": "; rm -rf /",
             "go.mod": "module x\n\ngo $(whoami)\n",
+            "composer.json": json.dumps({"require": {"php": "$(whoami)"}}),
         }
     )
     monkeypatch.setattr(ws, "write_text", _boom)
