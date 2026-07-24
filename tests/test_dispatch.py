@@ -36,6 +36,7 @@ from dev_team.dispatch import (
     SubmitRejected,
     ValidationError,
     _default_materialise,
+    _foreman_batch_job_ids,
 )
 from dev_team.dashboard import agent_history, collect_state
 from dev_team.eventlog import EVENTS_PATH, read_events
@@ -4710,6 +4711,41 @@ def test_foreman_plan_treats_an_unparseable_meta_repo_as_unrouteable():
     assert "no repository provenance" in payload["plan"][0]["reason"]
 
 
+# --- _foreman_batch_job_ids (#180) -----------------------------------------
+
+
+def test_foreman_batch_job_ids_from_a_success_payload():
+    payload = {
+        "jobs": [
+            {"job_id": "deliver-1", "story_id": "S1", "title": "t1", "position": 0},
+            {"job_id": "deliver-2", "story_id": "S2", "title": "t2", "position": 1},
+        ],
+        "skipped": [],
+        "budget_usd_per_story": 1.0,
+    }
+    assert _foreman_batch_job_ids(202, payload) == ["deliver-1", "deliver-2"]
+
+
+def test_foreman_batch_job_ids_from_an_all_skipped_success_payload():
+    payload = {"jobs": [], "skipped": [{"story_id": "S1", "reason": "x"}],
+               "budget_usd_per_story": 1.0}
+    assert _foreman_batch_job_ids(200, payload) == []
+
+
+def test_foreman_batch_job_ids_from_a_save_failed_compensation_payload():
+    payload = {
+        "error": "backlog write failed; enqueued jobs were cancelled",
+        "cancelled": [{"job_id": "deliver-1", "story_id": "S1"}],
+        "uncancellable": [{"job_id": "deliver-2", "story_id": "S2"}],
+    }
+    assert _foreman_batch_job_ids(500, payload) == ["deliver-1", "deliver-2"]
+
+
+def test_foreman_batch_job_ids_from_a_rejected_payload():
+    assert _foreman_batch_job_ids(400, {"error": "budget_usd is required"}) == []
+    assert _foreman_batch_job_ids(409, {"error": "the foreman needs a dashboard workspace"}) == []
+
+
 def test_foreman_run_needs_a_dashboard_workspace():
     status, payload = Dispatcher(token="x").foreman_run({"budget_usd": 1})
     assert status == 409
@@ -5090,6 +5126,111 @@ def test_foreman_routes_over_http(tmp_path):
         )
         assert status == 400
         assert "budget_usd is required" in payload["error"]
+
+
+# --- access log job_ids correlation for POST /foreman/run (#180) -----------
+
+
+def test_access_log_records_job_ids_for_a_foreman_run_batch(tmp_path):
+    # AC4: the access-log record's job_ids exactly equals the response body's
+    # jobs[*].job_id, in the same order — proves no drift.
+    dash = _foreman_dash()
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=dash, jobs_root=str(tmp_path),
+    ) as server:
+        status, payload = _call(
+            server, "/foreman/run", method="POST", body={"budget_usd": 1.5},
+        )
+        assert status == 202
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/foreman/run" and r["status"] == 202)
+    assert entry["job_ids"] == [j["job_id"] for j in payload["jobs"]]
+    assert len(entry["job_ids"]) == 2  # sanity: really a 2-job batch
+    assert "job_id" not in entry
+
+
+def test_access_log_omits_job_ids_for_an_empty_ready_backlog(tmp_path):
+    # AC5: a 200 with "jobs": [] (nothing ready) has no job_ids key.
+    dash = _foreman_dash(stories=0)
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=dash, jobs_root=str(tmp_path),
+    ) as server:
+        status, payload = _call(
+            server, "/foreman/run", method="POST", body={"budget_usd": 1.5},
+        )
+        assert (status, payload["jobs"]) == (200, [])
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/foreman/run")
+    assert "job_ids" not in entry
+
+
+def test_access_log_omits_job_ids_for_a_rejected_foreman_run(tmp_path):
+    # AC6: a 400 validation rejection (no job ever created) has no job_ids key.
+    dash = _foreman_dash()
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=dash, jobs_root=str(tmp_path),
+    ) as server:
+        status, _ = _call(server, "/foreman/run", method="POST", body={})
+        assert status == 400
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/foreman/run")
+    assert "job_ids" not in entry
+
+
+def test_access_log_records_job_ids_for_a_save_failed_compensated_batch(tmp_path, monkeypatch):
+    # AC7 (SECURITY, CLAUDE.md #7 audit-log integrity): jobs that were
+    # genuinely submitted (and could have started spending) before being
+    # compensated via cancel must still show up in the access log, even
+    # though the API ultimately reports a 500.
+    dash = _foreman_dash()
+
+    class _SaveBoomStore:
+        def __init__(self, workspace):
+            self._real = BacklogStore(workspace)
+
+        def load(self):
+            return self._real.load()
+
+        def save(self, backlog):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(dispatch_mod, "BacklogStore", _SaveBoomStore)
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=dash, jobs_root=str(tmp_path),
+    ) as server:
+        status, payload = _call(
+            server, "/foreman/run", method="POST", body={"budget_usd": 1.5},
+        )
+        assert status == 500
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/foreman/run" and r["status"] == 500)
+    expected = [c["job_id"] for c in payload["cancelled"]] + [
+        u["job_id"] for u in payload["uncancellable"]
+    ]
+    assert expected  # sanity: the batch really enqueued something
+    for job_id in expected:
+        assert job_id in entry["job_ids"]
+    assert entry["job_ids"] == expected
+
+
+def test_access_log_job_id_and_job_ids_never_both_appear(tmp_path):
+    # AC8 regression: a POST /jobs record carries job_id, never job_ids; a
+    # POST /foreman/run record carries job_ids, never job_id.
+    dash = _foreman_dash(stories=1)
+    with running(
+        runner=_deliver_runner(), materialise=_mem_materialise,
+        dashboard_workspace=dash, jobs_root=str(tmp_path),
+    ) as server:
+        _call(
+            server, "/jobs", method="POST",
+            body={"mode": "deliver", "repo": "acme/mono", "title": "t", "description": "d"},
+        )
+        _call(server, "/foreman/run", method="POST", body={"budget_usd": 1.5})
+    records = _access_records(tmp_path, expect=2)
+    jobs_entry = next(r for r in records if r["path"] == "/jobs" and r["status"] == 202)
+    foreman_entry = next(r for r in records if r["path"] == "/foreman/run" and r["status"] == 202)
+    assert "job_id" in jobs_entry and "job_ids" not in jobs_entry
+    assert "job_ids" in foreman_entry and "job_id" not in foreman_entry
 
 
 # --- GitHub OAuth sign-in over HTTP ------------------------------------------

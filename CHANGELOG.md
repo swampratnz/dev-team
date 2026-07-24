@@ -78,6 +78,28 @@ sections below are reconstructed from the repository history.
   run-level only: the architect runs once per whole plan with no task
   linkage in the data model, so a true per-task with/without-design
   attempts comparison remains future work pending an architect opt-out flag.
+- **A new opt-in mutation-lite check surfaces weak tests as an advisory
+  scorecard signal** (#176, closing `docs/BENCHMARKS.md`'s named
+  "Mutation-lite scoring → roadmap" gap next to the adopted fail-to-pass
+  check). `dev_team.mutation.mutate_first_comparison` is a pure, dependency-
+  free AST transform: it flips the first single-operator comparison
+  (`==`↔`!=`, `<`↔`>=`, `>`↔`<=`) found in a source string and returns the
+  unparsed mutated source, or `None` when nothing parses or no mutable
+  comparison exists. `DeliveryEngine._mutation_check` (a new sibling to
+  `_tests_are_vacuous`, called right after it in `_integrate`) applies this
+  to the task's one Python product file, reruns the gates, and records
+  `mutation_survived`/`mutation_killed` in the run scorecard —
+  **advisory-only**: unlike `fail_to_pass_check`, a surviving mutant never
+  rejects, retries, or rolls back the task. Gated on
+  `EngineConfig.mutation_check` (off by default, matching `visual_review`'s
+  earn-the-default stance) plus the same dry-run/remote-verification skips
+  `fail_to_pass_check` already has, and further scoped to exactly one
+  non-test `.py` product file. The mutated write is always restored via a
+  `finally` block, success or failure; a restore that itself fails raises
+  the same `_StashRestoreFailed` hard-stop class `_tests_are_vacuous` uses,
+  rejecting the attempt rather than risking mutated code left on disk or
+  committed. No new dependency, subprocess shape, or credential — reuses
+  the existing gate-evaluation path every other check already calls.
 - **A visual-critique failure is now diagnosable instead of a bare "skipping"**
   (#152, root-cause corrected by adversarial review). The default `--deliver`/
   `--assess` progress stream (`cli.py`'s `_progress_printer`) now renders
@@ -376,6 +398,19 @@ sections below are reconstructed from the repository history.
   returned entry carries exactly the four fields the write path persists —
   never an `Authorization` header or a request/response body, since #54
   never wrote those in the first place.
+- **Access log batch correlation for `POST /foreman/run`** (#180,
+  `docs/DISPATCH.md`): `AccessLog.append` gains a `job_ids` field, the list-
+  valued sibling of #167's single-job `job_id`. A `POST /foreman/run` call
+  that creates jobs now has its access-log record carry every `job_id` it
+  produced, in order — including the save-failed/compensated-cancel case
+  (`cancelled` then `uncancellable`), where the jobs genuinely existed and
+  could have started spending before being rolled back, so the audit trail
+  still shows they existed even though the API reported a `500`. A rejected
+  call (400/409, no job created) omits the field, same fail-secure
+  discipline `job_id` already established. Job ids are server-generated and
+  already returned in `/foreman/run`'s own response body, so this is not a
+  new payload-leak surface. The dashboard's Access log panel renders one
+  tag per id, mirroring the existing single-`job_id` tag.
 - **`citation_broken` on every enumerated finding** (`docs/DISPATCH.md`):
   the follow-up the $0 `broken_citations` check (above) named and deferred
   on purpose — `list_findings` now joins its own already-persisted
@@ -608,6 +643,28 @@ sections below are reconstructed from the repository history.
   `feature` is the one caller-influenced field (the delivered feature's
   free-text name), rendered through `esc()` before `innerHTML` like every
   other panel; a workspace with no recorded runs shows a muted empty state.
+- **Foreman run wired to the dashboard** (`docs/DASHBOARD.md`): a new
+  `POST /api/foreman/run` route — the write half #165 named as "a future,
+  separate slice" — proxies the dispatch service's `POST /foreman/run`
+  (above), the seventh proxy of this shape. The Foreman plan panel gains a
+  `budget_usd`/`max_stories` form with a two-step arm/confirm button
+  (mirroring the archived-job purge button's confirm pattern), so a
+  spend-multiplying batch enqueue always needs an explicit second click
+  (CLAUDE.md §1) — no prefilled `budget_usd`, no auto-submit. The dashboard
+  forwards the JSON body verbatim and relays the dispatch response
+  unchanged (`202`/`200` success, `400` validation, `500`
+  compensated-cancel, `502` unreachable); without a dispatch token wired it
+  answers `501 {"error": "foreman run not configured"}`, no outbound call
+  attempted. Scope is exactly `/api/foreman/run` — a path that merely
+  starts with it falls through to the ordinary `404`, mirroring the plan
+  route's own exact-match discipline. The enqueued jobs/skips (or an error)
+  render inline, every field escaped before `innerHTML` like the rest of
+  the panel. Editing `max_stories` after arming disarms the confirm button
+  back to a plain "run" label, mirroring the existing `budget_usd` listener,
+  so the on-screen confirm text can never go stale relative to what a click
+  would submit; the button is also disabled for the duration of an
+  in-flight request so a rapid double-click can't fire two overlapping
+  enqueue calls.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /
