@@ -148,6 +148,16 @@ _ACCESS_LOG_LIMIT_MAX = 1000
 #: and moves on. Injectable via the ``job_timeout`` constructor param for tests.
 _JOB_TIMEOUT_SECONDS = 3600.0
 
+#: How often (seconds) an idle worker re-runs the TTL auto-purge sweep, and
+#: the ``queue.Queue.get`` poll timeout that makes that possible. Only paid
+#: when ``--purge-ttl-days`` is set (see :meth:`Dispatcher._worker_loop`) —
+#: without it, waking up on a timer rather than blocking indefinitely on the
+#: queue would be pure overhead for the common case. A queued job is still
+#: served immediately; this only bounds how long an *idle* worker can go
+#: without re-checking the clock.
+_SWEEP_INTERVAL_SECONDS = 3600.0
+_SWEEP_POLL_SECONDS = 60.0
+
 #: Default :class:`~dev_team.interaction.QueueChannel` timeout (seconds) an
 #: interactive deliver job's ``interactive_timeout_seconds`` resolves to when
 #: omitted, and the floor/ceiling every requested value is clamped to before
@@ -521,6 +531,14 @@ class Dispatcher:
         # with a job mid-run, and jobs parked because their repo was busy.
         self._active_repos: set = set()
         self._deferred: Dict[str, List[str]] = {}
+        # purge_job's claim marker for the registry-miss fallback (guarded by
+        # self._lock): the registry-present path claims a job by deleting its
+        # registry entry inside the lock, but a registry-less job (post
+        # restart) has no registry entry to delete, so without this set two
+        # truly concurrent purge_job calls on the same id would both pass
+        # eligibility and both run the deletion path. Membership here is the
+        # claim; discarded once the claiming call's deletion has completed.
+        self._purging: set = set()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -574,24 +592,47 @@ class Dispatcher:
 
         The shutdown sentinel is re-enqueued before a worker exits, so one
         :meth:`stop` drains the whole pool.
+
+        When ``--purge-ttl-days`` is set, the TTL sweep (see
+        :func:`sweep_expired_archives`) needs to fire on a **wall-clock**
+        schedule (:data:`_SWEEP_INTERVAL_SECONDS`), not merely "once per loop
+        iteration" — an idle service with no queue activity would otherwise
+        sweep exactly once at startup and never again, silently defeating
+        the whole point of an automatic TTL purge. So in that mode the
+        blocking ``self._queue.get()`` below becomes a bounded
+        ``get(timeout=_SWEEP_POLL_SECONDS)`` poll: an idle worker wakes on
+        its own every :data:`_SWEEP_POLL_SECONDS` to re-check the clock and
+        re-sweep once :data:`_SWEEP_INTERVAL_SECONDS` has elapsed, entirely
+        independent of whether a job ever gets queued. A real queued job is
+        still picked up immediately (``queue.Empty`` just loops back around,
+        it never delays a genuine ``get()`` hit). Off by default
+        (``purge_ttl_days=None``): the blocking ``get()`` and its zero
+        wakeup overhead are unchanged from before this feature existed.
         """
 
         loop = asyncio.new_event_loop()
+        last_swept: Optional[float] = None
         try:
             while True:
                 if self._purge_ttl_days is not None:
-                    # Off by default (purge_ttl_days=None), so this branch —
-                    # and the redundant N-worker walk it costs when several
-                    # _worker_loop threads all reach it per tick — is only
-                    # ever paid when the operator opts in; see
-                    # docs/DISPATCH.md.
-                    sweep_expired_archives(
-                        self._dashboard_workspace,
-                        self._purge_ttl_days,
-                        self.purge_job,
-                        clock=self._clock,
-                    )
-                item = self._queue.get()
+                    now = self._clock()
+                    if (
+                        last_swept is None
+                        or now - last_swept >= _SWEEP_INTERVAL_SECONDS
+                    ):
+                        sweep_expired_archives(
+                            self._dashboard_workspace,
+                            self._purge_ttl_days,
+                            self.purge_job,
+                            clock=self._clock,
+                        )
+                        last_swept = now
+                    try:
+                        item = self._queue.get(timeout=_SWEEP_POLL_SECONDS)
+                    except queue.Empty:
+                        continue
+                else:
+                    item = self._queue.get()
                 if item is _SHUTDOWN:
                     self._queue.put(_SHUTDOWN)
                     return
@@ -1487,11 +1528,26 @@ class Dispatcher:
         archive marker, written by :meth:`_set_archived`) survives on disk —
         so when there is no registry record, the eligibility decision falls
         back to :meth:`_read_meta` directly instead of answering a blanket
-        404. No registry mutation is needed in that branch (there is nothing
-        to remove); the rest of this method — the workspace, audit-file,
+        404. The rest of this method — the workspace, audit-file,
         transcripts, events and backlog-story deletion below — is identical
         either way, since it already only ever reads ``job_id`` and
         ``self._dashboard_workspace``, never ``record``.
+
+        This branch still needs its own atomic claim, exactly like the
+        registry-present branch's ``del self._registry[job_id]`` above: two
+        truly concurrent calls on the same registry-less id would otherwise
+        both pass the disk-read eligibility check (the actual ``meta.json``
+        deletion happens further down, **outside** ``self._lock``) and both
+        run the full deletion path, breaking the documented "a second call
+        is always a 404, never a redundant 200" contract. ``self._purging``
+        is that claim: membership is added here, inside the lock, the moment
+        a registry-less job is found eligible, and a concurrent call that
+        finds the id already claimed answers 404 immediately rather than
+        re-deciding eligibility from a ``meta.json`` that may already be
+        mid-deletion. It is discarded once this call's deletion below
+        completes — by then ``meta.json`` is gone, so a later call would 404
+        from :meth:`_read_meta` alone; the discard is just hygiene against an
+        unbounded set.
         """
 
         with self._lock:
@@ -1505,11 +1561,23 @@ class Dispatcher:
                 self._order.remove(job_id)
                 self._events.pop(job_id, None)
             else:
+                if job_id in self._purging:
+                    return 404, {"error": "unknown job"}
                 meta = self._read_meta(job_id)
                 if meta is None:
                     return 404, {"error": "unknown job"}
                 if not meta.get("archived", False):
                     return 409, {"error": "job is not archived"}
+                self._purging.add(job_id)
+
+        try:
+            return self._finish_purge(job_id)
+        finally:
+            with self._lock:
+                self._purging.discard(job_id)
+
+    def _finish_purge(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The deletion half of :meth:`purge_job`, shared by both eligibility branches."""
 
         workspace_dir = Path(self._jobs_root) / job_id
         removed_workspace = workspace_dir.exists()

@@ -480,10 +480,13 @@ calling it from inside an already-held lock would hang the calling thread
 forever, and because every other mutation in this service shares that lock,
 freeze the entire single-flight dispatcher). The registry entry is deleted
 inside that same locked block, so a second purge call always sees "unknown
-job", never a redundant success. The backlog-story removal is a separate,
-independent lock — the same one `DELETE /backlog/story/{id}` uses — so a
-purge and a concurrent board write can never interleave into a corrupt
-`backlog.json`.
+job", never a redundant success. When there is no registry entry at all
+(the registry-miss fallback below), the same lock guards a dedicated
+`_purging` claim set instead, so the "never a redundant success" guarantee
+holds there too — see *registry-miss fallback* for why that separate claim
+is needed. The backlog-story removal is a separate, independent lock — the
+same one `DELETE /backlog/story/{id}` uses — so a purge and a concurrent
+board write can never interleave into a corrupt `backlog.json`.
 
 ### Registry-miss fallback (disk-first eligibility)
 
@@ -494,30 +497,53 @@ record for an id, it falls back to reading `meta.json` directly (reusing the
 existing `_read_meta` / `_is_archived` helpers `archive_job`/`unarchive_job`
 already use) instead of answering a blanket 404: no `meta.json` → `404`, a
 present-but-not-archived one → `409`, an archived one → the same `200`
-deletion as the registry-present path. No registry mutation happens in this
-branch (there's nothing to remove); the actual deletion logic below it is
-identical either way.
+deletion as the registry-present path. The actual deletion logic below the
+eligibility check is identical either way.
+
+This branch still needs its own atomic claim, exactly like the
+registry-present branch's registry-entry deletion: a job's actual deletion
+runs *after* the eligibility lock is released (the workspace, `meta.json`,
+transcripts, events and backlog-story removal all happen outside it), so
+without a claim, two truly concurrent calls on the same registry-less id
+could both read `meta.json` as archived before either finished deleting it,
+and both return a `200`. An in-memory `_purging` set (guarded by the same
+lock) closes that: the first eligible call claims the id inside the lock,
+a concurrent second call sees the claim and answers `404` immediately, and
+the claim is released once the first call's deletion completes. The
+documented contract — a second call is always `404`, never a redundant
+`200` — holds for the registry-miss path exactly as it does for the
+registry-present one.
 
 ## TTL auto-purge sweep over already-archived jobs
 
 `--purge-ttl-days N` (default: off) has the dispatch service purge, on its
 own, any already-archived job whose `archived_at` marker is older than `N`
 days — the automated version of the two-step archive-then-purge flow above,
-still gated on the same prior, explicit human archive action. Each
-`_worker_loop` iteration calls `sweep_expired_archives` once, before
-dequeuing the next queued job: it walks `audit/*/meta.json` (the same
-disk-first enumeration `calibration()` uses), filters to archived entries
-past the TTL, and calls `purge_job` for each — no independent
+still gated on the same prior, explicit human archive action. This needs to
+fire on a wall-clock schedule, not merely "once per worker-loop iteration":
+an idle service with no queue activity would otherwise sweep exactly once at
+startup and never again, silently defeating the point of an automatic TTL
+purge. So when `--purge-ttl-days` is set, each worker thread re-checks the
+clock at least every `_SWEEP_POLL_SECONDS` (currently 60s, via a bounded
+`queue.get(timeout=...)` poll instead of a blocking one) and re-runs
+`sweep_expired_archives` once `_SWEEP_INTERVAL_SECONDS` (currently 1 hour)
+has elapsed since its last sweep — independent of whether any job is ever
+queued. A genuinely queued job is still picked up immediately; the poll
+never delays real work, it only bounds how long an idle worker can go
+without re-checking the clock. Each sweep walks `audit/*/meta.json` (the
+same disk-first enumeration `calibration()` uses), filters to archived
+entries past the TTL, and calls `purge_job` for each — no independent
 existence/eligibility logic of its own, so every one of `purge_job`'s
-guarantees above (registry-miss fallback, running-job refusal, idempotent
-double-purge safety) applies unchanged to a swept job. `--max-concurrent-jobs
-N` runs `N` independent worker-loop threads, so the sweep fires redundantly
-across all of them once per tick when `--purge-ttl-days` is set — each
-redundant call still serialises through `purge_job`'s own lock and simply
-finds nothing left to do, an accepted, documented $0 cost against the shared
-Max pool rather than a bug. Off by default (`purge_ttl_days=None`): with no
-flag, `sweep_expired_archives` is never invoked and behaviour is byte-
-identical to before this feature existed.
+guarantees above (registry-miss fallback and its atomic claim,
+running-job refusal, idempotent double-purge safety) applies unchanged to a
+swept job. `--max-concurrent-jobs N` runs `N` independent worker-loop
+threads, so the sweep fires redundantly across all of them once per tick
+when `--purge-ttl-days` is set — each redundant call still serialises
+through `purge_job`'s own lock and simply finds nothing left to do, an
+accepted, documented $0 cost against the shared Max pool rather than a bug.
+Off by default (`purge_ttl_days=None`): with no flag, `sweep_expired_archives`
+is never invoked, the worker's queue wait stays a blocking (not polled)
+`get()`, and behaviour is byte-identical to before this feature existed.
 
 ### Natural growth (not in v1)
 

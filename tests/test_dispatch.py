@@ -1851,6 +1851,51 @@ def test_purge_registry_miss_meta_archived_purges_like_the_registry_present_path
     assert disp.purge_job(job_id) == (404, {"error": "unknown job"})
 
 
+def test_purge_registry_miss_concurrent_calls_only_one_claims_the_job(
+    tmp_path, monkeypatch
+):
+    # Regression for the review on #184: a second, truly concurrent
+    # purge_job call on a registry-less job must be refused even while the
+    # first call's deletion is still in flight (meta.json still on disk) --
+    # never both pass eligibility and both return 200.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-concurrent-claim"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
+    )
+
+    claimed = threading.Event()
+    release = threading.Event()
+    real_finish_purge = disp._finish_purge
+
+    def blocking_finish_purge(job_id_arg):
+        claimed.set()
+        assert release.wait(timeout=5)
+        return real_finish_purge(job_id_arg)
+
+    monkeypatch.setattr(disp, "_finish_purge", blocking_finish_purge)
+
+    results = {}
+    first = threading.Thread(
+        target=lambda: results.__setitem__("first", disp.purge_job(job_id))
+    )
+    first.start()
+    assert claimed.wait(timeout=5)
+
+    # The first call has claimed the job but not yet deleted meta.json --
+    # a second call racing it right now must not also pass eligibility.
+    second = disp.purge_job(job_id)
+    assert second == (404, {"error": "unknown job"})
+    assert dash.exists(f"audit/{job_id}/meta.json")
+
+    release.set()
+    first.join(timeout=5)
+    assert results["first"][0] == 200
+    assert not dash.exists(f"audit/{job_id}/meta.json")
+
+
 # --- TTL auto-purge sweep over already-archived jobs (#184) -------------------
 
 
@@ -2063,6 +2108,38 @@ def test_worker_loop_sweeps_expired_archives_before_the_next_job(tmp_path):
         # wedges the loop.
         job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
         assert disp.wait(job_id, 5)
+    finally:
+        disp.stop()
+
+
+def test_worker_loop_sweep_is_wall_clock_periodic_when_idle(monkeypatch, tmp_path):
+    # Regression for the review on #184: prior to the fix, sweep_expired_
+    # archives only ran when the worker loop came back around to dequeue or
+    # park a job -- an idle service (no jobs ever submitted) would sweep
+    # exactly once at startup and never again. Shrink the interval/poll
+    # constants so a real, idle worker demonstrably re-sweeps on its own.
+    monkeypatch.setattr(dispatch_mod, "_SWEEP_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(dispatch_mod, "_SWEEP_POLL_SECONDS", 0.02)
+    calls = []
+    real_sweep = dispatch_mod.sweep_expired_archives
+
+    def spying_sweep(*args, **kwargs):
+        calls.append(1)
+        return real_sweep(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch_mod, "sweep_expired_archives", spying_sweep)
+
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"),
+        purge_ttl_days=1,
+    )
+    disp.start()
+    try:
+        deadline = time.time() + 3
+        while time.time() < deadline and len(calls) < 3:
+            time.sleep(0.02)
+        assert len(calls) >= 3, "idle worker never re-swept on a wall-clock timer"
     finally:
         disp.stop()
 
