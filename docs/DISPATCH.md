@@ -584,9 +584,14 @@ concurrent agent calls against the shared pool. The result additionally
 carries `"votes":[{"verdict","rationale","citations"}]` (one entry per
 completed pass) and `"vote_count":int` when `votes > 1`; the top-level
 `verdict`/`rationale`/`citations` fields are unchanged, so
-`GET /jobs/{source-id}/verifications` and `GET /calibration` (which only
-ever read the top-level `verdict`) need no change and never double-count a
-multi-vote result as more than one entry.
+`GET /jobs/{source-id}/verifications` never double-counts a multi-vote
+result as more than one entry. The persisted entry itself (still one line
+per verification) additionally carries `"vote_count":int` and
+`"max_agreement":int` (the size of the winning verdict's tally — e.g. `3`
+of `5` passes) whenever `votes > 1`; a `votes=1` call (the default, and
+every existing caller) writes no such keys, so its entry is unchanged.
+`GET /calibration` rolls these into `multi_vote_total`/`unanimous_total`
+(see below) — see #194.
 
 The job then flows through the normal machinery: single-flight queue,
 `GET /jobs/{id}` status, and `GET /jobs/{id}/result` (shapes above — a
@@ -618,11 +623,24 @@ workspace, groups entries by the phase prefix of their `finding_id`
 verification stops skewing the rollup the moment its job is archived, and
 resumes contributing the moment it is unarchived.
 
+Each bucket also carries `multi_vote_total` (entries written by a
+`--verify-votes > 1` call, i.e. carrying a `vote_count`) and
+`unanimous_total` (the subset where every pass agreed, `max_agreement ==
+vote_count`) — the vote-agreement signal a `votes > 1` call pays extra
+budget for, otherwise discarded once the in-memory job result expires (see
+#194). A caller can derive "contested" as `multi_vote_total -
+unanimous_total`. A `votes=1` entry (the default, and every entry written
+before this field existed) contributes to neither counter, so both are
+always present, defaulting to `0` — never omitted, matching every other
+`_bucket()` field.
+
 ```json
 {"phases":{"risk":{"confirmed":6,"refuted":1,"needs_context":1,
-                     "total":8,"confirm_rate":0.75}},
+                     "total":8,"confirm_rate":0.75,
+                     "multi_vote_total":2,"unanimous_total":1}},
  "overall":{"confirmed":6,"refuted":1,"needs_context":1,
-            "total":8,"confirm_rate":0.75},
+            "total":8,"confirm_rate":0.75,
+            "multi_vote_total":2,"unanimous_total":1},
  "jobs_counted":3,
  "blind_spot_total":5,"broken_citation_total":2,
  "report_quality_jobs_counted":2}

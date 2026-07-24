@@ -350,8 +350,15 @@ did complete still decide the result (never fewer than 1 succeeding); only
 if every pass fails does this return the same failure shape a single
 failed call returns today. The result additionally carries `"votes"` (each
 pass's `verdict`/`rationale`/`citations`) and `"vote_count"` when `N > 1` —
-additive only, so `GET /calibration` (which only ever reads the top-level
-`verdict`) needs no change and a `votes=1` caller sees no schema change.
+additive only, so a `votes=1` caller sees no schema change. Over dispatch,
+the persisted `verifications.jsonl` entry for an `N > 1` call additionally
+carries `"vote_count"` and `"max_agreement"` (the size of the winning
+verdict's tally, e.g. `3` of `5`); `GET /calibration` rolls these into
+`multi_vote_total`/`unanimous_total` per phase and overall, so the
+vote-agreement signal a multi-vote call pays extra budget for survives a
+restart instead of being discarded once the in-memory job result expires
+(see [`docs/DISPATCH.md`](DISPATCH.md)). A `votes=1` entry (the default)
+carries neither key and leaves both counters untouched.
 `N` is capped at **5** (`--verify-votes 6` is rejected); the dispatch
 `votes` field enforces the identical cap (see below).
 

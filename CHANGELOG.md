@@ -6,6 +6,18 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Assessment
+- **`GET /calibration` now surfaces multi-vote agreement strength**
+  (`assessment.py`, `dispatch.py`), closing #129's own named follow-up: a
+  `--verify-votes N` call's per-pass tally was computed and then discarded
+  before reaching disk, so a 5-0 unanimous confirmation and a bare 3-2
+  plurality were indistinguishable in `GET /calibration`. Dispatch's
+  `_run_verify` now additionally persists `vote_count` and `max_agreement`
+  (the winning tally's size) on a multi-vote verification's
+  `verifications.jsonl` entry — re-tallied from the already-returned
+  `votes` list, no new agent call; a `votes=1` entry is byte-identical to
+  today. `calibration_summary` rolls these into `multi_vote_total`/
+  `unanimous_total` per phase and overall, additive-only against every
+  existing field. See `docs/DISPATCH.md` and `docs/ASSESSMENT.md`.
 - **Dependency scan now covers Go (`go.mod`) and Ruby (`Gemfile.lock`)**
   (`depscan.py`), closing the "verified EOL, model-knowledge CVE" asymmetry
   #117 left open on these two ecosystems. `parse_go_mod` reads every

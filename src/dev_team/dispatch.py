@@ -48,6 +48,7 @@ import queue
 import shutil
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1167,17 +1168,24 @@ class Dispatcher:
             # A $0 skip never invoked a model, so it must never be appended
             # here — GET /calibration's confirm_rate would otherwise be
             # silently diluted by an entry no model actually adjudicated.
-            self._mirror_verification(
-                spec.source_job,
-                {
-                    "finding_id": result["finding_id"],
-                    "verdict": result["verdict"],
-                    "rationale": result["rationale"],
-                    "citations": result["citations"],
-                    "cost_usd": result["cost_usd"],
-                    "ts": self._clock(),
-                },
-            )
+            entry = {
+                "finding_id": result["finding_id"],
+                "verdict": result["verdict"],
+                "rationale": result["rationale"],
+                "citations": result["citations"],
+                "cost_usd": result["cost_usd"],
+                "ts": self._clock(),
+            }
+            vote_count = result.get("vote_count")
+            if vote_count:
+                # Re-tally from the votes already in hand (no new agent
+                # call) rather than threading top_count out of
+                # verify_finding — see issue #194's alternatives-considered
+                # for why this stays out of that function's shared contract.
+                tally = Counter(v["verdict"] for v in result["votes"])
+                entry["vote_count"] = vote_count
+                entry["max_agreement"] = max(tally.values())
+            self._mirror_verification(spec.source_job, entry)
         return result, float(result["cost_usd"])
 
     def _mirror_report(self, job_id: str, outcome: Any) -> None:
