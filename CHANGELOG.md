@@ -788,6 +788,19 @@ sections below are reconstructed from the repository history.
   A reference-checker test resolves every cited `dev_team.x.y` symbol
   against the installed package so the doc can't silently drift from the
   code. Docs only — no `src/` change, no new credential surface.
+- **`docs/TROUBLESHOOTING.md` now indexes the backlog foreman**: a new "A
+  backlog story is stuck `blocked` and never resumes" section explains the
+  one-attempt-per-story design (`blocked` stories are never re-selected —
+  see `docs/DISPATCH.md`'s *The backlog foreman*), how to inspect a stuck
+  story's outcome (`GET /jobs/{id}/result`), and the recovery path (`POST
+  /backlog/story/{id}/status`, documented in `docs/DASHBOARD.md`'s *The
+  board write model*). The HTTP status quick-reference table gains a `500`
+  row for `POST /foreman/run`'s compensating-cancel failure. The
+  route-citation drift-check in `tests/test_docs.py` (added by #174) is
+  generalized from DISPATCH.md-only to the union of DISPATCH.md and
+  DASHBOARD.md, since TROUBLESHOOTING.md cross-links both and the new
+  recovery route lives only in the latter. Docs and tests only — no `src/`
+  change, no new credential surface.
 
 ## [0.7.0] — Legacy-repo analysis: dead code, live CVEs, conventions, remote CI
 
