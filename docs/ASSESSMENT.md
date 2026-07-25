@@ -122,16 +122,19 @@ machinery understands them now:
   not parsed — only `Gemfile.lock`'s resolved pins are. Likewise PHP's
   `composer.json` version constraints are not parsed — only
   `composer.lock`'s resolved pins are.
-- **Detected Node.js/Python/.NET/Ruby/Go/PHP runtime versions get a live
-  endoflife.date EOL/support-status check; every other EOL/support-status
-  judgment (other runtimes, frameworks, libraries) is model knowledge** —
-  the same report footer states which mode produced the claim. The
-  runtime version is parsed from `package.json` (`engines.node`),
-  `.nvmrc`, `runtime.txt`, `.python-version`, `global.json`
-  (`sdk.version`), `.ruby-version`, `go.mod` (the `go` directive), or
-  `composer.json` (`require.php`); an unresolved release cycle reports
-  `unknown` rather than guessing. Treat EOL findings outside those six
-  runtimes as a triage list, not a compliance scan.
+- **Detected Node.js/Python/.NET/Ruby/Go/PHP/Java runtime versions get a
+  live endoflife.date EOL/support-status check; every other EOL/support-
+  status judgment (other runtimes, frameworks, libraries) is model
+  knowledge** — the same report footer states which mode produced the
+  claim. The runtime version is parsed from `package.json`
+  (`engines.node`), `.nvmrc`, `runtime.txt`, `.python-version`,
+  `global.json` (`sdk.version`), `.ruby-version`, `go.mod` (the `go`
+  directive), `composer.json` (`require.php`), or `pom.xml`'s top-level
+  `<properties>` (`maven.compiler.release`/`java.version`/
+  `maven.compiler.target`/`maven.compiler.source`, in that priority
+  order); an unresolved release cycle reports `unknown` rather than
+  guessing. Treat EOL findings outside those seven runtimes as a triage
+  list, not a compliance scan.
 - Phase evidence is as good as what the auditors read: on very large repos
   the deterministic inventory is exact, but agents sample files. The report
   appendix names the **audit blind spots** — top-level directories no
@@ -175,13 +178,13 @@ involved, so their findings are exact and citable:
   `Cargo.lock`, NuGet `packages.lock.json`, Ruby `Gemfile.lock`, PHP
   `composer.lock`) queried against OSV.dev in one batch (`--no-osv-scan`
   opts out; offline degrades to a labelled model-knowledge fallback).
-- **Live EOL/support-status scan** — Node.js/Python/.NET/Ruby/Go runtime
-  versions detected from `package.json`/`.nvmrc`/`runtime.txt`/
-  `.python-version`/`global.json`/`.ruby-version`/`go.mod` are checked
-  against endoflife.date, one request per distinct detected product
-  (`--no-eol-scan` opts out; offline or an unresolved release cycle
-  degrades to a labelled model-knowledge/`unknown` fallback rather than
-  guessing).
+- **Live EOL/support-status scan** — Node.js/Python/.NET/Ruby/Go/PHP/Java
+  runtime versions detected from `package.json`/`.nvmrc`/`runtime.txt`/
+  `.python-version`/`global.json`/`.ruby-version`/`go.mod`/
+  `composer.json`/`pom.xml` are checked against endoflife.date, one
+  request per distinct detected product (`--no-eol-scan` opts out;
+  offline or an unresolved release cycle degrades to a labelled
+  model-knowledge/`unknown` fallback rather than guessing).
 - **Audit blind spots** — the exact set of top-level directories no phase
   finding (nor dead-code probe) cited, listed in the report appendix so
   sampling gaps are named instead of implied clean.

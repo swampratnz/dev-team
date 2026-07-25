@@ -6,6 +6,21 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Assessment
+- **Live EOL/support-status scan extended to Java (`pom.xml`) runtimes**
+  (`eolscan.py`): `parse_pom_xml_java` reads the top-level `<properties>`
+  element of a Maven `pom.xml` — `maven.compiler.release`, `java.version`,
+  `maven.compiler.target`, `maven.compiler.source`, in that priority order
+  — and checks the result against endoflife.date the same way as every
+  other runtime. A legacy `1.X` value (Java 5-8's dual-versioning
+  convention) normalises to `X` to match endoflife.date's `java` cycle
+  identifiers. `<profile>`-scoped property overrides are intentionally not
+  read (profile activation is conditional and this module has no build
+  context to evaluate it). `ET.fromstring` is wrapped in its own
+  `try/except ET.ParseError: return None`, mirroring `eolscan.py`'s own
+  `None`-returning parser convention. No change to `detect_runtimes`,
+  `query_eol`, or any existing parser — one new parser function registered
+  in `_PARSERS` (issue #199, follow-on to #61/#117/#192; Gradle's
+  Groovy/Kotlin DSL is a materially harder, separate problem, deferred).
 - **`GET /calibration` now surfaces multi-vote agreement strength**
   (`assessment.py`, `dispatch.py`), closing #129's own named follow-up: a
   `--verify-votes N` call's per-pass tally was computed and then discarded
