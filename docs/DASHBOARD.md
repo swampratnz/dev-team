@@ -281,7 +281,11 @@ currently-**running**, non-archived job carries a **pending question**
 panel: when the job is paused, it shows the live prompt/context and one
 button per choice (a choice with `accepts_text` gets a small text input
 alongside its button); clicking a button submits that choice (and any
-typed text) and clears the panel.
+typed text) and clears the panel. The run card's status chip also flips to
+a dashed "waiting for you" chip while paused — not just the sub-panel below
+it — so a paused job is distinguishable from an actively-running one at a
+glance, and reverts to its normal running/blocked/finished chip the moment
+the question is answered or the fetch stops reporting one pending.
 
 This is the dashboard-side "questions as buttons" surface `docs/ROADMAP.md`
 item 7 names, built on the interactive primitive

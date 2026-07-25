@@ -2825,6 +2825,73 @@ def test_dashboard_html_question_panel():
     assert "/api/jobs/" not in DASHBOARD_HTML[refresh_start:refresh_end]
 
 
+def test_dashboard_html_run_card_waiting_chip():
+    # A paused (interactive, question-pending) job previously fell through
+    # runChip's else branch and showed the exact same "running" chip as an
+    # actively-working job. loadQuestion now also drives a dedicated
+    # "waiting for you" chip on the run card itself, not just the
+    # sub-panel — desk-checked the same way as the rest of this file, since
+    # CI has no browser to exercise the JS directly.
+
+    # 1. A dedicated .chip.waiting CSS rule reusing --warning (the same
+    #    token the stale-heartbeat .beat.warn indicator already uses) —
+    #    no new color invented.
+    assert ".chip.waiting" in DASHBOARD_HTML
+    css_start = DASHBOARD_HTML.index(".chip.waiting")
+    css_end = DASHBOARD_HTML.index("}", css_start)
+    assert "var(--warning)" in DASHBOARD_HTML[css_start:css_end]
+
+    # 2. The waiting-chip label is an exact, hardcoded literal produced via
+    #    chip(...) — never built from response data — and its only call
+    #    site is inside waitingChip().
+    assert 'function waitingChip() {\n  return chip("\\u23F8 waiting for you", "waiting");\n}' in DASHBOARD_HTML
+    assert DASHBOARD_HTML.count("waitingChip()") == 2  # definition + one call site
+
+    # 3. The run card's chip wrapper is addressable by id, alongside the
+    #    existing id="q-${esc(r.id)}" question placeholder on the same card.
+    assert 'id="chip-${esc(r.id)}">${runChip(r.last_stage)}</span>' in DASHBOARD_HTML
+    chip_idx = DASHBOARD_HTML.index('id="chip-${esc(r.id)}"')
+    q_idx = DASHBOARD_HTML.index('id="q-${esc(r.id)}"')
+    assert chip_idx < q_idx  # same card, chip precedes the question placeholder
+
+    # 4. All three loadQuestion branches touch the chip element:
+    load_question_start = DASHBOARD_HTML.index("async function loadQuestion(id)")
+    load_question_end = DASHBOARD_HTML.index("async function pollQuestions()")
+    body = DASHBOARD_HTML[load_question_start:load_question_end]
+    #   (a) data.pending === true swaps the chip to the new waiting chip
+    assert "if (data && data.pending)" in body
+    pending_branch = body[body.index("if (data && data.pending)"):body.index("} else {")]
+    assert "waitingChip()" in pending_branch
+    #   (b) the !res.ok path and (c) the catch path both restore via
+    #   restoreRunChip(id), which itself calls runChip(...) — never leaving
+    #   the chip blank or stuck on "waiting".
+    assert "if (!res.ok) { put(el, \"\"); restoreRunChip(id); return; }" in body
+    assert "} catch (err) {\n    put(el, \"\");\n    restoreRunChip(id);\n  }" in body
+    assert "function restoreRunChip(id)" in DASHBOARD_HTML
+    restore_start = DASHBOARD_HTML.index("function restoreRunChip(id)")
+    restore_end = DASHBOARD_HTML.index("\n}", restore_start)
+    assert "runChip(" in DASHBOARD_HTML[restore_start:restore_end]
+
+    # 5. Regression: runChip's existing three-branch behaviour is untouched.
+    assert 'if (STAGE_BAD.has(s)) return chip("\\u2715 " + stage, "blocked");' in DASHBOARD_HTML
+    assert 'if (STAGE_GOOD.has(s)) return chip("\\u2713 finished", "done");' in DASHBOARD_HTML
+    assert 'return chip("\\u25B6 running", "active");' in DASHBOARD_HTML
+
+    # 6. Cost-story regression: no new fetch( call site and no new
+    #    interval/timer — loadQuestion/pollQuestions still perform exactly
+    #    the one GET /api/jobs/{id}/question request per running job per
+    #    5s tick that they did before this change, and the page still has
+    #    exactly the same total number of fetch(/setInterval( call sites.
+    assert DASHBOARD_HTML.count("fetch(") == 14
+    assert DASHBOARD_HTML.count("setInterval(") == 3
+    assert body.count("fetch(") == 1  # loadQuestion's one existing request
+    assert "setInterval(pollQuestions, 5000)" in DASHBOARD_HTML
+    # pollQuestions itself still only calls loadQuestion, no direct fetch.
+    poll_start = DASHBOARD_HTML.index("async function pollQuestions()")
+    poll_end = DASHBOARD_HTML.index("\n}", poll_start)
+    assert "fetch(" not in DASHBOARD_HTML[poll_start:poll_end]
+
+
 # --- /api/state?archived=1 ----------------------------------------------------
 
 
