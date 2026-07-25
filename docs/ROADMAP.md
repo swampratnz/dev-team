@@ -182,8 +182,8 @@ it just isn't used for engineering attempts yet.)
 **Shape:** a session-holding `AgentRunner` built on `ClaudeSDKClient`, keyed
 per task, with explicit reset on rollback.
 
-**Shipped:** opt-in via `EngineConfig.reuse_engineer_session` /
-`--reuse-engineer-session` (default off; agentic only). `sdk.AgentSession`
+**Shipped:** on by default via `EngineConfig.reuse_engineer_session`, agentic
+runs only; opt out with `--no-reuse-engineer-session`. `sdk.AgentSession`
 / `ClaudeAgentSession` hold a tool-enabled `ClaudeSDKClient` open across a task's
 attempts (metered per turn by `instrument.InstrumentedSession`); the engineer's
 first attempt sends the full prompt and each retry
@@ -195,8 +195,7 @@ that cold path (the session's model is fixed). Worktree mode now composes with
 session reuse too: `_develop_task_in_worktree` opens one session per task,
 rooted in that task's own worktree, reusing the same `_open_engineer_session`
 / `_engineer_attempt` machinery — closed before the worktree is removed so a
-live session never outlives its directory. An on-by-default flip is the
-remaining follow-up.
+live session never outlives its directory.
 
 ## 6. LLM retrospectives & benchmark history
 

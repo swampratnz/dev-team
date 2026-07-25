@@ -5265,6 +5265,10 @@ def test_propose_replan_stops_on_budget_exhaustion():
 # --- session continuity (--reuse-engineer-session) ----------------------
 
 
+def test_reuse_engineer_session_defaults_to_true():
+    assert EngineConfig().reuse_engineer_session is True
+
+
 def _rp_task(tid="T1"):
     return Task(id=tid, title="t", description="d", acceptance_criteria=["ok"])
 
@@ -5641,7 +5645,7 @@ def test_worktree_without_reuse_never_touches_session_machinery(tmp_path):
         runner,
         workspace=LocalWorkspace(str(tmp_path)),
         command_runner=cmd,
-        config=EngineConfig(worktrees=True),  # reuse_engineer_session defaults False
+        config=EngineConfig(worktrees=True, reuse_engineer_session=False),
         engineer_session_factory=factory,
     )
     outcome = run(engine.deliver(_request()))

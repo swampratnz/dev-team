@@ -86,6 +86,21 @@ sections below are reconstructed from the repository history.
   entry that's neither `str` nor `dict`) degrades to a skip, never raises.
   `docs/ASSESSMENT.md`'s honest-limitations note is updated accordingly.
 
+### Efficiency
+- **Engineer session reuse is now on by default** (ROADMAP #5's own named
+  remaining follow-up, closing it out). `EngineConfig.reuse_engineer_session`
+  defaults to `True` and the CLI flag flips polarity from opt-in
+  `--reuse-engineer-session` to opt-out `--no-reuse-engineer-session`,
+  mirroring the existing `--no-commit`/`--no-frontend-craft` convention. A
+  task's engineer attempts now hold one SDK session open by default on
+  agentic runs, so a retry continues the prior conversation instead of
+  restarting cold — the biggest token saving on retried tasks, per README's
+  own characterisation of the feature. No change to the underlying session
+  machinery (`_open_engineer_session`/`_engineer_attempt`, the cold-fallback
+  on a session-turn error, or worktree-mode composition), shipped and
+  reviewed under #69/#121 — this only flips the default and renames the
+  opt-out flag.
+
 ### Orchestration
 - **A backlog foreman turns ready stories into deliver jobs** (ROADMAP #9's
   second half, completing the item; see `docs/DISPATCH.md`). `GET

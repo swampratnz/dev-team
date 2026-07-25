@@ -186,10 +186,10 @@ def test_main_max_replan_rounds_rejected_without_deliver(capsys):
 
 def test_main_reuse_engineer_session_rejected_without_deliver(capsys):
     with pytest.raises(SystemExit) as excinfo:
-        main(["Login", "Add login", "--reuse-engineer-session"], runner=ScriptedRunner([]))
+        main(["Login", "Add login", "--no-reuse-engineer-session"], runner=ScriptedRunner([]))
     err = capsys.readouterr().err
     assert excinfo.value.code == 2
-    assert "--reuse-engineer-session" in err and "--deliver" in err
+    assert "--no-reuse-engineer-session" in err and "--deliver" in err
 
 
 def test_main_retrieval_rejected_without_deliver(capsys):
@@ -216,9 +216,9 @@ def test_engine_config_threads_reuse_engineer_session():
     # seam — exercising the live SDK is out of scope for a unit test.
     from dev_team.cli import _engine_config, build_parser
 
-    args = build_parser().parse_args(["T", "D", "--deliver", "--reuse-engineer-session"])
+    args = build_parser().parse_args(["T", "D", "--deliver"])
     assert _engine_config(args).reuse_engineer_session is True
-    off = build_parser().parse_args(["T", "D", "--deliver"])
+    off = build_parser().parse_args(["T", "D", "--deliver", "--no-reuse-engineer-session"])
     assert _engine_config(off).reuse_engineer_session is False
 
 
