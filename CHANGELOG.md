@@ -6,6 +6,25 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Assessment
+- **`GET /calibration` now surfaces multi-vote agreement strength**
+  (`assessment.py`, `dispatch.py`), closing #129's own named follow-up: a
+  `--verify-votes N` call's per-pass tally was computed and then discarded
+  before reaching disk, so a 5-0 unanimous confirmation and a bare 3-2
+  plurality were indistinguishable in `GET /calibration`. Dispatch's
+  `_run_verify` now additionally persists `vote_count` and `max_agreement`
+  (the winning tally's size) on a multi-vote verification's
+  `verifications.jsonl` entry — re-tallied from the already-returned
+  `votes` list, no new agent call; a `votes=1` entry is byte-identical to
+  today. Gated on every requested pass having completed
+  (`vote_count == spec.votes`): a budget-exhausted call that only
+  completed 1 of N requested passes is *not* persisted with these keys,
+  since its `max_agreement` would trivially equal its own `vote_count` and
+  misread as a genuine unanimous result. `calibration_summary` rolls the
+  gated fields into `multi_vote_total`/`unanimous_total` per phase and
+  overall, additive-only against every existing field; its `vote_count`/
+  `max_agreement` guard now also rejects `bool` (an `int` subclass in
+  Python), so a hand-edited `"vote_count": true` line can't slip through.
+  See `docs/DISPATCH.md` and `docs/ASSESSMENT.md`.
 - **Live EOL/support-status scan extended to PHP runtimes** (`eolscan.py`):
   `composer.json`'s `require.php` key (e.g. `"php": "^8.1"`) is now parsed
   alongside the existing Node.js/Python/.NET/Ruby/Go manifests and checked

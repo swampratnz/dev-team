@@ -2227,6 +2227,7 @@ def test_calibration_summary_empty():
         "overall": {
             "confirmed": 0, "refuted": 0, "needs_context": 0,
             "total": 0, "confirm_rate": None,
+            "multi_vote_total": 0, "unanimous_total": 0,
         },
     }
 
@@ -2248,14 +2249,17 @@ def test_calibration_summary_mixed_verdicts_across_phases():
     assert summary["phases"]["risk"] == {
         "confirmed": 2, "refuted": 1, "needs_context": 1,
         "total": 4, "confirm_rate": 0.5,
+        "multi_vote_total": 0, "unanimous_total": 0,
     }
     assert summary["phases"]["buildability"] == {
         "confirmed": 4, "refuted": 0, "needs_context": 0,
         "total": 4, "confirm_rate": 1.0,
+        "multi_vote_total": 0, "unanimous_total": 0,
     }
     assert summary["overall"] == {
         "confirmed": 6, "refuted": 1, "needs_context": 1,
         "total": 8, "confirm_rate": 0.75,
+        "multi_vote_total": 0, "unanimous_total": 0,
     }
 
 
@@ -2270,6 +2274,7 @@ def test_calibration_summary_drops_out_of_contract_verdicts():
         "overall": {
             "confirmed": 0, "refuted": 0, "needs_context": 0,
             "total": 0, "confirm_rate": None,
+            "multi_vote_total": 0, "unanimous_total": 0,
         },
     }
 
@@ -2286,6 +2291,115 @@ def test_calibration_summary_drops_missing_or_non_string_finding_id():
         ]
     )
     assert summary["overall"]["total"] == 0
+
+
+def test_calibration_summary_multi_vote_and_unanimous_totals_by_phase():
+    # Acceptance criterion 7: a mix of votes=1 and multi-vote entries (some
+    # unanimous, some contested) split across two phases — the new counters
+    # partition correctly per phase and overall, and every existing field
+    # is unaffected by their presence.
+    from dev_team.assessment import calibration_summary
+
+    entries = [
+        # risk: one votes=1 (untouched), one unanimous, one contested
+        {"finding_id": "risk.secrets[0]", "verdict": "confirmed"},
+        {"finding_id": "risk.secrets[1]", "verdict": "confirmed",
+         "vote_count": 5, "max_agreement": 5},
+        {"finding_id": "risk.secrets[2]", "verdict": "confirmed",
+         "vote_count": 5, "max_agreement": 3},
+        # buildability: one unanimous only
+        {"finding_id": "buildability.blockers[0]", "verdict": "refuted",
+         "vote_count": 3, "max_agreement": 3},
+    ]
+    summary = calibration_summary(entries)
+    assert summary["phases"]["risk"]["total"] == 3
+    assert summary["phases"]["risk"]["confirmed"] == 3
+    assert summary["phases"]["risk"]["multi_vote_total"] == 2
+    assert summary["phases"]["risk"]["unanimous_total"] == 1
+    assert summary["phases"]["buildability"] == {
+        "confirmed": 0, "refuted": 1, "needs_context": 0,
+        "total": 1, "confirm_rate": 0.0,
+        "multi_vote_total": 1, "unanimous_total": 1,
+    }
+    assert summary["overall"]["total"] == 4
+    assert summary["overall"]["confirmed"] == 3
+    assert summary["overall"]["refuted"] == 1
+    assert summary["overall"]["confirm_rate"] == 0.75
+    assert summary["overall"]["multi_vote_total"] == 3
+    assert summary["overall"]["unanimous_total"] == 2
+
+
+def test_calibration_summary_drops_malformed_vote_fields_from_new_counters():
+    # Acceptance criterion 8: a malformed vote_count/max_agreement never
+    # inflates the new counters, but the entry's verdict still counts
+    # normally (this isn't a new validation boundary on the base fields).
+    from dev_team.assessment import calibration_summary
+
+    entries = [
+        {"finding_id": "risk.secrets[0]", "verdict": "confirmed",
+         "vote_count": "5", "max_agreement": 5},          # non-int vote_count
+        {"finding_id": "risk.secrets[1]", "verdict": "confirmed",
+         "vote_count": -3, "max_agreement": 3},            # negative vote_count
+        {"finding_id": "risk.secrets[2]", "verdict": "confirmed",
+         "vote_count": 0, "max_agreement": 0},              # zero vote_count
+        {"finding_id": "risk.secrets[3]", "verdict": "confirmed",
+         "vote_count": 5, "max_agreement": "5"},             # non-int max_agreement
+        {"finding_id": "risk.secrets[4]", "verdict": "confirmed",
+         "vote_count": 5, "max_agreement": -1},               # negative max_agreement
+    ]
+    summary = calibration_summary(entries)
+    assert summary["overall"]["confirmed"] == 5
+    assert summary["overall"]["total"] == 5
+    # vote_count itself malformed -> not counted at all (3 entries)
+    # vote_count valid but max_agreement malformed -> counted, not unanimous (2 entries)
+    assert summary["overall"]["multi_vote_total"] == 2
+    assert summary["overall"]["unanimous_total"] == 0
+
+
+def test_calibration_summary_rejects_bool_vote_fields():
+    # Review fix on #195: isinstance(True, int) is True in Python, so a
+    # hand-edited `"vote_count": true` line must not slip past the
+    # positive-int guard and get counted as a multi-vote/unanimous entry —
+    # the docstring's fail-secure claim must actually hold for bool, not
+    # just for non-int/negative/zero values.
+    from dev_team.assessment import calibration_summary
+
+    entries = [
+        {"finding_id": "risk.secrets[0]", "verdict": "confirmed",
+         "vote_count": True, "max_agreement": True},
+        {"finding_id": "risk.secrets[1]", "verdict": "confirmed",
+         "vote_count": 5, "max_agreement": True},
+    ]
+    summary = calibration_summary(entries)
+    assert summary["overall"]["confirmed"] == 2
+    assert summary["overall"]["total"] == 2
+    # entry 0: bool vote_count -> not counted as multi-vote at all
+    # entry 1: valid vote_count, bool max_agreement -> counted, not unanimous
+    assert summary["overall"]["multi_vote_total"] == 1
+    assert summary["overall"]["unanimous_total"] == 0
+
+
+def test_calibration_summary_vote_fields_never_inflate_unanimous_beyond_multi_vote():
+    # Acceptance criterion 9 (SECURITY): this is a read-only rollup over
+    # already-trusted-by-construction disk state, not a new validation
+    # boundary, so a crafted vote_count/max_agreement exceeding the
+    # process-enforced MAX_VERIFY_VOTES cap (5) is still counted at face
+    # value into multi_vote_total/unanimous_total — but each qualifying
+    # entry increments unanimous_total by exactly 1, never by the field's
+    # magnitude, so unanimous_total can never exceed multi_vote_total.
+    from dev_team.assessment import calibration_summary
+
+    entries = [
+        {"finding_id": "risk.secrets[0]", "verdict": "confirmed",
+         "vote_count": 100, "max_agreement": 100},
+    ]
+    summary = calibration_summary(entries)
+    assert summary["overall"]["multi_vote_total"] == 1
+    assert summary["overall"]["unanimous_total"] == 1
+    assert (
+        summary["overall"]["unanimous_total"]
+        <= summary["overall"]["multi_vote_total"]
+    )
 
 
 def _security_verdict(payload):

@@ -643,6 +643,7 @@ def test_calibration_state_empty_workspace():
         "overall": {
             "confirmed": 0, "refuted": 0, "needs_context": 0,
             "total": 0, "confirm_rate": None,
+            "multi_vote_total": 0, "unanimous_total": 0,
         },
         "jobs_counted": 0,
         "blind_spot_total": 0,
@@ -678,6 +679,7 @@ def test_calibration_state_excludes_archived_job_by_default():
         "risk": {
             "confirmed": 0, "refuted": 1, "needs_context": 0,
             "total": 1, "confirm_rate": 0.0,
+            "multi_vote_total": 0, "unanimous_total": 0,
         }
     }
     assert state["overall"]["total"] == 1
@@ -705,6 +707,7 @@ def test_calibration_state_include_archived_reveals_everything():
     assert state["phases"]["risk"] == {
         "confirmed": 1, "refuted": 1, "needs_context": 0,
         "total": 2, "confirm_rate": 0.5,
+        "multi_vote_total": 0, "unanimous_total": 0,
     }
     assert state["overall"]["total"] == 2
 
@@ -722,6 +725,7 @@ def test_calibration_state_tolerates_corrupt_line_and_counts_the_rest():
     assert state["overall"] == {
         "confirmed": 1, "refuted": 0, "needs_context": 0,
         "total": 1, "confirm_rate": 1.0,
+        "multi_vote_total": 0, "unanimous_total": 0,
     }
 
 
@@ -759,6 +763,7 @@ def test_calibration_state_excludes_out_of_contract_entries():
     assert state["overall"] == {
         "confirmed": 1, "refuted": 0, "needs_context": 0,
         "total": 1, "confirm_rate": 1.0,
+        "multi_vote_total": 0, "unanimous_total": 0,
     }
 
 
