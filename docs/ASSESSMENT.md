@@ -107,10 +107,10 @@ machinery understands them now:
 - **Exactly-pinned dependencies get a live OSV.dev scan; everything else
   is model knowledge** — the report footer says which mode produced the
   claims. Lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`,
-  NuGet `packages.lock.json`, Ruby `Gemfile.lock`) are parsed alongside
-  the manifests, so a range-specified project still gets its *resolved*
-  versions scanned; only dependencies with no lockfile and no exact pin
-  fall back to training data. PEP 621 `pyproject.toml`
+  NuGet `packages.lock.json`, Ruby `Gemfile.lock`, PHP `composer.lock`) are
+  parsed alongside the manifests, so a range-specified project still gets
+  its *resolved* versions scanned; only dependencies with no lockfile and no
+  exact pin fall back to training data. PEP 621 `pyproject.toml`
   `[project.dependencies]` and `[project.optional-dependencies]` `==`
   pins are live-scanned too, even with no lockfile present; PEP 735
   `[dependency-groups]` `==` pins are live-scanned the same way, but
@@ -119,17 +119,19 @@ machinery understands them now:
   `require` entries are always exact pins (Go's module resolution has no
   version-range syntax) and are live-scanned with no lockfile needed;
   Ruby's bare `Gemfile` (a range-specified manifest with no lockfile) is
-  not parsed — only `Gemfile.lock`'s resolved pins are.
-- **Detected Node.js/Python/.NET/Ruby/Go runtime versions get a live
+  not parsed — only `Gemfile.lock`'s resolved pins are. Likewise PHP's
+  `composer.json` version constraints are not parsed — only
+  `composer.lock`'s resolved pins are.
+- **Detected Node.js/Python/.NET/Ruby/Go/PHP runtime versions get a live
   endoflife.date EOL/support-status check; every other EOL/support-status
   judgment (other runtimes, frameworks, libraries) is model knowledge** —
   the same report footer states which mode produced the claim. The
   runtime version is parsed from `package.json` (`engines.node`),
   `.nvmrc`, `runtime.txt`, `.python-version`, `global.json`
-  (`sdk.version`), `.ruby-version`, or `go.mod` (the `go` directive); an
-  unresolved release cycle reports `unknown` rather than guessing. Treat
-  EOL findings outside those five runtimes as a triage list, not a
-  compliance scan.
+  (`sdk.version`), `.ruby-version`, `go.mod` (the `go` directive), or
+  `composer.json` (`require.php`); an unresolved release cycle reports
+  `unknown` rather than guessing. Treat EOL findings outside those six
+  runtimes as a triage list, not a compliance scan.
 - Phase evidence is as good as what the auditors read: on very large repos
   the deterministic inventory is exact, but agents sample files. The report
   appendix names the **audit blind spots** — top-level directories no
@@ -170,9 +172,9 @@ involved, so their findings are exact and citable:
 - **Live dependency scan** — exact pins from the manifests
   (`packages.config`, `package.json`, `requirements.txt`, `Cargo.toml`,
   Go `go.mod`) and the lockfiles (`package-lock.json`, `poetry.lock`,
-  `Cargo.lock`, NuGet `packages.lock.json`, Ruby `Gemfile.lock`) queried
-  against OSV.dev in one batch (`--no-osv-scan` opts out; offline
-  degrades to a labelled model-knowledge fallback).
+  `Cargo.lock`, NuGet `packages.lock.json`, Ruby `Gemfile.lock`, PHP
+  `composer.lock`) queried against OSV.dev in one batch (`--no-osv-scan`
+  opts out; offline degrades to a labelled model-knowledge fallback).
 - **Live EOL/support-status scan** — Node.js/Python/.NET/Ruby/Go runtime
   versions detected from `package.json`/`.nvmrc`/`runtime.txt`/
   `.python-version`/`global.json`/`.ruby-version`/`go.mod` are checked
@@ -348,8 +350,22 @@ did complete still decide the result (never fewer than 1 succeeding); only
 if every pass fails does this return the same failure shape a single
 failed call returns today. The result additionally carries `"votes"` (each
 pass's `verdict`/`rationale`/`citations`) and `"vote_count"` when `N > 1` —
-additive only, so `GET /calibration` (which only ever reads the top-level
-`verdict`) needs no change and a `votes=1` caller sees no schema change.
+additive only, so a `votes=1` caller sees no schema change. Note
+`"vote_count"` can be **less than** `N` if the shared budget ran out before
+every pass completed (see above) — it reflects passes actually completed,
+not passes requested. Over dispatch, the persisted `verifications.jsonl`
+entry for an `N > 1` call additionally carries `"vote_count"` and
+`"max_agreement"` (the size of the winning verdict's tally, e.g. `3` of
+`5`) **only when every requested pass completed** (`vote_count == N`); a
+budget-truncated call (`vote_count < N`) writes neither key, exactly like a
+`votes=1` entry, since a partial tally's `max_agreement` would otherwise
+equal its own `vote_count` and misread as unanimous. `GET /calibration`
+rolls the gated fields into `multi_vote_total`/`unanimous_total` per phase
+and overall, so the vote-agreement signal a fully-completed multi-vote call
+pays extra budget for survives a restart instead of being discarded once
+the in-memory job result expires (see [`docs/DISPATCH.md`](DISPATCH.md)).
+A `votes=1` entry (the default) carries neither key and leaves both
+counters untouched.
 `N` is capped at **5** (`--verify-votes 6` is rejected); the dispatch
 `votes` field enforces the identical cap (see below).
 

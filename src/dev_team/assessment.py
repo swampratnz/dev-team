@@ -1606,15 +1606,40 @@ def calibration_summary(entries: List[Dict]) -> Dict:
     :data:`VERIFY_VERDICTS` set) plus an ``overall`` rollup, each with a
     ``confirm_rate`` of ``confirmed / total`` (``None`` when ``total`` is 0).
 
+    Also tallies, per bucket, ``multi_vote_total`` (entries carrying a
+    positive integer ``vote_count`` — i.e. written by a ``--verify-votes > 1``
+    call, see :func:`verify_finding`) and ``unanimous_total`` (the subset of
+    those where ``max_agreement == vote_count``, meaning every pass agreed).
+    An entry with no ``vote_count`` (every ``votes=1`` write, past and
+    future) leaves both counters untouched, so a rollup over history with no
+    multi-vote entries is unaffected beyond the two new always-present,
+    zero-valued keys.
+
     An entry with a non-string/missing ``finding_id``, a verdict outside
     ``VERIFY_VERDICTS``, or that is not itself a dict, is dropped rather than
     trusted — the same fail-secure posture :func:`verify_finding` applies at
     write time, re-applied here at read time: an out-of-contract verdict must
-    never inflate a count.
+    never inflate a count. A malformed ``vote_count``/``max_agreement`` (not
+    a positive int) is likewise never counted into the new totals, though the
+    entry's ``verdict`` still counts normally — this is a read-only rollup
+    over already-trusted-by-construction disk state, not a new validation
+    boundary, so an out-of-range ``vote_count`` (e.g. from a hand-edited
+    line) is still counted at face value: ``unanimous_total`` only ever
+    increments by ``1`` per qualifying entry, never by the field's
+    magnitude, so it can never exceed ``multi_vote_total``.
     """
 
     def _bucket() -> Dict[str, int]:
-        return {"confirmed": 0, "refuted": 0, "needs_context": 0, "total": 0}
+        return {
+            "confirmed": 0, "refuted": 0, "needs_context": 0, "total": 0,
+            "multi_vote_total": 0, "unanimous_total": 0,
+        }
+
+    def _is_positive_int(value: object) -> bool:
+        # `type(value) is int` (not `isinstance`) so a hand-edited
+        # `"vote_count": true` line is rejected — bool is an int subclass in
+        # Python, and isinstance(True, int) is True.
+        return type(value) is int and value > 0
 
     phases: Dict[str, Dict[str, int]] = {}
     overall = _bucket()
@@ -1631,6 +1656,15 @@ def calibration_summary(entries: List[Dict]) -> Dict:
         bucket["total"] += 1
         overall[key] += 1
         overall["total"] += 1
+        vote_count = entry.get("vote_count")
+        if _is_positive_int(vote_count):
+            bucket["multi_vote_total"] += 1
+            overall["multi_vote_total"] += 1
+            if _is_positive_int(entry.get("max_agreement")) and (
+                entry["max_agreement"] == vote_count
+            ):
+                bucket["unanimous_total"] += 1
+                overall["unanimous_total"] += 1
     result_phases = {}
     for name, bucket in phases.items():
         bucket["confirm_rate"] = (

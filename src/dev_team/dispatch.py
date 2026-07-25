@@ -48,6 +48,7 @@ import queue
 import shutil
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -204,6 +205,39 @@ def _valid_budget(value: Any) -> bool:
     except OverflowError:
         return False
     return value > 0
+
+
+def _foreman_batch_job_ids(status: int, payload: Dict[str, Any]) -> List[str]:
+    """The job ids a ``foreman_run`` outcome created, for access-log correlation.
+
+    Mirrors ``foreman_run``'s three outcome shapes (see its docstring):
+
+    - success (200/202) — ``payload["jobs"]``, each entry's ``job_id``, in
+      enqueue order.
+    - save-failed compensation (500) — every ``payload["cancelled"]`` entry's
+      ``job_id``, then every ``payload["uncancellable"]`` entry's, in that
+      order. These jobs were genuinely submitted (and could have started
+      spending) before being compensated, so the audit trail must show they
+      existed even though the API ultimately reported failure.
+    - validation rejection (400/409) — neither key is present, so ``[]``: no
+      job was ever created.
+
+    ``status`` is unused directly; the payload shape alone determines the
+    outcome, but it is accepted (and named in the signature) to keep the call
+    site self-documenting about which ``foreman_run`` return value this is
+    for.
+    """
+
+    jobs = payload.get("jobs")
+    if jobs:
+        return [entry["job_id"] for entry in jobs]
+    cancelled = payload.get("cancelled")
+    uncancellable = payload.get("uncancellable")
+    if cancelled or uncancellable:
+        return [entry["job_id"] for entry in (cancelled or [])] + [
+            entry["job_id"] for entry in (uncancellable or [])
+        ]
+    return []
 
 
 class ValidationError(Exception):
@@ -1210,17 +1244,32 @@ class Dispatcher:
             # A $0 skip never invoked a model, so it must never be appended
             # here — GET /calibration's confirm_rate would otherwise be
             # silently diluted by an entry no model actually adjudicated.
-            self._mirror_verification(
-                spec.source_job,
-                {
-                    "finding_id": result["finding_id"],
-                    "verdict": result["verdict"],
-                    "rationale": result["rationale"],
-                    "citations": result["citations"],
-                    "cost_usd": result["cost_usd"],
-                    "ts": self._clock(),
-                },
-            )
+            entry = {
+                "finding_id": result["finding_id"],
+                "verdict": result["verdict"],
+                "rationale": result["rationale"],
+                "citations": result["citations"],
+                "cost_usd": result["cost_usd"],
+                "ts": self._clock(),
+            }
+            vote_count = result.get("vote_count")
+            # A budget-exhausted multi-vote call can return vote_count < the
+            # requested spec.votes (verify_finding decides on whichever
+            # passes completed rather than failing outright) — persisting
+            # that partial tally here would read as "unanimous" once
+            # max_agreement inevitably equals the lone completed vote_count,
+            # indistinguishable from a genuine N-0 result. Gate on every
+            # requested pass having completed before treating this as a
+            # multi-vote/unanimous signal at all.
+            if vote_count and vote_count == spec.votes:
+                # Re-tally from the votes already in hand (no new agent
+                # call) rather than threading top_count out of
+                # verify_finding — see issue #194's alternatives-considered
+                # for why this stays out of that function's shared contract.
+                tally = Counter(v["verdict"] for v in result["votes"])
+                entry["vote_count"] = vote_count
+                entry["max_agreement"] = max(tally.values())
+            self._mirror_verification(spec.source_job, entry)
         return result, float(result["cost_usd"])
 
     def _mirror_report(self, job_id: str, outcome: Any) -> None:
@@ -2581,6 +2630,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
 
             self._access_log_status: Optional[int] = None
             self._access_log_job_id: Optional[str] = None
+            self._access_log_job_ids: Optional[List[str]] = None
             try:
                 super().handle_one_request()
             finally:
@@ -2592,6 +2642,7 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                             request_path=urlsplit(getattr(self, "path", "") or "").path,
                             status=status,
                             job_id=self._access_log_job_id,
+                            job_ids=self._access_log_job_ids,
                         )
                     except OSError:
                         pass
@@ -2892,6 +2943,9 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 if body is None:
                     return
                 status, payload = dispatcher.foreman_run(body)
+                job_ids = _foreman_batch_job_ids(status, payload)
+                if job_ids:
+                    self._access_log_job_ids = job_ids
                 self._json(status, payload)
                 return
             parts = path.strip("/").split("/")

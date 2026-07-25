@@ -77,6 +77,34 @@ applies the same check to skip any symlink whose real path escapes the root.
 The dispatch service's `purge_job` reuses this containment boundary when
 resolving a job's on-disk directory before deleting it.
 
+## Agent tool-loop containment
+
+The checks above cover the orchestrator's own file I/O; they say nothing
+about the agentic engineer's *own* SDK tool loop (Bash/Read/Write/Edit/Glob/
+Grep via the Claude CLI), which runs on the host outside `CommandRunner` and
+was, until now, scoped only by `cwd` — a working-directory default, not an
+access boundary. `dev_team.agent_sandbox.workspace_containment_hook` closes
+that gap with a `PreToolUse` hook (`ClaudeAgentOptions.hooks`) that denies any
+Bash/Read/Write/Edit/Glob/Grep call whose target resolves outside the session's
+workspace root, reusing the same real-path/symlink-escape check as
+`LocalWorkspace._within_root` above. `dev_team.sdk` wires it automatically
+whenever a call carries a `cwd` — the same condition that turns an SDK call
+into a real tool loop in the first place (see `AgentRunner`) — so both the
+persistent-session path (`DeliveryEngine._open_engineer_session`, rooted at
+the task's own worktree in worktree mode) and the cold `implement_in_place`
+path (the shared `ClaudeAgentRunner`'s per-call `cwd` override) are covered
+without either call site having to remember to opt in. A denial never
+includes any filesystem path in its reason (root or sibling), so it cannot
+leak another job's layout back to the model.
+
+Read/Write/Edit/Glob are checked deterministically against the tool call's
+own structured path argument — no false positives or negatives. **Bash is
+different: it is a best-effort string scan for path-like tokens (absolute
+paths, `..` segments, `cd` targets), not a shell parser, and is evadable by a
+sufficiently adversarial one-liner** (environment-variable expansion,
+base64, `eval`, and similar tricks are not defeated by it). It is
+defense-in-depth, not a hard boundary — treat it accordingly.
+
 ## HTTP surface auth
 
 Both HTTP surfaces require a bearer token compared with `hmac.compare_digest`
@@ -125,9 +153,14 @@ production alone:
   a *single* dispatched job's commands can reach, but ROADMAP item 1 names the
   remaining gap explicitly: one dispatched job's container can still see
   another's workspace on a shared host, because there is no per-job
-  rootless-container or namespace boundary yet — only the process-level
-  container/VM recipe in `DEPLOYMENT.md` §5d contains the engineer's own SDK
-  tool loop today.
+  rootless-container or namespace boundary yet. The engineer's own SDK tool
+  loop now has a filesystem-level trust boundary of its own (see *Agent
+  tool-loop containment* above) — deny-by-default outside its workspace root,
+  with the Bash side of that check an evadable heuristic, not a hard
+  guarantee — but that is still an in-process check, not an OS-level
+  isolation boundary: the process-level container/VM recipe in
+  `DEPLOYMENT.md` §5d remains the real isolation boundary for a shared host
+  until the per-job container/namespace work lands.
 - **The dashboard's unauthenticated-by-default localhost stance.** With
   `DEV_TEAM_DASHBOARD_TOKEN` unset, every dashboard route — including the
   event journal, backlog, memory, and any markdown report, plus recorded

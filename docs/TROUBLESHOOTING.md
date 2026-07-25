@@ -98,12 +98,34 @@ addressing why it escalated — that only routes the same problem back into
 automation to fail again, and defeats the human-oversight gate the label
 exists to enforce (see [`docs/PIPELINE.md`](PIPELINE.md)'s ownership rules).
 
+## "A backlog story is stuck `blocked` and never resumes"
+
+This is expected, not a bug. The backlog foreman gives each story exactly
+**one** autonomous attempt — see [`docs/DISPATCH.md`](DISPATCH.md)'s *The
+backlog foreman* section. A story lands in `blocked` when its
+foreman-enqueued job failed, timed out, or completed without a successful
+delivery, and `blocked` stories are **never re-selected** — they wait for a
+human by design.
+
+**To see why:** the story carries `delivery_job`, the id of the job the
+foreman enqueued for it. Fetch that job's outcome with
+`GET /jobs/{id}/result` (auth) — see [`docs/DISPATCH.md`](DISPATCH.md)'s job
+result route.
+
+**To resume it:** move the story back to `todo` with
+`POST /backlog/story/{id}/status` (auth) — see
+[`docs/DASHBOARD.md`](DASHBOARD.md)'s *The board write model* section, which
+documents this route in full. Once it's `todo` again, the next
+`POST /foreman/run` batch is free to re-select
+it as if it were new.
+
 ## Dashboard/dispatch HTTP status quick-reference
 
 | Status | Meaning | Source |
 |---|---|---|
 | `401` | Missing or wrong bearer token / dashboard session | [`docs/DASHBOARD.md`](DASHBOARD.md) (Authentication), [`docs/DISPATCH.md`](DISPATCH.md) (every route) |
 | `409` | A state-transition conflict — e.g. archiving a still-`queued`/`running` job, or a backlog request with no dashboard workspace configured | [`docs/DASHBOARD.md`](DASHBOARD.md) (Archived jobs), [`docs/DISPATCH.md`](DISPATCH.md) (backlog) |
+| `500` | POST /foreman/run's post-submit backlog write failed — the just-enqueued jobs were compensated (cancelled) rather than left to double-spend on a re-run | [`docs/DISPATCH.md`](DISPATCH.md) (The backlog foreman) |
 | `501` | The dashboard proxy feature isn't configured — no dispatch URL/token wired up, so board editing, job actions, or the cost rollup answer "not configured" instead of erroring | [`docs/DASHBOARD.md`](DASHBOARD.md) (The board write model, costs panel) |
 | `502` | The dashboard's proxy to the dispatch service couldn't reach it (dispatch service down/unreachable) | [`docs/DASHBOARD.md`](DASHBOARD.md) (The board write model) |
 

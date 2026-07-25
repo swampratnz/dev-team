@@ -10,14 +10,27 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Protocol, Sequence, runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ClaudeSDKError,
+    HookMatcher,
     query,
 )
+
+from .agent_sandbox import workspace_containment_hook
 
 # A single agent turn that takes longer than this has hung, not thought hard.
 DEFAULT_TIMEOUT_SECONDS = 600.0
@@ -72,12 +85,16 @@ def build_options(
     permission_mode: str,
     cwd: Optional[str],
     max_turns: Optional[int],
+    hooks: Optional[Mapping[str, Sequence[HookMatcher]]] = None,
 ) -> ClaudeAgentOptions:
     """Assemble :class:`ClaudeAgentOptions`, omitting unset values.
 
     ``allowed_tools`` is always set: ``None`` means an explicit *empty*
     allowlist, never "no restriction" — an agent gets exactly the tools its
-    caller granted it.
+    caller granted it. ``hooks`` is a generic passthrough to
+    ``ClaudeAgentOptions.hooks``; omitting it (the default) leaves today's
+    behaviour byte-for-byte unchanged. See :func:`_cwd_containment_hooks` for
+    how callers derive it from a live ``cwd``.
     """
 
     kwargs: dict[str, Any] = {
@@ -92,7 +109,29 @@ def build_options(
         kwargs["cwd"] = cwd
     if max_turns is not None:
         kwargs["max_turns"] = max_turns
+    if hooks is not None:
+        kwargs["hooks"] = hooks
     return ClaudeAgentOptions(**kwargs)
+
+
+def _cwd_containment_hooks(
+    cwd: Optional[str],
+) -> Optional[Dict[str, List[HookMatcher]]]:
+    """The ``PreToolUse`` workspace-containment hook rooted at ``cwd``, or
+    ``None`` when there is no ``cwd`` to root it at.
+
+    A real ``cwd`` is exactly what turns an SDK call from a text completion
+    into an agentic tool loop (see :class:`AgentRunner`'s docstring) — so
+    tying the hook to "a ``cwd`` was set" means every present and future
+    agentic call site is contained automatically, without each one having to
+    remember to opt in. Rebuilt fresh per call (not cached) so it always
+    tracks the *live* ``cwd`` — worktree mode roots a different directory per
+    task, and a stale hook would guard the wrong, or a since-removed, path.
+    """
+
+    if cwd is None:
+        return None
+    return {"PreToolUse": [workspace_containment_hook(cwd)]}
 
 
 def extract_text(message: Any) -> List[str]:
@@ -146,13 +185,15 @@ class ClaudeAgentRunner:
         model: Optional[str] = None,
         cwd: Optional[str] = None,
     ) -> AgentResult:
+        resolved_cwd = cwd or self.cwd
         options = build_options(
             system_prompt=system_prompt,
             allowed_tools=allowed_tools,
             model=model or self.default_model,
             permission_mode=self.permission_mode,
-            cwd=cwd or self.cwd,
+            cwd=resolved_cwd,
             max_turns=self.max_turns,
+            hooks=_cwd_containment_hooks(resolved_cwd),
         )
         self._last_options = options
         try:
@@ -335,6 +376,7 @@ class ClaudeAgentSession:
                 permission_mode=self.permission_mode,
                 cwd=self.cwd,
                 max_turns=self.max_turns,
+                hooks=_cwd_containment_hooks(self.cwd),
             )
             factory = self.client_factory or _default_client_factory
             self._client = factory(options)

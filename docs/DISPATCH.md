@@ -662,9 +662,19 @@ concurrent agent calls against the shared pool. The result additionally
 carries `"votes":[{"verdict","rationale","citations"}]` (one entry per
 completed pass) and `"vote_count":int` when `votes > 1`; the top-level
 `verdict`/`rationale`/`citations` fields are unchanged, so
-`GET /jobs/{source-id}/verifications` and `GET /calibration` (which only
-ever read the top-level `verdict`) need no change and never double-count a
-multi-vote result as more than one entry.
+`GET /jobs/{source-id}/verifications` never double-counts a multi-vote
+result as more than one entry. The persisted entry itself (still one line
+per verification) additionally carries `"vote_count":int` and
+`"max_agreement":int` (the size of the winning verdict's tally — e.g. `3`
+of `5` passes) whenever `votes > 1` **and every requested pass actually
+completed** (`result["vote_count"] == votes`); a shared-budget exhaustion
+partway through (see `docs/ASSESSMENT.md`'s `verify_finding`) can return
+fewer completed passes than requested, and persisting that partial tally
+would read as unanimous (`max_agreement` inevitably equals the lone
+completed `vote_count`) — indistinguishable from a genuine N-0 result. A
+`votes=1` call, or a multi-vote call cut short by the budget, writes no
+such keys, so its entry is unchanged. `GET /calibration` rolls the gated
+fields into `multi_vote_total`/`unanimous_total` (see below) — see #194.
 
 The job then flows through the normal machinery: single-flight queue,
 `GET /jobs/{id}` status, and `GET /jobs/{id}/result` (shapes above — a
@@ -696,11 +706,24 @@ workspace, groups entries by the phase prefix of their `finding_id`
 verification stops skewing the rollup the moment its job is archived, and
 resumes contributing the moment it is unarchived.
 
+Each bucket also carries `multi_vote_total` (entries written by a
+`--verify-votes > 1` call, i.e. carrying a `vote_count`) and
+`unanimous_total` (the subset where every pass agreed, `max_agreement ==
+vote_count`) — the vote-agreement signal a `votes > 1` call pays extra
+budget for, otherwise discarded once the in-memory job result expires (see
+#194). A caller can derive "contested" as `multi_vote_total -
+unanimous_total`. A `votes=1` entry (the default, and every entry written
+before this field existed) contributes to neither counter, so both are
+always present, defaulting to `0` — never omitted, matching every other
+`_bucket()` field.
+
 ```json
 {"phases":{"risk":{"confirmed":6,"refuted":1,"needs_context":1,
-                     "total":8,"confirm_rate":0.75}},
+                     "total":8,"confirm_rate":0.75,
+                     "multi_vote_total":2,"unanimous_total":1}},
  "overall":{"confirmed":6,"refuted":1,"needs_context":1,
-            "total":8,"confirm_rate":0.75},
+            "total":8,"confirm_rate":0.75,
+            "multi_vote_total":2,"unanimous_total":1},
  "jobs_counted":3,
  "blind_spot_total":5,"broken_citation_total":2,
  "report_quality_jobs_counted":2}
@@ -866,6 +889,7 @@ prints the bind URL once instead of a line per request).
 ```json
 {"ts":1789345678.0,"method":"GET","path":"/jobs","status":200}
 {"ts":1789345679.0,"method":"POST","path":"/jobs","status":202,"job_id":"deliver-20260722-140212-3"}
+{"ts":1789345680.0,"method":"POST","path":"/foreman/run","status":202,"job_ids":["deliver-20260722-140213-1","deliver-20260722-140213-2"]}
 ```
 
 Fields are deliberately minimal:
@@ -883,20 +907,31 @@ Fields are deliberately minimal:
   same call. Omitted entirely (not even `null`) on every other route,
   including job-scoped routes (whose id already lives in `path`) and a
   rejected `POST /jobs` (400/503 — no job was created, so there is nothing to
-  correlate). This is the only correlation the log records; batch creation
-  via `POST /foreman/run` is not covered (see below).
+  correlate).
+- `job_ids` — the batch sibling of `job_id`, present only on a `POST
+  /foreman/run` request that created at least one job. Its three-way
+  behaviour mirrors `foreman_run`'s own outcome shapes: an enqueued-success
+  call (200/202) records every entry's `job_id` from the response body's
+  `jobs` list, in enqueue order; a save-failed call that had to compensate by
+  cancelling (500) records every `cancelled` entry's `job_id` followed by
+  every `uncancellable` entry's — those jobs genuinely existed, and could
+  have started spending, before being compensated, so the log must show they
+  existed even though the API ultimately reported failure; and a rejected
+  call (400/409 — no job was ever created) omits the field entirely, same
+  "nothing to correlate" discipline as a rejected `POST /jobs`. `job_id` and
+  `job_ids` are never both set on the same record — single-job routes set the
+  former, `/foreman/run` sets the latter.
 
 **Deliberately never logged**: the `Authorization` header value (or any
 other header), and any request or response body. A `deliver` job's
 `title`/`description` is caller-supplied free text that could carry
 anything the caller pastes — logging *that* a call happened, on what path,
 with what outcome, is the goal; logging its payload is explicitly out of
-scope for this journal. `job_id` is the one exception: it is server-generated
-(never caller-supplied) and was already derivable from `GET /jobs`, so
-recording it is not a payload leak — it just saves the reader from
-timestamp-matching by hand. `POST /foreman/run` (which can create up to
-`max_stories` jobs in one call) is not correlated; that needs a list-valued
-field and its own design, left for a future proposal.
+scope for this journal. `job_id`/`job_ids` are the one exception: they are
+server-generated (never caller-supplied) and were already derivable from
+`GET /jobs` and from `/foreman/run`'s own response body, so recording them is
+not a payload leak — it just saves the reader from timestamp-matching by
+hand.
 
 Bounded like `.dev_team/events.jsonl` (`dev_team.eventlog.EventLog`): once
 the file exceeds 4000 lines it is rewritten keeping the newest half, so a

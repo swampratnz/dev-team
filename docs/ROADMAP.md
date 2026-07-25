@@ -46,9 +46,14 @@ self-delegates). **(c)** process-level — shipped as deployment guidance: the
 engineer's own SDK tool loop bypasses the `CommandRunner`, so it is contained by
 running the whole process in a container/VM ([`DEPLOYMENT.md` §5d](../DEPLOYMENT.md)
 has a hardened recipe and the layered model), with matching hardening on the
-standing systemd units. The remaining open edge is a per-job isolation boundary
+standing systemd units. The engineer's own tool loop also now carries an
+in-process filesystem trust boundary — a `PreToolUse` hook
+(`dev_team.agent_sandbox`, see [`docs/SECURITY.md`](SECURITY.md)) that denies
+any Bash/Read/Write/Edit/Glob/Grep call resolving outside its workspace root —
+but that is a check inside the same process, not OS-level isolation, so it
+does not close the remaining open edge: a per-job isolation boundary
 (review S4) — one dispatched job's container can still see another's workspace on
-a shared host; a per-job rootless container/namespace is the follow-up. A second
+a shared host; a per-job rootless container/namespace is still the follow-up. A second
 known-uncovered surface: visual review's served app (`SubprocessAppServer`) runs
 as a bare host subprocess even under `--sandbox` — the engine now logs an
 advisory warning rather than leaving the gap silently assumed-covered (see

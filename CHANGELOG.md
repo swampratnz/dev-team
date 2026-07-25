@@ -6,6 +6,35 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Assessment
+- **`GET /calibration` now surfaces multi-vote agreement strength**
+  (`assessment.py`, `dispatch.py`), closing #129's own named follow-up: a
+  `--verify-votes N` call's per-pass tally was computed and then discarded
+  before reaching disk, so a 5-0 unanimous confirmation and a bare 3-2
+  plurality were indistinguishable in `GET /calibration`. Dispatch's
+  `_run_verify` now additionally persists `vote_count` and `max_agreement`
+  (the winning tally's size) on a multi-vote verification's
+  `verifications.jsonl` entry — re-tallied from the already-returned
+  `votes` list, no new agent call; a `votes=1` entry is byte-identical to
+  today. Gated on every requested pass having completed
+  (`vote_count == spec.votes`): a budget-exhausted call that only
+  completed 1 of N requested passes is *not* persisted with these keys,
+  since its `max_agreement` would trivially equal its own `vote_count` and
+  misread as a genuine unanimous result. `calibration_summary` rolls the
+  gated fields into `multi_vote_total`/`unanimous_total` per phase and
+  overall, additive-only against every existing field; its `vote_count`/
+  `max_agreement` guard now also rejects `bool` (an `int` subclass in
+  Python), so a hand-edited `"vote_count": true` line can't slip through.
+  See `docs/DISPATCH.md` and `docs/ASSESSMENT.md`.
+- **Live EOL/support-status scan extended to PHP runtimes** (`eolscan.py`):
+  `composer.json`'s `require.php` key (e.g. `"php": "^8.1"`) is now parsed
+  alongside the existing Node.js/Python/.NET/Ruby/Go manifests and checked
+  against endoflife.date the same way — one request per distinct detected
+  product, degrading to `unknown`/model-knowledge on a malformed manifest
+  or a failed query, never guessed. No change to the scan orchestration,
+  HTTP fetch, cycle-matching, or verdict logic — just one new parser
+  function registered in the existing `_PARSERS` table (issue #192,
+  follow-on to #61/#117). PHP's dependency-CVE scanning (`composer.lock`,
+  #186) is unaffected — separate manifest, separate module.
 - **Dependency scan now covers Go (`go.mod`) and Ruby (`Gemfile.lock`)**
   (`depscan.py`), closing the "verified EOL, model-knowledge CVE" asymmetry
   #117 left open on these two ecosystems. `parse_go_mod` reads every
@@ -16,6 +45,19 @@ sections below are reconstructed from the repository history.
   dependency-constraint lines. Both register in `_PARSERS` and feed the
   existing `collect_dependencies`/`scan_dependencies`/OSV batch pipeline
   unchanged — no new credential, endpoint, or config. `docs/ASSESSMENT.md`'s
+  honest-limitations note is updated accordingly.
+- **Dependency scan now covers PHP (`composer.lock`)** (`depscan.py`),
+  closing the same "verified profile, model-knowledge CVE" asymmetry #145
+  (Composer profile detection) left open. `parse_composer_lock` reads the
+  `packages` and `packages-dev` JSON arrays as exact resolved pins under the
+  `Packagist` OSV ecosystem, mirroring `parse_package_lock`'s flat-array
+  shape; malformed entries (non-dict, missing `name`/`version`) are skipped,
+  and a non-JSON or non-object `composer.lock` degrades to an empty parse
+  rather than raising. `composer.json`'s version-range constraints remain
+  out of scope, same as Ruby's bare `Gemfile` — only the lockfile's resolved
+  pins are scanned. Registers in `_PARSERS` and feeds the existing
+  `collect_dependencies`/`scan_dependencies`/OSV batch pipeline unchanged —
+  no new credential, endpoint, or config. `docs/ASSESSMENT.md`'s
   honest-limitations note is updated accordingly.
 - **Dependency scan now parses PEP 735 `[dependency-groups]`** (`depscan.py`),
   completing the growth path #125 named for itself. `parse_pyproject_toml`
@@ -63,6 +105,43 @@ sections below are reconstructed from the repository history.
   decision document instead of the text proposal.
 
 ### Delivery
+- **A run-level design-thoroughness signal is now trended in the score
+  history** (#178, closing `docs/BENCHMARKS.md`'s named "in-house downstream
+  metric (attempts-per-task per design) → roadmap" gap). Right after a
+  successful `architect.design()` call, three scorecard keys —
+  `design_components_count`, `design_risks_count`,
+  `design_alternatives_count` — are set to the `len()` of the corresponding
+  list on that run's `Design`, reusing 100% of the existing
+  `ScoreHistory`/`_score_deltas` machinery (no changes to `scores.py`: its
+  generic key-union already trends any new scorecard key). A run halted
+  before design completes never gets these keys (matching the existing
+  "absent, not zero" convention for not-applicable metrics), while a design
+  with empty lists correctly gets explicit zeros. This is honestly scoped as
+  run-level only: the architect runs once per whole plan with no task
+  linkage in the data model, so a true per-task with/without-design
+  attempts comparison remains future work pending an architect opt-out flag.
+- **A new opt-in mutation-lite check surfaces weak tests as an advisory
+  scorecard signal** (#176, closing `docs/BENCHMARKS.md`'s named
+  "Mutation-lite scoring → roadmap" gap next to the adopted fail-to-pass
+  check). `dev_team.mutation.mutate_first_comparison` is a pure, dependency-
+  free AST transform: it flips the first single-operator comparison
+  (`==`↔`!=`, `<`↔`>=`, `>`↔`<=`) found in a source string and returns the
+  unparsed mutated source, or `None` when nothing parses or no mutable
+  comparison exists. `DeliveryEngine._mutation_check` (a new sibling to
+  `_tests_are_vacuous`, called right after it in `_integrate`) applies this
+  to the task's one Python product file, reruns the gates, and records
+  `mutation_survived`/`mutation_killed` in the run scorecard —
+  **advisory-only**: unlike `fail_to_pass_check`, a surviving mutant never
+  rejects, retries, or rolls back the task. Gated on
+  `EngineConfig.mutation_check` (off by default, matching `visual_review`'s
+  earn-the-default stance) plus the same dry-run/remote-verification skips
+  `fail_to_pass_check` already has, and further scoped to exactly one
+  non-test `.py` product file. The mutated write is always restored via a
+  `finally` block, success or failure; a restore that itself fails raises
+  the same `_StashRestoreFailed` hard-stop class `_tests_are_vacuous` uses,
+  rejecting the attempt rather than risking mutated code left on disk or
+  committed. No new dependency, subprocess shape, or credential — reuses
+  the existing gate-evaluation path every other check already calls.
 - **A visual-critique failure is now diagnosable instead of a bare "skipping"**
   (#152, root-cause corrected by adversarial review). The default `--deliver`/
   `--assess` progress stream (`cli.py`'s `_progress_printer`) now renders
@@ -361,6 +440,19 @@ sections below are reconstructed from the repository history.
   returned entry carries exactly the four fields the write path persists —
   never an `Authorization` header or a request/response body, since #54
   never wrote those in the first place.
+- **Access log batch correlation for `POST /foreman/run`** (#180,
+  `docs/DISPATCH.md`): `AccessLog.append` gains a `job_ids` field, the list-
+  valued sibling of #167's single-job `job_id`. A `POST /foreman/run` call
+  that creates jobs now has its access-log record carry every `job_id` it
+  produced, in order — including the save-failed/compensated-cancel case
+  (`cancelled` then `uncancellable`), where the jobs genuinely existed and
+  could have started spending before being rolled back, so the audit trail
+  still shows they existed even though the API reported a `500`. A rejected
+  call (400/409, no job created) omits the field, same fail-secure
+  discipline `job_id` already established. Job ids are server-generated and
+  already returned in `/foreman/run`'s own response body, so this is not a
+  new payload-leak surface. The dashboard's Access log panel renders one
+  tag per id, mirroring the existing single-`job_id` tag.
 - **`citation_broken` on every enumerated finding** (`docs/DISPATCH.md`):
   the follow-up the $0 `broken_citations` check (above) named and deferred
   on purpose — `list_findings` now joins its own already-persisted
@@ -593,6 +685,28 @@ sections below are reconstructed from the repository history.
   `feature` is the one caller-influenced field (the delivered feature's
   free-text name), rendered through `esc()` before `innerHTML` like every
   other panel; a workspace with no recorded runs shows a muted empty state.
+- **Foreman run wired to the dashboard** (`docs/DASHBOARD.md`): a new
+  `POST /api/foreman/run` route — the write half #165 named as "a future,
+  separate slice" — proxies the dispatch service's `POST /foreman/run`
+  (above), the seventh proxy of this shape. The Foreman plan panel gains a
+  `budget_usd`/`max_stories` form with a two-step arm/confirm button
+  (mirroring the archived-job purge button's confirm pattern), so a
+  spend-multiplying batch enqueue always needs an explicit second click
+  (CLAUDE.md §1) — no prefilled `budget_usd`, no auto-submit. The dashboard
+  forwards the JSON body verbatim and relays the dispatch response
+  unchanged (`202`/`200` success, `400` validation, `500`
+  compensated-cancel, `502` unreachable); without a dispatch token wired it
+  answers `501 {"error": "foreman run not configured"}`, no outbound call
+  attempted. Scope is exactly `/api/foreman/run` — a path that merely
+  starts with it falls through to the ordinary `404`, mirroring the plan
+  route's own exact-match discipline. The enqueued jobs/skips (or an error)
+  render inline, every field escaped before `innerHTML` like the rest of
+  the panel. Editing `max_stories` after arming disarms the confirm button
+  back to a plain "run" label, mirroring the existing `budget_usd` listener,
+  so the on-screen confirm text can never go stale relative to what a click
+  would submit; the button is also disabled for the duration of an
+  in-flight request so a rapid double-click can't fire two overlapping
+  enqueue calls.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /
@@ -718,6 +832,19 @@ sections below are reconstructed from the repository history.
   A reference-checker test resolves every cited `dev_team.x.y` symbol
   against the installed package so the doc can't silently drift from the
   code. Docs only — no `src/` change, no new credential surface.
+- **`docs/TROUBLESHOOTING.md` now indexes the backlog foreman**: a new "A
+  backlog story is stuck `blocked` and never resumes" section explains the
+  one-attempt-per-story design (`blocked` stories are never re-selected —
+  see `docs/DISPATCH.md`'s *The backlog foreman*), how to inspect a stuck
+  story's outcome (`GET /jobs/{id}/result`), and the recovery path (`POST
+  /backlog/story/{id}/status`, documented in `docs/DASHBOARD.md`'s *The
+  board write model*). The HTTP status quick-reference table gains a `500`
+  row for `POST /foreman/run`'s compensating-cancel failure. The
+  route-citation drift-check in `tests/test_docs.py` (added by #174) is
+  generalized from DISPATCH.md-only to the union of DISPATCH.md and
+  DASHBOARD.md, since TROUBLESHOOTING.md cross-links both and the new
+  recovery route lives only in the latter. Docs and tests only — no `src/`
+  change, no new credential surface.
 
 ## [0.7.0] — Legacy-repo analysis: dead code, live CVEs, conventions, remote CI
 

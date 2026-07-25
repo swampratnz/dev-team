@@ -36,6 +36,7 @@ from dev_team.dispatch import (
     SubmitRejected,
     ValidationError,
     _default_materialise,
+    _foreman_batch_job_ids,
     sweep_expired_archives,
 )
 from dev_team.dashboard import agent_history, collect_state
@@ -841,6 +842,7 @@ def test_calibration_with_no_verification_files_is_zeroed():
         "overall": {
             "confirmed": 0, "refuted": 0, "needs_context": 0,
             "total": 0, "confirm_rate": None,
+            "multi_vote_total": 0, "unanimous_total": 0,
         },
         "jobs_counted": 0,
         "blind_spot_total": 0,
@@ -890,6 +892,7 @@ def test_calibration_skips_a_corrupt_line_without_crashing():
     assert payload["phases"]["risk"] == {
         "confirmed": 1, "refuted": 1, "needs_context": 0,
         "total": 2, "confirm_rate": 0.5,
+        "multi_vote_total": 0, "unanimous_total": 0,
     }
 
 
@@ -4358,6 +4361,10 @@ def test_verify_job_end_to_end_on_a_fresh_dispatcher():
         assert entry["citations"] == [{"path": "global.json", "note": "pin exists"}]
         assert entry["cost_usd"] == 0.0
         assert "ts" in entry
+        # Acceptance criterion 1: a votes=1 (default) call is byte-identical
+        # to today — no vote_count/max_agreement keys at all.
+        assert "vote_count" not in entry
+        assert "max_agreement" not in entry
 
 
 def test_verify_job_agent_failure_becomes_a_failed_job():
@@ -4608,9 +4615,12 @@ def test_submit_verify_votes_invalid_is_400_http():
 
 
 def test_verify_job_votes_wires_through_and_counts_as_one_calibration_entry():
-    # Acceptance criteria 2/8/10: votes wires end-to-end over dispatch, and
-    # a multi-vote result is still exactly ONE entry in verifications.jsonl
-    # and GET /calibration — never double-counted from the votes array.
+    # #129's votes wiring: a multi-vote result is still exactly ONE entry in
+    # verifications.jsonl and GET /calibration — never double-counted from
+    # the votes array. #194 acceptance criterion 3 (3-2 plurality split):
+    # the persisted entry additionally carries vote_count/max_agreement
+    # (the winning tally's size, 2 — not 3, since it wasn't unanimous), but
+    # never the full per-pass "votes" breakdown.
     from dev_team.testing import json_response
 
     dash = _seeded_dash()
@@ -4652,11 +4662,202 @@ def test_verify_job_votes_wires_through_and_counts_as_one_calibration_entry():
         (entry,) = verifs["verifications"]
         assert entry["verdict"] == "confirmed"
         assert "votes" not in entry
-        assert "vote_count" not in entry
+        assert entry["vote_count"] == 3
+        assert entry["max_agreement"] == 2
 
         _, after = _call(server, "/calibration")
         assert after["overall"]["total"] == before[1]["overall"]["total"] + 1
         assert after["overall"]["confirmed"] == before[1]["overall"]["confirmed"] + 1
+        assert (
+            after["overall"]["multi_vote_total"]
+            == before[1]["overall"]["multi_vote_total"] + 1
+        )
+        assert (
+            after["overall"]["unanimous_total"]
+            == before[1]["overall"]["unanimous_total"]
+        )
+
+
+def test_verify_job_votes_unanimous_persists_full_agreement():
+    # Acceptance criterion 2: votes=5, all five passes confirmed -> the
+    # persisted entry carries vote_count=5, max_agreement=5 (unanimous).
+    from dev_team.testing import json_response
+
+    dash = _seeded_dash()
+    verifier = ScriptedRunner(
+        responses=[
+            json_response(
+                {"verdict": "confirmed", "rationale": f"r{i}", "citations": []}
+            )
+            for i in range(5)
+        ]
+    )
+    with running(
+        runner=verifier, materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]", "votes": 5},
+        )
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        _, verifs = _call(server, "/jobs/assess-old/verifications")
+        (entry,) = verifs["verifications"]
+        assert entry["verdict"] == "confirmed"
+        assert entry["vote_count"] == 5
+        assert entry["max_agreement"] == 5
+
+
+def test_verify_job_votes_tie_persists_partial_agreement():
+    # Acceptance criterion 4: votes=4, 2-confirmed/2-refuted ties, resolving
+    # to needs-context (per #129's existing tie-break) — the persisted
+    # entry proves the tally-size definition of max_agreement (2), not
+    # "votes matching the final verdict" (which would wrongly read 0, since
+    # no individual pass voted needs-context).
+    from dev_team.testing import json_response
+
+    dash = _seeded_dash()
+    verifier = ScriptedRunner(
+        responses=[
+            json_response(
+                {"verdict": "confirmed", "rationale": "r1", "citations": []}
+            ),
+            json_response(
+                {"verdict": "confirmed", "rationale": "r2", "citations": []}
+            ),
+            json_response(
+                {"verdict": "refuted", "rationale": "r3", "citations": []}
+            ),
+            json_response(
+                {"verdict": "refuted", "rationale": "r4", "citations": []}
+            ),
+        ]
+    )
+    with running(
+        runner=verifier, materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]", "votes": 4},
+        )
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert result["verdict"] == "needs-context"
+        _, verifs = _call(server, "/jobs/assess-old/verifications")
+        (entry,) = verifs["verifications"]
+        assert entry["verdict"] == "needs-context"
+        assert entry["vote_count"] == 4
+        assert entry["max_agreement"] == 2
+
+
+def test_verify_job_votes_budget_exhaustion_does_not_persist_as_multi_vote():
+    # Review fix on #195: a votes=3 call where the shared budget runs out
+    # after only 1 of 3 requested passes completes (verify_finding still
+    # decides on that 1 surviving vote — see
+    # test_verify_finding_votes_three_partial_budget_exhaustion_still_decides
+    # in test_assessment.py) must NOT be persisted with vote_count/
+    # max_agreement: a partial vote_count trivially equals its own
+    # max_agreement (1 == 1) and would misread as a genuine unanimous
+    # result, exactly the confidence-signal collapse this feature exists to
+    # prevent. The entry is byte-identical to a votes=1 entry instead.
+    from dev_team.testing import json_response
+
+    dash = _seeded_dash()
+    verifier = ScriptedRunner(
+        responses=[
+            AgentResult(
+                text=json_response(
+                    {"verdict": "confirmed", "rationale": "ok", "citations": []}
+                ),
+                cost_usd=0.05,
+            ),
+        ]
+    )
+    with running(
+        runner=verifier, materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        before = _call(server, "/calibration")
+        status, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]", "votes": 3,
+                  "budget_usd": 0.05},
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert server.dispatcher.wait(job_id, 5)
+
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["verdict"] == "confirmed"
+        # the budget cut the other 2 votes short of running at all
+        assert result["vote_count"] == 1
+        assert len(verifier.calls) == 1
+
+        _, verifs = _call(server, "/jobs/assess-old/verifications")
+        (entry,) = verifs["verifications"]
+        assert entry["verdict"] == "confirmed"
+        assert "vote_count" not in entry
+        assert "max_agreement" not in entry
+
+        _, after = _call(server, "/calibration")
+        assert after["overall"]["total"] == before[1]["overall"]["total"] + 1
+        assert (
+            after["overall"]["multi_vote_total"]
+            == before[1]["overall"]["multi_vote_total"]
+        )
+        assert (
+            after["overall"]["unanimous_total"]
+            == before[1]["overall"]["unanimous_total"]
+        )
+
+
+def test_calibration_http_distinguishes_single_vote_from_unanimous_multi_vote():
+    # Acceptance criterion 10: one votes=1 and one votes=3 (unanimous)
+    # verification against the same source job -> GET /calibration's
+    # overall.multi_vote_total == 1 and overall.unanimous_total == 1.
+    from dev_team.testing import json_response
+
+    dash = _seeded_dash()
+    verifier = ScriptedRunner(
+        responses=[
+            json_response(
+                {"verdict": "confirmed", "rationale": "single", "citations": []}
+            ),
+            json_response(
+                {"verdict": "confirmed", "rationale": "r1", "citations": []}
+            ),
+            json_response(
+                {"verdict": "confirmed", "rationale": "r2", "citations": []}
+            ),
+            json_response(
+                {"verdict": "confirmed", "rationale": "r3", "citations": []}
+            ),
+        ]
+    )
+    with running(
+        runner=verifier, materialise=_mem_materialise, dashboard_workspace=dash
+    ) as server:
+        _, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]"},
+        )
+        assert server.dispatcher.wait(payload["id"], 5)
+        _, payload = _call(
+            server, "/jobs", method="POST",
+            body={"mode": "verify", "source_job": "assess-old",
+                  "finding_id": "recommendation.plan[0]", "votes": 3},
+        )
+        assert server.dispatcher.wait(payload["id"], 5)
+
+        _, after = _call(server, "/calibration")
+        assert after["overall"]["multi_vote_total"] == 1
+        assert after["overall"]["unanimous_total"] == 1
+        assert after["overall"]["total"] == 2
 
 
 def test_verify_job_votes_at_cap_succeeds_http():
@@ -5183,6 +5384,41 @@ def test_foreman_plan_treats_an_unparseable_meta_repo_as_unrouteable():
     assert "no repository provenance" in payload["plan"][0]["reason"]
 
 
+# --- _foreman_batch_job_ids (#180) -----------------------------------------
+
+
+def test_foreman_batch_job_ids_from_a_success_payload():
+    payload = {
+        "jobs": [
+            {"job_id": "deliver-1", "story_id": "S1", "title": "t1", "position": 0},
+            {"job_id": "deliver-2", "story_id": "S2", "title": "t2", "position": 1},
+        ],
+        "skipped": [],
+        "budget_usd_per_story": 1.0,
+    }
+    assert _foreman_batch_job_ids(202, payload) == ["deliver-1", "deliver-2"]
+
+
+def test_foreman_batch_job_ids_from_an_all_skipped_success_payload():
+    payload = {"jobs": [], "skipped": [{"story_id": "S1", "reason": "x"}],
+               "budget_usd_per_story": 1.0}
+    assert _foreman_batch_job_ids(200, payload) == []
+
+
+def test_foreman_batch_job_ids_from_a_save_failed_compensation_payload():
+    payload = {
+        "error": "backlog write failed; enqueued jobs were cancelled",
+        "cancelled": [{"job_id": "deliver-1", "story_id": "S1"}],
+        "uncancellable": [{"job_id": "deliver-2", "story_id": "S2"}],
+    }
+    assert _foreman_batch_job_ids(500, payload) == ["deliver-1", "deliver-2"]
+
+
+def test_foreman_batch_job_ids_from_a_rejected_payload():
+    assert _foreman_batch_job_ids(400, {"error": "budget_usd is required"}) == []
+    assert _foreman_batch_job_ids(409, {"error": "the foreman needs a dashboard workspace"}) == []
+
+
 def test_foreman_run_needs_a_dashboard_workspace():
     status, payload = Dispatcher(token="x").foreman_run({"budget_usd": 1})
     assert status == 409
@@ -5563,6 +5799,111 @@ def test_foreman_routes_over_http(tmp_path):
         )
         assert status == 400
         assert "budget_usd is required" in payload["error"]
+
+
+# --- access log job_ids correlation for POST /foreman/run (#180) -----------
+
+
+def test_access_log_records_job_ids_for_a_foreman_run_batch(tmp_path):
+    # AC4: the access-log record's job_ids exactly equals the response body's
+    # jobs[*].job_id, in the same order — proves no drift.
+    dash = _foreman_dash()
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=dash, jobs_root=str(tmp_path),
+    ) as server:
+        status, payload = _call(
+            server, "/foreman/run", method="POST", body={"budget_usd": 1.5},
+        )
+        assert status == 202
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/foreman/run" and r["status"] == 202)
+    assert entry["job_ids"] == [j["job_id"] for j in payload["jobs"]]
+    assert len(entry["job_ids"]) == 2  # sanity: really a 2-job batch
+    assert "job_id" not in entry
+
+
+def test_access_log_omits_job_ids_for_an_empty_ready_backlog(tmp_path):
+    # AC5: a 200 with "jobs": [] (nothing ready) has no job_ids key.
+    dash = _foreman_dash(stories=0)
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=dash, jobs_root=str(tmp_path),
+    ) as server:
+        status, payload = _call(
+            server, "/foreman/run", method="POST", body={"budget_usd": 1.5},
+        )
+        assert (status, payload["jobs"]) == (200, [])
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/foreman/run")
+    assert "job_ids" not in entry
+
+
+def test_access_log_omits_job_ids_for_a_rejected_foreman_run(tmp_path):
+    # AC6: a 400 validation rejection (no job ever created) has no job_ids key.
+    dash = _foreman_dash()
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=dash, jobs_root=str(tmp_path),
+    ) as server:
+        status, _ = _call(server, "/foreman/run", method="POST", body={})
+        assert status == 400
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/foreman/run")
+    assert "job_ids" not in entry
+
+
+def test_access_log_records_job_ids_for_a_save_failed_compensated_batch(tmp_path, monkeypatch):
+    # AC7 (SECURITY, CLAUDE.md #7 audit-log integrity): jobs that were
+    # genuinely submitted (and could have started spending) before being
+    # compensated via cancel must still show up in the access log, even
+    # though the API ultimately reports a 500.
+    dash = _foreman_dash()
+
+    class _SaveBoomStore:
+        def __init__(self, workspace):
+            self._real = BacklogStore(workspace)
+
+        def load(self):
+            return self._real.load()
+
+        def save(self, backlog):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(dispatch_mod, "BacklogStore", _SaveBoomStore)
+    with running(
+        materialise=_mem_materialise, dashboard_workspace=dash, jobs_root=str(tmp_path),
+    ) as server:
+        status, payload = _call(
+            server, "/foreman/run", method="POST", body={"budget_usd": 1.5},
+        )
+        assert status == 500
+    records = _access_records(tmp_path, expect=1)
+    entry = next(r for r in records if r["path"] == "/foreman/run" and r["status"] == 500)
+    expected = [c["job_id"] for c in payload["cancelled"]] + [
+        u["job_id"] for u in payload["uncancellable"]
+    ]
+    assert expected  # sanity: the batch really enqueued something
+    for job_id in expected:
+        assert job_id in entry["job_ids"]
+    assert entry["job_ids"] == expected
+
+
+def test_access_log_job_id_and_job_ids_never_both_appear(tmp_path):
+    # AC8 regression: a POST /jobs record carries job_id, never job_ids; a
+    # POST /foreman/run record carries job_ids, never job_id.
+    dash = _foreman_dash(stories=1)
+    with running(
+        runner=_deliver_runner(), materialise=_mem_materialise,
+        dashboard_workspace=dash, jobs_root=str(tmp_path),
+    ) as server:
+        _call(
+            server, "/jobs", method="POST",
+            body={"mode": "deliver", "repo": "acme/mono", "title": "t", "description": "d"},
+        )
+        _call(server, "/foreman/run", method="POST", body={"budget_usd": 1.5})
+    records = _access_records(tmp_path, expect=2)
+    jobs_entry = next(r for r in records if r["path"] == "/jobs" and r["status"] == 202)
+    foreman_entry = next(r for r in records if r["path"] == "/foreman/run" and r["status"] == 202)
+    assert "job_id" in jobs_entry and "job_ids" not in jobs_entry
+    assert "job_ids" in foreman_entry and "job_id" not in foreman_entry
 
 
 # --- GitHub OAuth sign-in over HTTP ------------------------------------------
