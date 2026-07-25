@@ -3102,13 +3102,15 @@ class _FakeDispatchServer:
     instances = []
 
     def __init__(self, token, *, host, port, runner=None, dashboard_workspace=None,
-                 record_transcripts=False, oauth=None, max_workers=1, sandbox=None):
+                 record_transcripts=False, oauth=None, max_workers=1, sandbox=None,
+                 purge_ttl_days=None):
         self.token, self.host, self.port, self.runner = token, host, port, runner
         self.dashboard_workspace = dashboard_workspace
         self.record_transcripts = record_transcripts
         self.oauth = oauth
         self.max_workers = max_workers
         self.sandbox = sandbox
+        self.purge_ttl_days = purge_ttl_days
         self.interrupted = False
         self.shut_down = False
         _FakeDispatchServer.instances.append(self)
@@ -3151,11 +3153,13 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
 
     def interrupting_init(self, token, *, host, port, runner=None,
                           dashboard_workspace=None, record_transcripts=False,
-                          oauth=None, max_workers=1, sandbox=None):
+                          oauth=None, max_workers=1, sandbox=None,
+                          purge_ttl_days=None):
         original_init(self, token, host=host, port=port, runner=runner,
                       dashboard_workspace=dashboard_workspace,
                       record_transcripts=record_transcripts, oauth=oauth,
-                      max_workers=max_workers, sandbox=sandbox)
+                      max_workers=max_workers, sandbox=sandbox,
+                      purge_ttl_days=purge_ttl_days)
         self.interrupted = True
 
     monkeypatch.setattr(_FakeDispatchServer, "__init__", interrupting_init)
@@ -3271,6 +3275,37 @@ def test_main_dispatch_flag_validation():
         with pytest.raises(SystemExit) as excinfo:
             main(argv, runner=ScriptedRunner([]))
         assert excinfo.value.code == 2
+
+
+def test_main_dispatch_rejects_negative_purge_ttl_days(monkeypatch, capsys):
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    code = main(
+        ["--dispatch", "--purge-ttl-days", "-1"], runner=ScriptedRunner([])
+    )
+    assert code == 2
+    assert "--purge-ttl-days" in capsys.readouterr().err
+
+
+def test_main_dispatch_purge_ttl_days_defaults_to_none(monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    code = main(["--dispatch"], runner=ScriptedRunner([]))
+    assert code == 0
+    (server,) = _FakeDispatchServer.instances
+    assert server.purge_ttl_days is None
+
+
+def test_main_dispatch_purge_ttl_days_is_wired(monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    code = main(
+        ["--dispatch", "--purge-ttl-days", "30"], runner=ScriptedRunner([])
+    )
+    assert code == 0
+    (server,) = _FakeDispatchServer.instances
+    assert server.purge_ttl_days == 30
 
 
 def test_main_dispatch_sandbox_is_wired(monkeypatch):

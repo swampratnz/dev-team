@@ -394,6 +394,18 @@ def build_parser() -> argparse.ArgumentParser:
         "Claude subscription, so keep this small.",
     )
     serving.add_argument(
+        "--purge-ttl-days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --dispatch and --dashboard-workspace: automatically purge "
+        "any already-archived job whose archive marker is older than N days "
+        "(checked once per worker-loop iteration). Default: off (no "
+        "auto-purge). Purging is still gated on the job having been "
+        "explicitly archived first; this only automates the already-approved "
+        "second step.",
+    )
+    serving.add_argument(
         "--dispatch-url",
         default=None,
         metavar="URL",
@@ -1997,6 +2009,8 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
         )
     if args.max_concurrent_jobs < 1:
         raise DevTeamError("--max-concurrent-jobs must be at least 1")
+    if args.purge_ttl_days is not None and args.purge_ttl_days < 0:
+        raise DevTeamError("--purge-ttl-days must be at least 0")
     # GitHub OAuth sign-in is wired only when configured (same env-file
     # search as every other credential); unconfigured keeps the classic
     # single-token service with no new routes.
@@ -2021,6 +2035,7 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
         oauth=oauth,
         max_workers=args.max_concurrent_jobs,
         sandbox=_sandbox_config(args),
+        purge_ttl_days=args.purge_ttl_days,
     )
     print(
         f"dev-team dispatch service at {server.url} (Ctrl-C to stop)"
