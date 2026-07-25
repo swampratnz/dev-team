@@ -14,6 +14,7 @@ _CROSS_REFERENCED_PATHS = [
     "docs/DISPATCH.md",
     "docs/DASHBOARD.md",
     "docs/PIPELINE.md",
+    "docs/INTERACTION.md",
 ]
 
 # AC3: one required heading substring per symptom section from AC1.
@@ -24,6 +25,7 @@ _REQUIRED_HEADINGS = [
     "labelled `needs-human`",
     "stuck `blocked` and never resumes",
     "HTTP status quick-reference",
+    "My --interactive-pr-comments reply never got answered",
 ]
 
 # AC4: closed set of secret-shaped literal substrings.
@@ -149,3 +151,16 @@ def test_status_table_documents_foreman_500():
         if "500" in line and "POST /foreman/run" in line
     ]
     assert lines_with_500_and_foreman_run
+
+
+def test_pr_comment_section_documents_the_allowlist_and_failsafe():
+    text = _troubleshooting_text()
+    assert "--interactive-pr-comment-author" in text
+    assert "`apply`" in text
+    assert "`skip`" in text
+    assert "fail" in text
+
+
+def test_pr_comment_section_cross_links_interaction_doc():
+    text = _troubleshooting_text()
+    assert "(docs/INTERACTION.md)" in text

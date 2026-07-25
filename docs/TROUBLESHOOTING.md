@@ -119,6 +119,38 @@ documents this route in full. Once it's `todo` again, the next
 `POST /foreman/run` batch is free to re-select
 it as if it were new.
 
+## "My --interactive-pr-comments reply never got answered / the CI-fix round skipped anyway"
+
+This is almost always one of two by-design behaviours of
+`GitHubPRCommentChannel`, not a hang or a crash — see the "Supervising CI
+fixes from the pull request (`--interactive-pr-comments`)" section of
+[`docs/INTERACTION.md`](INTERACTION.md) (docs/INTERACTION.md) for the full
+mechanism.
+
+**A reply is silently ignored** if either check fails:
+
+- the commenter's GitHub login isn't in the `--interactive-pr-comment-author`
+  allow-list passed at startup (case-insensitive, no implicit default — an
+  empty list matches nobody); or
+- the reply's first whitespace-trimmed, lower-cased word isn't exactly
+  `` `apply` `` or `` `skip` `` — there is no fuzzy matching, so `"applying
+  now"` or `"Apply this"` (extra words) does not count as a match.
+
+Neither case logs anything the operator sees or posts an acknowledgement —
+the channel just keeps polling as if no reply had arrived.
+
+**The round fails safe to `skip` once the poll window is exhausted** (30
+polls at a 20-second interval by default — about 10 minutes). This is not a
+missed fix: the CI fix is deliberately *not* force-applied without a
+blessed reply, mirroring the console channel's own end-of-input fail-safe.
+
+**How to confirm this is what happened, not a hang:** nothing else needs
+checking — this channel only ever replaces the single `ci_fix_question`
+asked after a PR is open; plan review, escalation, and approval questions
+on the console terminal are a separate channel and are unaffected. Reply
+again from an allow-listed login with exactly `apply` or `skip` as the
+first word of a fresh comment before the next poll window closes.
+
 ## Dashboard/dispatch HTTP status quick-reference
 
 | Status | Meaning | Source |
