@@ -105,6 +105,33 @@ sections below are reconstructed from the repository history.
   decision document instead of the text proposal.
 
 ### Delivery
+- **A new opt-in, advisory docker-build verification gate closes
+  `docs/BENCHMARKS.md`'s named "Artifact execution gates ... can be added
+  today via `CommandGate` ... but not wired" DevOps gap** (#196). After
+  deployment artifacts are applied, `DeliveryEngine._docker_build_gate`
+  (called from `_provision_deployment`, gated on the new
+  `EngineConfig.docker_build_gate` / CLI `--docker-build-gate`, off by
+  default) scans the **post-apply** workspace listing for a root-level or
+  first-level-nested `Dockerfile` — the same `"/"`-count convention
+  `_manifest_signature` uses — and, if found, runs one
+  `CommandGate`-shaped `docker build -t <tag> .` through the existing
+  `command_runner` (`asyncio.to_thread`, `cwd`/`timeout` matching every
+  other gate). `tag` is a locally-generated run identifier
+  (`dev-team-verify-<pid>-<counter>`, never derived from Dockerfile
+  content), so a Dockerfile engineered with shell metacharacters in
+  comments/labels/`ARG` values cannot alter the invoked argv. The outcome
+  lands as advisory-only scorecard keys — `docker_build_verified` (bool)
+  and, on failure, a truncated `docker_build_detail` — mirroring
+  `mutation_check`'s "advisory, never a rejection" precedent: it never
+  raises, blocks, retries, or rolls back the delivery. A best-effort
+  `docker rmi <tag>` cleanup always runs afterwards, success or failure;
+  a cleanup that itself raises or fails is logged (a
+  `docker-build-cleanup-failed` event) and swallowed, never propagated.
+  Reuses `self.command_runner` verbatim, so under `--sandbox` this is a
+  true no-op (`docker_build_verified=False`, expected and harmless — see
+  `docs/SANDBOX.md`); without `--sandbox`, the build genuinely executes
+  the Dockerfile's own `RUN`/`ARG`/`FROM` instructions on the host, a
+  known tradeoff documented rather than glossed over.
 - **A run-level design-thoroughness signal is now trended in the score
   history** (#178, closing `docs/BENCHMARKS.md`'s named "in-house downstream
   metric (attempts-per-task per design) → roadmap" gap). Right after a

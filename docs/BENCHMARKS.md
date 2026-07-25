@@ -112,8 +112,20 @@ beat either alone, and false-positive suppression is a first-class metric.**
   the built environment). Unanimous oracle: **execution, never text quality**.
 - **Adopted:** real artifacts ✅ — Dockerfile/CI/service files authored as
   workspace files and shipped in the feature commit, matched to the detected
-  project kind. Artifact execution gates (`docker build` as a DoD gate) can
-  be added today via `CommandGate`; container-native verification → roadmap.
+  project kind. An opt-in, advisory execution gate (`--docker-build-gate` /
+  `EngineConfig.docker_build_gate`) now closes the "not wired" half of this
+  gap: after deployment artifacts are applied, a root or first-level-nested
+  Dockerfile is built once (`docker build -t <tag> .`, fixed argv, `tag`
+  locally generated — never derived from Dockerfile content) through the
+  existing `command_runner`, and the outcome lands as an advisory
+  `docker_build_verified` scorecard signal (never a rejection, mirroring
+  `mutation_check`'s precedent), with a best-effort `docker rmi` cleanup
+  always attempted. Off by default. Under `--sandbox`, this reuses the same
+  contained `command_runner` as every other gate — which typically has no
+  docker socket/network — so `docker_build_verified=False` there is the
+  expected, harmless outcome, not a bug. Container-native verification
+  (running the shipped health endpoint inside the built image) remains on
+  the roadmap.
 
 ## The in-house advantage
 

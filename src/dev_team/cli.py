@@ -676,6 +676,18 @@ def build_parser() -> argparse.ArgumentParser:
         "unless this is set.",
     )
     delivery.add_argument(
+        "--docker-build-gate",
+        action="store_true",
+        help="After deployment artifacts are applied, if a root or "
+        "first-level-nested Dockerfile is present, run 'docker build' "
+        "through the existing command runner (with --deliver). Off by "
+        "default; advisory only — records a docker_build_verified scorecard "
+        "signal, never blocks the delivery. Requires the host running the "
+        "engine to already have legitimate local docker access, and builds "
+        "whatever the Dockerfile's own RUN/ARG/FROM instructions do — see "
+        "docs/BENCHMARKS.md (DevOps).",
+    )
+    delivery.add_argument(
         "--finalization-reserve",
         type=float,
         default=0.10,
@@ -1159,6 +1171,7 @@ def _reject_deliver_only_flags(
         ("--proceed-on-red-baseline", args.proceed_on_red_baseline),
         ("--require-recognised-project", args.require_recognised_project),
         ("--allow-ci-workflows", args.allow_ci_workflows),
+        ("--docker-build-gate", args.docker_build_gate),
         (
             "--finalization-reserve",
             args.finalization_reserve != parser.get_default("finalization_reserve"),
@@ -1244,6 +1257,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         require_green_baseline=not args.proceed_on_red_baseline,
         require_recognised_project=args.require_recognised_project,
         allow_ci_workflows=args.allow_ci_workflows,
+        docker_build_gate=args.docker_build_gate,
         finalization_reserve_fraction=args.finalization_reserve,
         frontend_craft=not args.no_frontend_craft,
         visual_review=args.visual_review,

