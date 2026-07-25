@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -39,6 +40,7 @@ _DISPLAY_NAMES = {
     "ruby": "Ruby",
     "go": "Go",
     "php": "PHP",
+    "java": "Java",
 }
 
 #: The only products this module understands (every audited repo has
@@ -47,6 +49,19 @@ _DISPLAY_NAMES = {
 _SUPPORTED_PRODUCTS = frozenset(_DISPLAY_NAMES)
 
 _VERSION_RE = re.compile(r"\d+(?:\.\d+){0,2}")
+
+#: Java 5-8's dual-versioning convention (``1.5`` .. ``1.8``): endoflife.date
+#: indexes these cycles as ``"8"``, not ``"1.8"``.
+_LEGACY_JAVA_RE = re.compile(r"^1\.(\d+)")
+
+#: Checked in this order against a ``pom.xml``'s top-level ``<properties>``;
+#: the first present, non-empty, version-shaped value wins.
+_JAVA_VERSION_PROPERTIES = (
+    "maven.compiler.release",
+    "java.version",
+    "maven.compiler.target",
+    "maven.compiler.source",
+)
 
 
 @dataclass(frozen=True)
@@ -250,6 +265,49 @@ def parse_composer_json_php(text: str) -> Optional[Tuple[str, str]]:
     return ("php", version) if version else None
 
 
+def parse_pom_xml_java(text: str) -> Optional[Tuple[str, str]]:
+    """Maven ``pom.xml``: the effective Java language-level property.
+
+    Only the top-level ``<properties>`` element is read — not per-``
+    <profile>`` overrides, since profile activation is conditional and this
+    module has no build context to evaluate it. Checked in priority order
+    (see :data:`_JAVA_VERSION_PROPERTIES`); the first present, non-empty,
+    version-shaped value wins. A legacy ``1.X`` value (Java 5-8's dual-
+    versioning convention) reduces to ``X`` to match endoflife.date's
+    ``java`` cycle identifiers (``"8"``, ``"11"``, ``"17"``, ...).
+
+    ``ValueError`` is caught alongside ``ET.ParseError``: an XML
+    declaration naming a multi-byte encoding (e.g. ``UTF-16``) on a
+    ``str`` input — exactly what ``workspace.read_text`` hands this
+    function — makes expat raise a bare ``ValueError``, not a
+    ``ParseError``.
+    """
+
+    try:
+        root = ET.fromstring(text)
+    except (ET.ParseError, ValueError):
+        return None
+    properties = None
+    for child in root:
+        if child.tag.rsplit("}", 1)[-1] == "properties":
+            properties = child
+            break
+    if properties is None:
+        return None
+    values: Dict[str, str] = {}
+    for prop in properties:
+        tag = prop.tag.rsplit("}", 1)[-1]
+        if tag in _JAVA_VERSION_PROPERTIES and tag not in values:
+            values[tag] = prop.text or ""
+    for name in _JAVA_VERSION_PROPERTIES:
+        version = _leading_version(values.get(name, ""))
+        if not version:
+            continue
+        legacy = _LEGACY_JAVA_RE.match(version)
+        return ("java", legacy.group(1) if legacy else version)
+    return None
+
+
 _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "package.json": parse_package_json_engines,
     ".nvmrc": parse_nvmrc,
@@ -259,6 +317,7 @@ _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     ".ruby-version": parse_ruby_version,
     "go.mod": parse_go_mod,
     "composer.json": parse_composer_json_php,
+    "pom.xml": parse_pom_xml_java,
 }
 
 

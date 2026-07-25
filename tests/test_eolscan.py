@@ -11,6 +11,7 @@ import pytest
 from dev_team.eolscan import (
     EolScan,
     EolStatus,
+    Runtime,
     _cycle_candidates,
     _eol_verdict,
     _http_fetch,
@@ -21,6 +22,7 @@ from dev_team.eolscan import (
     parse_go_mod,
     parse_nvmrc,
     parse_package_json_engines,
+    parse_pom_xml_java,
     parse_python_version,
     parse_ruby_version,
     parse_runtime_txt,
@@ -161,6 +163,224 @@ def test_parse_composer_json_php_malformed_never_raises():
         json.dumps({"require": {"php": 8}})
     ) is None
     assert parse_composer_json_php("") is None
+
+
+_POM_NS = "http://maven.apache.org/POM/4.0.0"
+
+
+def _pom(properties_xml="", *, namespaced=True, extra="", tag="project"):
+    xmlns = f' xmlns="{_POM_NS}"' if namespaced else ""
+    return f"<{tag}{xmlns}>{extra}<properties>{properties_xml}</properties></{tag}>"
+
+
+def test_parse_pom_xml_java_well_formed_namespaced():
+    text = _pom("<maven.compiler.release>17</maven.compiler.release>")
+    assert parse_pom_xml_java(text) == ("java", "17")
+
+
+def test_parse_pom_xml_java_priority_release_over_java_version():
+    text = _pom(
+        "<maven.compiler.release>17</maven.compiler.release>"
+        "<java.version>11</java.version>"
+    )
+    assert parse_pom_xml_java(text) == ("java", "17")
+
+
+def test_parse_pom_xml_java_priority_java_version_over_target():
+    text = _pom(
+        "<java.version>11</java.version>"
+        "<maven.compiler.target>1.8</maven.compiler.target>"
+    )
+    assert parse_pom_xml_java(text) == ("java", "11")
+
+
+def test_parse_pom_xml_java_priority_target_over_source():
+    text = _pom(
+        "<maven.compiler.target>17</maven.compiler.target>"
+        "<maven.compiler.source>1.8</maven.compiler.source>"
+    )
+    assert parse_pom_xml_java(text) == ("java", "17")
+
+
+def test_parse_pom_xml_java_source_alone():
+    text = _pom("<maven.compiler.source>11</maven.compiler.source>")
+    assert parse_pom_xml_java(text) == ("java", "11")
+
+
+def test_parse_pom_xml_java_legacy_1_x_normalises():
+    text = _pom("<maven.compiler.source>1.8</maven.compiler.source>")
+    assert parse_pom_xml_java(text) == ("java", "8")
+
+
+def test_parse_pom_xml_java_modern_version_passes_through():
+    text = _pom("<java.version>21</java.version>")
+    assert parse_pom_xml_java(text) == ("java", "21")
+
+
+def test_parse_pom_xml_java_no_properties_element():
+    text = f'<project xmlns="{_POM_NS}"><groupId>x</groupId></project>'
+    assert parse_pom_xml_java(text) is None
+
+
+def test_parse_pom_xml_java_properties_with_no_recognised_keys():
+    text = _pom("<other.thing>1</other.thing>")
+    assert parse_pom_xml_java(text) is None
+
+
+def test_parse_pom_xml_java_empty_document():
+    assert parse_pom_xml_java("") is None
+
+
+def test_parse_pom_xml_java_non_version_shaped_value_falls_through():
+    text = _pom(
+        "<maven.compiler.release>${revision}</maven.compiler.release>"
+        "<java.version>11</java.version>"
+    )
+    assert parse_pom_xml_java(text) == ("java", "11")
+
+
+def test_parse_pom_xml_java_non_version_shaped_value_with_no_fallback_is_none():
+    text = _pom("<maven.compiler.release>${revision}</maven.compiler.release>")
+    assert parse_pom_xml_java(text) is None
+
+
+def test_parse_pom_xml_java_empty_property_text_falls_through():
+    text = _pom(
+        "<maven.compiler.release></maven.compiler.release>"
+        "<maven.compiler.source>11</maven.compiler.source>"
+    )
+    assert parse_pom_xml_java(text) == ("java", "11")
+
+
+def test_parse_pom_xml_java_malformed_never_raises():
+    assert parse_pom_xml_java("<project><properties>") is None  # truncated
+    assert parse_pom_xml_java("not xml at all \x00\x01") is None  # non-XML bytes
+    assert parse_pom_xml_java("<not-even-xml") is None
+
+
+def test_parse_pom_xml_java_multibyte_encoding_declaration_never_raises(monkeypatch):
+    # A `pom.xml` whose XML declaration names a multi-byte encoding (e.g.
+    # `encoding="UTF-16"`) fed as a `str` — exactly what workspace.read_text
+    # hands this function — makes CPython's expat binding raise a bare
+    # `ValueError: multi-byte encodings are not supported`, not
+    # `ET.ParseError`. That's not reliably reproducible across expat/CPython
+    # builds, so pin the contract directly: force `ET.fromstring` to raise
+    # `ValueError` and assert it degrades to `None` rather than propagating,
+    # both directly and via detect_runtimes.
+    import dev_team.eolscan as eolscan
+
+    def _raise_value_error(text):
+        raise ValueError("multi-byte encodings are not supported")
+
+    monkeypatch.setattr(eolscan.ET, "fromstring", _raise_value_error)
+
+    text = _pom("<java.version>17</java.version>")
+    assert parse_pom_xml_java(text) is None
+    ws = InMemoryWorkspace({"pom.xml": text})
+    assert detect_runtimes(ws) == []
+
+
+def test_parse_pom_xml_java_billion_laughs_never_raises():
+    # Classic 9-level "billion laughs" entity expansion inside <properties>:
+    # expat's built-in amplification-attack protection surfaces this as
+    # ET.ParseError, which this parser already catches — assert it degrades
+    # to None, not a crash or a resource-exhausting hang, both directly and
+    # via detect_runtimes.
+    payload = (
+        '<?xml version="1.0"?>\n'
+        "<!DOCTYPE properties [\n"
+        ' <!ENTITY lol1 "1234567890">\n'
+        ' <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">\n'
+        ' <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">\n'
+        ' <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">\n'
+        ' <!ENTITY lol5 "&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;">\n'
+        ' <!ENTITY lol6 "&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;">\n'
+        ' <!ENTITY lol7 "&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;">\n'
+        ' <!ENTITY lol8 "&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;">\n'
+        ' <!ENTITY lol9 "&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;">\n'
+        "]>\n"
+        f'<project xmlns="{_POM_NS}"><properties>'
+        "<java.version>&lol9;</java.version>"
+        "</properties></project>\n"
+    )
+    assert parse_pom_xml_java(payload) is None
+    ws = InMemoryWorkspace({"pom.xml": payload})
+    assert detect_runtimes(ws) == []
+
+
+def test_parse_pom_xml_java_profile_scoped_properties_not_read():
+    # Only the top-level <properties> is read — a <profile>-scoped override
+    # is conditionally activated and this module has no build context to
+    # evaluate it, so it must never be picked up as a fallback.
+    text = (
+        f'<project xmlns="{_POM_NS}">'
+        "<properties><maven.compiler.release>17</maven.compiler.release></properties>"
+        "<profiles><profile><properties>"
+        "<maven.compiler.release>21</maven.compiler.release>"
+        "</properties></profile></profiles>"
+        "</project>"
+    )
+    assert parse_pom_xml_java(text) == ("java", "17")
+
+
+def test_crafted_pom_xml_property_value_never_parses_to_a_version():
+    malicious = ["$(rm -rf /)", "../../etc/passwd", "; rm -rf /", "`id`"]
+    for spec in malicious:
+        text = _pom(f"<java.version>{spec}</java.version>")
+        assert parse_pom_xml_java(text) is None
+
+
+def test_detect_runtimes_java_from_pom_xml():
+    text = _pom("<maven.compiler.release>17</maven.compiler.release>")
+    ws = InMemoryWorkspace({"pom.xml": text})
+    runtimes = detect_runtimes(ws)
+    assert runtimes == [Runtime(product="java", version="17", manifest="pom.xml")]
+
+
+def test_detect_runtimes_java_alongside_another_product_no_cross_interference():
+    ws = InMemoryWorkspace(
+        {
+            "pom.xml": _pom("<java.version>17</java.version>"),
+            "go.mod": "module example.com/foo\n\ngo 1.21\n",
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert sorted((r.product, r.version, r.manifest) for r in runtimes) == [
+        ("go", "1.21", "go.mod"),
+        ("java", "17", "pom.xml"),
+    ]
+
+
+def test_detect_runtimes_no_pom_xml_unchanged_by_java_support():
+    ws = InMemoryWorkspace(
+        {
+            "composer.json": json.dumps({"require": {"php": "^8.1"}}),
+            "go.mod": "module example.com/foo\n\ngo 1.21\n",
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert sorted((r.product, r.version, r.manifest) for r in runtimes) == [
+        ("go", "1.21", "go.mod"),
+        ("php", "8.1", "composer.json"),
+    ]
+
+
+def test_scan_eol_reports_status_for_java():
+    ws = InMemoryWorkspace(
+        {"pom.xml": _pom("<maven.compiler.release>17</maven.compiler.release>")}
+    )
+
+    def fetch(product):
+        assert product == "java"
+        return [{"cycle": "17", "eol": _FUTURE_EOL}]
+
+    scan = scan_eol(ws, fetch=fetch)
+    assert scan.queried is True
+    by_product = {s.runtime.product: s for s in scan.statuses}
+    assert by_product["java"].end_of_life is False
+    rendered = scan.render()
+    assert "Java 17 (pom.xml)" in rendered
+    assert "supported" in rendered
 
 
 # --- detect_runtimes ----------------------------------------------------------------
