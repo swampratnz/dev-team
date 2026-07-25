@@ -118,6 +118,39 @@ def test_render_no_delta_annotation_when_metrics_unchanged():
     assert lines[-1] == "- B: ok, 1/1 tasks, 1 attempt(s), $0.0100"  # no "| delta"
 
 
+def test_score_deltas_pick_up_design_thoroughness_keys_generically():
+    # Regression test: the generic key-union mechanism in `_score_deltas`
+    # picks up new scorecard keys (design_components_count etc., issue #178)
+    # with no production changes to this module.
+    ws = InMemoryWorkspace()
+    hist = ScoreHistory(ws)
+    hist.record(
+        _score(
+            "First",
+            scorecard={
+                "design_components_count": 1,
+                "design_risks_count": 1,
+                "design_alternatives_count": 0,
+            },
+        )
+    )
+    hist.record(
+        _score(
+            "Second",
+            scorecard={
+                "design_components_count": 3,
+                "design_risks_count": 0,
+                "design_alternatives_count": 2,
+            },
+        )
+    )
+    delta = hist.latest_delta()
+    assert delta is not None
+    assert "design_components_count +2" in delta
+    assert "design_risks_count -1" in delta
+    assert "design_alternatives_count +2" in delta
+
+
 def test_latest_delta_edges():
     ws = InMemoryWorkspace()
     hist = ScoreHistory(ws)
