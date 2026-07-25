@@ -432,12 +432,12 @@ with a different approach, or drop it — and re-runs the mutated plan, bounded 
 `N` rounds and the budget. Interactive runs supervise each proposal (apply /
 revise / reject); unattended runs apply it autonomously.
 
-`--reuse-engineer-session` (default off, agentic runs only) holds one SDK session
-open across a task's engineer attempts, so a retry continues the prior
-conversation — the code it read, the changes it made — and sends only the
-feedback rather than re-establishing everything from cold. It's the biggest
-token saving on retried tasks; a session that errors falls back to a cold
-attempt.
+Session reuse (agentic runs only) holds one SDK session open across a task's
+engineer attempts, so a retry continues the prior conversation — the code it
+read, the changes it made — and sends only the feedback rather than
+re-establishing everything from cold. It's the biggest token saving on
+retried tasks; a session that errors falls back to a cold attempt. On by
+default; opt out with `--no-reuse-engineer-session`.
 
 `--retrieval` (default off) puts the most *relevant* existing code in front of
 the architect and the described engineer, not just the repo's file tree: a

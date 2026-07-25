@@ -305,11 +305,12 @@ class EngineConfig:
     #: Reuse one persistent SDK session across a task's engineer attempts, so a
     #: retry continues the prior conversation (the code it read, the changes it
     #: made) rather than restarting cold — the big token saving on the shared
-    #: pool. Off by default (opt-in); agentic, non-worktree only. A session turn
-    #: that errors falls back to a cold attempt, and per-attempt model
-    #: escalation does not apply on the session path (the session's model is
-    #: fixed for its life). See ROADMAP #5.
-    reuse_engineer_session: bool = False
+    #: pool. On by default; agentic runs only (opt out with
+    #: ``--no-reuse-engineer-session``). A session turn that errors falls back
+    #: to a cold attempt, and per-attempt model escalation does not apply on
+    #: the session path (the session's model is fixed for its life). See
+    #: ROADMAP #5.
+    reuse_engineer_session: bool = True
     #: Retrieve the workspace's most-relevant code into the architect's prompt
     #: (and, later, the described engineer's), instead of only the repo map's
     #: path tree. Off by default (opt-in); deterministic lexical ranking, see

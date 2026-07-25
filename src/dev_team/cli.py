@@ -777,11 +777,12 @@ def build_parser() -> argparse.ArgumentParser:
         "(0 = off, the default; with --deliver).",
     )
     delivery.add_argument(
-        "--reuse-engineer-session",
+        "--no-reuse-engineer-session",
         action="store_true",
-        help="Reuse one SDK session across a task's engineer attempts so a "
-        "retry continues rather than restarts cold, saving tokens (agentic "
-        "runs only; off by default; with --deliver).",
+        help="Do not reuse one SDK session across a task's engineer attempts; "
+        "restart cold on every retry instead of continuing the prior "
+        "conversation (agentic runs only; session reuse is on by default; "
+        "with --deliver).",
     )
     delivery.add_argument(
         "--retrieval",
@@ -1188,7 +1189,7 @@ def _reject_deliver_only_flags(
             "--max-replan-rounds",
             args.max_replan_rounds != parser.get_default("max_replan_rounds"),
         ),
-        ("--reuse-engineer-session", args.reuse_engineer_session),
+        ("--no-reuse-engineer-session", args.no_reuse_engineer_session),
         ("--retrieval", args.retrieval),
         ("--retrieval-tokens", args.retrieval_tokens != parser.get_default("retrieval_tokens")),
         ("--llm-retrospective", args.llm_retrospective),
@@ -1249,7 +1250,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         commit=not args.no_commit,
         branch=args.branch,
         max_replan_rounds=args.max_replan_rounds,
-        reuse_engineer_session=args.reuse_engineer_session,
+        reuse_engineer_session=not args.no_reuse_engineer_session,
         retrieval=args.retrieval,
         retrieval_token_budget=args.retrieval_tokens,
         llm_retrospective=args.llm_retrospective,
