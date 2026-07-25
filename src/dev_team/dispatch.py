@@ -620,12 +620,29 @@ class Dispatcher:
                         last_swept is None
                         or now - last_swept >= _SWEEP_INTERVAL_SECONDS
                     ):
-                        sweep_expired_archives(
-                            self._dashboard_workspace,
-                            self._purge_ttl_days,
-                            self.purge_job,
-                            clock=self._clock,
-                        )
+                        try:
+                            sweep_expired_archives(
+                                self._dashboard_workspace,
+                                self._purge_ttl_days,
+                                self.purge_job,
+                                clock=self._clock,
+                            )
+                        except Exception:  # noqa: BLE001 — a failed sweep must not kill the worker
+                            # Same containment as the _execute guard below.
+                            # The sweep's per-job deletions are already
+                            # contained inside sweep_expired_archives, so
+                            # what reaches here is an enumeration-level
+                            # failure (a dashboard workspace list_files()
+                            # raising OSError, say). Without this the
+                            # exception would escape the `while True` body
+                            # — the enclosing try has only a `finally` — and
+                            # kill this daemon thread for good, which at the
+                            # default --max-concurrent-jobs 1 silently ends
+                            # all future job dispatch for the service.
+                            pass
+                        # Set even when the sweep failed: back off for a full
+                        # interval rather than re-attempting a failing sweep
+                        # on every idle poll.
                         last_swept = now
                     try:
                         item = self._queue.get(timeout=_SWEEP_POLL_SECONDS)
@@ -2488,7 +2505,12 @@ def sweep_expired_archives(
 
     A missing or malformed ``meta.json``, or a non-numeric ``archived_at``,
     is treated as not-eligible rather than raising — the same fail-closed
-    posture as :meth:`Dispatcher._read_meta`.
+    posture as :meth:`Dispatcher._read_meta`. A ``purge_fn`` that *raises*
+    (rather than answering a non-200) is contained the same way: that job is
+    skipped and the sweep continues with the next candidate, so one
+    undeletable job can neither abort the rest of the sweep nor, via
+    :meth:`Dispatcher._worker_loop`, kill the worker thread. The next sweep
+    retries it.
 
     Returns the ids actually purged (``purge_fn`` returned ``200``).
     """
@@ -2515,7 +2537,18 @@ def sweep_expired_archives(
             continue
         if archived_at > cutoff:
             continue
-        status, _ = purge_fn(job_id)
+        try:
+            status, _ = purge_fn(job_id)
+        except Exception:  # noqa: BLE001 — one bad job must not stop the sweep
+            # purge_fn's deletion path contains WorkspaceError (a planted
+            # symlink escape) but not a bare OSError: a permission-denied
+            # file, or a TOCTOU race between its exists() check and the
+            # unlink, still raises. Unlike an explicit HTTP purge — where
+            # the caller sees the failure and retries — this sweep runs
+            # unattended on the worker thread, so one undeletable job must
+            # not abort the remaining candidates (nor, via the caller, kill
+            # the worker). Skip it; the next sweep retries it.
+            continue
         if status == 200:
             purged.append(job_id)
     return purged

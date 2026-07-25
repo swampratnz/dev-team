@@ -2126,6 +2126,54 @@ def test_sweep_expired_archives_second_racing_pass_finds_nothing_left_to_purge(
     assert second == []
 
 
+def test_sweep_expired_archives_a_raising_purge_skips_that_job_and_keeps_going(
+    tmp_path,
+):
+    # Regression for the third #184 review: purge_job's deletion path only
+    # contains WorkspaceError, so a bare OSError (permission denied, or a
+    # TOCTOU race between its exists() check and the unlink) escaped the
+    # sweep. Unattended on the worker thread, one undeletable job must not
+    # abort the remaining candidates.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    bad_id, good_id = "assess-aaa-undeletable", "assess-zzz-fine"
+    for job_id in (bad_id, good_id):
+        dash.write_text(
+            f"audit/{job_id}/meta.json",
+            json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
+        )
+
+    def purge_fn(job_id):
+        if job_id == bad_id:
+            raise PermissionError("audit file is not deletable")
+        return 200, {}
+
+    purged = sweep_expired_archives(dash, 1, purge_fn, clock=lambda: 10_000_000.0)
+
+    assert purged == [good_id]
+
+
+def test_worker_loop_survives_a_sweep_that_raises(monkeypatch, tmp_path):
+    # Regression for the third #184 review: an exception escaping the sweep
+    # propagated out of the `while True` body (whose enclosing try has only a
+    # `finally`), killing this daemon thread for good -- at the default
+    # --max-concurrent-jobs 1 that silently ends all future job dispatch.
+    def exploding_sweep(*args, **kwargs):
+        raise OSError("dashboard workspace enumeration failed")
+
+    monkeypatch.setattr(dispatch_mod, "sweep_expired_archives", exploding_sweep)
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=_mem_materialise,
+        dashboard_workspace=InMemoryWorkspace(), jobs_root=str(tmp_path),
+        purge_ttl_days=1,
+    )
+    disp.start()
+    try:
+        job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert disp.wait(job_id, 5), "worker thread died on a failing sweep"
+    finally:
+        disp.stop()
+
+
 def test_purge_ttl_none_default_never_invokes_the_sweep(monkeypatch, tmp_path):
     calls = []
     real_sweep = dispatch_mod.sweep_expired_archives

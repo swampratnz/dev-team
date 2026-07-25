@@ -541,6 +541,22 @@ threads, so the sweep fires redundantly across all of them once per tick
 when `--purge-ttl-days` is set — each redundant call still serialises
 through `purge_job`'s own lock and simply finds nothing left to do, an
 accepted, documented $0 cost against the shared Max pool rather than a bug.
+
+Because the sweep runs unattended on the worker thread — unlike an explicit
+`DELETE` where the caller sees the failure and retries — it is contained at
+both levels. A `purge_job` that *raises* rather than answering a non-200 (its
+deletion path contains `WorkspaceError`, but a bare `OSError` such as a
+permission-denied file or a TOCTOU race between its `exists()` check and the
+unlink still escapes) skips only that job; the sweep continues with the
+remaining candidates and the next sweep retries it. An enumeration-level
+failure that escapes the sweep entirely is caught by the worker loop, which
+backs off a full interval rather than re-attempting on every idle poll. This
+matters because the worker is a daemon thread that is never respawned: an
+uncaught exception here would silently end all future job dispatch for the
+service (at the default `--max-concurrent-jobs 1`, permanently), which is
+exactly the failure mode automating an unattended purge would otherwise
+introduce.
+
 Off by default (`purge_ttl_days=None`): with no flag, `sweep_expired_archives`
 is never invoked, the worker's queue wait stays a blocking (not polled)
 `get()`, and behaviour is byte-identical to before this feature existed.
