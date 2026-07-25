@@ -29,9 +29,10 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import itertools
 import os
 from dataclasses import dataclass, field, replace
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .agents import (
     ArchitectAgent,
@@ -139,6 +140,13 @@ from .verification import (
 # Internal bookkeeping lives under this prefix and is not part of the product.
 _INTERNAL_PREFIX = ".dev_team/"
 
+# Process-local counter combined with the PID to give each DeliveryEngine a
+# distinct run identifier (same "PID + counter" shape as execution.py's
+# staging-file suffix) — used to tag advisory-only local artifacts (e.g. the
+# docker-build gate's image tag) so two engines building the same repo's
+# Dockerfile concurrently on one host can't collide.
+_RUN_ID_COUNTER = itertools.count()
+
 
 @dataclass
 class EngineConfig:
@@ -202,6 +210,16 @@ class EngineConfig:
       repositories whose build only runs remotely (e.g. legacy .NET
       Framework on a Windows pipeline). ``status_command`` is polled until
       it exits zero; the optional trigger kicks the remote run off first.
+    - ``docker_build_gate``: after deployment artifacts are applied, if a
+      root or first-level-nested Dockerfile is present, run one
+      ``docker build -t <tag> .`` through the existing ``command_runner``
+      (inheriting whatever ``--sandbox`` posture the rest of the run has) and
+      record the outcome as an advisory ``docker_build_verified`` scorecard
+      signal plus a truncated ``docker_build_detail`` on failure — never a
+      rejection, retry, or rollback (mirrors ``mutation_check``'s
+      advisory-only precedent). Off by default. A best-effort ``docker rmi``
+      cleanup always runs afterwards, success or failure. See
+      ``docs/BENCHMARKS.md`` (DevOps) and ROADMAP.
     """
 
     model: Optional[str] = None
@@ -320,6 +338,11 @@ class EngineConfig:
     remote_verify_trigger: Optional[Sequence[str]] = None
     remote_verify_max_polls: int = 30
     remote_verify_interval_seconds: float = 60.0
+    #: Opt-in advisory verification: build a root/first-level-nested
+    #: Dockerfile the DevOps agent authored, through the existing
+    #: ``command_runner``. Off by default; never blocks, retries, or rolls
+    #: back the delivery — see the class docstring for the full contract.
+    docker_build_gate: bool = False
     #: How many rounds of dynamic re-planning to run after the schedule leaves
     #: tasks failed. 0 (the default) keeps the current behaviour — a failed task
     #: just stays failed. When >0, the product manager proposes a mutation
@@ -383,7 +406,10 @@ class DeliveryOutcome:
     branch: Optional[str] = None
     baseline: Optional[DoDReport] = None
     halted_reason: Optional[str] = None
-    scorecard: Dict[str, int] = field(default_factory=dict)
+    #: Mostly ``int`` counters (``gate_failures``, ``mutation_survived``, ...);
+    #: ``docker_build_gate`` additionally sets ``docker_build_verified``
+    #: (``bool``) and, on failure, ``docker_build_detail`` (``str``).
+    scorecard: Dict[str, Any] = field(default_factory=dict)
     #: URL of the pull request opened for this delivery, when the caller asked
     #: for one (``--pull-request``) and the delivery had a committed branch to
     #: publish. ``None`` otherwise. Set after ``deliver`` returns, by the
@@ -566,7 +592,7 @@ _MAX_REJECTION_DETAIL_CHARS = 400
 def _run_evidence(
     task_results: List[TaskResult],
     security: Optional[SecurityReport],
-    scorecard: Mapping[str, int],
+    scorecard: Mapping[str, Any],
     spans: Sequence[TraceSpan],
     budget_spent: Optional[float],
 ) -> str:
@@ -942,7 +968,12 @@ class DeliveryEngine:
         self._profile_autodetected = False
         self._last_manifest_signature: frozenset = frozenset()
         self._conventions: Optional[str] = None
-        self._scorecard: Dict[str, int] = {}
+        self._scorecard: Dict[str, Any] = {}
+        # Distinct per engine instance (PID + a process-local counter), never
+        # random or wall-clock derived — the docker-build gate's image tag
+        # embeds this so two engines building the same repo's Dockerfile
+        # concurrently on one host can't collide.
+        self._run_id = f"{os.getpid()}-{next(_RUN_ID_COUNTER)}"
 
         def make(cls):
             wrapped = InstrumentedRunner(
@@ -1036,7 +1067,7 @@ class DeliveryEngine:
         if halt is not None:
             self.tracer.end(run_span, "halted")
             return self._halted(request, halt)
-        self._scorecard: Dict[str, int] = {
+        self._scorecard: Dict[str, Any] = {
             "plan_lint_issues": 0,
             "review_rejections": 0,
             "gate_failures": 0,
@@ -3287,7 +3318,87 @@ class DeliveryEngine:
                 "FEATURE",
                 ", ".join(c.path for c in artifacts.files if c.path),
             )
+        await self._docker_build_gate()
         return plan
+
+    async def _docker_build_gate(self) -> None:
+        """Advisory-only: build the just-materialised workspace's Dockerfile.
+
+        Off unless ``docker_build_gate`` is set (early return keeps a run with
+        the flag off byte-identical to before this existed). Reads the
+        **post-apply** workspace listing — not ``artifacts.files`` — so this
+        only ever sees what actually landed on disk, independent of the
+        ``allow_ci_workflows`` filter above. A root-level or first-level-nested
+        ``Dockerfile`` (the same ``"/"``-count convention
+        :meth:`_manifest_signature` uses) triggers one fixed
+        ``docker build -t <tag> .`` through the existing ``command_runner`` —
+        ``tag`` is a locally-generated run identifier, never derived from
+        Dockerfile content, so the invoked argv can't be influenced by
+        agent-authored (and therefore, transitively, repo-influenced) text.
+        This inherits whatever containment posture (``--sandbox`` or not) the
+        rest of the run already has; the build itself still executes whatever
+        the Dockerfile's own ``RUN``/``ARG``/``FROM`` instructions do.
+
+        Records the outcome as advisory scorecard keys only — it never
+        raises, blocks, or rolls back the delivery. A best-effort
+        ``docker rmi`` cleanup always runs afterwards, success or failure, so
+        a shared dispatch host doesn't accumulate verification images; a
+        cleanup failure is logged, never raised.
+        """
+
+        if not self.config.docker_build_gate:
+            return
+        files = [
+            f for f in self.workspace.list_files() if not f.startswith(_INTERNAL_PREFIX)
+        ]
+        has_dockerfile = any(
+            f == "Dockerfile" or (f.count("/") == 1 and f.rsplit("/", 1)[1] == "Dockerfile")
+            for f in files
+        )
+        if not has_dockerfile:
+            return
+        tag = f"dev-team-verify-{self._run_id}"
+        build_result = await asyncio.to_thread(
+            self.command_runner.run,
+            ["docker", "build", "-t", tag, "."],
+            cwd=self.workdir,
+            timeout=self.config.gate_timeout_seconds,
+        )
+        self._scorecard["docker_build_verified"] = build_result.ok
+        if build_result.ok:
+            self._event(
+                "docker-build-verified",
+                f"advisory docker build succeeded (tag={tag})",
+            )
+        else:
+            detail = " ".join(str(build_result.output).split())
+            if len(detail) > _MAX_REJECTION_DETAIL_CHARS:
+                detail = detail[:_MAX_REJECTION_DETAIL_CHARS].rstrip() + "..."
+            self._scorecard["docker_build_detail"] = detail
+            self._event(
+                "docker-build-failed",
+                f"advisory docker build failed (tag={tag})",
+                detail=detail,
+            )
+        try:
+            cleanup_result = await asyncio.to_thread(
+                self.command_runner.run,
+                ["docker", "rmi", tag],
+                cwd=self.workdir,
+                timeout=self.config.gate_timeout_seconds,
+            )
+        except Exception as exc:
+            self._event(
+                "docker-build-cleanup-failed",
+                f"best-effort docker rmi {tag} raised: {exc}",
+            )
+        else:
+            if not cleanup_result.ok:
+                self._event(
+                    "docker-build-cleanup-failed",
+                    f"best-effort docker rmi {tag} failed",
+                    detail=cleanup_result.output or None,
+                )
 
     async def _assess_reliability(
         self,
