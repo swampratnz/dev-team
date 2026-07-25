@@ -113,10 +113,14 @@ sections below are reconstructed from the repository history.
   `EngineConfig.docker_build_gate` / CLI `--docker-build-gate`, off by
   default) scans the **post-apply** workspace listing for a root-level or
   first-level-nested `Dockerfile` — the same `"/"`-count convention
-  `_manifest_signature` uses — and, if found, runs one
-  `CommandGate`-shaped `docker build -t <tag> .` through the existing
+  `_manifest_signature` uses (root preferred when both exist) — and, if
+  found, runs one `CommandGate`-shaped build through the existing
   `command_runner` (`asyncio.to_thread`, `cwd`/`timeout` matching every
-  other gate). `tag` is a locally-generated run identifier
+  other gate): `docker build -t <tag> .` for a root `Dockerfile`, or
+  `docker build -t <tag> -f <nested>/Dockerfile .` for a first-level-nested
+  one — plain `docker build .` only ever resolves `<context>/Dockerfile`, so
+  the nested case needs the explicit `-f` or the wrong (or no) file gets
+  built. `tag` is a locally-generated run identifier
   (`dev-team-verify-<pid>-<counter>`, never derived from Dockerfile
   content), so a Dockerfile engineered with shell metacharacters in
   comments/labels/`ARG` values cannot alter the invoked argv. The outcome

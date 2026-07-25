@@ -212,14 +212,16 @@ class EngineConfig:
       it exits zero; the optional trigger kicks the remote run off first.
     - ``docker_build_gate``: after deployment artifacts are applied, if a
       root or first-level-nested Dockerfile is present, run one
-      ``docker build -t <tag> .`` through the existing ``command_runner``
-      (inheriting whatever ``--sandbox`` posture the rest of the run has) and
-      record the outcome as an advisory ``docker_build_verified`` scorecard
-      signal plus a truncated ``docker_build_detail`` on failure — never a
-      rejection, retry, or rollback (mirrors ``mutation_check``'s
-      advisory-only precedent). Off by default. A best-effort ``docker rmi``
-      cleanup always runs afterwards, success or failure. See
-      ``docs/BENCHMARKS.md`` (DevOps) and ROADMAP.
+      ``docker build -t <tag> .`` (root) or
+      ``docker build -t <tag> -f <nested/Dockerfile> .`` (first-level-nested,
+      context stays the workspace root) through the existing
+      ``command_runner`` (inheriting whatever ``--sandbox`` posture the rest
+      of the run has) and record the outcome as an advisory
+      ``docker_build_verified`` scorecard signal plus a truncated
+      ``docker_build_detail`` on failure — never a rejection, retry, or
+      rollback (mirrors ``mutation_check``'s advisory-only precedent). Off by
+      default. A best-effort ``docker rmi`` cleanup always runs afterwards,
+      success or failure. See ``docs/BENCHMARKS.md`` (DevOps) and ROADMAP.
     """
 
     model: Optional[str] = None
@@ -3330,14 +3332,23 @@ class DeliveryEngine:
         only ever sees what actually landed on disk, independent of the
         ``allow_ci_workflows`` filter above. A root-level or first-level-nested
         ``Dockerfile`` (the same ``"/"``-count convention
-        :meth:`_manifest_signature` uses) triggers one fixed
-        ``docker build -t <tag> .`` through the existing ``command_runner`` —
-        ``tag`` is a locally-generated run identifier, never derived from
-        Dockerfile content, so the invoked argv can't be influenced by
-        agent-authored (and therefore, transitively, repo-influenced) text.
-        This inherits whatever containment posture (``--sandbox`` or not) the
-        rest of the run already has; the build itself still executes whatever
-        the Dockerfile's own ``RUN``/``ARG``/``FROM`` instructions do.
+        :meth:`_manifest_signature` uses) triggers one fixed build through the
+        existing ``command_runner``: a root ``Dockerfile`` (preferred when
+        both exist, since that's what a plain ``docker build .`` resolves to)
+        runs as ``docker build -t <tag> .``; a first-level-nested one (e.g.
+        ``deploy/Dockerfile``) runs as
+        ``docker build -t <tag> -f deploy/Dockerfile .`` — Docker's default
+        Dockerfile resolution only ever looks at ``<context>/Dockerfile``, so
+        without the explicit ``-f`` a nested Dockerfile would never actually
+        be the one built. ``tag`` is a locally-generated run identifier,
+        never derived from Dockerfile content, and the detected path is a
+        repo-relative filename constrained to the same "root or exactly one
+        '/'" shape checked below — never attacker-controlled shell text — so
+        neither can influence the invoked argv beyond selecting which
+        already-on-disk file is built. This inherits whatever containment
+        posture (``--sandbox`` or not) the rest of the run already has; the
+        build itself still executes whatever the Dockerfile's own
+        ``RUN``/``ARG``/``FROM`` instructions do.
 
         Records the outcome as advisory scorecard keys only — it never
         raises, blocks, or rolls back the delivery. A best-effort
@@ -3351,16 +3362,23 @@ class DeliveryEngine:
         files = [
             f for f in self.workspace.list_files() if not f.startswith(_INTERNAL_PREFIX)
         ]
-        has_dockerfile = any(
-            f == "Dockerfile" or (f.count("/") == 1 and f.rsplit("/", 1)[1] == "Dockerfile")
-            for f in files
+        nested_dockerfiles = sorted(
+            f for f in files if f.count("/") == 1 and f.rsplit("/", 1)[1] == "Dockerfile"
         )
-        if not has_dockerfile:
+        if "Dockerfile" in files:
+            dockerfile_path = "Dockerfile"
+        elif nested_dockerfiles:
+            dockerfile_path = nested_dockerfiles[0]
+        else:
             return
         tag = f"dev-team-verify-{self._run_id}"
+        build_command = ["docker", "build", "-t", tag]
+        if dockerfile_path != "Dockerfile":
+            build_command += ["-f", dockerfile_path]
+        build_command.append(".")
         build_result = await asyncio.to_thread(
             self.command_runner.run,
-            ["docker", "build", "-t", tag, "."],
+            build_command,
             cwd=self.workdir,
             timeout=self.config.gate_timeout_seconds,
         )
