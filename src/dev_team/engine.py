@@ -95,7 +95,7 @@ from .memory import (
     RunCheckpoint,
     task_fingerprint,
 )
-from .mutation import mutate_first_comparison
+from .mutation import mutate_first_mutant
 from .scores import RunScore, ScoreHistory
 from .models import (
     ChangeType,
@@ -187,14 +187,15 @@ class EngineConfig:
       Skipped for dry runs, and whenever verification is remote or degraded
       (re-running those "gates" on reverted code proves nothing).
     - ``mutation_check``: after gates pass, flip the first comparison
-      operator (``==``/``!=``/``<``/``>=``/``>``/``<=``) in the task's one
-      Python product file and re-run the gates; a mutant that still passes
-      is an advisory ``mutation_survived`` scorecard signal, never a
-      rejection (unlike ``fail_to_pass_check``, this never gates, retries,
-      or rolls back the task). Off by default — a new, less-proven signal,
-      matching ``visual_review``'s "off by default, advisory-only" opt-in.
-      Skipped for dry runs, non-local verification, non-Python or
-      multi-file changes, and when the file has no mutable comparison.
+      operator (``==``/``!=``/``<``/``>=``/``>``/``<=``) or boolean operator
+      (``and``/``or``) in the task's one Python product file and re-run the
+      gates; a mutant that still passes is an advisory ``mutation_survived``
+      scorecard signal, never a rejection (unlike ``fail_to_pass_check``,
+      this never gates, retries, or rolls back the task). Off by default —
+      a new, less-proven signal, matching ``visual_review``'s "off by
+      default, advisory-only" opt-in. Skipped for dry runs, non-local
+      verification, non-Python or multi-file changes, and when the file has
+      no mutable comparison or boolean operator.
     - ``remote_verify_status`` / ``remote_verify_trigger``: delegate
       verification to an external CI system (see
       :class:`~dev_team.verification.RemoteCIGate`) — the escape hatch for
@@ -2977,17 +2978,18 @@ class DeliveryEngine:
         repo: GitRepo,
         cwd: Optional[str],
     ) -> None:
-        """Advisory mutation-lite signal: does one flipped comparison survive?
+        """Advisory mutation-lite signal: does one flipped mutant survive?
 
-        Flips the first comparison operator (see :mod:`dev_team.mutation`) in
-        the task's one Python product file, re-runs the gates, and records a
+        Flips the first comparison or boolean operator (see
+        :mod:`dev_team.mutation`) in the task's one Python product file,
+        re-runs the gates, and records a
         ``mutation_survived``/``mutation_killed`` scorecard counter —
         **never** a rejection, retry, or rollback (unlike
         :meth:`_tests_are_vacuous`). Skipped, with no scorecard change, no
         gate re-run, and no file written to disk, when: disabled; a dry run;
         verification is remote or degraded; ``impl_paths`` holds zero or more
         than one non-test product file; that one file is not Python; or it
-        has no mutable comparison.
+        has no mutable comparison or boolean operator.
 
         The mutated write is always restored, success or failure — mirroring
         :meth:`_tests_are_vacuous`'s fail-secure guarantee — via a ``finally``
@@ -3013,7 +3015,7 @@ class DeliveryEngine:
         if not path.endswith(".py"):
             return
         original = ws.read_text(path)
-        mutated = mutate_first_comparison(original)
+        mutated = mutate_first_mutant(original)
         if mutated is None:
             return
 

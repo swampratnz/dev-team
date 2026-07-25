@@ -1,12 +1,13 @@
-"""Mutation-lite: flip the first comparison operator in a source file.
+"""Mutation-lite: flip the first comparison or boolean operator in a source file.
 
 An opt-in, advisory signal (:attr:`~dev_team.engine.EngineConfig.mutation_check`)
 that fills the gap :doc:`../docs/BENCHMARKS.md` names next to the adopted
 fail-to-pass check: a test suite can exercise a code path without ever pinning
 its *behaviour* (e.g. asserting no exception, never asserting on the
-comparison that makes the logic correct). A single flipped comparison
-(``==``↔``!=``, ``<``↔``>=``, ``>``↔``<=``) that still passes the
-existing suite is the textbook signature of that gap.
+comparison or boolean condition that makes the logic correct). A single
+flipped comparison (``==``↔``!=``, ``<``↔``>=``, ``>``↔``<=``) or boolean
+operator (``and``↔``or``) that still passes the existing suite is the
+textbook signature of that gap.
 
 This module is a pure, dependency-free AST transform — no subprocess, no
 network, no model call. It never mutates anything on disk itself; the caller
@@ -18,7 +19,7 @@ the original content.
 from __future__ import annotations
 
 import ast
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional, Type, Union
 
 # The comparison-operator flips this mutator knows: each maps to its logical
 # opposite, so a mutant that still passes the suite means the suite never
@@ -34,11 +35,22 @@ _FLIPS: Dict[Type[ast.cmpop], Type[ast.cmpop]] = {
     ast.LtE: ast.Gt,
 }
 
+# The boolean-operator flips this mutator knows: ``and``/``or`` never chain
+# ambiguously the way ``is``/``in`` do, so every syntactically valid
+# ``BoolOp`` qualifies (unlike ``Compare``, there is no "chained, skip it"
+# case to guard against).
+_BOOL_FLIPS: Dict[Type[ast.boolop], Type[ast.boolop]] = {
+    ast.And: ast.Or,
+    ast.Or: ast.And,
+}
 
-class _FlipComparison(ast.NodeTransformer):
-    """Replaces one specific ``Compare`` node's operator with its flip."""
+_Mutant = Union[ast.Compare, ast.BoolOp]
 
-    def __init__(self, target: ast.Compare) -> None:
+
+class _FlipMutant(ast.NodeTransformer):
+    """Replaces one specific ``Compare``/``BoolOp`` node's operator with its flip."""
+
+    def __init__(self, target: _Mutant) -> None:
         self._target = target
 
     def visit_Compare(self, node: ast.Compare) -> ast.AST:
@@ -48,40 +60,50 @@ class _FlipComparison(ast.NodeTransformer):
             node.ops = [ast.copy_location(flipped, node.ops[0])]
         return node
 
+    def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
+        self.generic_visit(node)
+        if node is self._target:
+            flipped = _BOOL_FLIPS[type(node.op)]()
+            node.op = ast.copy_location(flipped, node.op)
+        return node
 
-def _mutable_comparisons(tree: ast.AST) -> List[ast.Compare]:
-    """Every ``Compare`` node in ``tree`` with a single, flippable operator.
+
+def _mutation_candidates(tree: ast.AST) -> List[_Mutant]:
+    """Every flippable ``Compare``/``BoolOp`` node in ``tree``.
 
     A chained comparison (``a < b < c``, more than one op) and a comparison
     using an operator outside :data:`_FLIPS` (``is``, ``in``, ...) are not
     candidates — conservative by design, mirroring
     :func:`dev_team.engine._is_test_path`'s "skip the ambiguous case" stance.
+    Every ``BoolOp`` node qualifies unconditionally.
     """
 
-    candidates: List[ast.Compare] = []
+    candidates: List[_Mutant] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare):
-            continue
-        if len(node.ops) != 1:
-            continue
-        if type(node.ops[0]) not in _FLIPS:
-            continue
-        candidates.append(node)
+        if isinstance(node, ast.Compare):
+            if len(node.ops) != 1:
+                continue
+            if type(node.ops[0]) not in _FLIPS:
+                continue
+            candidates.append(node)
+        elif isinstance(node, ast.BoolOp):
+            candidates.append(node)
     return candidates
 
 
-def mutate_first_comparison(source: str) -> Optional[str]:
-    """Flip the first mutable comparison operator in ``source``.
+def mutate_first_mutant(source: str) -> Optional[str]:
+    """Flip the first mutable comparison or boolean operator in ``source``.
 
     Walks the parsed AST for every single-operator comparison using one of
-    ``==``/``!=``/``<``/``>=``/``>``/``<=``, picks the one earliest in source
-    order (by line, then column), flips it to its logical opposite, and
-    returns the unparsed mutated source.
+    ``==``/``!=``/``<``/``>=``/``>``/``<=`` and every boolean operator
+    (``and``/``or``), picks the one earliest in source order (by line, then
+    column), flips it to its logical opposite, and returns the unparsed
+    mutated source.
 
     Returns ``None`` — a silent skip, never an error — when ``source`` does
-    not parse, or contains no flippable comparison. This is the common case
-    (a diff that's pure new functions, imports, or dataclass fields) and must
-    never be treated as a failure.
+    not parse, or contains no flippable comparison or boolean operator. This
+    is the common case (a diff that's pure new functions, imports, or
+    dataclass fields) and must never be treated as a failure.
     """
 
     try:
@@ -89,11 +111,11 @@ def mutate_first_comparison(source: str) -> Optional[str]:
     except SyntaxError:
         return None
 
-    candidates = _mutable_comparisons(tree)
+    candidates = _mutation_candidates(tree)
     if not candidates:
         return None
 
     target = min(candidates, key=lambda node: (node.lineno, node.col_offset))
-    mutated = _FlipComparison(target).visit(tree)
+    mutated = _FlipMutant(target).visit(tree)
     ast.fix_missing_locations(mutated)
     return ast.unparse(mutated)
