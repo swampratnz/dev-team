@@ -914,6 +914,19 @@ sections below are reconstructed from the repository history.
   DASHBOARD.md, since TROUBLESHOOTING.md cross-links both and the new
   recovery route lives only in the latter. Docs and tests only — no `src/`
   change, no new credential surface.
+- **`docs/TROUBLESHOOTING.md` now indexes `--interactive-pr-comments`**: a
+  new "My --interactive-pr-comments reply never got answered / the CI-fix
+  round skipped anyway" section explains `GitHubPRCommentChannel`'s two
+  by-design, entirely-silent failure modes (`pr_comment_channel.py`) — a
+  reply from a login outside the closed `--interactive-pr-comment-author`
+  allow-list, or whose first word isn't exactly `apply`/`skip`, is skipped
+  with no operator-visible signal, and the round fails safe to `skip` once
+  the ~10-minute poll window is exhausted rather than force-applying an
+  unreviewed CI fix — cross-linking `docs/INTERACTION.md`'s "Supervising CI
+  fixes from the pull request" section for the full mechanism. The
+  `_CROSS_REFERENCED_PATHS` list in `tests/test_docs.py` gains
+  `docs/INTERACTION.md`. Docs and tests only — no `src/` change, no new
+  credential surface.
 
 ## [0.7.0] — Legacy-repo analysis: dead code, live CVEs, conventions, remote CI
 
