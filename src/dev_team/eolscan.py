@@ -275,11 +275,17 @@ def parse_pom_xml_java(text: str) -> Optional[Tuple[str, str]]:
     version-shaped value wins. A legacy ``1.X`` value (Java 5-8's dual-
     versioning convention) reduces to ``X`` to match endoflife.date's
     ``java`` cycle identifiers (``"8"``, ``"11"``, ``"17"``, ...).
+
+    ``ValueError`` is caught alongside ``ET.ParseError``: an XML
+    declaration naming a multi-byte encoding (e.g. ``UTF-16``) on a
+    ``str`` input — exactly what ``workspace.read_text`` hands this
+    function — makes expat raise a bare ``ValueError``, not a
+    ``ParseError``.
     """
 
     try:
         root = ET.fromstring(text)
-    except ET.ParseError:
+    except (ET.ParseError, ValueError):
         return None
     properties = None
     for child in root:

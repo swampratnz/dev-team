@@ -258,6 +258,28 @@ def test_parse_pom_xml_java_malformed_never_raises():
     assert parse_pom_xml_java("<not-even-xml") is None
 
 
+def test_parse_pom_xml_java_multibyte_encoding_declaration_never_raises(monkeypatch):
+    # A `pom.xml` whose XML declaration names a multi-byte encoding (e.g.
+    # `encoding="UTF-16"`) fed as a `str` — exactly what workspace.read_text
+    # hands this function — makes CPython's expat binding raise a bare
+    # `ValueError: multi-byte encodings are not supported`, not
+    # `ET.ParseError`. That's not reliably reproducible across expat/CPython
+    # builds, so pin the contract directly: force `ET.fromstring` to raise
+    # `ValueError` and assert it degrades to `None` rather than propagating,
+    # both directly and via detect_runtimes.
+    import dev_team.eolscan as eolscan
+
+    def _raise_value_error(text):
+        raise ValueError("multi-byte encodings are not supported")
+
+    monkeypatch.setattr(eolscan.ET, "fromstring", _raise_value_error)
+
+    text = _pom("<java.version>17</java.version>")
+    assert parse_pom_xml_java(text) is None
+    ws = InMemoryWorkspace({"pom.xml": text})
+    assert detect_runtimes(ws) == []
+
+
 def test_parse_pom_xml_java_billion_laughs_never_raises():
     # Classic 9-level "billion laughs" entity expansion inside <properties>:
     # expat's built-in amplification-attack protection surfaces this as
