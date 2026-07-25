@@ -115,8 +115,10 @@ beat either alone, and false-positive suppression is a first-class metric.**
   project kind. An opt-in, advisory execution gate (`--docker-build-gate` /
   `EngineConfig.docker_build_gate`) now closes the "not wired" half of this
   gap: after deployment artifacts are applied, a root or first-level-nested
-  Dockerfile is built once (`docker build -t <tag> .`, fixed argv, `tag`
-  locally generated — never derived from Dockerfile content) through the
+  Dockerfile is built once (root: `docker build -t <tag> .`; first-level
+  nested: `docker build -t <tag> -f <nested>/Dockerfile .`, since plain
+  `docker build .` only ever resolves `<context>/Dockerfile` — fixed argv,
+  `tag` locally generated — never derived from Dockerfile content) through the
   existing `command_runner`, and the outcome lands as an advisory
   `docker_build_verified` scorecard signal (never a rejection, mirroring
   `mutation_check`'s precedent), with a best-effort `docker rmi` cleanup

@@ -4218,7 +4218,54 @@ def test_docker_build_gate_detects_first_level_nested_dockerfile():
 
     assert outcome.success is True
     assert outcome.scorecard["docker_build_verified"] is True
-    assert any(c[:2] == ["docker", "build"] for c in cmd.calls)
+    build_calls = [c for c in cmd.calls if c[:2] == ["docker", "build"]]
+    assert len(build_calls) == 1
+    # a real `docker build .` only ever resolves <context>/Dockerfile, so the
+    # nested file must be pointed at explicitly with -f or it's never the
+    # file actually built.
+    tag = build_calls[0][3]
+    assert build_calls[0] == ["docker", "build", "-t", tag, "-f", "deploy/Dockerfile", "."]
+
+
+def test_docker_build_gate_prefers_root_dockerfile_when_both_present():
+    responses = engine_responses()
+    responses["DevOps engineer"] = json_response(
+        {
+            "environment": "production",
+            "summary": "containerised",
+            "steps": ["build image"],
+            "rollback": ["previous tag"],
+            "files": [
+                {
+                    "path": "Dockerfile",
+                    "change_type": "create",
+                    "summary": "app image",
+                    "content": "FROM python:3.12-slim\n",
+                },
+                {
+                    "path": "deploy/Dockerfile",
+                    "change_type": "create",
+                    "summary": "deploy image",
+                    "content": "FROM python:3.12-slim\n",
+                },
+            ],
+        }
+    )
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner, workspace=ws, command_runner=cmd, config=EngineConfig(docker_build_gate=True)
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_build_verified"] is True
+    build_calls = [c for c in cmd.calls if c[:2] == ["docker", "build"]]
+    assert len(build_calls) == 1
+    tag = build_calls[0][3]
+    # matches plain `docker build .` semantics: the root Dockerfile wins.
+    assert build_calls[0] == ["docker", "build", "-t", tag, "."]
 
 
 def test_docker_build_gate_ignores_deeper_nested_dockerfile():
