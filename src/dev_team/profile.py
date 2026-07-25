@@ -281,12 +281,14 @@ def _detect_from_manifests(workspace: Workspace) -> ProjectProfile:
         return ProjectProfile(
             kind="rust",
             verify_command=("cargo", "test"),
+            security_scan_command=("cargo", "audit"),
             reason="Cargo.toml at workspace root",
         )
     if "go.mod" in files:
         return ProjectProfile(
             kind="go",
             verify_command=("go", "test", "./..."),
+            security_scan_command=("govulncheck", "./..."),
             reason="go.mod at workspace root",
         )
     if "pom.xml" in files:

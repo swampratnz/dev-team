@@ -3067,6 +3067,35 @@ def test_security_scanner_not_found_is_not_passed_off_as_findings():
     assert "No such file or directory" in outcome.security.scanner_error
 
 
+def test_security_scan_missing_binary_for_go_profile_degrades_gracefully():
+    # The #50 missing-binary degrade path composes with the new Go
+    # security_scan_command with zero new engine.py code: govulncheck absent
+    # must not be misread as scanner findings.
+    ws = InMemoryWorkspace({"go.mod": "module x\n"})
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "govulncheck",
+        CommandResult(
+            ["govulncheck"],
+            EXIT_NOT_FOUND,
+            "",
+            "[Errno 2] No such file or directory: 'govulncheck'",
+        ),
+    )
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(runner, workspace=ws, command_runner=cmd)
+    outcome = run(engine.deliver(_request()))
+    sec_prompt = next(
+        c["prompt"]
+        for c in runner.calls
+        if "application security engineer" in (c["system_prompt"] or "")
+    )
+    assert "No such file or directory" not in sec_prompt
+    assert "(no scanner output available" in sec_prompt
+    assert outcome.security.scanner_failed is True
+    assert "No such file or directory" in outcome.security.scanner_error
+
+
 def test_security_scanner_timeout_is_not_passed_off_as_findings():
     cmd = GateCycleRunner()
     cmd.add_rule(
