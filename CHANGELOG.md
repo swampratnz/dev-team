@@ -142,6 +142,29 @@ sections below are reconstructed from the repository history.
   rejecting the attempt rather than risking mutated code left on disk or
   committed. No new dependency, subprocess shape, or credential — reuses
   the existing gate-evaluation path every other check already calls.
+- **Mutation-lite now also flips boolean operators (`and`↔`or`), closing the
+  remaining in-language half of `docs/BENCHMARKS.md`'s "additional mutation
+  operators... remain future work" note** (#197). Previously,
+  `dev_team.mutation.mutate_first_comparison` only ever considered
+  `ast.Compare` nodes, so a product file whose only testable branching was a
+  boolean condition (`if a and b:`, `return x or default`) had zero
+  flippable comparisons and `_mutation_check` silently skipped it — no gate
+  rerun, no scorecard signal — the same "suite exercises a path without
+  pinning its behaviour" blind spot the check exists to catch, just for
+  boolean logic. The entry point is renamed
+  `mutate_first_comparison`→`mutate_first_mutant` (one call site,
+  `engine.py`) since it now flips both node kinds; the candidate walk is
+  generalised to also collect every `ast.BoolOp` node (unconditionally
+  eligible, unlike `Compare`'s single-op-only filter — `and`/`or` never
+  chain ambiguously the way `is`/`in` do), with selection unchanged:
+  earliest in source order by `(lineno, col_offset)` across the combined
+  pool. No change to `_mutation_check`'s integration, gate rerun,
+  `finally`-restore, `_stash_lock` sharing, or scorecard counters — purely
+  additive to what counts as *mutable* within the already-selected file. A
+  security regression test confirms the existing test-path exclusion and
+  single-non-test-impl-file selection are unchanged: a boolean-op-only test
+  file alongside a comparison-only product file still only ever mutates the
+  product file.
 - **A visual-critique failure is now diagnosable instead of a bare "skipping"**
   (#152, root-cause corrected by adversarial review). The default `--deliver`/
   `--assess` progress stream (`cli.py`'s `_progress_printer`) now renders

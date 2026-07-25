@@ -3576,6 +3576,61 @@ def test_mutation_check_excludes_engineer_authored_test_files():
     assert ws.read_text("src/x.py") == "def f(a, b):\n    return a == b\n"
 
 
+def test_mutation_check_boolop_only_test_file_still_excluded_from_mutation():
+    # SECURITY regression (issue #197 criterion 9): generalising the
+    # candidate walk to also cover BoolOp nodes must not loosen
+    # `_is_test_path`'s exclusion or the single-non-test-impl-file selection.
+    # The test file here is boolean-op-only and the product file is
+    # comparison-only; only the product file may ever be mutated.
+    from dev_team.models import ChangeType, FileChange
+
+    ws = InMemoryWorkspace(
+        {
+            "src/x.py": "def f(a, b):\n    return a == b\n",
+            "tests/test_x.py": "def test_f(a, b):\n    assert a and b\n",
+        }
+    )
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[
+            FileChange(path="src/x.py", change_type=ChangeType.CREATE, summary="s"),
+            FileChange(path="tests/test_x.py", change_type=ChangeType.CREATE, summary="s"),
+        ],
+    )
+    run(engine._mutation_check(impl, ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert ws.read_text("src/x.py") == "def f(a, b):\n    return a == b\n"
+    assert ws.read_text("tests/test_x.py") == "def test_f(a, b):\n    assert a and b\n"
+
+
+def test_mutation_check_now_checks_boolop_only_product_file():
+    # Pre-#197: a product file with a boolean condition and no comparison
+    # made `mutate_first_mutant` return None, so `_mutation_check` returned
+    # at `mutated is None` with no gate re-run and no scorecard change. This
+    # is the core new-coverage assertion: it now performs the check.
+    ws = InMemoryWorkspace(
+        {"src/x.py": "def f(a, b):\n    if a and b:\n        return 1\n    return 0\n"}
+    )
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert ws.read_text("src/x.py") == (
+        "def f(a, b):\n    if a and b:\n        return 1\n    return 0\n"
+    )
+
+
 def test_mutation_check_skipped_for_non_python_file():
     ws = InMemoryWorkspace({"src/x.ts": "function f(a, b) { return a === b; }\n"})
     cmd = FakeCommandRunner()
