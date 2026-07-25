@@ -776,6 +776,22 @@ sections below are reconstructed from the repository history.
   would submit; the button is also disabled for the duration of an
   in-flight request so a rapid double-click can't fire two overlapping
   enqueue calls.
+- **Run cards signal a paused job at the status-chip level**
+  (`docs/DASHBOARD.md`): previously a job paused on the Pending-question
+  panel (above) was indistinguishable from an actively-running one at a
+  glance — `runChip`'s status chip only ever read `last_stage`, and pausing
+  for a question is never journaled to `events.jsonl`, so the chip stayed
+  on "running". `loadQuestion` now also swaps the run card's `chip-${id}`
+  element to a new dashed `.chip.waiting` "waiting for you" chip
+  (`chip("⏸ waiting for you", "waiting")`, reusing the existing
+  `--warning` custom property, same as the stale-heartbeat indicator) the
+  moment its already-scoped, already-5s-polled `GET /api/jobs/{id}/question`
+  response reports `pending: true`, and restores the ordinary
+  running/blocked/finished chip the instant it doesn't (including the
+  `!res.ok` and fetch-error paths). No new HTTP route, poll, or fetch call
+  site — this only changes what's done with the response the panel already
+  fetches every 5s for running jobs; the waiting-chip label is a fixed
+  string literal, never built from response data.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /

@@ -1131,6 +1131,7 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
 .chip.done    { border-color: transparent; color: var(--good-ink); background: var(--good-soft); }
 .chip.blocked { border-color: transparent; color: var(--critical); background: var(--critical-soft); }
 .chip.idle    { border-style: dashed; color: var(--ink-3); }
+.chip.waiting { border-style: dashed; color: var(--warning); }
 
 .agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
 .agent { position: relative; background: var(--card); border: 1px solid var(--line);
@@ -1742,6 +1743,12 @@ function runChip(stage) {
   return chip("\\u25B6 running", "active");
 }
 
+// Fixed string literal, never built from data/res fields — a paused job's
+// prompt/context text must never reach the chip unescaped (see loadQuestion).
+function waitingChip() {
+  return chip("\\u23F8 waiting for you", "waiting");
+}
+
 // One archive/unarchive button, forwarded through the dashboard's own
 // /api/jobs/{id}/... proxy (the dispatch bearer token stays server-side).
 function archiveButton(id, archived) {
@@ -1785,7 +1792,7 @@ function runsPanel(s) {
       `<span title="${esc(absTime(r.ended))}">${esc(ago(r.ended))}</span>`,
     ].filter(Boolean).join("");
     return `<div class="run${filters.run === r.id ? " selected" : ""}" data-run="${esc(r.id)}" role="button" tabindex="0" title="filter the activity feed to ${esc(r.id)}">
-      <div class="top"><code>${esc(r.id)}</code>${runChip(r.last_stage)}${isArchived ? chip("archived", "archived") : ""}</div>
+      <div class="top"><code>${esc(r.id)}</code><span id="chip-${esc(r.id)}">${runChip(r.last_stage)}</span>${isArchived ? chip("archived", "archived") : ""}</div>
       <div class="meta">${meta}${archiveButton(r.id, isArchived)}${purgeButton(r.id, isArchived)}</div>
       ${r.last_message ? `<div class="msg" title="${esc(r.last_message)}">${esc(r.last_message)}</div>` : ""}
       ${runningSet.has(r.id) ? `<div class="question" id="q-${esc(r.id)}"></div>` : ""}
@@ -1819,15 +1826,33 @@ function questionPanel(id, data) {
     + `<div class="qchoices">${choices}</div>`;
 }
 
+// Restores the run card's status chip to its normal runChip(...) state —
+// shared by the !res.ok and catch paths below, so a failed/unconfigured
+// question fetch never leaves the chip stuck on "waiting for you".
+function restoreRunChip(id) {
+  const chipEl = $("chip-" + id);
+  if (!chipEl) return;
+  const r = state && state.runs.find(x => x.id === id);
+  put(chipEl, runChip(r ? r.last_stage : ""));
+}
+
 async function loadQuestion(id) {
   const el = $("q-" + id);
   if (!el) return;
   try {
     const res = await fetch("/api/jobs/" + encodeURIComponent(id) + "/question");
-    if (!res.ok) { put(el, ""); return; }
-    put(el, questionPanel(id, await res.json()));
+    if (!res.ok) { put(el, ""); restoreRunChip(id); return; }
+    const data = await res.json();
+    put(el, questionPanel(id, data));
+    if (data && data.pending) {
+      const chipEl = $("chip-" + id);
+      if (chipEl) put(chipEl, waitingChip());
+    } else {
+      restoreRunChip(id);
+    }
   } catch (err) {
     put(el, "");
+    restoreRunChip(id);
   }
 }
 
