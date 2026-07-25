@@ -16,6 +16,7 @@ def test_detect_node():
     assert profile.kind == "node"
     assert profile.verify_command == ("npm", "test")
     assert profile.setup_command == ("npm", "install")
+    assert profile.security_scan_command == ("npm", "audit", "--audit-level=high")
 
 
 def test_detect_rust():
@@ -23,12 +24,14 @@ def test_detect_rust():
     assert profile.kind == "rust"
     assert profile.verify_command == ("cargo", "test")
     assert profile.setup_command is None
+    assert profile.security_scan_command == ("cargo", "audit")
 
 
 def test_detect_go():
     profile = detect_project(_ws("go.mod", "main.go"))
     assert profile.kind == "go"
     assert profile.verify_command == ("go", "test", "./...")
+    assert profile.security_scan_command == ("govulncheck", "./...")
 
 
 def test_detect_python_with_requirements():
@@ -36,6 +39,9 @@ def test_detect_python_with_requirements():
     assert profile.kind == "python"
     assert profile.verify_command == ("pytest", "-q")
     assert profile.setup_command == ("pip", "install", "-r", "requirements.txt")
+    assert profile.security_scan_command == (
+        "bandit", "-r", ".", "-q", "-x", "./tests,./.dev_team",
+    )
 
 
 def test_detect_python_without_requirements():
@@ -50,6 +56,7 @@ def test_detect_maven():
     assert profile.verify_command == ("mvn", "test")
     assert profile.setup_command is None
     assert profile.reason == "pom.xml at workspace root"
+    assert profile.security_scan_command is None
 
 
 def test_detect_gradle_groovy():
@@ -58,6 +65,7 @@ def test_detect_gradle_groovy():
     assert profile.verify_command == ("gradle", "test")
     assert profile.setup_command is None
     assert profile.reason == "build.gradle at workspace root"
+    assert profile.security_scan_command is None
 
 
 def test_detect_gradle_kotlin_dsl():
@@ -74,6 +82,7 @@ def test_detect_composer_php():
     assert profile.verify_command == ("composer", "test")
     assert profile.setup_command == ("composer", "install")
     assert profile.reason == "composer.json at workspace root"
+    assert profile.security_scan_command is None
 
 
 def test_detect_unknown_falls_back_to_pytest():
@@ -92,7 +101,9 @@ def test_detect_dotnet_solution():
     assert profile.kind == "dotnet"
     assert profile.verify_command == ("dotnet", "test")
     assert profile.setup_command == ("dotnet", "restore")
-    assert profile.security_scan_command[0:3] == ("dotnet", "list", "package")
+    assert profile.security_scan_command == (
+        "dotnet", "list", "package", "--vulnerable", "--include-transitive",
+    )
     assert "MyApp.sln" in profile.reason
 
 
