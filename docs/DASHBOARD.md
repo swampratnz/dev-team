@@ -285,7 +285,11 @@ typed text) and clears the panel. The run card's status chip also flips to
 a dashed "waiting for you" chip while paused — not just the sub-panel below
 it — so a paused job is distinguishable from an actively-running one at a
 glance, and reverts to its normal running/blocked/finished chip the moment
-the question is answered or the fetch stops reporting one pending.
+the question is answered or the fetch stops reporting one pending. The
+run list's own unconditional 2.5s re-render tracks the same pending state
+(a small `pendingIds` set, updated wherever the chip itself is), so that
+re-render draws the waiting chip too instead of overwriting it with a plain
+running chip between the question poll's 5s ticks.
 
 This is the dashboard-side "questions as buttons" surface `docs/ROADMAP.md`
 item 7 names, built on the interactive primitive

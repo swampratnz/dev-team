@@ -2842,31 +2842,57 @@ def test_dashboard_html_run_card_waiting_chip():
     assert "var(--warning)" in DASHBOARD_HTML[css_start:css_end]
 
     # 2. The waiting-chip label is an exact, hardcoded literal produced via
-    #    chip(...) — never built from response data — and its only call
-    #    site is inside waitingChip().
+    #    chip(...) — never built from response data — and it's called from
+    #    exactly two sites: loadQuestion's fast path (below) and runsPanel's
+    #    pendingIds-aware re-render (see point 3).
     assert 'function waitingChip() {\n  return chip("\\u23F8 waiting for you", "waiting");\n}' in DASHBOARD_HTML
-    assert DASHBOARD_HTML.count("waitingChip()") == 2  # definition + one call site
+    assert DASHBOARD_HTML.count("waitingChip()") == 3  # definition + 2 call sites
 
-    # 3. The run card's chip wrapper is addressable by id, alongside the
-    #    existing id="q-${esc(r.id)}" question placeholder on the same card.
-    assert 'id="chip-${esc(r.id)}">${runChip(r.last_stage)}</span>' in DASHBOARD_HTML
+    # 3. runsPanel's every-2.5s full re-render is pendingIds-aware: it must
+    #    render the waiting chip itself rather than relying on loadQuestion's
+    #    out-of-band DOM write, which the next runsPanel call would otherwise
+    #    overwrite with a plain runChip() and cause the chip to flicker
+    #    between "waiting" and "running" until the next (up to 5s later)
+    #    pollQuestions tick puts it back.
+    runspanel_start = DASHBOARD_HTML.index("function runsPanel(s)")
+    runspanel_end = DASHBOARD_HTML.index("\n}", runspanel_start)
+    runspanel_body = DASHBOARD_HTML[runspanel_start:runspanel_end]
+    assert "const pendingIds = new Set();" in DASHBOARD_HTML
+    # pruned to currently-running ids on every call, so a finished/archived
+    # run can never keep a stale pending entry and get stuck on "waiting".
+    assert "for (const id of pendingIds) if (!runningSet.has(id)) pendingIds.delete(id);" in runspanel_body
+    assert (
+        "const statusChip = runningSet.has(r.id) && pendingIds.has(r.id) "
+        "? waitingChip() : runChip(r.last_stage);"
+    ) in runspanel_body
+    assert 'id="chip-${esc(r.id)}">${statusChip}</span>' in runspanel_body
     chip_idx = DASHBOARD_HTML.index('id="chip-${esc(r.id)}"')
     q_idx = DASHBOARD_HTML.index('id="q-${esc(r.id)}"')
     assert chip_idx < q_idx  # same card, chip precedes the question placeholder
 
-    # 4. All three loadQuestion branches touch the chip element:
+    # 4. All three loadQuestion branches touch the chip element, and keep
+    #    pendingIds in sync so runsPanel's next re-render agrees with them.
     load_question_start = DASHBOARD_HTML.index("async function loadQuestion(id)")
     load_question_end = DASHBOARD_HTML.index("async function pollQuestions()")
     body = DASHBOARD_HTML[load_question_start:load_question_end]
-    #   (a) data.pending === true swaps the chip to the new waiting chip
+    #   (a) data.pending === true adds to pendingIds and swaps the chip
     assert "if (data && data.pending)" in body
     pending_branch = body[body.index("if (data && data.pending)"):body.index("} else {")]
+    assert "pendingIds.add(id);" in pending_branch
     assert "waitingChip()" in pending_branch
-    #   (b) the !res.ok path and (c) the catch path both restore via
-    #   restoreRunChip(id), which itself calls runChip(...) — never leaving
-    #   the chip blank or stuck on "waiting".
-    assert "if (!res.ok) { put(el, \"\"); restoreRunChip(id); return; }" in body
-    assert "} catch (err) {\n    put(el, \"\");\n    restoreRunChip(id);\n  }" in body
+    #   (b) the !res.ok path and (c) the catch path both drop the id from
+    #   pendingIds and restore via restoreRunChip(id), which itself calls
+    #   runChip(...) — never leaving the chip blank, stuck on "waiting", or
+    #   disagreeing with what the next runsPanel re-render would show.
+    assert (
+        'if (!res.ok) { put(el, ""); pendingIds.delete(id); restoreRunChip(id); return; }'
+    ) in body
+    assert (
+        '} catch (err) {\n    put(el, "");\n    pendingIds.delete(id);\n    restoreRunChip(id);\n  }'
+    ) in body
+    #   (d) the non-pending else branch also drops the id from pendingIds.
+    else_branch = body[body.index("} else {"):body.index("} catch (err) {")]
+    assert "pendingIds.delete(id);" in else_branch
     assert "function restoreRunChip(id)" in DASHBOARD_HTML
     restore_start = DASHBOARD_HTML.index("function restoreRunChip(id)")
     restore_end = DASHBOARD_HTML.index("\n}", restore_start)

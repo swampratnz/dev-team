@@ -1641,6 +1641,13 @@ function renderMarkdown(src) {
 // ---- views ----
 let state = null;
 const filters = { agent: "", run: "" };
+// Run ids loadQuestion most recently found pending — runsPanel's own
+// unconditional-every-2.5s re-render consults this so it renders the
+// waiting chip itself instead of overwriting the chip loadQuestion set
+// out-of-band, which would otherwise revert it to "running" until the next
+// (up to 5s later) pollQuestions tick. Pruned to runningJobIds(s) on every
+// runsPanel call so a finished/archived run can never keep a stale entry.
+const pendingIds = new Set();
 
 function tiles(s) {
   const c = s.backlog.counts;
@@ -1781,10 +1788,12 @@ function runsPanel(s) {
   if (!s.runs.length) { put($("runs"), '<div class="panel muted">no runs recorded</div>'); return; }
   const archivedSet = new Set(s.archived_jobs || []);
   const runningSet = new Set(runningJobIds(s));
+  for (const id of pendingIds) if (!runningSet.has(id)) pendingIds.delete(id);
   put($("runs"), s.runs.map(r => {
     const cost = parseCost(r.last_message);
     const dur = (r.started != null && r.ended != null) ? fmtDur(r.ended - r.started) : "";
     const isArchived = archivedSet.has(r.id);
+    const statusChip = runningSet.has(r.id) && pendingIds.has(r.id) ? waitingChip() : runChip(r.last_stage);
     const meta = [
       dur && `<span title="started ${esc(absTime(r.started))}">${esc(dur)}</span>`,
       `<span>${esc(r.events)} event${r.events === 1 ? "" : "s"}</span>`,
@@ -1792,7 +1801,7 @@ function runsPanel(s) {
       `<span title="${esc(absTime(r.ended))}">${esc(ago(r.ended))}</span>`,
     ].filter(Boolean).join("");
     return `<div class="run${filters.run === r.id ? " selected" : ""}" data-run="${esc(r.id)}" role="button" tabindex="0" title="filter the activity feed to ${esc(r.id)}">
-      <div class="top"><code>${esc(r.id)}</code><span id="chip-${esc(r.id)}">${runChip(r.last_stage)}</span>${isArchived ? chip("archived", "archived") : ""}</div>
+      <div class="top"><code>${esc(r.id)}</code><span id="chip-${esc(r.id)}">${statusChip}</span>${isArchived ? chip("archived", "archived") : ""}</div>
       <div class="meta">${meta}${archiveButton(r.id, isArchived)}${purgeButton(r.id, isArchived)}</div>
       ${r.last_message ? `<div class="msg" title="${esc(r.last_message)}">${esc(r.last_message)}</div>` : ""}
       ${runningSet.has(r.id) ? `<div class="question" id="q-${esc(r.id)}"></div>` : ""}
@@ -1841,17 +1850,20 @@ async function loadQuestion(id) {
   if (!el) return;
   try {
     const res = await fetch("/api/jobs/" + encodeURIComponent(id) + "/question");
-    if (!res.ok) { put(el, ""); restoreRunChip(id); return; }
+    if (!res.ok) { put(el, ""); pendingIds.delete(id); restoreRunChip(id); return; }
     const data = await res.json();
     put(el, questionPanel(id, data));
     if (data && data.pending) {
+      pendingIds.add(id);
       const chipEl = $("chip-" + id);
       if (chipEl) put(chipEl, waitingChip());
     } else {
+      pendingIds.delete(id);
       restoreRunChip(id);
     }
   } catch (err) {
     put(el, "");
+    pendingIds.delete(id);
     restoreRunChip(id);
   }
 }

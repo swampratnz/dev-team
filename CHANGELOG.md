@@ -791,7 +791,14 @@ sections below are reconstructed from the repository history.
   `!res.ok` and fetch-error paths). No new HTTP route, poll, or fetch call
   site — this only changes what's done with the response the panel already
   fetches every 5s for running jobs; the waiting-chip label is a fixed
-  string literal, never built from response data.
+  string literal, never built from response data. `runsPanel`'s own
+  unconditional 2.5s `/api/state` re-render is pendingIds-aware (a small
+  module-level `Set` of run ids `loadQuestion` last found pending, pruned
+  to `runningJobIds` on every `runsPanel` call so a finished/archived run
+  can't keep a stale entry) — without it, the very next 2.5s tick would
+  rebuild the run list from `runChip(r.last_stage)` alone and stomp the
+  waiting chip back to "running" until the next question poll, flickering
+  between the two states rather than holding steady.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /
