@@ -4,7 +4,7 @@ The risk phase's CVE claims otherwise come from model knowledge — plausible,
 stale, and unverifiable. This module is the deterministic counterpart: exact
 pins are parsed straight out of the manifests (NuGet ``packages.config``,
 ``package.json``, ``requirements.txt``, PEP 621 ``pyproject.toml``,
-``Cargo.toml``, Go ``go.mod``) *and* the lockfiles
+``Cargo.toml``, Go ``go.mod``, PHP ``composer.json``) *and* the lockfiles
 (``package-lock.json``, ``poetry.lock``, ``Cargo.lock``, NuGet
 ``packages.lock.json``, Ruby ``Gemfile.lock``, PHP ``composer.lock``) and checked against
 the OSV.dev batch API, which covers every major
@@ -547,10 +547,12 @@ def parse_composer_lock(text: str, manifest: str) -> List[Dependency]:
     """PHP ``composer.lock``: ``packages``/``packages-dev`` are exact resolved
     pins, mirroring ``package-lock.json``'s flat-array shape.
 
-    ``composer.json`` itself is out of scope: its ``^``/``~``/``.*`` version
-    constraints don't resolve to an exact pin without running Composer's
-    dependency resolver, so — like a bare Ruby ``Gemfile`` — only the
-    lockfile is scanned.
+    Resolved pins here supersede :func:`parse_composer_json`'s range-derived
+    lower bounds for the same package (see :func:`collect_dependencies`);
+    Composer's fuller constraint algebra (OR-lists, AND-lists, branch
+    aliases) still has no exact-pin equivalent without running Composer's
+    dependency resolver, so — like a bare Ruby ``Gemfile`` — those forms stay
+    unparsed even with this lockfile present.
     """
 
     try:
@@ -573,6 +575,46 @@ def parse_composer_lock(text: str, manifest: str) -> List[Dependency]:
     return deps
 
 
+def parse_composer_json(text: str, manifest: str) -> List[Dependency]:
+    """PHP ``composer.json``: ``require``/``require-dev`` caret/tilde/bare-exact
+    constraints, mirroring :func:`parse_package_json`'s treatment of npm's
+    identical ``^``/``~`` range shape.
+
+    Platform pseudo-packages (``php``, ``ext-mbstring``, ``lib-openssl``, ...)
+    are not real Packagist packages and are skipped — identifiable, like in
+    Composer's own platform-repository check, by having no ``/`` separating a
+    vendor from a package name. Composer's fuller constraint algebra (OR-lists
+    ``||``, comma-separated AND-lists, ``dev-*`` branch aliases, open ranges)
+    is out of scope for v1 (see the module docstring's honest-limitations
+    note); reusing :func:`_exact_version` verbatim already rejects all of
+    those forms, so no extra filtering is needed here.
+    """
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    deps = []
+    for section in ("require", "require-dev"):
+        entries = data.get(section)
+        if not isinstance(entries, dict):
+            continue
+        for name, spec in sorted(entries.items()):
+            if "/" not in name:
+                continue
+            version = _exact_version(str(spec))
+            if version is not None:
+                deps.append(
+                    Dependency(
+                        name, version, "Packagist", manifest,
+                        approximate=_is_range_spec(str(spec)),
+                    )
+                )
+    return deps
+
+
 _PARSERS = {
     "packages.config": parse_packages_config,
     "package.json": parse_package_json,
@@ -585,6 +627,7 @@ _PARSERS = {
     "packages.lock.json": parse_packages_lock_json,
     "go.mod": parse_go_mod,
     "Gemfile.lock": parse_gemfile_lock,
+    "composer.json": parse_composer_json,
     "composer.lock": parse_composer_lock,
 }
 

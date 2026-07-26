@@ -6,6 +6,19 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Assessment
+- **OSV scan parses PHP `composer.json` `^`/`~`/bare-exact constraints**
+  (`depscan.py`), closing the doc-named gap: previously only
+  `composer.lock`'s resolved pins were scanned (#186), so a `composer.json`
+  full of ordinary caret/tilde ranges with no committed lockfile — a valid,
+  common state for libraries — yielded zero live-scanned dependencies. A new
+  `parse_composer_json` is a mechanical sibling of `parse_package_json`,
+  reading `require`/`require-dev`, reusing `_exact_version`/`_is_range_spec`
+  verbatim (no new parsing primitive), and skipping platform pseudo-packages
+  (`php`, `ext-*`, `lib-*`) by their missing vendor/`/`separator. Registered
+  in `_PARSERS["composer.json"]`; no changes to `collect_dependencies`'s
+  supersede rule or `DependencyScan.render()` — both already generalise
+  unmodified, so a `composer.lock` pin for the same package still wins over
+  the manifest's range-derived lower bound.
 - **OSV scan resolves PEP 735 `include-group` composition transitively**
   (`depscan.py`), closing #157's own named follow-up: `parse_pyproject_toml`
   previously skipped a `[dependency-groups]` entry that was a table
