@@ -148,6 +148,21 @@ fresh assessment's report-quality signals are never hidden behind the
 verdict table's own empty state — and renders nothing when both totals are
 zero, keeping a clean run's panel uncluttered.
 
+Beneath the phase/overall table, a **by repo** sub-table breaks the same
+verdict counts down per repo, so a workspace that has assessed more than
+one repo can see each repo's own confirm rate instead of one number
+blending everyone's variance together (e.g. repo A confirming at 90% and
+repo B at 40% no longer wash out into a single misleading "overall" row).
+It's built from the same `audit/<id>/meta.json` parse the archived-job
+check already performs — no extra file reads, no new HTTP route, and no
+`dispatch.py` change. A job whose `meta.json` has no `repo` field, or an
+empty one, groups under an explicit `"(unknown)"` bucket rather than being
+silently dropped, so the by-repo totals always reconcile with the existing
+overall row. It shares the same archived-job exclusion and `?archived=1`
+toggle as the rest of the panel (same request, same flag — no separate
+control), and it's omitted entirely when there are no verifications yet,
+matching the panel's existing empty state.
+
 ### Score history
 
 The **Score history** block (in the Memory & conventions panel, next to

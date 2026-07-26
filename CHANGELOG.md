@@ -898,6 +898,22 @@ sections below are reconstructed from the repository history.
   rebuild the run list from `runChip(r.last_stage)` alone and stomp the
   waiting chip back to "running" until the next question poll, flickering
   between the two states rather than holding steady.
+- **Verdict calibration panel gains a per-repo breakdown** (#223,
+  `docs/DASHBOARD.md`): the panel's overall confirm-rate blended every repo
+  the workspace has ever assessed into one number, hiding legitimate
+  multi-repo variance (repo A confirming at 90%, repo B at 40%). A new
+  `by_repo` dict on `_calibration_state`'s payload groups the same
+  `verifications.jsonl` entries by the owning job's `meta.json` `repo`
+  field — riding the one meta.json parse pass the archived-job check
+  already performs, so no additional file reads. A job with no/empty
+  `repo` groups under an explicit `"(unknown)"` bucket rather than being
+  dropped, so `by_repo`'s totals always reconcile with `overall`. Shares
+  the existing archived-job exclusion and `?archived=1`/`include_archived`
+  toggle exactly (same request, same flag). The dashboard renders it as a
+  "by repo" sub-table beneath the existing phase/overall table, shown only
+  when non-empty; `repo` is caller-supplied (`POST /jobs`), so it flows
+  through `esc()` before `innerHTML` like every other panel field. Purely
+  additive to `dashboard.py` — no `dispatch.py` change, no new HTTP route.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /

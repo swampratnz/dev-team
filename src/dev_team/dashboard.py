@@ -246,6 +246,40 @@ def _report_job_id(path: str) -> Optional[str]:
     return None
 
 
+def _job_meta_index(workspace: Workspace) -> Dict[str, Dict[str, object]]:
+    """Parses every ``audit/<id>/meta.json`` once: ``id -> {"archived", "repo"}``.
+
+    The single shared parsing pass behind both :func:`_archived_job_ids` and
+    :func:`_calibration_state`'s ``by_repo`` breakdown — a missing or corrupt
+    ``meta.json`` simply isn't indexed (never a 500 for the whole state
+    payload), and a missing/empty/non-string ``repo`` is normalized to
+    ``None`` here so callers have one place to apply their own "unknown"
+    sentinel rather than re-deriving the same falsy-string check.
+    """
+
+    index: Dict[str, Dict[str, object]] = {}
+    for path in workspace.list_files():
+        parts = path.split("/")
+        if len(parts) != 3 or parts[0] != "audit" or parts[2] != "meta.json":
+            continue
+        try:
+            meta = json.loads(workspace.read_text(path))
+        except (OSError, ValueError, WorkspaceError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        repo = meta.get("repo")
+        index[parts[1]] = {
+            "archived": bool(meta.get("archived")),
+            "repo": repo if isinstance(repo, str) and repo else None,
+        }
+    return index
+
+
+def _archived_from_index(index: Dict[str, Dict[str, object]]) -> frozenset:
+    return frozenset(job_id for job_id, meta in index.items() if meta["archived"])
+
+
 def _archived_job_ids(workspace: Workspace) -> frozenset:
     """Job ids whose mirrored ``audit/<id>/meta.json`` is marked archived.
 
@@ -255,18 +289,7 @@ def _archived_job_ids(workspace: Workspace) -> frozenset:
     simply not archived — never a 500 for the whole state payload.
     """
 
-    ids = set()
-    for path in workspace.list_files():
-        parts = path.split("/")
-        if len(parts) != 3 or parts[0] != "audit" or parts[2] != "meta.json":
-            continue
-        try:
-            meta = json.loads(workspace.read_text(path))
-        except (OSError, ValueError, WorkspaceError):
-            continue
-        if meta.get("archived"):
-            ids.add(parts[1])
-    return frozenset(ids)
+    return _archived_from_index(_job_meta_index(workspace))
 
 
 def _calibration_state(workspace: Workspace, *, include_archived: bool = False) -> Dict:
@@ -286,10 +309,23 @@ def _calibration_state(workspace: Workspace, *, include_archived: bool = False) 
     for ``blind_spot_total``/``broken_citation_total``/
     ``report_quality_jobs_counted``, identical field-for-field to
     :meth:`Dispatcher.calibration`'s own copy so the two never drift.
+
+    ``by_repo`` groups the same verification entries by the repo their
+    owning job's ``meta.json`` carries (riding the one meta.json parse pass
+    :func:`_job_meta_index` already performs — no additional file reads), so
+    a workspace that has assessed more than one repo doesn't blend
+    everyone's confirm-rate into a single misleading ``overall`` row. A job
+    with no meta.json, or whose ``repo`` is missing/empty, groups under the
+    ``"(unknown)"`` sentinel rather than being dropped, so ``by_repo``'s
+    totals always reconcile with ``overall``. Archived-job exclusion is
+    identical to the rest of this rollup: same ``archived``/``include_archived``
+    behavior, no separate flag.
     """
 
-    archived = frozenset() if include_archived else _archived_job_ids(workspace)
+    meta_index = _job_meta_index(workspace)
+    archived = frozenset() if include_archived else _archived_from_index(meta_index)
     entries: List[Dict] = []
+    entries_by_repo: Dict[str, List[Dict]] = {}
     jobs_counted = 0
     for path in workspace.list_files():
         if not path.startswith("audit/") or not path.endswith("/verifications.jsonl"):
@@ -297,17 +333,32 @@ def _calibration_state(workspace: Workspace, *, include_archived: bool = False) 
         parts = path.split("/")
         if len(parts) == 3 and parts[1] in archived:
             continue
+        repo = meta_index.get(parts[1], {}).get("repo") if len(parts) == 3 else None
+        repo_key = repo if repo else "(unknown)"
         contributed = False
         for line in workspace.read_text(path).splitlines():
             if not line.strip():
                 continue
             try:
-                entries.append(json.loads(line))
+                entry = json.loads(line)
             except ValueError:
                 continue
+            entries.append(entry)
+            entries_by_repo.setdefault(repo_key, []).append(entry)
             contributed = True
         if contributed:
             jobs_counted += 1
+
+    by_repo = {
+        repo_key: {
+            "confirmed": bucket["confirmed"],
+            "refuted": bucket["refuted"],
+            "needs_context": bucket["needs_context"],
+            "confirm_rate": bucket["confirm_rate"],
+        }
+        for repo_key, repo_entries in entries_by_repo.items()
+        for bucket in (calibration_summary(repo_entries)["overall"],)
+    }
 
     blind_spot_total = 0
     broken_citation_total = 0
@@ -338,6 +389,7 @@ def _calibration_state(workspace: Workspace, *, include_archived: bool = False) 
 
     return {
         **calibration_summary(entries),
+        "by_repo": by_repo,
         "jobs_counted": jobs_counted,
         "blind_spot_total": blind_spot_total,
         "broken_citation_total": broken_citation_total,
@@ -2090,13 +2142,35 @@ function calibrationSummary(cal) {
     + `${esc(cal.report_quality_jobs_counted)} audits</div>`;
 }
 
+// One "by repo" row: repo label plus its verdict counts. SECURITY: repo is
+// caller-supplied via POST /jobs (untrusted), mirrored verbatim into
+// meta.json — esc() before innerHTML, same discipline as every other panel.
+function calibrationRepoRow(repo, b) {
+  const rate = b.confirm_rate === null ? "\\u2014" : `${Math.round(b.confirm_rate * 100)}%`;
+  return `<tr><td>${esc(repo)}</td><td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td>`
+    + `<td>${esc(b.needs_context)}</td><td>${esc(rate)}</td></tr>`;
+}
+
+// The "by repo" sub-table beneath the overall/per-phase table — shown only
+// when by_repo is non-empty, so a fresh/single-repo-free workspace's panel
+// stays byte-identical to before this breakdown existed.
+function calibrationRepoTable(byRepo) {
+  const repos = Object.keys(byRepo || {}).sort();
+  if (!repos.length) return "";
+  const rows = repos.map(r => calibrationRepoRow(r, byRepo[r])).join("");
+  return `<table class="cal-table cal-by-repo"><thead><tr><th>repo</th><th>confirmed</th>`
+    + `<th>refuted</th><th>needs context</th><th>confirm rate</th></tr></thead>`
+    + `<tbody>${rows}</tbody></table>`;
+}
+
 function calibrationPanel(cal) {
   const summary = calibrationSummary(cal);
   if (!cal.overall.total) return summary || '<span class="muted">no verifications recorded yet</span>';
   const rows = Object.keys(cal.phases).sort().map(p => calibrationRow(p, cal.phases[p])).join("")
     + calibrationRow("overall", cal.overall);
   return summary + `<table class="cal-table"><thead><tr><th>phase</th><th>confirmed</th><th>refuted</th>`
-    + `<th>needs context</th><th>total</th><th>confirm rate</th></tr></thead><tbody>${rows}</tbody></table>`;
+    + `<th>needs context</th><th>total</th><th>confirm rate</th></tr></thead><tbody>${rows}</tbody></table>`
+    + calibrationRepoTable(cal.by_repo);
 }
 
 // The Spend panel: total + by-mode breakdown from GET /api/costs. Fetched
