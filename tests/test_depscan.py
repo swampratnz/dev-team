@@ -13,6 +13,7 @@ from dev_team.depscan import (
     Vulnerability,
     _exact_version,
     _MAX_DEPENDENCIES,
+    _MAX_GROUP_EXPANSIONS,
     collect_dependencies,
     parse_cargo_toml,
     parse_composer_lock,
@@ -250,16 +251,105 @@ test = ["foo>=1.0", "bar", "baz~=2.0", "pytest==8.0.0"]
     assert [(d.name, d.version) for d in deps] == [("pytest", "8.0.0")]
 
 
-def test_parse_pyproject_toml_dependency_groups_include_group_skipped():
+def test_parse_pyproject_toml_dependency_groups_include_group_resolves_transitively():
     text = """
 [dependency-groups]
 test = ["pytest==8.0.0"]
 all = [{include-group = "test"}]
 """
     deps = parse_pyproject_toml(text, "pyproject.toml")
-    # The "all" group's include-group reference is not resolved — only
-    # "test"'s own directly-listed package is scanned.
-    assert [(d.name, d.version) for d in deps] == [("pytest", "8.0.0")]
+    # "all"'s include-group reference is resolved: it picks up "test"'s own
+    # directly-listed package (in addition to "test" itself, which is also
+    # scanned directly as its own top-level group).
+    names_versions = [(d.name, d.version) for d in deps]
+    assert names_versions.count(("pytest", "8.0.0")) == 2
+
+
+def test_parse_pyproject_toml_dependency_groups_multi_level_transitive():
+    text = """
+[dependency-groups]
+all = [{include-group = "docs"}]
+docs = [{include-group = "sphinx-docs"}]
+sphinx-docs = ["sphinx==7.0.0"]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert ("sphinx", "7.0.0") in [(d.name, d.version) for d in deps]
+
+
+def test_parse_pyproject_toml_dependency_groups_mixed_direct_and_include():
+    text = """
+[dependency-groups]
+test = ["pytest==8.0.0"]
+all = ["requests==2.31.0", {include-group = "test"}]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    names_versions = [(d.name, d.version) for d in deps]
+    assert ("requests", "2.31.0") in names_versions
+    assert ("pytest", "8.0.0") in names_versions
+
+
+def test_parse_pyproject_toml_dependency_groups_self_reference_is_safe():
+    text = """
+[dependency-groups]
+all = ["own-pkg==1.0.0", {include-group = "all"}]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    # The self-reference contributes nothing beyond the group's own direct
+    # entry — it neither raises nor hangs nor duplicates infinitely.
+    assert [(d.name, d.version) for d in deps] == [("own-pkg", "1.0.0")]
+
+
+def test_parse_pyproject_toml_dependency_groups_indirect_cycle_is_safe():
+    text = """
+[dependency-groups]
+a = [{include-group = "b"}, "pkg-a==1.0.0"]
+b = [{include-group = "a"}, "pkg-b==1.0.0"]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    names_versions = [(d.name, d.version) for d in deps]
+    # Cycle guard is per-path, not whole-table refusal: each group's own
+    # real direct entry still shows up despite the a<->b cycle.
+    assert ("pkg-a", "1.0.0") in names_versions
+    assert ("pkg-b", "1.0.0") in names_versions
+
+
+def test_parse_pyproject_toml_dependency_groups_bounded_expansion():
+    # A long include-group chain, deliberately longer than the expansion
+    # cap: resolution must stop early rather than raise RecursionError or
+    # hang, and the final package (only reachable past the cap) never
+    # appears.
+    chain_length = _MAX_GROUP_EXPANSIONS + 50
+    lines = ["[dependency-groups]"]
+    for i in range(chain_length):
+        lines.append(f'g{i} = [{{include-group = "g{i + 1}"}}]')
+    lines.append(f'g{chain_length} = ["tail-pkg==1.0.0"]')
+    text = "\n".join(lines) + "\n"
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert all(d.name != "tail-pkg" for d in deps)
+
+
+def test_parse_pyproject_toml_dependency_groups_bounded_expansion_breadth_specs():
+    # A single group whose own entry list is attacker-long: one pop walks
+    # this whole list in the inner `for entry in entries` loop. The cap must
+    # be enforced per-entry inside that loop, not just once per pop —
+    # otherwise a single top-level group with hundreds of thousands of
+    # plain-string entries bypasses _MAX_GROUP_EXPANSIONS entirely (the
+    # depth-chained test above only exercises the once-per-pop check, which
+    # this breadth shape bypasses).
+    count = _MAX_GROUP_EXPANSIONS * 3
+    entries = ", ".join(f'"pkg{i}==1.0.0"' for i in range(count))
+    text = f"[dependency-groups]\nall = [{entries}]\n"
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert len(deps) < count
+
+
+def test_parse_pyproject_toml_dependency_groups_unknown_group_reference():
+    text = """
+[dependency-groups]
+all = [{include-group = "does-not-exist"}, "requests==2.31.0"]
+"""
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert [(d.name, d.version) for d in deps] == [("requests", "2.31.0")]
 
 
 def test_parse_pyproject_toml_dependency_groups_adversarial_shapes():
@@ -277,10 +367,17 @@ def test_parse_pyproject_toml_dependency_groups_adversarial_shapes():
         )
         == []
     )
-    # a list entry that is neither str nor dict, and a malformed include-group
+    # a list entry that is neither str nor dict, and a malformed
+    # include-group: missing key, non-string int, non-string list
     text = """
 [dependency-groups]
-test = [42, true, {not-include-group = "x"}, {include-group = 1}]
+test = [
+    42,
+    true,
+    {not-include-group = "x"},
+    {include-group = 1},
+    {include-group = ["x"]},
+]
 """
     assert parse_pyproject_toml(text, "pyproject.toml") == []
 

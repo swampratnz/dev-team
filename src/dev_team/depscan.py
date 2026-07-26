@@ -33,6 +33,12 @@ _HTTP_TIMEOUT_SECONDS = 30.0
 # the API. Overflow is recorded, not silently dropped.
 _MAX_DEPENDENCIES = 500
 
+# Bounds how many stack frames a single manifest's PEP 735 [dependency-groups]
+# `include-group` resolution may push in total, across every top-level group
+# (see _resolve_dependency_groups) — mirrors _MAX_DEPENDENCIES's role of
+# closing off unbounded work from a hostile input without ever raising.
+_MAX_GROUP_EXPANSIONS = 500
+
 #: A ``fetch`` callable posts the querybatch payload and returns the response.
 Fetch = Callable[[Dict], Dict]
 
@@ -275,16 +281,62 @@ def _pep508_pin(spec: str) -> Optional[tuple]:
     return None
 
 
+def _resolve_dependency_groups(groups: Dict) -> List[str]:
+    """Flatten a PEP 735 ``[dependency-groups]`` table into PEP 508 spec
+    strings, resolving ``{include-group = "..."}`` composition transitively.
+
+    Walked with an explicit stack, not Python recursion: the table comes from
+    an untrusted, cloned third-party repo whose composition graph is fully
+    attacker-controlled, and an explicit stack has no ``RecursionError``
+    ceiling on a deep or wide malicious chain. Each stack frame carries the
+    set of group names already visited on *that* path, so re-visiting a name
+    on the same path — a direct self-reference or an indirect cycle like
+    ``a`` -> ``b`` -> ``a`` — is dropped rather than re-expanded. A single
+    counter shared across every top-level group caps the total amount of
+    work the whole table may do (:data:`_MAX_GROUP_EXPANSIONS`), closing off
+    both a deep chain of pops *and* a single group whose own entry list is
+    made attacker-long (a single pop can otherwise walk an unbounded ``for
+    entry in entries`` loop) from unbounded work; once the cap is hit,
+    resolution stops early for the rest of the manifest rather than raising.
+    """
+
+    specs: List[str] = []
+    expansions = 0
+    for name in groups:
+        stack: List[tuple] = [(name, frozenset())]
+        while stack:
+            if expansions >= _MAX_GROUP_EXPANSIONS:
+                return specs
+            expansions += 1
+            current, visited_in_path = stack.pop()
+            if current in visited_in_path:
+                continue
+            entries = groups.get(current)
+            if not isinstance(entries, list):
+                continue
+            next_visited = visited_in_path | {current}
+            for entry in entries:
+                if expansions >= _MAX_GROUP_EXPANSIONS:
+                    return specs
+                expansions += 1
+                if isinstance(entry, str):
+                    specs.append(entry)
+                elif isinstance(entry, dict):
+                    ref = entry.get("include-group")
+                    if isinstance(ref, str):
+                        stack.append((ref, next_visited))
+    return specs
+
+
 def parse_pyproject_toml(text: str, manifest: str) -> List[Dependency]:
     """PEP 621 ``pyproject.toml``: ``==`` pins from ``[project.dependencies]``,
     ``[project.optional-dependencies]``, and PEP 735 ``[dependency-groups]``.
 
     Ranges and unpinned entries are out of scope for v1 (see the module
     docstring's honest-limitations note) — only exact pins are live-scanned,
-    everything else stays model knowledge. A ``[dependency-groups]`` entry
-    that is a table (PEP 735's ``{include-group = "..."}`` composition
-    reference, not a package) is skipped rather than resolved: v1 only scans
-    a group's own directly-listed packages.
+    everything else stays model knowledge. ``[dependency-groups]``
+    ``{include-group = "..."}`` composition is resolved transitively — see
+    :func:`_resolve_dependency_groups` for the cycle-safe, bounded walk.
     """
 
     try:
@@ -304,9 +356,7 @@ def parse_pyproject_toml(text: str, manifest: str) -> List[Dependency]:
                     specs.extend(spec for spec in group if isinstance(spec, str))
     groups = data.get("dependency-groups")
     if isinstance(groups, dict):
-        for group in groups.values():
-            if isinstance(group, list):
-                specs.extend(entry for entry in group if isinstance(entry, str))
+        specs.extend(_resolve_dependency_groups(groups))
     deps = []
     for spec in specs:
         pin = _pep508_pin(spec)

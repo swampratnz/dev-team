@@ -113,8 +113,9 @@ machinery understands them now:
   exact pin fall back to training data. PEP 621 `pyproject.toml`
   `[project.dependencies]` and `[project.optional-dependencies]` `==`
   pins are live-scanned too, even with no lockfile present; PEP 735
-  `[dependency-groups]` `==` pins are live-scanned the same way, but
-  `include-group` composition is not resolved. Any non-`==` range in
+  `[dependency-groups]` `==` pins are live-scanned the same way, and
+  `include-group` composition is resolved transitively (cycle-safe,
+  bounded). Any non-`==` range in
   `pyproject.toml` still falls back to model knowledge. Go `go.mod`
   `require` entries are always exact pins (Go's module resolution has no
   version-range syntax) and are live-scanned with no lockfile needed;
