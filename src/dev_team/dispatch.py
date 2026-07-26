@@ -1022,6 +1022,9 @@ class Dispatcher:
         offset: int = 0,
         include_archived: bool = False,
         session: Optional[Session] = None,
+        repo: Optional[str] = None,
+        mode: Optional[str] = None,
+        state: Optional[str] = None,
     ) -> List[JobRecord]:
         """A newest-first page of records.
 
@@ -1033,6 +1036,14 @@ class Dispatcher:
         the slice sane for every caller. Archived jobs (per their mirrored
         ``meta.json``) are excluded by default; ``include_archived=True``
         (``GET /jobs?archived=1``) reveals them too.
+
+        ``repo``/``mode``/``state`` are optional exact-match filters
+        (``GET /jobs?repo=``/``?mode=``/``?state=``), AND-composed with each
+        other and applied before the ``offset``/``limit`` slice so pagination
+        is computed over the filtered set. A falsy value (``None`` or ``""``)
+        means "no filter" — mirroring ``?archived=``'s existing forgiving
+        contract on this route, an unrecognised value simply matches zero
+        records rather than raising.
         """
 
         limit = max(1, min(limit, _LIST_LIMIT_MAX))
@@ -1046,6 +1057,12 @@ class Dispatcher:
             # A signed-in session's page holds only its own tenants' jobs —
             # filtered before pagination so pages stay full.
             records = [r for r in records if self.session_sees_job(session, r.spec.id)]
+        if repo:
+            records = [r for r in records if r.spec.repo == repo]
+        if mode:
+            records = [r for r in records if r.spec.mode == mode]
+        if state:
+            records = [r for r in records if r.state == state]
         return records[offset : offset + limit]
 
     def wait(self, job_id: str, timeout: float = 5.0) -> bool:
@@ -2844,11 +2861,18 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 # ?archived=1 reveals archived jobs too; any other value (or
                 # its absence) keeps the default exclusion. ?limit=/?offset=
                 # page the newest-first list (bounds enforced by recent()).
-                # A session's page is scoped to its installations.
+                # ?repo=/?mode=/?state= exact-match filter the list (AND-
+                # composed, applied before the offset/limit slice) — a
+                # missing or empty value means "no filter", same forgiving
+                # posture as ?archived=. A session's page is scoped to its
+                # installations.
                 query = parse_qs(split.query)
                 include_archived = query.get("archived", ["0"])[0] == "1"
                 limit = self._int_param(query, "limit", _LIST_LIMIT)
                 offset = self._int_param(query, "offset", 0)
+                repo = query.get("repo", [""])[0]
+                mode = query.get("mode", [""])[0]
+                state = query.get("state", [""])[0]
                 self._json(
                     200,
                     {
@@ -2859,6 +2883,9 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                                 offset=offset,
                                 include_archived=include_archived,
                                 session=session,
+                                repo=repo,
+                                mode=mode,
+                                state=state,
                             )
                         ]
                     },

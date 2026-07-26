@@ -207,6 +207,19 @@ are excluded by default; `?archived=1` includes them:
           "started":123.0,"ended":null}]}
 ```
 
+`?repo=`/`?mode=`/`?state=` narrow the list by exact string match against
+the job's `repo` (as originally submitted, or resolved from `meta.json` for
+a `verify` job — see `_verify_spec`), `mode` (`assess`/`deliver`/`verify`),
+and `state` (`queued`/`running`/`succeeded`/`failed`/`cancelled`)
+respectively. All three are optional, AND-composed with each other and with
+`?archived=`, and applied *before* `?limit=`/`?offset=` pagination, so a page
+is always computed over the filtered set. A missing or empty value means "no
+filter" — matching `?archived=`'s existing forgiving contract on this route,
+an unrecognised value (a typo'd mode, a state outside the closed set) is
+never rejected; it simply matches zero jobs. There is no normalization
+between repo forms (e.g. `owner/name` vs. a full URL are distinct strings) —
+a caller filters with the exact string a job was submitted with.
+
 ### `GET /jobs/{id}` (auth) — status
 
 ```json

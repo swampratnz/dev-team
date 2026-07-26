@@ -10,6 +10,7 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -1015,13 +1016,13 @@ def test_calibration_report_quality_excludes_archived_job_and_reappears_after_un
 # --- costs rollup ---------------------------------------------------------
 
 
-def _insert_job(disp, job_id, mode, state, cost_usd):
+def _insert_job(disp, job_id, mode, state, cost_usd, repo="acme/mono"):
     """Register a job directly in the registry, bypassing submit/run_job —
     lets one test exercise every state/cost combination with no real clone
     or agent run."""
 
     spec = JobSpec(
-        mode=mode, repo="acme/mono", title="T", description="D",
+        mode=mode, repo=repo, title="T", description="D",
         budget_usd=None, id=job_id,
     )
     disp._registry[job_id] = JobRecord(spec=spec, state=state, cost_usd=cost_usd)
@@ -2477,6 +2478,121 @@ def test_recent_excludes_archived_jobs_by_default():
         disp.stop()
 
 
+# --- ?repo=/?mode=/?state= filters on recent() (issue #221) -------------------
+
+
+def test_recent_filters_by_repo_exact_match():
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "j1", "assess", "queued", None, repo="acme/rota")
+    _insert_job(disp, "j2", "assess", "queued", None, repo="other/repo")
+    assert [r.spec.id for r in disp.recent(repo="acme/rota")] == ["j1"]
+
+
+def test_recent_filters_by_mode_exact_match():
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "j1", "assess", "queued", None)
+    _insert_job(disp, "j2", "verify", "queued", None)
+    _insert_job(disp, "j3", "deliver", "queued", None)
+    assert [r.spec.id for r in disp.recent(mode="deliver")] == ["j3"]
+
+
+def test_recent_filters_by_state_exact_match():
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "j1", "assess", "failed", None)
+    _insert_job(disp, "j2", "assess", "succeeded", None)
+    _insert_job(disp, "j3", "assess", "queued", None)
+    assert [r.spec.id for r in disp.recent(state="failed")] == ["j1"]
+
+
+def test_recent_filters_compose_with_and_not_or():
+    # AC4: an acme/rota assess job and an other/repo deliver job — neither
+    # individually empty under either filter alone — must yield nothing when
+    # both filters are applied together.
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "j1", "assess", "queued", None, repo="acme/rota")
+    _insert_job(disp, "j2", "deliver", "queued", None, repo="other/repo")
+    assert [r.spec.id for r in disp.recent(repo="acme/rota")] == ["j1"]
+    assert [r.spec.id for r in disp.recent(mode="deliver")] == ["j2"]
+    assert disp.recent(repo="acme/rota", mode="deliver") == []
+
+
+def test_recent_repo_filter_applies_before_offset_limit_slice():
+    # AC5: with 3+ jobs matching ?repo=, offset/limit must page over the
+    # FILTERED set, not the result of slicing first and filtering after.
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "other", "assess", "queued", None, repo="other/repo")
+    for i in range(4):
+        _insert_job(disp, f"m{i}", "assess", "queued", None, repo="acme/rota")
+    # newest-first matching order: m3, m2, m1, m0
+    result = disp.recent(repo="acme/rota", limit=1, offset=1)
+    assert [r.spec.id for r in result] == ["m2"]
+
+
+def test_recent_repo_filter_composes_with_archived():
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    disp.start()
+    try:
+        id1, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "acme/rota"}))
+        disp.wait(id1, 5)
+        disp.archive_job(id1)
+        assert disp.recent(repo="acme/rota") == []
+        assert [r.spec.id for r in disp.recent(repo="acme/rota", include_archived=True)] == [id1]
+    finally:
+        disp.stop()
+
+
+def test_recent_lenient_on_unrecognised_or_empty_filter_values():
+    # AC7: an unrecognised value matches zero records; an empty/falsy value
+    # (mirroring an absent key) means "no filter" — never an error either way.
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "j1", "assess", "queued", None)
+    assert disp.recent(mode="bogus") == []
+    assert [r.spec.id for r in disp.recent(state="")] == ["j1"]
+    assert [r.spec.id for r in disp.recent(repo=None)] == ["j1"]
+
+
+def test_recent_repo_filter_matches_a_resolved_verify_job():
+    # AC9: a verify job's JobSpec.repo is resolved from the source job's
+    # meta.json (via _verify_spec / build_spec), not submitted directly —
+    # confirm it's filterable identically to a direct submission.
+    disp = Dispatcher(token="x", dashboard_workspace=_seeded_dash())
+    spec = disp.build_spec(
+        {"mode": "verify", "source_job": "assess-old",
+         "finding_id": "recommendation.plan[0]"}
+    )
+    disp._registry[spec.id] = JobRecord(spec=spec)
+    disp._order.append(spec.id)
+    assert spec.repo == "acme/mono"
+    assert [r.spec.id for r in disp.recent(repo="acme/mono")] == [spec.id]
+
+
+def test_recent_filters_never_leak_across_tenants():
+    # AC10: session scoping must still hold even when repo/mode/state all
+    # match another tenant's job. The foreign job matches every filter
+    # (mode=assess, state=queued, and repo= the value we query with) — only
+    # tenant scoping keeps it out.
+    from dev_team.oauth import Session as OAuthSession
+
+    oauth, _ = _oauth_fixture()
+    disp = Dispatcher(token="x", oauth=oauth)
+    session = OAuthSession(
+        token="t", login="chris", installations=("acme",),
+        refresh_token=None, expires=10**12,
+    )
+    _insert_job(disp, "assess-own", "assess", "queued", None)  # repo acme/mono
+    foreign = JobSpec(mode="assess", repo="other/mono", title="T", description="",
+                      budget_usd=None, id="assess-foreign")
+    with disp._lock:
+        disp._registry["assess-foreign"] = JobRecord(spec=foreign, state="queued")
+        disp._order.append("assess-foreign")
+    result = disp.recent(session=session, repo="other/mono", mode="assess", state="queued")
+    assert result == []
+
+
 def test_calibration_excludes_archived_job_and_reappears_after_unarchive():
     dash = InMemoryWorkspace()
     dash.write_text(
@@ -3226,6 +3342,144 @@ def test_jobs_list_archived_query_param_reveals_archived_jobs():
         status, payload = _call(server, "/jobs?archived=1")
         assert status == 200
         assert [j["id"] for j in payload["jobs"]] == [job["id"]]
+
+
+def test_jobs_list_http_route_repo_mode_state_query_params():
+    # AC1-AC3: ?repo=/?mode=/?state= each independently narrow the list.
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "j1", "assess", "queued", None,
+                    repo="acme/rota")
+        _insert_job(server.dispatcher, "j2", "deliver", "succeeded", None,
+                    repo="other/repo")
+        _insert_job(server.dispatcher, "j3", "verify", "failed", None,
+                    repo="acme/rota")
+
+        status, payload = _call(server, "/jobs?repo=acme/rota")
+        assert status == 200
+        assert {j["id"] for j in payload["jobs"]} == {"j1", "j3"}
+
+        status, payload = _call(server, "/jobs?mode=deliver")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == ["j2"]
+
+        status, payload = _call(server, "/jobs?state=failed")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == ["j3"]
+
+
+def test_jobs_list_http_route_repo_and_mode_compose_with_and():
+    # AC4: neither filter alone is empty, but together they must be.
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "j1", "assess", "queued", None,
+                    repo="acme/rota")
+        _insert_job(server.dispatcher, "j2", "deliver", "queued", None,
+                    repo="other/repo")
+        status, payload = _call(server, "/jobs?repo=acme/rota&mode=deliver")
+        assert status == 200
+        assert payload["jobs"] == []
+
+
+def test_jobs_list_http_route_repo_filter_before_limit_offset_slice():
+    # AC5: filtering happens before pagination, not after.
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "other", "assess", "queued", None,
+                    repo="other/repo")
+        for i in range(4):
+            _insert_job(server.dispatcher, f"m{i}", "assess", "queued", None,
+                        repo="acme/rota")
+        status, payload = _call(server, "/jobs?repo=acme/rota&limit=1&offset=1")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == ["m2"]
+
+
+def test_jobs_list_http_route_repo_filter_composes_with_archived():
+    # AC6: an archived job matching ?repo= stays excluded unless ?archived=1.
+    dash = InMemoryWorkspace()
+    with running(runner=_assess_runner(), materialise=_mem_materialise,
+                 dashboard_workspace=dash) as server:
+        _, job = _call(server, "/jobs", method="POST",
+                       body={"mode": "assess", "repo": "acme/rota"})
+        server.dispatcher.wait(job["id"], 5)
+        _call(server, f"/jobs/{job['id']}/archive", method="POST")
+
+        status, payload = _call(server, "/jobs?repo=acme/rota")
+        assert status == 200
+        assert payload["jobs"] == []
+
+        status, payload = _call(server, "/jobs?repo=acme/rota&archived=1")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == [job["id"]]
+
+
+def test_jobs_list_http_route_lenient_on_unrecognised_and_empty_values():
+    # AC7: an unrecognised value never errors, just yields zero matches; an
+    # empty value is treated the same as an absent key (unfiltered).
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "j1", "assess", "queued", None)
+
+        status, payload = _call(server, "/jobs?mode=bogus")
+        assert status == 200
+        assert payload["jobs"] == []
+
+        status, payload = _call(server, "/jobs?state=")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == ["j1"]
+
+
+def test_jobs_list_http_route_repo_filter_fuzzed_with_traversal_and_shell_strings():
+    # AC8 [security]: ?repo= is only ever compared as a plain string — a
+    # path-traversal or shell-metacharacter value must never error or match
+    # anything, proving no filesystem/subprocess use of the value.
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "j1", "assess", "queued", None,
+                    repo="acme/rota")
+        for fuzz in ("../../../etc/passwd", "$(rm -rf /)"):
+            status, payload = _call(
+                server, f"/jobs?repo={urllib.parse.quote(fuzz, safe='')}"
+            )
+            assert status == 200
+            assert payload["jobs"] == []
+
+
+def test_jobs_list_http_route_repo_filter_matches_resolved_verify_job():
+    # AC9: a verify job's repo (resolved from meta.json, not submitted
+    # directly) is filterable identically to any other job.
+    with running(materialise=_mem_materialise,
+                 dashboard_workspace=_seeded_dash()) as server:
+        spec = server.dispatcher.build_spec(
+            {"mode": "verify", "source_job": "assess-old",
+             "finding_id": "recommendation.plan[0]"}
+        )
+        server.dispatcher._registry[spec.id] = JobRecord(spec=spec)
+        server.dispatcher._order.append(spec.id)
+        status, payload = _call(server, "/jobs?repo=acme/mono")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == [spec.id]
+
+
+def test_jobs_list_http_route_filters_never_leak_across_tenants():
+    # AC10: repo/mode/state filters never surface another tenant's job to a
+    # signed-in session, even when all three match — the foreign job matches
+    # mode/state and the exact repo= we query with; only tenant scoping
+    # keeps it out.
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        _insert_job(server.dispatcher, "assess-own", "assess", "queued", None,
+                    repo="acme/mono")
+        foreign = JobSpec(mode="assess", repo="other/mono", title="T",
+                          description="", budget_usd=None, id="assess-theirs")
+        with server.dispatcher._lock:
+            server.dispatcher._registry["assess-theirs"] = JobRecord(
+                spec=foreign, state="queued"
+            )
+            server.dispatcher._order.append("assess-theirs")
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server, "/jobs?repo=other/mono&mode=assess&state=queued",
+            token=session_token,
+        )
+        assert status == 200
+        assert payload["jobs"] == []
 
 
 def test_jobs_list_http_route_paginates_with_limit_and_offset():
