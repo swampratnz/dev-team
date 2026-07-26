@@ -292,11 +292,12 @@ def _resolve_dependency_groups(groups: Dict) -> List[str]:
     set of group names already visited on *that* path, so re-visiting a name
     on the same path — a direct self-reference or an indirect cycle like
     ``a`` -> ``b`` -> ``a`` — is dropped rather than re-expanded. A single
-    counter shared across every top-level group caps the total number of
-    frames the whole table may push (:data:`_MAX_GROUP_EXPANSIONS`), closing
-    off a densely cross-referencing graph from unbounded work; once the cap
-    is hit, resolution stops early for the rest of the manifest rather than
-    raising.
+    counter shared across every top-level group caps the total amount of
+    work the whole table may do (:data:`_MAX_GROUP_EXPANSIONS`), closing off
+    both a deep chain of pops *and* a single group whose own entry list is
+    made attacker-long (a single pop can otherwise walk an unbounded ``for
+    entry in entries`` loop) from unbounded work; once the cap is hit,
+    resolution stops early for the rest of the manifest rather than raising.
     """
 
     specs: List[str] = []
@@ -315,6 +316,9 @@ def _resolve_dependency_groups(groups: Dict) -> List[str]:
                 continue
             next_visited = visited_in_path | {current}
             for entry in entries:
+                if expansions >= _MAX_GROUP_EXPANSIONS:
+                    return specs
+                expansions += 1
                 if isinstance(entry, str):
                     specs.append(entry)
                 elif isinstance(entry, dict):

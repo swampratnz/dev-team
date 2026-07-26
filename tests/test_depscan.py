@@ -328,6 +328,21 @@ def test_parse_pyproject_toml_dependency_groups_bounded_expansion():
     assert all(d.name != "tail-pkg" for d in deps)
 
 
+def test_parse_pyproject_toml_dependency_groups_bounded_expansion_breadth_specs():
+    # A single group whose own entry list is attacker-long: one pop walks
+    # this whole list in the inner `for entry in entries` loop. The cap must
+    # be enforced per-entry inside that loop, not just once per pop —
+    # otherwise a single top-level group with hundreds of thousands of
+    # plain-string entries bypasses _MAX_GROUP_EXPANSIONS entirely (the
+    # depth-chained test above only exercises the once-per-pop check, which
+    # this breadth shape bypasses).
+    count = _MAX_GROUP_EXPANSIONS * 3
+    entries = ", ".join(f'"pkg{i}==1.0.0"' for i in range(count))
+    text = f"[dependency-groups]\nall = [{entries}]\n"
+    deps = parse_pyproject_toml(text, "pyproject.toml")
+    assert len(deps) < count
+
+
 def test_parse_pyproject_toml_dependency_groups_unknown_group_reference():
     text = """
 [dependency-groups]

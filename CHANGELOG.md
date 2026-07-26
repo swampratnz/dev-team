@@ -20,12 +20,20 @@ sections below are reconstructed from the repository history.
   self-reference or an indirect cycle (`a` -> `b` -> `a`) is dropped rather
   than re-expanded or looping; a new bounded module-level constant,
   `_MAX_GROUP_EXPANSIONS` (mirroring the existing `_MAX_DEPENDENCIES`
-  pattern), caps how many stack frames the whole table may push, so a
-  densely cross-referencing composition graph can't force unbounded work.
-  Resolved specs flow through the unchanged `_pep508_pin` extraction — no
-  new pin-parsing logic. No new file, manifest registration, dependency, or
-  external call: resolved entries ride the same existing batched OSV.dev
-  query (issue #210, follow-on to #157).
+  pattern), caps total work — checked per stack pop *and* per entry within a
+  single group's own list, so one group with an attacker-long entry list
+  can't push or scan past the cap before the next check — so a densely
+  cross-referencing or attacker-long composition graph can't force unbounded
+  work. Resolved specs flow through the unchanged `_pep508_pin` extraction —
+  no new pin-parsing logic. Security-impact note: a group that is both a
+  top-level entry and reachable via another group's `include-group` is
+  resolved (and counted) both ways, so the same package can appear more than
+  once in `deps` for one manifest — harmless for OSV query correctness
+  (duplicate queries, not wrong ones) but it does mean adversarial
+  composition eats into the shared `_MAX_DEPENDENCIES` batch budget faster
+  than one entry per package would. No new file, manifest registration,
+  dependency, or external call: resolved entries ride the same existing
+  batched OSV.dev query (issue #210, follow-on to #157).
 - **Live EOL/support-status scan extended to Java (`pom.xml`) runtimes**
   (`eolscan.py`): `parse_pom_xml_java` reads the top-level `<properties>`
   element of a Maven `pom.xml` — `maven.compiler.release`, `java.version`,
