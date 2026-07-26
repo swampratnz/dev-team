@@ -4394,6 +4394,284 @@ def test_docker_build_gate_dockerfile_content_never_reaches_argv():
     assert "rm -rf" not in tag and "whoami" not in tag and "curl" not in tag
 
 
+def test_docker_run_gate_off_by_default_no_new_calls():
+    # docker_run_gate unset (default False) with docker_build_gate on: a
+    # successful build still only issues its own build + rmi calls, nothing
+    # docker-run/-inspect/-logs/-stop shaped, and no new scorecard keys.
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner, workspace=ws, command_runner=cmd, config=EngineConfig(docker_build_gate=True)
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_build_verified"] is True
+    docker_calls = [c for c in cmd.calls if c and c[0] == "docker"]
+    assert {c[1] for c in docker_calls} == {"build", "rmi"}
+    assert "docker_run_verified" not in outcome.scorecard
+    assert "docker_run_detail" not in outcome.scorecard
+
+
+def test_docker_run_gate_short_circuits_when_build_gate_off():
+    # docker_run_gate=True but docker_build_gate=False: no Dockerfile is even
+    # built, so there is nothing to smoke-test — no docker calls at all.
+    cmd = GateCycleRunner()
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner, command_runner=cmd, config=EngineConfig(docker_run_gate=True)
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert not any(c and c[0] == "docker" for c in cmd.calls)
+    assert "docker_run_verified" not in outcome.scorecard
+
+
+def test_docker_run_gate_short_circuits_when_build_fails():
+    # Both gates on, but the build itself fails: the run gate must never
+    # start a container from an image that was never successfully built.
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule("docker build", CommandResult(["docker", "build"], 1, "step 2/4 failed", ""))
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_build_verified"] is False
+    docker_calls = [c for c in cmd.calls if c and c[0] == "docker"]
+    # build gate's own cleanup still runs (build failed -> not deferred), but
+    # nothing run/inspect/logs/stop-shaped is ever issued.
+    assert {c[1] for c in docker_calls} == {"build", "rmi"}
+    assert "docker_run_verified" not in outcome.scorecard
+
+
+def test_docker_run_gate_success_records_scorecard_and_cleans_up():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", "")
+    )
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_build_verified"] is True
+    assert outcome.scorecard["docker_run_verified"] is True
+    assert "docker_run_detail" not in outcome.scorecard
+    run_calls = [c for c in cmd.calls if c[:2] == ["docker", "run"]]
+    inspect_calls = [c for c in cmd.calls if c[:2] == ["docker", "inspect"]]
+    stop_calls = [c for c in cmd.calls if c[:2] == ["docker", "stop"]]
+    rmi_calls = [c for c in cmd.calls if c[:2] == ["docker", "rmi"]]
+    logs_calls = [c for c in cmd.calls if c[:2] == ["docker", "logs"]]
+    assert len(run_calls) == 1
+    assert len(inspect_calls) == 1
+    assert len(stop_calls) == 1
+    assert len(rmi_calls) == 1  # deferred by the build gate, run here instead
+    assert not logs_calls  # container stayed up: no need to read its logs
+    tag = run_calls[0][-1]
+    assert stop_calls[0] == ["docker", "stop", tag]
+    assert rmi_calls[0] == ["docker", "rmi", tag]
+    verified_events = [e for e in events if e.stage == "docker-run-verified"]
+    assert len(verified_events) == 1
+
+
+def test_docker_run_gate_exit_early_records_failure_detail():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "false\n", "")
+    )
+    cmd.add_rule(
+        "docker logs", CommandResult(["docker", "logs"], 0, "boom: missing dependency", "")
+    )
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    # advisory only: the run still succeeds
+    assert outcome.success is True
+    assert outcome.scorecard["docker_run_verified"] is False
+    assert "boom: missing dependency" in outcome.scorecard["docker_run_detail"]
+    stop_calls = [c for c in cmd.calls if c[:2] == ["docker", "stop"]]
+    rmi_calls = [c for c in cmd.calls if c[:2] == ["docker", "rmi"]]
+    assert len(stop_calls) == 1
+    assert len(rmi_calls) == 1
+    failed_events = [e for e in events if e.stage == "docker-run-failed"]
+    assert len(failed_events) == 1
+
+
+def test_docker_run_gate_cleanup_failure_is_swallowed_and_logged():
+    class _StopRaisingRunner(GateCycleRunner):
+        def run(self, command, *, cwd=None, timeout=None):
+            args = list(command)
+            if args[:2] == ["docker", "stop"]:
+                self.calls.append(args)
+                raise RuntimeError("stop exploded")
+            return super().run(command, cwd=cwd, timeout=timeout)
+
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = _StopRaisingRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", "")
+    )
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    # the run never fails on account of a cleanup that itself blew up, and
+    # the deferred image rmi still runs afterwards
+    assert outcome.success is True
+    assert outcome.scorecard["docker_run_verified"] is True
+    rmi_calls = [c for c in cmd.calls if c[:2] == ["docker", "rmi"]]
+    assert len(rmi_calls) == 1
+    cleanup_events = [e for e in events if e.stage == "docker-run-cleanup-failed"]
+    assert len(cleanup_events) == 1
+    assert "stop exploded" in cleanup_events[0].message
+
+
+def test_docker_run_gate_cleanup_nonzero_exit_is_swallowed_and_logged():
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile()
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", "")
+    )
+    cmd.add_rule("docker stop", CommandResult(["docker", "stop"], 1, "no such container", ""))
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    # a cleanup that fails (without raising) is also swallowed and logged
+    assert outcome.success is True
+    assert outcome.scorecard["docker_run_verified"] is True
+    rmi_calls = [c for c in cmd.calls if c[:2] == ["docker", "rmi"]]
+    assert len(rmi_calls) == 1
+    cleanup_events = [e for e in events if e.stage == "docker-run-cleanup-failed"]
+    assert len(cleanup_events) == 1
+    assert "no such container" in cleanup_events[0].detail
+
+
+def test_docker_run_gate_argv_is_network_none_and_never_leaks_content():
+    # SECURITY: the run argv unconditionally isolates the network and never
+    # embeds anything beyond the locally-generated tag.
+    malicious_content = (
+        "FROM python:3.12-slim\n"
+        "RUN echo $(rm -rf /) `whoami` ; cat /etc/passwd\n"
+    )
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(content=malicious_content)
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", "")
+    )
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    run_calls = [c for c in cmd.calls if c[:2] == ["docker", "run"]]
+    assert len(run_calls) == 1
+    tag = run_calls[0][-1]
+    assert run_calls[0] == [
+        "docker", "run", "-d", "--rm", "--network", "none", "--name", tag, tag,
+    ]
+    assert "rm -rf" not in tag and "whoami" not in tag
+
+
+def test_docker_run_gate_no_http_probe_introduced():
+    # SCOPE: liveness-after-grace-period via `docker inspect` is the entire
+    # check — nothing resembling an HTTP client call was added.
+    import inspect as inspect_module
+
+    source = inspect_module.getsource(DeliveryEngine._docker_run_gate)
+    for token in ("requests", "httpx", "urllib", "http.client", "curl", "aiohttp"):
+        assert token not in source
+
+
+def test_docker_run_gate_reuses_sandboxed_command_runner(tmp_path):
+    # SECURITY: under --sandbox, the run-gate's docker/inspect/stop calls go
+    # through the same containerised self.command_runner as every other
+    # gate — no separate, sandbox-bypassing execution path.
+    from dev_team.sandbox import SandboxConfig
+
+    fake = FakeCommandRunner()
+    fake.add_rule("docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", ""))
+    engine = _engine(
+        ScriptedRunner(by_system_prompt={}),
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=fake,
+        config=EngineConfig(sandbox=SandboxConfig(image="toolchain:1"), docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    engine._scorecard["docker_build_verified"] = True
+    run(engine._docker_run_gate())
+
+    docker_run_gate_calls = [c for c in fake.calls if "docker" in c and c[0] == "docker"]
+    assert docker_run_gate_calls  # sanity: the gate actually ran commands
+    # every command was containerised (rewritten into an outer `docker run`
+    # against the sandbox image) rather than executed directly on the host.
+    assert all(c[:2] == ["docker", "run"] and "toolchain:1" in c for c in fake.calls)
+
+
 def test_writer_docs_are_written_to_workspace():
     responses = engine_responses()
     responses["technical writer"] = json_response(
