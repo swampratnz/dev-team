@@ -6,6 +6,26 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Assessment
+- **OSV scan resolves PEP 735 `include-group` composition transitively**
+  (`depscan.py`), closing #157's own named follow-up: `parse_pyproject_toml`
+  previously skipped a `[dependency-groups]` entry that was a table
+  (`{include-group = "..."}`) rather than a package, so a group defined by
+  composing others (`all = [{include-group = "test"}, {include-group =
+  "docs"}]`) never had its own contribution resolved through that
+  reference. A new `_resolve_dependency_groups` helper walks the
+  composition graph with an explicit stack, not Python recursion — the
+  table comes from an untrusted, cloned third-party repo, so an explicit
+  stack has no `RecursionError` ceiling on a hostile deep/wide chain. Each
+  stack frame carries the set of group names visited on its own path, so a
+  self-reference or an indirect cycle (`a` -> `b` -> `a`) is dropped rather
+  than re-expanded or looping; a new bounded module-level constant,
+  `_MAX_GROUP_EXPANSIONS` (mirroring the existing `_MAX_DEPENDENCIES`
+  pattern), caps how many stack frames the whole table may push, so a
+  densely cross-referencing composition graph can't force unbounded work.
+  Resolved specs flow through the unchanged `_pep508_pin` extraction — no
+  new pin-parsing logic. No new file, manifest registration, dependency, or
+  external call: resolved entries ride the same existing batched OSV.dev
+  query (issue #210, follow-on to #157).
 - **Live EOL/support-status scan extended to Java (`pom.xml`) runtimes**
   (`eolscan.py`): `parse_pom_xml_java` reads the top-level `<properties>`
   element of a Maven `pom.xml` — `maven.compiler.release`, `java.version`,
