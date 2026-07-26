@@ -16,6 +16,7 @@ from dev_team.depscan import (
     _MAX_GROUP_EXPANSIONS,
     collect_dependencies,
     parse_cargo_toml,
+    parse_composer_json,
     parse_composer_lock,
     parse_gemfile_lock,
     parse_go_mod,
@@ -952,11 +953,86 @@ def test_parse_composer_lock_rejects_adversarial_json():
     ) == []
 
 
+def test_parse_composer_json_caret_tilde_and_bare_exact():
+    text = json.dumps(
+        {
+            "require": {
+                "laravel/framework": "^9.0",
+                "symfony/console": "~5.4.10",
+                "vendor/pkg": "9.0.0",
+            }
+        }
+    )
+    deps = parse_composer_json(text, "composer.json")
+    assert [
+        (d.name, d.version, d.ecosystem, d.manifest, d.approximate) for d in deps
+    ] == [
+        ("laravel/framework", "9.0", "Packagist", "composer.json", True),
+        ("symfony/console", "5.4.10", "Packagist", "composer.json", True),
+        ("vendor/pkg", "9.0.0", "Packagist", "composer.json", False),
+    ]
+
+
+def test_parse_composer_json_reads_require_dev():
+    text = json.dumps({"require-dev": {"phpunit/phpunit": "^9.5"}})
+    deps = parse_composer_json(text, "composer.json")
+    assert [(d.name, d.version, d.approximate) for d in deps] == [
+        ("phpunit/phpunit", "9.5", True)
+    ]
+
+
+def test_parse_composer_json_skips_platform_pseudo_packages():
+    text = json.dumps(
+        {
+            "require": {
+                "php": "^8.1",
+                "ext-mbstring": "*",
+                "lib-openssl": "*",
+                "vendor/real": "^1.0",
+            }
+        }
+    )
+    deps = parse_composer_json(text, "composer.json")
+    assert [(d.name, d.version) for d in deps] == [("vendor/real", "1.0")]
+
+
+def test_parse_composer_json_skips_ambiguous_and_wide_constraints():
+    text = json.dumps(
+        {
+            "require": {
+                "vendor/a": "*",
+                "vendor/b": "dev-master",
+                "vendor/c": ">=1.0 <2.0",
+                "vendor/d": "1.0 || 2.0",
+                "vendor/e": "^1.0 || ^2.0",
+            }
+        }
+    )
+    assert parse_composer_json(text, "composer.json") == []
+
+
+def test_parse_composer_json_rejects_malformed_input():
+    assert parse_composer_json("not json at all", "composer.json") == []
+    assert parse_composer_json('"a string"', "composer.json") == []
+    assert parse_composer_json("[]", "composer.json") == []
+    assert parse_composer_json(
+        json.dumps({"require": "not-a-dict"}), "composer.json"
+    ) == []
+    assert parse_composer_json(
+        json.dumps({"require-dev": "not-a-dict"}), "composer.json"
+    ) == []
+    assert parse_composer_json(
+        json.dumps({"require": {"vendor/pkg": ["not", "a", "string"]}}),
+        "composer.json",
+    ) == []
+
+
 def test_parsers_registered_in_parsers_table():
     from dev_team.depscan import _PARSERS
 
     assert _PARSERS["go.mod"] is parse_go_mod
     assert _PARSERS["Gemfile.lock"] is parse_gemfile_lock
+    assert _PARSERS["composer.json"] is parse_composer_json
     assert _PARSERS["composer.lock"] is parse_composer_lock
 
 
@@ -1020,6 +1096,38 @@ def test_collect_dependencies_dedupes_composer_lock():
     )
     deps = collect_dependencies(ws)
     assert len(deps) == 1
+
+
+def test_collect_dependencies_composer_lock_supersedes_composer_json_range():
+    ws = InMemoryWorkspace(
+        {
+            "composer.json": json.dumps({"require": {"vendor/pkg": "^9.0"}}),
+            "composer.lock": json.dumps(
+                {"packages": [{"name": "vendor/pkg", "version": "9.2.3"}]}
+            ),
+        }
+    )
+    deps = collect_dependencies(ws)
+    # Only the lockfile-resolved 9.2.3 survives; the ^9.0 floor (9.0) is
+    # dropped, proving the existing supersede rule generalises unmodified.
+    assert [(d.name, d.version, d.approximate) for d in deps] == [
+        ("vendor/pkg", "9.2.3", False)
+    ]
+
+
+def test_collect_dependencies_keeps_unresolved_composer_json_range():
+    # With no composer.lock the ^ range's floor is all we have; keep it
+    # (flagged approximate) and let it render through the existing
+    # "lower bound only" language.
+    ws = InMemoryWorkspace(
+        {"composer.json": json.dumps({"require": {"vendor/pkg": "^9.0"}})}
+    )
+    deps = collect_dependencies(ws)
+    assert [(d.name, d.version, d.approximate) for d in deps] == [
+        ("vendor/pkg", "9.0", True)
+    ]
+    rendered = DependencyScan(dependencies=deps).render()
+    assert "lower bound only" in rendered
 
 
 def test_scan_dependencies_go_and_rubygems_vulnerabilities():

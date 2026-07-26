@@ -120,9 +120,13 @@ machinery understands them now:
   `require` entries are always exact pins (Go's module resolution has no
   version-range syntax) and are live-scanned with no lockfile needed;
   Ruby's bare `Gemfile` (a range-specified manifest with no lockfile) is
-  not parsed — only `Gemfile.lock`'s resolved pins are. Likewise PHP's
-  `composer.json` version constraints are not parsed — only
-  `composer.lock`'s resolved pins are.
+  not parsed — only `Gemfile.lock`'s resolved pins are. PHP `composer.json`
+  `require`/`require-dev` caret (`^`), tilde (`~`), and bare-exact
+  constraints are live-scanned the same way as `package.json`'s `^`/`~`
+  ranges (lower bound only, superseded by `composer.lock` when present);
+  wider forms — OR-lists (`||`), comma-separated AND-lists, and `dev-*`
+  branch aliases — still fall back to model knowledge, since resolving them
+  correctly needs Composer's own dependency resolver.
 - **Detected Node.js/Python/.NET/Ruby/Go/PHP/Java runtime versions get a
   live endoflife.date EOL/support-status check; every other EOL/support-
   status judgment (other runtimes, frameworks, libraries) is model
