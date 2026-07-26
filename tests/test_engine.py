@@ -3666,6 +3666,61 @@ def test_mutation_check_boolop_only_test_file_still_excluded_from_mutation():
     assert ws.read_text("tests/test_x.py") == "def test_f(a, b):\n    assert a and b\n"
 
 
+def test_mutation_check_identity_only_test_file_still_excluded_from_mutation():
+    # SECURITY regression (issue #219 criterion 8): widening `_FLIPS` to
+    # cover `is`/`is not`/`in`/`not in` must not loosen `_is_test_path`'s
+    # exclusion or the single-non-test-impl-file selection. The test file
+    # here is identity/membership-only and the product file is
+    # equality-only; only the product file may ever be mutated.
+    from dev_team.models import ChangeType, FileChange
+
+    ws = InMemoryWorkspace(
+        {
+            "src/x.py": "def f(a, b):\n    return a == b\n",
+            "tests/test_x.py": "def test_f(a, b):\n    assert a is b\n",
+        }
+    )
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[
+            FileChange(path="src/x.py", change_type=ChangeType.CREATE, summary="s"),
+            FileChange(path="tests/test_x.py", change_type=ChangeType.CREATE, summary="s"),
+        ],
+    )
+    run(engine._mutation_check(impl, ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert ws.read_text("src/x.py") == "def f(a, b):\n    return a == b\n"
+    assert ws.read_text("tests/test_x.py") == "def test_f(a, b):\n    assert a is b\n"
+
+
+def test_mutation_check_now_checks_identity_only_product_file():
+    # Pre-#219: a product file with only an identity comparison and no
+    # equality/ordering comparison made `mutate_first_mutant` return `None`,
+    # so `_mutation_check` returned at `mutated is None` with no gate re-run
+    # and no scorecard change. This is the core new-coverage assertion.
+    ws = InMemoryWorkspace(
+        {"src/x.py": "def f(a):\n    if a is None:\n        return 1\n    return 0\n"}
+    )
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert ws.read_text("src/x.py") == (
+        "def f(a):\n    if a is None:\n        return 1\n    return 0\n"
+    )
+
+
 def test_mutation_check_now_checks_boolop_only_product_file():
     # Pre-#197: a product file with a boolean condition and no comparison
     # made `mutate_first_mutant` return None, so `_mutation_check` returned

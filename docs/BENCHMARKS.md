@@ -37,12 +37,13 @@ beat either alone, and false-positive suppression is a first-class metric.**
   reruns them with the implementation reverted (snapshot restore or
   `git stash -u`); a suite that still passes is rejected as vacuous
   (`EngineConfig.fail_to_pass_check`). Mutation-lite scoring ✅ — opt-in,
-  Python-only v1: flips the first comparison (`==`/`!=`/`<`/`>=`/`>`/`<=`)
-  or boolean-operator (`and`/`or`) flip in the task's one product file and
-  reruns the gates; a surviving mutant is an advisory `mutation_survived`
-  scorecard signal only (never a rejection, unlike fail-to-pass)
-  (`EngineConfig.mutation_check`, off by default). Per-profile mutators for
-  other languages remain future work.
+  Python-only v1: flips the first comparison (including identity/membership:
+  `==`/`!=`/`<`/`>=`/`>`/`<=`/`is`/`is not`/`in`/`not in`) or boolean-operator
+  (`and`/`or`) flip in the task's one product file and reruns the gates; a
+  surviving mutant is an advisory `mutation_survived` scorecard signal only
+  (never a rejection, unlike fail-to-pass) (`EngineConfig.mutation_check`,
+  off by default). Per-profile mutators for other languages remain future
+  work.
 
 ## Security
 - **Benchmarks:** CWE-Bench-Java/IRIS (neurosymbolic LLM+CodeQL found 2× the

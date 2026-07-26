@@ -5,9 +5,9 @@ that fills the gap :doc:`../docs/BENCHMARKS.md` names next to the adopted
 fail-to-pass check: a test suite can exercise a code path without ever pinning
 its *behaviour* (e.g. asserting no exception, never asserting on the
 comparison or boolean condition that makes the logic correct). A single
-flipped comparison (``==``↔``!=``, ``<``↔``>=``, ``>``↔``<=``) or boolean
-operator (``and``↔``or``) that still passes the existing suite is the
-textbook signature of that gap.
+flipped comparison (``==``↔``!=``, ``<``↔``>=``, ``>``↔``<=``,
+``is``↔``is not``, ``in``↔``not in``) or boolean operator (``and``↔``or``)
+that still passes the existing suite is the textbook signature of that gap.
 
 This module is a pure, dependency-free AST transform — no subprocess, no
 network, no model call. It never mutates anything on disk itself; the caller
@@ -23,9 +23,11 @@ from typing import Dict, List, Optional, Type, Union
 
 # The comparison-operator flips this mutator knows: each maps to its logical
 # opposite, so a mutant that still passes the suite means the suite never
-# distinguished the two. Identity/membership operators (``is``, ``in``, ...)
-# are deliberately excluded — flipping them is a different mutation class,
-# out of scope for this v1 (see ROADMAP growth path in the proposal).
+# distinguished the two. Covers equality/ordering (``==``/``!=``/``<``/``>=``/
+# ``>``/``<=``) and identity/membership (``is``/``is not``/``in``/``not in``)
+# — every ``cmpop`` has a logical-opposite flip here. Arithmetic-operator
+# flips (``+``/``-``, ``*``/``/``) remain out of scope for this v1 (see
+# ROADMAP growth path in the proposal).
 _FLIPS: Dict[Type[ast.cmpop], Type[ast.cmpop]] = {
     ast.Eq: ast.NotEq,
     ast.NotEq: ast.Eq,
@@ -33,6 +35,10 @@ _FLIPS: Dict[Type[ast.cmpop], Type[ast.cmpop]] = {
     ast.GtE: ast.Lt,
     ast.Gt: ast.LtE,
     ast.LtE: ast.Gt,
+    ast.Is: ast.IsNot,
+    ast.IsNot: ast.Is,
+    ast.In: ast.NotIn,
+    ast.NotIn: ast.In,
 }
 
 # The boolean-operator flips this mutator knows: ``and``/``or`` never chain
@@ -71,19 +77,20 @@ class _FlipMutant(ast.NodeTransformer):
 def _mutation_candidates(tree: ast.AST) -> List[_Mutant]:
     """Every flippable ``Compare``/``BoolOp`` node in ``tree``.
 
-    A chained comparison (``a < b < c``, more than one op) and a comparison
-    using an operator outside :data:`_FLIPS` (``is``, ``in``, ...) are not
-    candidates — conservative by design, mirroring
+    A chained comparison (``a < b < c``, more than one op) is not a
+    candidate — conservative by design, mirroring
     :func:`dev_team.engine._is_test_path`'s "skip the ambiguous case" stance.
-    Every ``BoolOp`` node qualifies unconditionally.
+    Every single-op ``Compare`` node otherwise qualifies: :data:`_FLIPS` now
+    maps every :class:`ast.cmpop` subtype to its logical opposite, so there
+    is no longer an "operator outside ``_FLIPS``" case to guard against
+    (unlike the chained-comparison case above). Every ``BoolOp`` node
+    qualifies unconditionally too.
     """
 
     candidates: List[_Mutant] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1:
-                continue
-            if type(node.ops[0]) not in _FLIPS:
                 continue
             candidates.append(node)
         elif isinstance(node, ast.BoolOp):
@@ -95,10 +102,10 @@ def mutate_first_mutant(source: str) -> Optional[str]:
     """Flip the first mutable comparison or boolean operator in ``source``.
 
     Walks the parsed AST for every single-operator comparison using one of
-    ``==``/``!=``/``<``/``>=``/``>``/``<=`` and every boolean operator
-    (``and``/``or``), picks the one earliest in source order (by line, then
-    column), flips it to its logical opposite, and returns the unparsed
-    mutated source.
+    ``==``/``!=``/``<``/``>=``/``>``/``<=``/``is``/``is not``/``in``/
+    ``not in`` and every boolean operator (``and``/``or``), picks the one
+    earliest in source order (by line, then column), flips it to its
+    logical opposite, and returns the unparsed mutated source.
 
     Returns ``None`` — a silent skip, never an error — when ``source`` does
     not parse, or contains no flippable comparison or boolean operator. This
