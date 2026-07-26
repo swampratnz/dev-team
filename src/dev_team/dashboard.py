@@ -25,12 +25,18 @@ rotation is "change the env var and restart". This is a deliberate stopgap
 until an IdP (Auth0) lands; the seam a real integration replaces is
 ``Handler._authorised`` plus the /login//logout flow. With no token the
 dashboard is exactly as open as before (localhost dev).
+
+Repeated wrong-token/wrong-cookie requests from one source IP, on either the
+bearer/API path or the ``POST /login`` form, are throttled to ``429`` by
+:mod:`dev_team.authguard` (``--auth-rate-limit-*``) before the comparison
+even runs — see that module's docstring.
 """
 
 from __future__ import annotations
 
 import hmac
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -40,6 +46,8 @@ from typing import Callable, Dict, List, Optional
 from urllib.parse import parse_qs, quote, urlsplit
 
 from .assessment import calibration_summary
+from .authguard import DEFAULT_LOCKOUT_SECONDS, DEFAULT_THRESHOLD, DEFAULT_WINDOW_SECONDS
+from .authguard import FailedAuthTracker
 from .backlog import BacklogStore
 from .conventions import ConventionsStore
 from .eventlog import read_events
@@ -531,6 +539,10 @@ def _make_handler(
     dispatch_token: Optional[str] = None,
     *,
     secure: bool = False,
+    auth_rate_limit_threshold: int = DEFAULT_THRESHOLD,
+    auth_rate_limit_window_seconds: float = DEFAULT_WINDOW_SECONDS,
+    auth_rate_limit_lockout_seconds: float = DEFAULT_LOCKOUT_SECONDS,
+    auth_guard: Optional[FailedAuthTracker] = None,
 ) -> type:
     """A request handler class bound to ``workspace``.
 
@@ -542,6 +554,15 @@ def _make_handler(
     ``secure`` marks the session cookie ``Secure`` (TLS-only); leave it off for
     the plain-HTTP localhost default, turn it on when the dashboard is served
     over HTTPS (see :class:`DashboardServer`).
+
+    ``auth_rate_limit_threshold``/``_window_seconds``/``_lockout_seconds``
+    configure the shared :class:`~dev_team.authguard.FailedAuthTracker`
+    guarding both the bearer/API path (``_authorised``) and the ``POST
+    /login`` form — one tracker per dashboard process, so a lockout tripped
+    on one path also blocks the other from the same source. ``auth_guard``
+    lets callers (tests) inject a tracker directly, e.g. with a fake clock;
+    otherwise one is built from the three numeric knobs. A ``threshold`` of
+    0 disables the guard.
 
     With BOTH ``dispatch_url`` and ``dispatch_token`` set, authorised writes
     under ``/api/backlog/`` are forwarded to the dispatch service's
@@ -562,16 +583,31 @@ def _make_handler(
     reflected.
     """
 
+    guard = auth_guard if auth_guard is not None else FailedAuthTracker(
+        threshold=auth_rate_limit_threshold,
+        window_seconds=auth_rate_limit_window_seconds,
+        lockout_seconds=auth_rate_limit_lockout_seconds,
+    )
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:  # noqa: A002
             """Silence per-request stderr noise; the CLI prints the URL once."""
 
-        def _send(self, status: int, content_type: str, body: str) -> None:
+        def _send(
+            self,
+            status: int,
+            content_type: str,
+            body: str,
+            *,
+            extra_headers: Optional[Dict[str, str]] = None,
+        ) -> None:
             payload = body.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", f"{content_type}; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(payload)
 
@@ -591,6 +627,42 @@ def _make_handler(
                 return True
             morsel = SimpleCookie(self.headers.get("Cookie", "")).get(_COOKIE_NAME)
             return morsel is not None and _tokens_match(morsel.value, token)
+
+        def _send_lockout(self, retry_after: float) -> None:
+            """429 a source past its failure threshold — see ``dev_team.authguard``."""
+
+            seconds = max(1, math.ceil(retry_after))
+            self._send(
+                429,
+                "application/json",
+                json.dumps({"error": "too many failed attempts", "retry_after": seconds}),
+                extra_headers={"Retry-After": str(seconds)},
+            )
+
+        def _guard_and_authorise(self, path: str) -> bool:
+            """:meth:`_authorised`, gated by the shared :data:`guard` tracker.
+
+            Sends the 401/429 response itself on failure (mirroring
+            ``_reject``'s content-type routing for the 401 case) and returns
+            whether the caller may proceed. A source already past its
+            failure threshold is short-circuited straight to ``429`` before
+            ``_authorised`` (and so ``_tokens_match``) ever runs — the
+            token, right or wrong, is never even compared. Shares one
+            tracker with ``_login`` so a bearer-path prober and a
+            login-form prober from the same source share one budget.
+            """
+
+            source = self.client_address[0]
+            retry_after = guard.is_locked_out(source)
+            if retry_after is not None:
+                self._send_lockout(retry_after)
+                return False
+            if self._authorised():
+                guard.record_success(source)
+                return True
+            guard.record_failure(source)
+            self._reject(path)
+            return False
 
         def _reject(self, path: str) -> None:
             """401 an unauthenticated request: JSON for the API, the login
@@ -618,24 +690,35 @@ def _make_handler(
             The body read is Content-Length-bounded (an oversized or absent
             body is rejected unread) and the submitted value is compared in
             constant time. Every failure yields the same 401 form with the
-            same generic note.
+            same generic note. Shares ``guard`` with ``_authorised`` (via
+            ``_guard_and_authorise``) — a source already locked out from
+            probing the bearer/API path is short-circuited to ``429`` here
+            too, before the submitted value is even read.
             """
 
             if token is None:
                 self._redirect(None)  # nothing to log in to; the page is open
+                return
+            source = self.client_address[0]
+            retry_after = guard.is_locked_out(source)
+            if retry_after is not None:
+                self._send_lockout(retry_after)
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 length = 0
             if not 0 < length <= _MAX_LOGIN_BODY:
+                guard.record_failure(source)
                 self._send(401, "text/html", LOGIN_FAILED_HTML)
                 return
             body = self.rfile.read(length).decode("utf-8", "replace")
             submitted = parse_qs(body).get("token", [""])[0]
             if not _tokens_match(submitted, token):
+                guard.record_failure(source)
                 self._send(401, "text/html", LOGIN_FAILED_HTML)
                 return
+            guard.record_success(source)
             self._redirect(_session_cookie(token, secure=secure))
 
         def _logout(self) -> None:
@@ -651,8 +734,8 @@ def _make_handler(
                 self._login()
             elif path == "/logout":
                 self._logout()
-            elif not self._authorised():
-                self._reject(path)
+            elif not self._guard_and_authorise(path):
+                pass  # response already sent by _guard_and_authorise
             elif path.startswith(_BACKLOG_PROXY_PREFIX):
                 self._proxy_backlog("POST", path)
             elif path.startswith(_JOBS_PROXY_PREFIX):
@@ -672,8 +755,8 @@ def _make_handler(
             """Auth-gate a PATCH/DELETE: only ``/api/backlog/*`` exists."""
 
             path = urlsplit(self.path).path
-            if not self._authorised():
-                self._reject(path)
+            if not self._guard_and_authorise(path):
+                pass  # response already sent by _guard_and_authorise
             elif path.startswith(_BACKLOG_PROXY_PREFIX):
                 self._proxy_backlog(method, path)
             else:
@@ -784,8 +867,8 @@ def _make_handler(
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             parts = urlsplit(self.path)
-            if not self._authorised():
-                self._reject(parts.path)
+            if not self._guard_and_authorise(parts.path):
+                pass  # response already sent by _guard_and_authorise
             elif parts.path == "/":
                 self._send(200, "text/html", DASHBOARD_HTML)
             elif parts.path == "/api/state":
@@ -1018,11 +1101,25 @@ class DashboardServer:
         dispatch_url: Optional[str] = None,
         dispatch_token: Optional[str] = None,
         secure: bool = False,
+        auth_rate_limit_threshold: int = DEFAULT_THRESHOLD,
+        auth_rate_limit_window_seconds: float = DEFAULT_WINDOW_SECONDS,
+        auth_rate_limit_lockout_seconds: float = DEFAULT_LOCKOUT_SECONDS,
+        auth_guard: Optional[FailedAuthTracker] = None,
     ) -> None:
         self.workspace = workspace
         self.httpd = ThreadingHTTPServer(
             (host, port),
-            _make_handler(workspace, token, dispatch_url, dispatch_token, secure=secure),
+            _make_handler(
+                workspace,
+                token,
+                dispatch_url,
+                dispatch_token,
+                secure=secure,
+                auth_rate_limit_threshold=auth_rate_limit_threshold,
+                auth_rate_limit_window_seconds=auth_rate_limit_window_seconds,
+                auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds,
+                auth_guard=auth_guard,
+            ),
         )
 
     @property

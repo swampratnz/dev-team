@@ -208,12 +208,23 @@ configured, `GET /api/costs` answers `501` and the panel renders a muted
 
 The **Access log** panel (next to Spend) shows the dispatch service's most
 recent HTTP requests — method, path, and status, status colour-coded so a
-run of `401`s is visually obvious — the same page `GET /access-log` returns
-(see [`docs/DISPATCH.md`](DISPATCH.md)). The dispatch service is deployed
-tailnet-only behind a hardened systemd unit, so this panel is what lets an
-operator notice a misconfigured caller or a credential-stuffing burst from
-the dashboard they already have open, instead of SSHing in to `cat
-access.jsonl`.
+run of `401`s (or now `429`s — see below) is visually obvious — the same
+page `GET /access-log` returns (see [`docs/DISPATCH.md`](DISPATCH.md)). The
+dispatch service is deployed tailnet-only behind a hardened systemd unit, so
+this panel is what lets an operator notice a misconfigured caller or a
+credential-stuffing burst from the dashboard they already have open, instead
+of SSHing in to `cat access.jsonl`.
+
+A credential-stuffing burst is no longer just something to notice after the
+fact: both the dispatch service and this dashboard itself throttle repeated
+wrong-token requests from one source IP to `429` once past
+`--auth-rate-limit-threshold` (default 10) within `--auth-rate-limit-
+window-seconds` (default 60), for `--auth-rate-limit-lockout-seconds`
+(default 60) — see `dev_team.authguard.FailedAuthTracker` and
+[`docs/SECURITY.md`](SECURITY.md)'s *HTTP surface auth* section. On the
+dashboard's own bearer/cookie and `POST /login` paths this is enforced
+directly, independent of the panel above; the panel here only ever surfaces
+the dispatch service's side of it.
 
 Same proxy shape and the same on-demand-only discipline as Spend: fetched
 **once on page load plus a manual refresh button**, never part of the 2.5s
@@ -376,6 +387,15 @@ DEV_TEAM_DASHBOARD_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsa
   working immediately.
 - Empty/unset keeps the dashboard **open**, exactly as before — for
   localhost development only.
+- **Repeated wrong-token/wrong-cookie requests are throttled.** A source IP
+  past `--auth-rate-limit-threshold` failures (default 10) within
+  `--auth-rate-limit-window-seconds` (default 60) gets `429 {"error": "too
+  many failed attempts", "retry_after": N}` (with a `Retry-After` header) for
+  `--auth-rate-limit-lockout-seconds` (default 60) — on *either* the
+  bearer/cookie path or `POST /login`, sharing one budget, before the
+  comparison itself runs. `--auth-rate-limit-threshold 0` disables it. See
+  `dev_team.authguard.FailedAuthTracker` and
+  [`docs/SECURITY.md`](SECURITY.md).
 
 This is a stopgap until an IdP (Auth0) integration lands; the seam it
 replaces is `Handler._authorised` (plus the `/login` flow) in

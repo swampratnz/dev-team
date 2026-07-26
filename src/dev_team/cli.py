@@ -22,6 +22,7 @@ from .assessment import (
     outcome_to_dict,
     verify_finding,
 )
+from .authguard import DEFAULT_LOCKOUT_SECONDS, DEFAULT_THRESHOLD, DEFAULT_WINDOW_SECONDS
 from .backlog import BacklogStore
 from .budget import Budget, BudgetExceededError
 from .chat import ChatSession, chat_system_prompt
@@ -414,6 +415,36 @@ def build_parser() -> argparse.ArgumentParser:
         f"{DEFAULT_DISPATCH_URL}). The proxy authenticates with the "
         "DEV_TEAM_DISPATCH_TOKEN environment variable; without that token "
         "the board stays read-only (writes answer 501).",
+    )
+    serving.add_argument(
+        "--auth-rate-limit-threshold",
+        type=int,
+        default=DEFAULT_THRESHOLD,
+        metavar="N",
+        help="With --dashboard or --dispatch: wrong-token requests allowed "
+        f"from one source IP within the window (default {DEFAULT_THRESHOLD}) "
+        "before that source is locked out with 429 responses. 0 disables "
+        "the guard entirely (byte-identical to the prior unthrottled "
+        "behaviour) — an explicit opt-out, e.g. for a trusted-network "
+        "deployment. A negative value is rejected.",
+    )
+    serving.add_argument(
+        "--auth-rate-limit-window-seconds",
+        type=int,
+        default=int(DEFAULT_WINDOW_SECONDS),
+        metavar="N",
+        help="With --dashboard or --dispatch: how many seconds of "
+        f"wrong-token requests count toward the threshold (default "
+        f"{int(DEFAULT_WINDOW_SECONDS)}). A negative value is rejected.",
+    )
+    serving.add_argument(
+        "--auth-rate-limit-lockout-seconds",
+        type=int,
+        default=int(DEFAULT_LOCKOUT_SECONDS),
+        metavar="N",
+        help="With --dashboard or --dispatch: how many seconds a source "
+        f"stays locked out once it trips the threshold (default "
+        f"{int(DEFAULT_LOCKOUT_SECONDS)}). A negative value is rejected.",
     )
     assessment.add_argument(
         "--report",
@@ -1808,6 +1839,25 @@ _DASHBOARD_EXCLUDED_DIRS = DEFAULT_EXCLUDED_DIRS - {".dev_team"}
 DASHBOARD_TOKEN_ENV = "DEV_TEAM_DASHBOARD_TOKEN"
 
 
+def _validate_auth_rate_limit(args) -> None:
+    """Reject a negative ``--auth-rate-limit-*`` value; shared by --dashboard
+    and --dispatch, whose auth surfaces both wire ``dev_team.authguard``.
+
+    ``0`` is the only valid "off" spelling for the threshold (checked at the
+    guard itself, not here) — a negative value is always a mistake, never a
+    meaningful setting.
+    """
+
+    if args.auth_rate_limit_threshold < 0:
+        raise DevTeamError(
+            "--auth-rate-limit-threshold must be at least 0 (0 disables the guard)"
+        )
+    if args.auth_rate_limit_window_seconds < 0:
+        raise DevTeamError("--auth-rate-limit-window-seconds must be at least 0")
+    if args.auth_rate_limit_lockout_seconds < 0:
+        raise DevTeamError("--auth-rate-limit-lockout-seconds must be at least 0")
+
+
 def _serve_dashboard(args) -> int:
     """Serve the workspace dashboard until interrupted; returns exit code.
 
@@ -1819,6 +1869,7 @@ def _serve_dashboard(args) -> int:
     stderr warning still fires and the server starts as before.
     """
 
+    _validate_auth_rate_limit(args)
     token = os.environ.get(DASHBOARD_TOKEN_ENV, "")
     host = args.host if args.host is not None else "127.0.0.1"
     workspace = LocalWorkspace(args.workspace, excluded_dirs=_DASHBOARD_EXCLUDED_DIRS)
@@ -1864,6 +1915,9 @@ def _serve_dashboard(args) -> int:
             args.dispatch_url if args.dispatch_url is not None else DEFAULT_DISPATCH_URL
         ),
         dispatch_token=dispatch_token or None,
+        auth_rate_limit_threshold=args.auth_rate_limit_threshold,
+        auth_rate_limit_window_seconds=args.auth_rate_limit_window_seconds,
+        auth_rate_limit_lockout_seconds=args.auth_rate_limit_lockout_seconds,
     )
     print(
         f"dev-team dashboard for {args.workspace} at {server.url} "
@@ -2026,6 +2080,7 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
         raise DevTeamError("--max-concurrent-jobs must be at least 1")
     if args.purge_ttl_days is not None and args.purge_ttl_days < 0:
         raise DevTeamError("--purge-ttl-days must be at least 0")
+    _validate_auth_rate_limit(args)
     # GitHub OAuth sign-in is wired only when configured (same env-file
     # search as every other credential); unconfigured keeps the classic
     # single-token service with no new routes.
@@ -2051,6 +2106,9 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
         max_workers=args.max_concurrent_jobs,
         sandbox=_sandbox_config(args),
         purge_ttl_days=args.purge_ttl_days,
+        auth_rate_limit_threshold=args.auth_rate_limit_threshold,
+        auth_rate_limit_window_seconds=args.auth_rate_limit_window_seconds,
+        auth_rate_limit_lockout_seconds=args.auth_rate_limit_lockout_seconds,
     )
     print(
         f"dev-team dispatch service at {server.url} (Ctrl-C to stop)"
