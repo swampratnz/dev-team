@@ -224,18 +224,21 @@ class EngineConfig:
       success or failure. See ``docs/BENCHMARKS.md`` (DevOps) and ROADMAP.
     - ``docker_run_gate``: requires ``docker_build_gate`` and only engages
       when that build reports ``docker_build_verified is True`` for the same
-      run. Starts the just-built image detached and networkless
-      (``docker run -d --rm --network none --name <tag> <tag>``, the same
-      locally-generated tag the build used) through the existing
-      ``command_runner``, waits a short fixed grace period, then checks
-      liveness with ``docker inspect -f {{.State.Running}} <tag>``. Records
-      an advisory ``docker_run_verified`` scorecard signal (plus a truncated
-      ``docker_run_detail`` from ``docker logs`` when the container exited
-      early) — never a rejection, retry, or rollback. ``--network none`` is
-      unconditional; there is no override. A best-effort ``docker
-      stop``/``docker rmi`` cleanup always runs afterwards, success or
-      failure. Off by default. See ``docs/BENCHMARKS.md`` (DevOps) and
-      ROADMAP.
+      run. Starts the just-built image detached, networkless, and hardened
+      (``docker run -d --rm --network none --cap-drop ALL --security-opt
+      no-new-privileges --memory ... --cpus ... --pids-limit ... --name
+      <tag> <tag>``, the same locally-generated tag the build used and the
+      same resource/capability posture ``SandboxConfig`` defaults to)
+      through the existing ``command_runner``, waits a short fixed grace
+      period, then checks liveness with ``docker inspect -f
+      {{.State.Running}} <tag>``. Records an advisory ``docker_run_verified``
+      scorecard signal (plus a truncated ``docker_run_detail`` from ``docker
+      logs`` when the container exited early, or when the initial ``docker
+      run`` itself failed to start) — never a rejection, retry, or rollback.
+      ``--network none`` and the hardening flags are unconditional; there is
+      no override. A best-effort ``docker stop``/``docker rmi`` cleanup
+      always runs afterwards, success or failure. Off by default. See
+      ``docs/BENCHMARKS.md`` (DevOps) and ROADMAP.
     """
 
     model: Optional[str] = None
@@ -620,6 +623,39 @@ _MAX_REJECTION_DETAIL_CHARS = 400
 # container is still bounded by gate_timeout_seconds on every subprocess call.
 _DOCKER_RUN_GATE_GRACE_SECONDS = 3.0
 
+# Resource/capability hardening applied to the docker-run gate's own `docker
+# run` invocation of the untrusted, attacker-authored image. `--network none`
+# blocks exfiltration but does nothing against a fork bomb or memory bomb in
+# the image's entrypoint; a --sandbox wrapper (when set at all) only isolates
+# the *outer* command, not this image, so these flags are unconditional here.
+# Values are read from SandboxConfig's own defaults (sandbox.py) rather than
+# duplicating separately-tuned numbers; a plain, non-tunable SandboxConfig()
+# instance is never anything but those defaults, so this is evaluated once at
+# import time.
+_DOCKER_RUN_GATE_DEFAULTS = SandboxConfig()
+_DOCKER_RUN_GATE_HARDENING: Tuple[str, ...] = (
+    "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges",
+    "--memory", _DOCKER_RUN_GATE_DEFAULTS.memory,
+    "--cpus", _DOCKER_RUN_GATE_DEFAULTS.cpus,
+    "--pids-limit", str(_DOCKER_RUN_GATE_DEFAULTS.pids_limit),
+)
+
+
+def _truncate_detail(output: str) -> str:
+    """Collapse ``output`` to one line and cap it at ``_MAX_REJECTION_DETAIL_CHARS``.
+
+    Shared by every advisory gate that surfaces raw command output (docker
+    build/run failures): a single, length-bounded line so one verbose dump
+    can't bloat events.jsonl, and no embedded newlines to fake a multi-line
+    structure elsewhere it's later rendered.
+    """
+
+    detail = " ".join(str(output).split())
+    if len(detail) > _MAX_REJECTION_DETAIL_CHARS:
+        detail = detail[:_MAX_REJECTION_DETAIL_CHARS].rstrip() + "..."
+    return detail
+
 
 def _run_evidence(
     task_results: List[TaskResult],
@@ -633,6 +669,15 @@ def _run_evidence(
     Deterministic and pure, so the LLM retrospective is fed exactly what the
     tests assert — task outcomes, the scorecard, the trace's shape, and the
     spend — rather than the raw transcript. Bounded overall by a char cap.
+
+    Scorecard keys ending in ``_detail`` (``docker_build_detail``,
+    ``docker_run_detail``) are excluded from the digest: they carry raw
+    command output — for the run gate, literally ``docker logs`` from an
+    image an adversarial repo's own entrypoint controls — and this digest
+    otherwise has no delimiting around individual scorecard values. The
+    boolean/numeric signal (``docker_run_verified``, etc.) still surfaces;
+    only the free-form attacker-influenced text is dropped before it reaches
+    the prompt.
     """
 
     lines: List[str] = ["Task outcomes:"]
@@ -644,7 +689,12 @@ def _run_evidence(
         lines.append(
             f'- {tr.task.id} "{tr.task.title}": {tr.attempts} attempt(s), {status}{note}'
         )
-    lines.append("Scorecard: " + ", ".join(f"{k}={scorecard[k]}" for k in sorted(scorecard)))
+    lines.append(
+        "Scorecard: "
+        + ", ".join(
+            f"{k}={scorecard[k]}" for k in sorted(scorecard) if not k.endswith("_detail")
+        )
+    )
     if security is not None:
         verdict = "approved" if security.approved else "BLOCKED"
         lines.append(f"Security: {verdict} - {security.summary}")
@@ -3429,9 +3479,7 @@ class DeliveryEngine:
                 f"advisory docker build succeeded (tag={tag})",
             )
         else:
-            detail = " ".join(str(build_result.output).split())
-            if len(detail) > _MAX_REJECTION_DETAIL_CHARS:
-                detail = detail[:_MAX_REJECTION_DETAIL_CHARS].rstrip() + "..."
+            detail = _truncate_detail(build_result.output)
             self._scorecard["docker_build_detail"] = detail
             self._event(
                 "docker-build-failed",
@@ -3477,13 +3525,27 @@ class DeliveryEngine:
 
         Starts the just-built image (the same locally-generated ``tag``
         :meth:`_docker_build_gate` used — never derived from Dockerfile or
-        image content) detached and networkless
-        (``docker run -d --rm --network none --name <tag> <tag>``) through
-        the existing ``command_runner`` (inheriting whatever ``--sandbox``
-        posture the rest of the run has — no separate execution path).
-        ``--network none`` is unconditional; nothing in this method can
-        override it. After a short fixed grace period, liveness is checked
-        with ``docker inspect -f {{.State.Running}} <tag>``:
+        image content) detached, networkless, and hardened
+        (``docker run -d --rm --network none --cap-drop ALL --security-opt
+        no-new-privileges --memory ... --cpus ... --pids-limit ... --name
+        <tag> <tag>`` — the flags mirror :class:`~dev_team.sandbox.
+        SandboxConfig`'s own defaults) through the existing
+        ``command_runner`` (inheriting whatever ``--sandbox`` posture the
+        rest of the run has — no separate execution path). This gate's whole
+        purpose is running the ``ENTRYPOINT``/``CMD`` of an image built from
+        an untrusted, adversarial repo, so these flags are unconditional;
+        nothing in this method can override them — a fork/memory bomb in
+        that entrypoint is bounded even when ``--sandbox`` isn't set (the
+        common case), and even when it is, since ``--sandbox`` only isolates
+        the *outer* ``docker run``, not this one.
+
+        If the ``docker run`` invocation itself fails to start (missing
+        ``docker``, a stale name collision, ...), that is recorded directly
+        as ``docker_run_verified = False`` with a ``docker-run-start-failed``
+        event — no grace-period sleep or liveness inspection against a
+        container that was never running. Otherwise, after a short fixed
+        grace period, liveness is checked with ``docker inspect -f
+        {{.State.Running}} <tag>``:
 
         - Still running → ``docker_run_verified = True``.
         - Exited early → ``docker_run_verified = False``, plus a truncated
@@ -3504,14 +3566,27 @@ class DeliveryEngine:
             return
         tag = f"dev-team-verify-{self._run_id}"
         run_command = [
-            "docker", "run", "-d", "--rm", "--network", "none", "--name", tag, tag,
+            "docker", "run", "-d", "--rm", "--network", "none",
+            *_DOCKER_RUN_GATE_HARDENING,
+            "--name", tag, tag,
         ]
-        await asyncio.to_thread(
+        run_result = await asyncio.to_thread(
             self.command_runner.run,
             run_command,
             cwd=self.workdir,
             timeout=self.config.gate_timeout_seconds,
         )
+        if not run_result.ok:
+            self._scorecard["docker_run_verified"] = False
+            detail = _truncate_detail(run_result.output)
+            self._scorecard["docker_run_detail"] = detail
+            self._event(
+                "docker-run-start-failed",
+                f"advisory docker run itself failed to start (tag={tag})",
+                detail=detail,
+            )
+            await self._docker_build_cleanup(tag)
+            return
         await asyncio.sleep(self._docker_run_gate_grace_seconds)
         inspect_result = await asyncio.to_thread(
             self.command_runner.run,
@@ -3533,9 +3608,7 @@ class DeliveryEngine:
                 cwd=self.workdir,
                 timeout=self.config.gate_timeout_seconds,
             )
-            detail = " ".join(str(logs_result.output).split())
-            if len(detail) > _MAX_REJECTION_DETAIL_CHARS:
-                detail = detail[:_MAX_REJECTION_DETAIL_CHARS].rstrip() + "..."
+            detail = _truncate_detail(logs_result.output)
             self._scorecard["docker_run_detail"] = detail
             self._event(
                 "docker-run-failed",
