@@ -688,6 +688,16 @@ def build_parser() -> argparse.ArgumentParser:
         "docs/BENCHMARKS.md (DevOps).",
     )
     delivery.add_argument(
+        "--docker-run-gate",
+        action="store_true",
+        help="After --docker-build-gate reports a successful build, start the "
+        "built image detached and networkless and check it is still running "
+        "after a short grace period (with --deliver). Off by default; "
+        "advisory only — records a docker_run_verified scorecard signal, "
+        "never blocks the delivery. Requires --docker-build-gate. See "
+        "docs/BENCHMARKS.md (DevOps).",
+    )
+    delivery.add_argument(
         "--finalization-reserve",
         type=float,
         default=0.10,
@@ -1045,6 +1055,11 @@ def _validate_args(
         parser.error("--watch-fix-rounds must be non-negative")
     if args.watch_fix_rounds and not args.watch_checks:
         parser.error("--watch-fix-rounds requires --watch-checks (there is no watch to fix)")
+    if args.docker_run_gate and not args.docker_build_gate:
+        parser.error(
+            "--docker-run-gate requires --docker-build-gate "
+            "(there is nothing built to smoke-test)"
+        )
     if args.interactive_pr_comments and not args.interactive:
         parser.error("--interactive-pr-comments requires --interactive")
     if args.interactive_pr_comments and not args.pull_request:
@@ -1173,6 +1188,7 @@ def _reject_deliver_only_flags(
         ("--require-recognised-project", args.require_recognised_project),
         ("--allow-ci-workflows", args.allow_ci_workflows),
         ("--docker-build-gate", args.docker_build_gate),
+        ("--docker-run-gate", args.docker_run_gate),
         (
             "--finalization-reserve",
             args.finalization_reserve != parser.get_default("finalization_reserve"),
@@ -1259,6 +1275,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         require_recognised_project=args.require_recognised_project,
         allow_ci_workflows=args.allow_ci_workflows,
         docker_build_gate=args.docker_build_gate,
+        docker_run_gate=args.docker_run_gate,
         finalization_reserve_fraction=args.finalization_reserve,
         frontend_craft=not args.no_frontend_craft,
         visual_review=args.visual_review,

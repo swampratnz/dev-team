@@ -222,6 +222,20 @@ class EngineConfig:
       rollback (mirrors ``mutation_check``'s advisory-only precedent). Off by
       default. A best-effort ``docker rmi`` cleanup always runs afterwards,
       success or failure. See ``docs/BENCHMARKS.md`` (DevOps) and ROADMAP.
+    - ``docker_run_gate``: requires ``docker_build_gate`` and only engages
+      when that build reports ``docker_build_verified is True`` for the same
+      run. Starts the just-built image detached and networkless
+      (``docker run -d --rm --network none --name <tag> <tag>``, the same
+      locally-generated tag the build used) through the existing
+      ``command_runner``, waits a short fixed grace period, then checks
+      liveness with ``docker inspect -f {{.State.Running}} <tag>``. Records
+      an advisory ``docker_run_verified`` scorecard signal (plus a truncated
+      ``docker_run_detail`` from ``docker logs`` when the container exited
+      early) — never a rejection, retry, or rollback. ``--network none`` is
+      unconditional; there is no override. A best-effort ``docker
+      stop``/``docker rmi`` cleanup always runs afterwards, success or
+      failure. Off by default. See ``docs/BENCHMARKS.md`` (DevOps) and
+      ROADMAP.
     """
 
     model: Optional[str] = None
@@ -346,6 +360,13 @@ class EngineConfig:
     #: ``command_runner``. Off by default; never blocks, retries, or rolls
     #: back the delivery — see the class docstring for the full contract.
     docker_build_gate: bool = False
+    #: Opt-in advisory verification: after ``docker_build_gate`` reports a
+    #: successful build, start the built image detached and networkless and
+    #: check it is still running after a short grace period. Requires
+    #: ``docker_build_gate`` also be set; off by default; never blocks,
+    #: retries, or rolls back the delivery — see the class docstring for the
+    #: full contract.
+    docker_run_gate: bool = False
     #: How many rounds of dynamic re-planning to run after the schedule leaves
     #: tasks failed. 0 (the default) keeps the current behaviour — a failed task
     #: just stays failed. When >0, the product manager proposes a mutation
@@ -411,7 +432,9 @@ class DeliveryOutcome:
     halted_reason: Optional[str] = None
     #: Mostly ``int`` counters (``gate_failures``, ``mutation_survived``, ...);
     #: ``docker_build_gate`` additionally sets ``docker_build_verified``
-    #: (``bool``) and, on failure, ``docker_build_detail`` (``str``).
+    #: (``bool``) and, on failure, ``docker_build_detail`` (``str``);
+    #: ``docker_run_gate`` additionally sets ``docker_run_verified``
+    #: (``bool``) and, on an early exit, ``docker_run_detail`` (``str``).
     scorecard: Dict[str, Any] = field(default_factory=dict)
     #: URL of the pull request opened for this delivery, when the caller asked
     #: for one (``--pull-request``) and the delivery had a committed branch to
@@ -590,6 +613,12 @@ _MAX_EVIDENCE_NOTABLE_SPANS = 10
 # delivery is diagnosable in place (not only via --transcript's trace). The
 # reason is length-bounded so one verbose gate dump can't bloat events.jsonl.
 _MAX_REJECTION_DETAIL_CHARS = 400
+
+# How long the docker-run gate waits after starting the smoke-tested
+# container before checking whether it is still alive. Fixed and small: this
+# is a liveness check, not a boot-time budget, and a hung/slow-booting
+# container is still bounded by gate_timeout_seconds on every subprocess call.
+_DOCKER_RUN_GATE_GRACE_SECONDS = 3.0
 
 
 def _run_evidence(
@@ -977,6 +1006,11 @@ class DeliveryEngine:
         # embeds this so two engines building the same repo's Dockerfile
         # concurrently on one host can't collide.
         self._run_id = f"{os.getpid()}-{next(_RUN_ID_COUNTER)}"
+        # Fixed grace period the docker-run gate waits before checking
+        # liveness. Not exposed as a config/CLI knob (the proposal's
+        # "smallest viable version" is deliberately non-tunable); tests poke
+        # this private attribute directly to avoid a real sleep.
+        self._docker_run_gate_grace_seconds = _DOCKER_RUN_GATE_GRACE_SECONDS
 
         def make(cls):
             wrapped = InstrumentedRunner(
@@ -3322,6 +3356,7 @@ class DeliveryEngine:
                 ", ".join(c.path for c in artifacts.files if c.path),
             )
         await self._docker_build_gate()
+        await self._docker_run_gate()
         return plan
 
     async def _docker_build_gate(self) -> None:
@@ -3355,7 +3390,11 @@ class DeliveryEngine:
         raises, blocks, or rolls back the delivery. A best-effort
         ``docker rmi`` cleanup always runs afterwards, success or failure, so
         a shared dispatch host doesn't accumulate verification images; a
-        cleanup failure is logged, never raised.
+        cleanup failure is logged, never raised. Exception: when the build
+        succeeds and ``docker_run_gate`` is also set, the image cleanup is
+        deferred to :meth:`_docker_run_gate`, which needs the just-built
+        image to still exist for its own smoke test and takes over cleanup
+        once that finishes.
         """
 
         if not self.config.docker_build_gate:
@@ -3399,6 +3438,15 @@ class DeliveryEngine:
                 f"advisory docker build failed (tag={tag})",
                 detail=detail,
             )
+        if build_result.ok and self.config.docker_run_gate:
+            # _docker_run_gate needs this image to still exist; it takes over
+            # cleanup responsibility once its own smoke test finishes.
+            return
+        await self._docker_build_cleanup(tag)
+
+    async def _docker_build_cleanup(self, tag: str) -> None:
+        """Best-effort ``docker rmi <tag>``: logged on failure, never raised."""
+
         try:
             cleanup_result = await asyncio.to_thread(
                 self.command_runner.run,
@@ -3418,6 +3466,102 @@ class DeliveryEngine:
                     f"best-effort docker rmi {tag} failed",
                     detail=cleanup_result.output or None,
                 )
+
+    async def _docker_run_gate(self) -> None:
+        """Advisory-only: smoke-test the image ``_docker_build_gate`` built.
+
+        Off unless ``docker_run_gate`` is set, and short-circuits unless the
+        same run's ``docker_build_verified`` scorecard key is ``True`` —
+        there is nothing to smoke-test without a successful build, and this
+        also means ``docker_build_gate`` being off makes this a no-op too.
+
+        Starts the just-built image (the same locally-generated ``tag``
+        :meth:`_docker_build_gate` used — never derived from Dockerfile or
+        image content) detached and networkless
+        (``docker run -d --rm --network none --name <tag> <tag>``) through
+        the existing ``command_runner`` (inheriting whatever ``--sandbox``
+        posture the rest of the run has — no separate execution path).
+        ``--network none`` is unconditional; nothing in this method can
+        override it. After a short fixed grace period, liveness is checked
+        with ``docker inspect -f {{.State.Running}} <tag>``:
+
+        - Still running → ``docker_run_verified = True``.
+        - Exited early → ``docker_run_verified = False``, plus a truncated
+          ``docker_run_detail`` captured from ``docker logs <tag>``.
+
+        Records the outcome as advisory scorecard keys only — it never
+        raises, blocks, or rolls back the delivery. A best-effort
+        ``docker stop`` (the container was started with ``--rm``, so a
+        successful stop also removes it) followed by the image's ``docker
+        rmi`` cleanup (deferred here by ``_docker_build_gate``) always runs
+        afterwards, success or failure; a cleanup failure is logged, never
+        raised.
+        """
+
+        if not self.config.docker_run_gate:
+            return
+        if self._scorecard.get("docker_build_verified") is not True:
+            return
+        tag = f"dev-team-verify-{self._run_id}"
+        run_command = [
+            "docker", "run", "-d", "--rm", "--network", "none", "--name", tag, tag,
+        ]
+        await asyncio.to_thread(
+            self.command_runner.run,
+            run_command,
+            cwd=self.workdir,
+            timeout=self.config.gate_timeout_seconds,
+        )
+        await asyncio.sleep(self._docker_run_gate_grace_seconds)
+        inspect_result = await asyncio.to_thread(
+            self.command_runner.run,
+            ["docker", "inspect", "-f", "{{.State.Running}}", tag],
+            cwd=self.workdir,
+            timeout=self.config.gate_timeout_seconds,
+        )
+        running = inspect_result.ok and inspect_result.stdout.strip() == "true"
+        self._scorecard["docker_run_verified"] = running
+        if running:
+            self._event(
+                "docker-run-verified",
+                f"advisory docker run stayed up (tag={tag})",
+            )
+        else:
+            logs_result = await asyncio.to_thread(
+                self.command_runner.run,
+                ["docker", "logs", tag],
+                cwd=self.workdir,
+                timeout=self.config.gate_timeout_seconds,
+            )
+            detail = " ".join(str(logs_result.output).split())
+            if len(detail) > _MAX_REJECTION_DETAIL_CHARS:
+                detail = detail[:_MAX_REJECTION_DETAIL_CHARS].rstrip() + "..."
+            self._scorecard["docker_run_detail"] = detail
+            self._event(
+                "docker-run-failed",
+                f"advisory docker run exited before the grace period (tag={tag})",
+                detail=detail,
+            )
+        try:
+            stop_result = await asyncio.to_thread(
+                self.command_runner.run,
+                ["docker", "stop", tag],
+                cwd=self.workdir,
+                timeout=self.config.gate_timeout_seconds,
+            )
+        except Exception as exc:
+            self._event(
+                "docker-run-cleanup-failed",
+                f"best-effort docker stop {tag} raised: {exc}",
+            )
+        else:
+            if not stop_result.ok:
+                self._event(
+                    "docker-run-cleanup-failed",
+                    f"best-effort docker stop {tag} failed",
+                    detail=stop_result.output or None,
+                )
+        await self._docker_build_cleanup(tag)
 
     async def _assess_reliability(
         self,

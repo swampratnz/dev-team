@@ -361,6 +361,39 @@ def test_engine_config_threads_docker_build_gate():
     assert _engine_config(off).docker_build_gate is False
 
 
+def test_main_docker_run_gate_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["Login", "Add login", "--docker-build-gate", "--docker-run-gate"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--docker-run-gate" in err and "--deliver" in err
+
+
+def test_main_docker_run_gate_requires_docker_build_gate(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["Login", "Add login", "--deliver", "--docker-run-gate"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--docker-run-gate" in err and "--docker-build-gate" in err
+
+
+def test_engine_config_threads_docker_run_gate():
+    from dev_team.cli import _engine_config, build_parser
+
+    on = build_parser().parse_args(
+        ["T", "D", "--deliver", "--docker-build-gate", "--docker-run-gate"]
+    )
+    assert _engine_config(on).docker_run_gate is True
+    off = build_parser().parse_args(["T", "D", "--deliver", "--docker-build-gate"])
+    assert _engine_config(off).docker_run_gate is False
+
+
 def test_main_finalization_reserve_rejected_without_deliver(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["Login", "Add login", "--finalization-reserve", "0.2"], runner=ScriptedRunner([]))
