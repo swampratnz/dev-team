@@ -143,6 +143,17 @@ sections below are reconstructed from the repository history.
   opt-out flag.
 
 ### Orchestration
+- **`GET /jobs` gains `?repo=`/`?mode=`/`?state=` filters** (#221): three
+  optional, AND-composed, exact-match query parameters layered into
+  `Dispatcher.recent()` alongside the existing `?archived=`/`?limit=`/
+  `?offset=`, applied before the offset/limit slice so pagination is
+  computed over the filtered set. Lets an operator or Dave find "the latest
+  `deliver` job for `acme/rota`" without paging through every other repo's
+  jobs. Same forgiving contract as `?archived=`: a missing or empty value
+  means "no filter", an unrecognised value simply matches zero jobs, never a
+  `400`. No new auth surface or untrusted-input execution path — the values
+  are only ever compared with `==` against in-memory strings; tenant
+  scoping (`session_sees_job`) is unaffected regardless of filter ordering.
 - **A backlog foreman turns ready stories into deliver jobs** (ROADMAP #9's
   second half, completing the item; see `docs/DISPATCH.md`). `GET
   /foreman/plan` is a $0 dry-run; `POST /foreman/run` enqueues
