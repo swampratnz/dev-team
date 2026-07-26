@@ -267,6 +267,23 @@ sections below are reconstructed from the repository history.
   single-non-test-impl-file selection are unchanged: a boolean-op-only test
   file alongside a comparison-only product file still only ever mutates the
   product file.
+- **Mutation-lite now also flips identity/membership operators (`is`↔`is not`,
+  `in`↔`not in`), closing the last named exclusion in `mutation.py`'s own v1
+  comment** (#219). Previously `_FLIPS` mapped only the six equality/ordering
+  `ast.cmpop` types, so a product file whose only testable branching was an
+  identity or membership check (`if x is None:`, `if key in cache:`) had zero
+  flippable candidates and `_mutation_check` silently skipped it — the same
+  blind spot #197 closed for boolean conditions, just for `is`/`in`. Four new
+  entries in the existing `_FLIPS` dict (`ast.Is`/`ast.IsNot`/`ast.In`/
+  `ast.NotIn`, each mapped to its logical opposite) are the entire behavioural
+  change: `visit_Compare`/`_mutation_candidates` already handle any `cmpop`
+  found in `_FLIPS` generically, so no new node-visitor branch, dict, or
+  selection logic was needed. Chained comparisons (`a is b is c`,
+  `len(node.ops) != 1`) remain excluded, unchanged. A security regression
+  test confirms the widened table doesn't loosen `_mutation_check`'s existing
+  test-path exclusion or single-non-test-impl-file selection: an
+  identity/membership-only test file alongside a comparison-only product file
+  still only ever mutates the product file.
 - **A visual-critique failure is now diagnosable instead of a bare "skipping"**
   (#152, root-cause corrected by adversarial review). The default `--deliver`/
   `--assess` progress stream (`cli.py`'s `_progress_printer`) now renders
