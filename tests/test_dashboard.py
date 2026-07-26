@@ -626,6 +626,14 @@ def test_archived_job_ids_tolerates_corrupt_and_non_matching_meta():
     assert _archived_job_ids(ws) == frozenset({"archived"})
 
 
+def test_job_meta_index_skips_non_dict_meta_json():
+    from dev_team.dashboard import _job_meta_index
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/not-a-dict/meta.json", json.dumps(["nope"]))
+    assert _job_meta_index(ws) == {}
+
+
 def test_report_job_id_extracts_the_owning_job_or_none():
     from dev_team.dashboard import _report_job_id
 
@@ -647,6 +655,7 @@ def test_calibration_state_empty_workspace():
             "total": 0, "confirm_rate": None,
             "multi_vote_total": 0, "unanimous_total": 0,
         },
+        "by_repo": {},
         "jobs_counted": 0,
         "blind_spot_total": 0,
         "broken_citation_total": 0,
@@ -924,6 +933,169 @@ def test_dispatcher_calibration_and_calibration_state_parity():
         assert dispatcher_payload[key] == dashboard_payload[key]
 
 
+# --- calibration by_repo (issue #223) -------------------------------------------------
+
+
+def test_calibration_state_by_repo_splits_two_repos():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"id": "assess-a", "repo": "acme/rota"}),
+    )
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        _verification_line("risk.secrets[0]", "confirmed") + "\n",
+    )
+    ws.write_text(
+        "audit/assess-b/meta.json",
+        json.dumps({"id": "assess-b", "repo": "acme/other"}),
+    )
+    ws.write_text(
+        "audit/assess-b/verifications.jsonl",
+        _verification_line("risk.secrets[1]", "refuted") + "\n",
+    )
+
+    state = _calibration_state(ws)
+    assert state["by_repo"] == {
+        "acme/rota": {
+            "confirmed": 1, "refuted": 0, "needs_context": 0, "confirm_rate": 1.0,
+        },
+        "acme/other": {
+            "confirmed": 0, "refuted": 1, "needs_context": 0, "confirm_rate": 0.0,
+        },
+    }
+
+
+def test_calibration_state_by_repo_aggregates_same_repo_across_jobs():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"id": "assess-a", "repo": "acme/rota"}),
+    )
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        _verification_line("risk.secrets[0]", "confirmed") + "\n",
+    )
+    ws.write_text(
+        "audit/assess-c/meta.json",
+        json.dumps({"id": "assess-c", "repo": "acme/rota"}),
+    )
+    ws.write_text(
+        "audit/assess-c/verifications.jsonl",
+        _verification_line("risk.secrets[1]", "confirmed") + "\n",
+    )
+
+    state = _calibration_state(ws)
+    assert state["by_repo"] == {
+        "acme/rota": {
+            "confirmed": 2, "refuted": 0, "needs_context": 0, "confirm_rate": 1.0,
+        },
+    }
+
+
+def test_calibration_state_by_repo_unknown_bucket_reconciles_with_overall():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    # no meta.json at all for assess-a
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        _verification_line("risk.secrets[0]", "confirmed") + "\n",
+    )
+    # meta.json present but repo omitted
+    ws.write_text("audit/assess-b/meta.json", json.dumps({"id": "assess-b"}))
+    ws.write_text(
+        "audit/assess-b/verifications.jsonl",
+        _verification_line("risk.secrets[1]", "refuted") + "\n",
+    )
+    # meta.json present but repo is an empty string
+    ws.write_text(
+        "audit/assess-d/meta.json", json.dumps({"id": "assess-d", "repo": ""})
+    )
+    ws.write_text(
+        "audit/assess-d/verifications.jsonl",
+        _verification_line("qa.tests[0]", "needs-context") + "\n",
+    )
+
+    state = _calibration_state(ws)
+    assert state["by_repo"] == {
+        "(unknown)": {
+            "confirmed": 1, "refuted": 1, "needs_context": 1,
+            "confirm_rate": 1 / 3,
+        },
+    }
+    by_repo_total = sum(
+        b["confirmed"] + b["refuted"] + b["needs_context"]
+        for b in state["by_repo"].values()
+    )
+    assert by_repo_total == state["overall"]["total"]
+
+
+def test_calibration_state_by_repo_excludes_archived_by_default_and_reappears():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"id": "assess-a", "repo": "acme/rota", "archived": True}),
+    )
+    ws.write_text(
+        "audit/assess-a/verifications.jsonl",
+        _verification_line("risk.secrets[0]", "confirmed") + "\n",
+    )
+    ws.write_text(
+        "audit/assess-b/meta.json",
+        json.dumps({"id": "assess-b", "repo": "acme/other"}),
+    )
+    ws.write_text(
+        "audit/assess-b/verifications.jsonl",
+        _verification_line("risk.secrets[1]", "refuted") + "\n",
+    )
+
+    state = _calibration_state(ws)
+    assert state["by_repo"] == {
+        "acme/other": {
+            "confirmed": 0, "refuted": 1, "needs_context": 0, "confirm_rate": 0.0,
+        },
+    }
+
+    state = _calibration_state(ws, include_archived=True)
+    assert state["by_repo"] == {
+        "acme/rota": {
+            "confirmed": 1, "refuted": 0, "needs_context": 0, "confirm_rate": 1.0,
+        },
+        "acme/other": {
+            "confirmed": 0, "refuted": 1, "needs_context": 0, "confirm_rate": 0.0,
+        },
+    }
+
+
+def test_calibration_state_by_repo_empty_when_no_verifications():
+    from dev_team.dashboard import _calibration_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/assess-a/meta.json", json.dumps({"id": "assess-a", "repo": "acme/rota"}))
+    assert _calibration_state(ws)["by_repo"] == {}
+
+
+def test_dashboard_html_calibration_by_repo_panel():
+    # Static desk-check of the "by repo" sub-table JS (CI has no browser),
+    # mirroring test_dashboard_html_spend_panel's approach. SECURITY: repo
+    # is caller-supplied (POST /jobs), mirrored verbatim into meta.json, so
+    # every field must flow through esc() before innerHTML — same
+    # discipline as the existing per-phase calibrationRow.
+    assert "function calibrationRepoTable(byRepo)" in DASHBOARD_HTML
+    assert 'if (!repos.length) return ""' in DASHBOARD_HTML
+    assert "<tr><td>${esc(repo)}</td><td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td>" in DASHBOARD_HTML
+    assert "<td>${esc(b.needs_context)}</td>" in DASHBOARD_HTML
+    assert "cal-table cal-by-repo" in DASHBOARD_HTML
+    assert "calibrationRepoTable(cal.by_repo)" in DASHBOARD_HTML
+
+
 # --- report meta (blind spots / broken citations) ---------------------------------
 
 
@@ -1103,7 +1275,7 @@ def test_server_serves_the_page_and_state(server):
     state = json.loads(body)
     assert state["activity"][0]["message"] == "building"
     assert set(state["calibration"]) == {
-        "phases", "overall", "jobs_counted",
+        "phases", "overall", "by_repo", "jobs_counted",
         "blind_spot_total", "broken_citation_total",
         "report_quality_jobs_counted",
     }
