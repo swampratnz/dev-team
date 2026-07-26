@@ -16,7 +16,10 @@ code on a shared box:
 
 - **Auth.** Every route except ``GET /health`` requires
   ``Authorization: Bearer <token>``; the token is compared with
-  :func:`hmac.compare_digest` (constant-time) and a miss is ``401``.
+  :func:`hmac.compare_digest` (constant-time) and a miss is ``401``. Repeated
+  misses from one source IP within a window are throttled to ``429`` by
+  :mod:`dev_team.authguard` (``--auth-rate-limit-*``; see that module's
+  docstring) before the comparison even runs.
 - **Single-flight.** A background worker thread runs its own asyncio event
   loop and drains a queue **one job at a time**. The box has one shared Claude
   subscription and dev-team has no cross-run locking, so overlapping runs would
@@ -57,6 +60,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from .accesslog import AccessLog, read_access_log
 from .approval import PolicyApprovalGate
+from .authguard import DEFAULT_LOCKOUT_SECONDS, DEFAULT_THRESHOLD, DEFAULT_WINDOW_SECONDS
+from .authguard import FailedAuthTracker
 from .assessment import (
     MAX_VERIFY_VOTES,
     AssessConfig,
@@ -485,6 +490,10 @@ class Dispatcher:
         checks_reader: Optional[Callable[[RepoRef], ChecksReader]] = None,
         sandbox: Optional[SandboxConfig] = None,
         purge_ttl_days: Optional[int] = None,
+        auth_rate_limit_threshold: int = DEFAULT_THRESHOLD,
+        auth_rate_limit_window_seconds: float = DEFAULT_WINDOW_SECONDS,
+        auth_rate_limit_lockout_seconds: float = DEFAULT_LOCKOUT_SECONDS,
+        auth_guard: Optional[FailedAuthTracker] = None,
     ) -> None:
         self.token = token
         # Injectable factory for GET /checks (tests never touch the network);
@@ -511,6 +520,16 @@ class Dispatcher:
         # Dispatcher instances (every non-HTTP unit test) never end up
         # appending to it.
         self.access_log = AccessLog(jobs_root, clock=clock)
+        # Bounds repeated bad-token requests against _authenticate (see
+        # dev_team.authguard's module docstring). `auth_guard` lets tests
+        # inject a tracker with a fake clock; CLI callers instead pass the
+        # three numeric knobs (`--auth-rate-limit-*`), which build the
+        # default tracker below. A `threshold` of 0 disables the guard.
+        self.auth_guard = auth_guard if auth_guard is not None else FailedAuthTracker(
+            threshold=auth_rate_limit_threshold,
+            window_seconds=auth_rate_limit_window_seconds,
+            lockout_seconds=auth_rate_limit_lockout_seconds,
+        )
         # Off by default: capturing raw agent I/O is opt-in (the operator
         # enables it via --record-transcripts or DEV_TEAM_RECORD_TRANSCRIPTS).
         self._record_transcripts = record_transcripts
@@ -2651,12 +2670,20 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             self._access_log_status = code
             super().send_response(code, message)
 
-        def _json(self, status: int, payload: Dict[str, Any]) -> None:
+        def _json(
+            self,
+            status: int,
+            payload: Dict[str, Any],
+            *,
+            extra_headers: Optional[Dict[str, str]] = None,
+        ) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -2707,6 +2734,38 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                     return ("user", session)
             return None
 
+        def _require_auth(self) -> Optional[Tuple[str, Optional[Session]]]:
+            """:meth:`_authenticate`, gated by :attr:`Dispatcher.auth_guard`.
+
+            Sends the 401/429 response itself and returns ``None`` to tell
+            the caller to stop; a non-``None`` result means the caller may
+            proceed. A source already past its failure threshold (see
+            ``dev_team.authguard``) is short-circuited straight to ``429``
+            *before* ``_authenticate`` ever runs — the token, right or
+            wrong, is never even compared. Every other failure (a bad
+            operator token, or a bearer that also fails the OAuth
+            session lookup) records one failure for this source; a success
+            clears its history.
+            """
+
+            source = self.client_address[0]
+            retry_after = dispatcher.auth_guard.is_locked_out(source)
+            if retry_after is not None:
+                seconds = max(1, math.ceil(retry_after))
+                self._json(
+                    429,
+                    {"error": "too many failed attempts", "retry_after": seconds},
+                    extra_headers={"Retry-After": str(seconds)},
+                )
+                return None
+            auth = self._authenticate()
+            if auth is None:
+                dispatcher.auth_guard.record_failure(source)
+                self._json(401, {"error": "unauthorized"})
+                return None
+            dispatcher.auth_guard.record_success(source)
+            return auth
+
         def _operator_only(self) -> bool:
             """Answer the 403 unless the caller holds the operator token.
 
@@ -2716,9 +2775,8 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             submit and observe work, never administer the service.
             """
 
-            auth = self._authenticate()
+            auth = self._require_auth()
             if auth is None:
-                self._json(401, {"error": "unauthorized"})
                 return False
             if auth[0] != "operator":
                 self._json(403, {"error": "operator token required"})
@@ -2778,9 +2836,8 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return
             if self._auth_route(path, parse_qs(split.query)):
                 return
-            auth = self._authenticate()
+            auth = self._require_auth()
             if auth is None:
-                self._json(401, {"error": "unauthorized"})
                 return
             session = auth[1]
             if path == "/jobs":
@@ -2925,9 +2982,8 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 status, payload = dispatcher.oauth.refresh(bearer)
                 self._json(status, payload)
                 return
-            auth = self._authenticate()
+            auth = self._require_auth()
             if auth is None:
-                self._json(401, {"error": "unauthorized"})
                 return
             if path == "/jobs":
                 self._create(auth[1])
@@ -3212,6 +3268,10 @@ class DispatchServer:
         checks_reader: Optional[Callable[[RepoRef], ChecksReader]] = None,
         sandbox: Optional[SandboxConfig] = None,
         purge_ttl_days: Optional[int] = None,
+        auth_rate_limit_threshold: int = DEFAULT_THRESHOLD,
+        auth_rate_limit_window_seconds: float = DEFAULT_WINDOW_SECONDS,
+        auth_rate_limit_lockout_seconds: float = DEFAULT_LOCKOUT_SECONDS,
+        auth_guard: Optional[FailedAuthTracker] = None,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -3228,6 +3288,10 @@ class DispatchServer:
             checks_reader=checks_reader,
             sandbox=sandbox,
             purge_ttl_days=purge_ttl_days,
+            auth_rate_limit_threshold=auth_rate_limit_threshold,
+            auth_rate_limit_window_seconds=auth_rate_limit_window_seconds,
+            auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds,
+            auth_guard=auth_guard,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()

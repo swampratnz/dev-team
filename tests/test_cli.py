@@ -2912,11 +2912,18 @@ class _FakeDashboardServer:
     instances = []
 
     def __init__(self, workspace, *, host, port, token=None,
-                 dispatch_url=None, dispatch_token=None):
+                 dispatch_url=None, dispatch_token=None, secure=False,
+                 auth_rate_limit_threshold=None, auth_rate_limit_window_seconds=None,
+                 auth_rate_limit_lockout_seconds=None, auth_guard=None):
         self.workspace, self.host, self.port = workspace, host, port
         self.token = token
         self.dispatch_url = dispatch_url
         self.dispatch_token = dispatch_token
+        self.secure = secure
+        self.auth_rate_limit_threshold = auth_rate_limit_threshold
+        self.auth_rate_limit_window_seconds = auth_rate_limit_window_seconds
+        self.auth_rate_limit_lockout_seconds = auth_rate_limit_lockout_seconds
+        self.auth_guard = auth_guard
         self.interrupted = False
         self.shut_down = False
         _FakeDashboardServer.instances.append(self)
@@ -2957,9 +2964,15 @@ def test_main_dashboard_defaults_and_ctrl_c(tmp_path, monkeypatch):
     original_init = _FakeDashboardServer.__init__
 
     def interrupting_init(self, workspace, *, host, port, token=None,
-                          dispatch_url=None, dispatch_token=None):
+                          dispatch_url=None, dispatch_token=None,
+                          auth_rate_limit_threshold=None,
+                          auth_rate_limit_window_seconds=None,
+                          auth_rate_limit_lockout_seconds=None):
         original_init(self, workspace, host=host, port=port, token=token,
-                      dispatch_url=dispatch_url, dispatch_token=dispatch_token)
+                      dispatch_url=dispatch_url, dispatch_token=dispatch_token,
+                      auth_rate_limit_threshold=auth_rate_limit_threshold,
+                      auth_rate_limit_window_seconds=auth_rate_limit_window_seconds,
+                      auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds)
         self.interrupted = True
 
     monkeypatch.setattr(_FakeDashboardServer, "__init__", interrupting_init)
@@ -3153,7 +3166,8 @@ class _FakeDispatchServer:
 
     def __init__(self, token, *, host, port, runner=None, dashboard_workspace=None,
                  record_transcripts=False, oauth=None, max_workers=1, sandbox=None,
-                 purge_ttl_days=None):
+                 purge_ttl_days=None, auth_rate_limit_threshold=None,
+                 auth_rate_limit_window_seconds=None, auth_rate_limit_lockout_seconds=None):
         self.token, self.host, self.port, self.runner = token, host, port, runner
         self.dashboard_workspace = dashboard_workspace
         self.record_transcripts = record_transcripts
@@ -3161,6 +3175,9 @@ class _FakeDispatchServer:
         self.max_workers = max_workers
         self.sandbox = sandbox
         self.purge_ttl_days = purge_ttl_days
+        self.auth_rate_limit_threshold = auth_rate_limit_threshold
+        self.auth_rate_limit_window_seconds = auth_rate_limit_window_seconds
+        self.auth_rate_limit_lockout_seconds = auth_rate_limit_lockout_seconds
         self.interrupted = False
         self.shut_down = False
         _FakeDispatchServer.instances.append(self)
@@ -3204,12 +3221,17 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
     def interrupting_init(self, token, *, host, port, runner=None,
                           dashboard_workspace=None, record_transcripts=False,
                           oauth=None, max_workers=1, sandbox=None,
-                          purge_ttl_days=None):
+                          purge_ttl_days=None, auth_rate_limit_threshold=None,
+                          auth_rate_limit_window_seconds=None,
+                          auth_rate_limit_lockout_seconds=None):
         original_init(self, token, host=host, port=port, runner=runner,
                       dashboard_workspace=dashboard_workspace,
                       record_transcripts=record_transcripts, oauth=oauth,
                       max_workers=max_workers, sandbox=sandbox,
-                      purge_ttl_days=purge_ttl_days)
+                      purge_ttl_days=purge_ttl_days,
+                      auth_rate_limit_threshold=auth_rate_limit_threshold,
+                      auth_rate_limit_window_seconds=auth_rate_limit_window_seconds,
+                      auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds)
         self.interrupted = True
 
     monkeypatch.setattr(_FakeDispatchServer, "__init__", interrupting_init)
@@ -3356,6 +3378,97 @@ def test_main_dispatch_purge_ttl_days_is_wired(monkeypatch):
     assert code == 0
     (server,) = _FakeDispatchServer.instances
     assert server.purge_ttl_days == 30
+
+
+# --- failed-auth rate limiting CLI flags (issue #214) ------------------------
+
+
+def test_main_dispatch_rejects_negative_auth_rate_limit_flags(monkeypatch, capsys):
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    for flag in (
+        "--auth-rate-limit-threshold",
+        "--auth-rate-limit-window-seconds",
+        "--auth-rate-limit-lockout-seconds",
+    ):
+        code = main(["--dispatch", flag, "-1"], runner=ScriptedRunner([]))
+        assert code == 2
+        assert flag in capsys.readouterr().err
+
+
+def test_main_dashboard_rejects_negative_auth_rate_limit_flags(tmp_path, capsys):
+    for flag in (
+        "--auth-rate-limit-threshold",
+        "--auth-rate-limit-window-seconds",
+        "--auth-rate-limit-lockout-seconds",
+    ):
+        code = main(
+            ["--dashboard", "--workspace", str(tmp_path), flag, "-1"],
+            runner=ScriptedRunner([]),
+        )
+        assert code == 2
+        assert flag in capsys.readouterr().err
+
+
+def test_main_dispatch_auth_rate_limit_flags_default(monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    code = main(["--dispatch"], runner=ScriptedRunner([]))
+    assert code == 0
+    (server,) = _FakeDispatchServer.instances
+    assert server.auth_rate_limit_threshold == 10
+    assert server.auth_rate_limit_window_seconds == 60
+    assert server.auth_rate_limit_lockout_seconds == 60
+
+
+def test_main_dispatch_auth_rate_limit_flags_are_wired(monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DispatchServer", _FakeDispatchServer)
+    _FakeDispatchServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DISPATCH_TOKEN", "tok")
+    code = main(
+        [
+            "--dispatch",
+            "--auth-rate-limit-threshold", "0",
+            "--auth-rate-limit-window-seconds", "30",
+            "--auth-rate-limit-lockout-seconds", "45",
+        ],
+        runner=ScriptedRunner([]),
+    )
+    assert code == 0
+    (server,) = _FakeDispatchServer.instances
+    assert server.auth_rate_limit_threshold == 0  # the documented opt-out
+    assert server.auth_rate_limit_window_seconds == 30
+    assert server.auth_rate_limit_lockout_seconds == 45
+
+
+def test_main_dashboard_auth_rate_limit_flags_default(tmp_path, monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    code = main(["--dashboard", "--workspace", str(tmp_path)], runner=None)
+    assert code == 0
+    (server,) = _FakeDashboardServer.instances
+    assert server.auth_rate_limit_threshold == 10
+    assert server.auth_rate_limit_window_seconds == 60
+    assert server.auth_rate_limit_lockout_seconds == 60
+
+
+def test_main_dashboard_auth_rate_limit_flags_are_wired(tmp_path, monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    code = main(
+        [
+            "--dashboard", "--workspace", str(tmp_path),
+            "--auth-rate-limit-threshold", "0",
+            "--auth-rate-limit-window-seconds", "30",
+            "--auth-rate-limit-lockout-seconds", "45",
+        ],
+        runner=None,
+    )
+    assert code == 0
+    (server,) = _FakeDashboardServer.instances
+    assert server.auth_rate_limit_threshold == 0
+    assert server.auth_rate_limit_window_seconds == 30
+    assert server.auth_rate_limit_lockout_seconds == 45
 
 
 def test_main_dispatch_sandbox_is_wired(monkeypatch):

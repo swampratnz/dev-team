@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import io
 import json
@@ -11,6 +12,7 @@ import urllib.request
 
 import pytest
 
+from dev_team.authguard import FailedAuthTracker
 from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.conventions import ConventionsProfile, ConventionsStore
 from dev_team.dashboard import (
@@ -1422,6 +1424,123 @@ def test_open_server_login_lifecycle_is_harmless(server):
     assert "Max-Age=0" in headers["Set-Cookie"]
     status, _, _ = _request(server, "POST", "/nope")
     assert status == 404
+
+
+# --- failed-auth rate limiting (issue #214) -----------------------------------
+
+
+@contextlib.contextmanager
+def _running(**kwargs):
+    ws = InMemoryWorkspace({})
+    srv = DashboardServer(ws, port=0, token=TOKEN, **kwargs)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield srv
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
+
+
+def test_repeated_wrong_bearer_locks_out_after_threshold():
+    with _running(auth_rate_limit_threshold=2, auth_rate_limit_window_seconds=60,
+                  auth_rate_limit_lockout_seconds=60) as srv:
+        wrong = {"Authorization": "Bearer wrong"}
+        # requests 1..threshold-1 (here just #1) behave exactly as today.
+        status, _, _ = _request(srv, "GET", "/api/state", headers=wrong)
+        assert status == 401
+        # the threshold-th (#2) request still evaluates normally.
+        status, _, _ = _request(srv, "GET", "/api/state", headers=wrong)
+        assert status == 401
+        # the NEXT request from this source is locked out — even with the
+        # CORRECT credential, proving the comparison itself never ran.
+        status, headers, body = _request(
+            srv, "GET", "/api/state", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        assert status == 429
+        payload = json.loads(body)
+        assert payload["error"] == "too many failed attempts"
+        assert payload["retry_after"] > 0
+        assert int(headers["Retry-After"]) == payload["retry_after"]
+
+
+def test_lockout_recovers_after_the_configured_seconds_elapse():
+    box = [0.0]
+    guard = FailedAuthTracker(threshold=1, window_seconds=60, lockout_seconds=10,
+                               clock=lambda: box[0])
+    with _running(auth_guard=guard) as srv:
+        wrong = {"Authorization": "Bearer wrong"}
+        right = {"Authorization": f"Bearer {TOKEN}"}
+        status, _, _ = _request(srv, "GET", "/api/state", headers=wrong)
+        assert status == 401
+        status, _, _ = _request(srv, "GET", "/api/state", headers=right)
+        assert status == 429  # still locked, even with the right token
+        box[0] += 10.001
+        status, _, _ = _request(srv, "GET", "/api/state", headers=right)
+        assert status == 200  # evaluated normally again
+
+
+def test_a_correct_credential_clears_history_for_a_later_fresh_miss():
+    with _running(auth_rate_limit_threshold=2, auth_rate_limit_window_seconds=60,
+                  auth_rate_limit_lockout_seconds=60) as srv:
+        wrong = {"Authorization": "Bearer wrong"}
+        right = {"Authorization": f"Bearer {TOKEN}"}
+        status, _, _ = _request(srv, "GET", "/api/state", headers=wrong)
+        assert status == 401
+        status, _, _ = _request(srv, "GET", "/api/state", headers=right)
+        assert status == 200  # clears the count
+        status, _, _ = _request(srv, "GET", "/api/state", headers=wrong)
+        assert status == 401  # fresh 1st failure
+        status, _, _ = _request(srv, "GET", "/api/state", headers=wrong)
+        assert status == 401  # 2nd (threshold-th), still evaluated
+        status, _, _ = _request(srv, "GET", "/api/state", headers=wrong)
+        assert status == 429  # NOW locked out
+
+
+def test_auth_rate_limit_threshold_zero_disables_the_guard():
+    with _running(auth_rate_limit_threshold=0) as srv:
+        wrong = {"Authorization": "Bearer wrong"}
+        for _ in range(25):
+            status, _, _ = _request(srv, "GET", "/api/state", headers=wrong)
+            assert status == 401  # never 429
+
+
+def test_login_form_and_bearer_path_share_one_lockout_budget():
+    # A lockout tripped via repeated wrong-token API calls also blocks a
+    # subsequent login-form attempt from the same source, and vice versa —
+    # one FailedAuthTracker instance per dashboard process.
+    with _running(auth_rate_limit_threshold=2, auth_rate_limit_window_seconds=60,
+                  auth_rate_limit_lockout_seconds=60) as srv:
+        wrong = {"Authorization": "Bearer wrong"}
+        status, _, _ = _request(srv, "GET", "/api/state", headers=wrong)
+        assert status == 401
+        status, _, _ = _request(srv, "GET", "/api/state", headers=wrong)
+        assert status == 401
+        status, headers, _ = _request(
+            srv, "POST", "/login", body=f"token={TOKEN}", headers=FORM
+        )
+        assert status == 429  # locked out even with the correct token
+        assert "Set-Cookie" not in headers  # no session was ever minted
+
+
+def test_login_form_failures_also_count_toward_the_bearer_path_lockout():
+    with _running(auth_rate_limit_threshold=2, auth_rate_limit_window_seconds=60,
+                  auth_rate_limit_lockout_seconds=60) as srv:
+        status, _, _ = _request(srv, "POST", "/login", body="token=wrong", headers=FORM)
+        assert status == 401
+        status, _, _ = _request(srv, "POST", "/login", body="token=wrong", headers=FORM)
+        assert status == 401
+        status, _, _ = _request(
+            srv, "GET", "/api/state", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        assert status == 429
+
+
+def test_login_lockout_is_never_reached_when_no_token_is_configured(server):
+    # server (no token) keeps /login a no-op regardless of the guard.
+    for _ in range(5):
+        status, _, _ = _request(server, "POST", "/login", body="token=wrong", headers=FORM)
+        assert status == 303  # _login short-circuits before the guard entirely
 
 
 # --- the board write proxy (/api/backlog/* → the dispatch service) ------------

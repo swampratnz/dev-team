@@ -125,6 +125,27 @@ Both HTTP surfaces require a bearer token compared with `hmac.compare_digest`
   and `GET /api/costs` are forwarded, each to the single matching dispatch
   route, with the dispatch token attached server-side and never handed to the
   browser. There is no general `/api/jobs/*` or arbitrary-route passthrough.
+- **Repeated bad-token requests are throttled.** Both surfaces share the same
+  discipline: a source IP that racks up `--auth-rate-limit-threshold` wrong
+  tokens (default 10) within `--auth-rate-limit-window-seconds` (default 60)
+  is locked out for `--auth-rate-limit-lockout-seconds` (default 60) —
+  further requests from that source get `429 {"error": "too many failed
+  attempts", "retry_after": N}` with a `Retry-After` header, and the token
+  comparison itself never runs while locked out. Dispatch gates this ahead of
+  `_authenticate` (both the operator-token comparison and the OAuth
+  session-token lookup branch count as failures); the dashboard gates it in
+  both `_authorised` (bearer/cookie) and `POST /login` (the form), sharing one
+  tracker per process so probing either path draws on the same budget.
+  Implemented in `dev_team.authguard.FailedAuthTracker` — in-memory only,
+  keyed on source IP (never the attempted token), bounded to
+  `max_tracked_sources` (default 4096) distinct sources. `--auth-rate-limit-
+  threshold 0` disables the guard (byte-identical to the prior unthrottled
+  behaviour); a negative value for any of the three flags is a startup
+  error. Keying on source IP assumes the tailnet-only deployment model this
+  document and `docs/DISPATCH.md` already document — behind a reverse proxy
+  or shared NAT, every caller collapses to one source IP and shares one
+  lockout budget, a shared-fate risk that is a consequence of the deployment
+  model, not of the throttle itself.
 
 ## Pipeline/CI guardrails
 

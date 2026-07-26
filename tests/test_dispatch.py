@@ -21,6 +21,7 @@ from test_assessment import assess_responses
 from dev_team import __version__
 from dev_team import dispatch as dispatch_mod
 from dev_team.accesslog import read_access_log
+from dev_team.authguard import FailedAuthTracker
 from dev_team.approval import ApprovalRequest, PolicyApprovalGate
 from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.budget import Budget
@@ -3351,6 +3352,28 @@ def _call(server, path, *, method="GET", token=TOKEN, body=None):
         return exc.code, payload
 
 
+def _call_with_headers(server, path, *, method="GET", token=TOKEN, body=None):
+    """Like :func:`_call`, but also returns the response headers."""
+
+    url = server.url.rstrip("/") + path
+    headers = {}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if body is not None:
+        data = body if isinstance(body, (bytes, bytearray)) else json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return res.status, json.loads(res.read().decode()), dict(res.headers)
+    except urllib.error.HTTPError as exc:
+        payload = json.loads(exc.read().decode())
+        resp_headers = dict(exc.headers)
+        exc.close()
+        return exc.code, payload, resp_headers
+
+
 def test_health_needs_no_auth_and_reports_version():
     with running(materialise=_mem_materialise) as server:
         status, payload = _call(server, "/health", token=None)
@@ -4995,6 +5018,140 @@ def test_access_log_records_404_for_an_unknown_path(tmp_path):
     records = _access_records(tmp_path, expect=1)
     assert records[-1] == {**records[-1], "method": "GET", "path": "/nope", "status": 404}
     assert set(records[-1].keys()) == {"ts", "method", "path", "status"}
+
+
+# --- failed-auth rate limiting (issue #214) ----------------------------------
+
+
+def test_repeated_wrong_token_locks_out_after_threshold():
+    with running(
+        materialise=_mem_materialise,
+        auth_rate_limit_threshold=2,
+        auth_rate_limit_window_seconds=60,
+        auth_rate_limit_lockout_seconds=60,
+    ) as server:
+        # requests 1..threshold-1 (here just #1) behave exactly as today.
+        assert _call(server, "/jobs", token="wrong")[0] == 401
+        # the threshold-th (#2) request still evaluates normally.
+        assert _call(server, "/jobs", token="wrong")[0] == 401
+        # the NEXT request from the same source is locked out — even with the
+        # CORRECT token, proving the comparison itself never ran.
+        status, payload, headers = _call_with_headers(server, "/jobs", token=TOKEN)
+        assert status == 429
+        assert payload["error"] == "too many failed attempts"
+        assert payload["retry_after"] > 0
+        assert int(headers["Retry-After"]) == payload["retry_after"]
+
+
+def test_lockout_recovers_after_the_configured_seconds_elapse():
+    box = [0.0]
+    guard = FailedAuthTracker(
+        threshold=1, window_seconds=60, lockout_seconds=10, clock=lambda: box[0]
+    )
+    with running(materialise=_mem_materialise, auth_guard=guard) as server:
+        assert _call(server, "/jobs", token="wrong")[0] == 401
+        assert _call(server, "/jobs")[0] == 429  # correct token, still locked
+        box[0] += 10.001
+        assert _call(server, "/jobs")[0] == 200  # evaluated normally again
+
+
+def test_a_correct_token_clears_history_so_a_later_miss_is_a_fresh_first_failure():
+    with running(
+        materialise=_mem_materialise,
+        auth_rate_limit_threshold=2,
+        auth_rate_limit_window_seconds=60,
+        auth_rate_limit_lockout_seconds=60,
+    ) as server:
+        assert _call(server, "/jobs", token="wrong")[0] == 401
+        assert _call(server, "/jobs")[0] == 200  # correct token clears the count
+        assert _call(server, "/jobs", token="wrong")[0] == 401  # fresh 1st failure
+        assert _call(server, "/jobs", token="wrong")[0] == 401  # 2nd (threshold-th)
+        assert _call(server, "/jobs", token="wrong")[0] == 429  # NOW locked out
+
+
+def test_health_is_never_gated_by_the_auth_guard():
+    with running(materialise=_mem_materialise, auth_rate_limit_threshold=1) as server:
+        assert _call(server, "/jobs", token="wrong")[0] == 401
+        # tripped the lockout (threshold=1) — /health is unaffected either way
+        assert _call(server, "/jobs", token="wrong")[0] == 429
+        assert _call(server, "/health", token=None)[0] == 200
+
+
+def test_auth_rate_limit_threshold_zero_disables_the_guard():
+    with running(materialise=_mem_materialise, auth_rate_limit_threshold=0) as server:
+        for _ in range(25):
+            assert _call(server, "/jobs", token="wrong")[0] == 401  # never 429
+
+
+def test_oauth_session_lookup_failure_counts_toward_the_same_lockout():
+    oauth, _ = _oauth_fixture()
+    with running(
+        oauth=oauth,
+        auth_rate_limit_threshold=2,
+        auth_rate_limit_window_seconds=60,
+        auth_rate_limit_lockout_seconds=60,
+    ) as server:
+        assert _call(server, "/jobs", token="not-a-session")[0] == 401
+        assert _call(server, "/jobs", token="not-a-session")[0] == 401
+        status, _ = _call(server, "/jobs", token="not-a-session")
+        assert status == 429
+
+
+def test_a_429_lockout_is_recorded_in_the_access_log(tmp_path):
+    with running(
+        materialise=_mem_materialise, jobs_root=str(tmp_path), auth_rate_limit_threshold=1
+    ) as server:
+        assert _call(server, "/jobs", token="wrong")[0] == 401
+        status, _ = _call(server, "/jobs", token="wrong")
+        assert status == 429
+    records = _access_records(tmp_path, expect=2)
+    entry = next(r for r in records if r["status"] == 429)
+    assert set(entry.keys()) == {"ts", "method", "path", "status"}
+    assert entry["path"] == "/jobs"
+    raw = (Path(tmp_path) / "access.jsonl").read_text()
+    assert "wrong" not in raw
+
+
+def test_two_sources_are_locked_out_independently_via_the_wired_guard():
+    with running(materialise=_mem_materialise, auth_rate_limit_threshold=1) as server:
+        guard = server.dispatcher.auth_guard
+        guard.record_failure("1.1.1.1")
+        assert guard.is_locked_out("1.1.1.1") is not None
+        assert guard.is_locked_out("2.2.2.2") is None
+        # requests genuinely served over HTTP all come from the same loopback
+        # source in-process, so the per-key independence itself is exercised
+        # exhaustively at the tracker level (test_authguard.py); this proves
+        # the wired dispatcher shares one tracker keyed correctly.
+
+
+def test_dispatcher_builds_the_default_auth_guard_from_its_rate_limit_kwargs():
+    disp = Dispatcher(
+        token="x",
+        auth_rate_limit_threshold=3,
+        auth_rate_limit_window_seconds=5,
+        auth_rate_limit_lockout_seconds=7,
+    )
+    assert disp.auth_guard.threshold == 3
+    assert disp.auth_guard.window_seconds == 5
+    assert disp.auth_guard.lockout_seconds == 7
+
+
+def test_dispatcher_accepts_an_injected_auth_guard():
+    guard = FailedAuthTracker(threshold=1)
+    disp = Dispatcher(token="x", auth_guard=guard)
+    assert disp.auth_guard is guard
+
+
+def test_dispatch_server_threads_auth_guard_kwargs_into_its_dispatcher():
+    with running(
+        materialise=_mem_materialise,
+        auth_rate_limit_threshold=4,
+        auth_rate_limit_window_seconds=9,
+        auth_rate_limit_lockout_seconds=11,
+    ) as server:
+        assert server.dispatcher.auth_guard.threshold == 4
+        assert server.dispatcher.auth_guard.window_seconds == 9
+        assert server.dispatcher.auth_guard.lockout_seconds == 11
 
 
 # --- access log job-id correlation (#167) ----------------------------------

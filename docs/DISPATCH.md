@@ -34,6 +34,17 @@ service never runs unauthenticated). It is compared with
 The token is a credential: keep it out of version control, hand it only to the
 authorised caller, and rotate it by editing the env file and restarting.
 
+Repeated wrong-token requests from one source IP are throttled: past
+`--auth-rate-limit-threshold` failures (default 10, counting both a wrong
+operator token and a bearer that also fails the GitHub-sign-in session
+lookup below) within `--auth-rate-limit-window-seconds` (default 60), that
+source gets `429 {"error":"too many failed attempts","retry_after":N}` (with
+a `Retry-After` header) for `--auth-rate-limit-lockout-seconds` (default
+60) — the comparison itself never runs while locked out. `--auth-rate-limit-
+threshold 0` disables it. See *Access log* below for how a `429` is
+journaled, and [`docs/SECURITY.md`](SECURITY.md) for the full model
+(`dev_team.authguard.FailedAuthTracker`).
+
 **GitHub sign-in (optional)**: with `GITHUB_OAUTH_CLIENT_ID`/`_SECRET`
 configured, users can sign in with GitHub (`GET /auth/login` →
 `GET /auth/callback` → session token, renewable via `POST /auth/refresh`)
@@ -935,14 +946,33 @@ hand.
 
 Bounded like `.dev_team/events.jsonl` (`dev_team.eventlog.EventLog`): once
 the file exceeds 4000 lines it is rewritten keeping the newest half, so a
-long-running service never accretes an unbounded file, including under
-sustained hostile traffic (even just repeated auth misses). Appends are
+long-running service never accretes an unbounded file. Appends are
 lock-serialised (`dev_team.accesslog.AccessLog`), so concurrent requests —
 this is a `ThreadingHTTPServer` — never lose an entry to a lost-update race.
 A log-write failure (disk full, unwritable `jobs_root`) is swallowed at the
 handler level and never turns an otherwise-successful response into a
 crash; it also never affects the response already sent to the caller,
 since the record is appended only after `send_response` has been called.
+
+Sustained hostile traffic (repeated auth misses) is no longer just a bounded
+log entry: a source IP past `--auth-rate-limit-threshold` wrong-token
+requests (default 10) within `--auth-rate-limit-window-seconds` (default 60)
+is locked out for `--auth-rate-limit-lockout-seconds` (default 60), and every
+request while locked out short-circuits to `429
+{"error":"too many failed attempts","retry_after":N}` (with a `Retry-After`
+header) *before* the token is even compared — the wrong-token comparison
+that would have run today never happens for a locked-out caller. A `429`
+lockout response is journaled here exactly like any other request (same
+`ts`/`method`/`path`/`status` shape, `Authorization` still never logged).
+`--auth-rate-limit-threshold 0` disables the guard (byte-identical to the
+prior always-compare behaviour) — e.g. for a deployment that already trusts
+every caller on its network. This throttle is keyed on source IP
+(`self.client_address[0]`, never the attempted token), which assumes the
+tailnet-only deployment model this service is designed for (see *Deployment*
+below): behind a reverse proxy or shared NAT, every caller collapses to one
+source IP and shares one lockout budget. See
+`dev_team.authguard.FailedAuthTracker` and
+[`docs/SECURITY.md`](SECURITY.md)'s *HTTP surface auth* section.
 
 ### `GET /access-log` (auth) — recent access records
 

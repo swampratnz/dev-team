@@ -384,6 +384,32 @@ sections below are reconstructed from the repository history.
   case, and the loopback-with-transcripts warning, are unchanged — this is
   scoped strictly to the one branch SECURITY.md flagged as unhardened.
   `docs/SECURITY.md` and `docs/DASHBOARD.md` are updated to match.
+- **Repeated bad-token requests against dispatch/dashboard are now throttled**
+  (issue #214), closing the gap `docs/DISPATCH.md`/`docs/DASHBOARD.md` both
+  named but only ever answered with post-hoc detection (the bounded access
+  log, the dashboard's Access log panel): a wrong-token `hmac.compare_digest`
+  loop had no counter, no backoff, no lockout. The new
+  `dev_team.authguard.FailedAuthTracker` is a small, dependency-free,
+  in-memory, lock-serialised structure keyed on source IP only (never the
+  attempted token, per CLAUDE.md section 2) and bounded to
+  `max_tracked_sources` (default 4096, oldest-inserted evicted first). Wired
+  ahead of dispatch's `_authenticate` (both the operator-token miss and a
+  bearer that also fails the GitHub-sign-in session lookup count as
+  failures) and ahead of dashboard's `_authorised` (bearer/cookie) and
+  `POST /login`, sharing one tracker per dashboard process so a bearer-path
+  and login-form prober from the same source share one budget. Past
+  `--auth-rate-limit-threshold` failures (default 10) within
+  `--auth-rate-limit-window-seconds` (default 60), a source is locked out
+  for `--auth-rate-limit-lockout-seconds` (default 60): further requests get
+  `429 {"error":"too many failed attempts","retry_after":N}` with a
+  `Retry-After` header, and the token comparison itself never runs.
+  `--auth-rate-limit-threshold 0` disables the guard (byte-identical to the
+  prior unthrottled behaviour); a negative value for any of the three flags
+  is a startup error. A `429` is journaled through dispatch's existing
+  `AccessLog` exactly like any other status. `docs/SECURITY.md`,
+  `docs/DISPATCH.md`, and `docs/DASHBOARD.md` are updated to describe the new
+  behaviour and its reverse-proxy/shared-NAT caveat (per-source-IP keying
+  assumes the documented tailnet-only deployment model).
 
 ### Self-improvement pipeline
 - **A supervised multi-loop development pipeline now extends this repo
