@@ -151,6 +151,51 @@ on the console terminal are a separate channel and are unaffected. Reply
 again from an allow-listed login with exactly `apply` or `skip` as the
 first word of a fresh comment before the next poll window closes.
 
+## `docker_build_verified` / `docker_run_verified` is false — is my delivery broken?
+
+No. Both `--docker-build-gate` and `--docker-run-gate`
+(`EngineConfig.docker_build_gate` / `docker_run_gate`) are **advisory only**
+— see [`docs/BENCHMARKS.md`](BENCHMARKS.md)'s DevOps section for the design
+rationale: it never blocks, fails, or rolls back a delivery, even when the
+underlying build or run itself fails. A run can finish green while its
+scorecard shows `docker_build_verified: false` or `docker_run_verified:
+false`, and that is not a contradiction.
+
+**The three states you'll see on each scorecard key:**
+
+- **Absent** — the gate is off (both are off by default; pass
+  `--docker-build-gate` / `--docker-run-gate` at the CLI to turn one on).
+- **`True`** — the build (`docker_build_verified`) or the smoke-tested
+  container (`docker_run_verified`) succeeded.
+- **`False`** — something did not succeed; check the matching `_detail`
+  scorecard key for what happened:
+  - `docker_build_detail` — the `docker build` invocation failed (event
+    `docker-build-failed`); truncated build output is captured there.
+  - `docker_run_detail` — one of two distinct causes, both surfaced under
+    `docker_run_verified: False`:
+    - the `docker run` invocation itself never started (missing/
+      misconfigured local docker daemon, a stale container-name collision,
+      ...) — recorded as event `docker-run-start-failed`, with no
+      grace-period wait, since there is nothing yet to wait on; or
+    - the container started but exited before the fixed grace period
+      (`_DOCKER_RUN_GATE_GRACE_SECONDS`, 3.0s) elapsed — recorded as event
+      `docker-run-failed` (not `docker-run-verified`, which only ever fires
+      when the container is still running), with `docker_run_detail`
+      captured from `docker logs`.
+
+**`docker_build_verified: False` under `--sandbox` is expected, not a
+bug.** The gate reuses the same contained `command_runner` as every other
+gate, which typically has no docker socket/network — so a build simply
+cannot succeed there. See [`docs/BENCHMARKS.md`](BENCHMARKS.md) (DevOps)
+for the full design note.
+
+**Do not "fix" a `False` reading by relaxing containment.** Because
+`--docker-run-gate` starts an image built from an untrusted, adversarial
+repo's own `ENTRYPOINT`, its `docker run` invocation always launches with
+`--network none --cap-drop ALL --security-opt no-new-privileges` — these
+flags are unconditional and are not the cause of a `docker_run_verified:
+False` result; look at `docker_run_detail` instead.
+
 ## Dashboard/dispatch HTTP status quick-reference
 
 | Status | Meaning | Source |
