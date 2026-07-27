@@ -82,7 +82,7 @@ def test_detect_composer_php():
     assert profile.verify_command == ("composer", "test")
     assert profile.setup_command == ("composer", "install")
     assert profile.reason == "composer.json at workspace root"
-    assert profile.security_scan_command is None
+    assert profile.security_scan_command == ("composer", "audit")
 
 
 def test_detect_unknown_falls_back_to_pytest():
