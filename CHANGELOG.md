@@ -945,6 +945,24 @@ sections below are reconstructed from the repository history.
   when non-empty; `repo` is caller-supplied (`POST /jobs`), so it flows
   through `esc()` before `innerHTML` like every other panel field. Purely
   additive to `dashboard.py` — no `dispatch.py` change, no new HTTP route.
+- **Spend panel gains a per-repo breakdown** (#232, `docs/DISPATCH.md`,
+  `docs/DASHBOARD.md`): the deferred other half of #223's own named
+  follow-up — `Dispatcher.costs()` blended every dispatched job's spend
+  into one `total_usd`/`by_mode` rollup, so a shared dispatch instance
+  serving more than one repo had no way to see one repo's spend without
+  hand-correlating `GET /jobs`'s `repo` field. A new `by_repo` dict on
+  `costs()`'s payload accumulates in the same filtered registry loop
+  `by_mode` already uses, keyed on `record.spec.repo` — a required
+  `JobSpec` field, so unlike calibration's meta.json-sourced case there is
+  no missing-repo bucket to handle. Shares the existing archived-job
+  exclusion and `?archived=1`/`include_archived` toggle exactly (same
+  loop, same flag). The dashboard renders it as a "by repo" sub-table
+  beneath the by-mode table, shown only when **more than one** repo has
+  spend (a single-repo table would just restate the total line above it);
+  `repo` flows through `esc()` before `innerHTML`, same discipline as
+  every other caller-supplied field. Purely additive to `costs()`'s
+  response shape and `dashboard.py`'s rendering — no new HTTP route or
+  query parameter.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /

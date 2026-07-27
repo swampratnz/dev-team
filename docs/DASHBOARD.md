@@ -219,6 +219,18 @@ number that only changes when a job finishes. Without a dispatch URL/token
 configured, `GET /api/costs` answers `501` and the panel renders a muted
 "not configured" state, never a raw error.
 
+Beneath the by-mode table, a **by repo** sub-table breaks the same spend
+total down per repo, mirroring the calibration panel's by-repo table above —
+same "sorted keys, one row per repo" shape, `esc()`-escaped since `repo` is
+caller-supplied (`POST /jobs`) text. It's rendered directly from `/costs`'s
+`by_repo` field with zero proxy changes, since `GET /api/costs` already
+forwards the dispatch response verbatim. Unlike the calibration table's
+"any non-empty" threshold, this one shows only when **more than one** repo
+has spend — a single-repo workspace's by-repo row would just restate the
+total line already shown above it, adding visual noise for zero information.
+It shares the same archived-job exclusion as the rest of the panel (same
+request, same flag — no separate control).
+
 ### Access log
 
 The **Access log** panel (next to Spend) shows the dispatch service's most

@@ -2214,6 +2214,19 @@ def test_dashboard_html_spend_panel():
     assert "\nloadSpend();" in DASHBOARD_HTML
 
 
+def test_dashboard_html_spend_by_repo_panel():
+    # AC8 + AC9 + AC10: static desk-check of the Spend panel's "by repo"
+    # sub-table JS (CI has no browser), mirroring
+    # test_dashboard_html_calibration_by_repo_panel's approach. SECURITY:
+    # repo is caller-supplied (POST /jobs) — esc() before innerHTML, same
+    # discipline as spendRow/calibrationRepoRow.
+    assert "function spendRepoTable(byRepo)" in DASHBOARD_HTML
+    assert 'if (repos.length <= 1) return "";' in DASHBOARD_HTML
+    assert "<tr><td>${esc(repo)}</td><td>$${esc(usd.toFixed(2))}</td></tr>" in DASHBOARD_HTML
+    assert "cal-table cal-by-repo" in DASHBOARD_HTML
+    assert "spendRepoTable(data.by_repo)" in DASHBOARD_HTML
+
+
 # --- the access log proxy (GET /api/access-log → dispatch GET /access-log) ---
 
 

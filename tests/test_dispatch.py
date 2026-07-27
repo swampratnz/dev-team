@@ -460,7 +460,8 @@ def test_failed_job_reports_real_partial_spend():
          "error": record.error, "cost_usd": 0.75},
     )
     assert disp.costs() == (
-        200, {"total_usd": 0.75, "by_mode": {"assess": 0.75}, "jobs_counted": 1})
+        200, {"total_usd": 0.75, "by_mode": {"assess": 0.75},
+              "by_repo": {"a/b": 0.75}, "jobs_counted": 1})
 
 
 def test_worker_times_out_a_hung_job_and_keeps_serving():
@@ -1032,7 +1033,7 @@ def _insert_job(disp, job_id, mode, state, cost_usd, repo="acme/mono"):
 def test_costs_on_empty_registry_is_zeroed():
     disp = Dispatcher(token="x")
     assert disp.costs() == (
-        200, {"total_usd": 0.0, "by_mode": {}, "jobs_counted": 0})
+        200, {"total_usd": 0.0, "by_mode": {}, "by_repo": {}, "jobs_counted": 0})
 
 
 def test_costs_counts_one_succeeded_job_without_a_dashboard_workspace():
@@ -1042,7 +1043,8 @@ def test_costs_counts_one_succeeded_job_without_a_dashboard_workspace():
     disp = Dispatcher(token="x")
     _insert_job(disp, "assess-1", "assess", "succeeded", 2.5)
     assert disp.costs() == (
-        200, {"total_usd": 2.5, "by_mode": {"assess": 2.5}, "jobs_counted": 1})
+        200, {"total_usd": 2.5, "by_mode": {"assess": 2.5},
+              "by_repo": {"acme/mono": 2.5}, "jobs_counted": 1})
 
 
 def test_costs_sums_across_all_three_modes():
@@ -1064,7 +1066,8 @@ def test_costs_counts_a_failed_jobs_real_partial_spend():
     disp = Dispatcher(token="x")
     _insert_job(disp, "assess-1", "assess", "failed", 1.5)
     assert disp.costs() == (
-        200, {"total_usd": 1.5, "by_mode": {"assess": 1.5}, "jobs_counted": 1})
+        200, {"total_usd": 1.5, "by_mode": {"assess": 1.5},
+              "by_repo": {"acme/mono": 1.5}, "jobs_counted": 1})
 
 
 def test_costs_excludes_queued_and_running_jobs():
@@ -1072,14 +1075,14 @@ def test_costs_excludes_queued_and_running_jobs():
     _insert_job(disp, "assess-1", "assess", "queued", None)
     _insert_job(disp, "assess-2", "assess", "running", None)
     assert disp.costs() == (
-        200, {"total_usd": 0.0, "by_mode": {}, "jobs_counted": 0})
+        200, {"total_usd": 0.0, "by_mode": {}, "by_repo": {}, "jobs_counted": 0})
 
 
 def test_costs_excludes_a_cancelled_job():
     disp = Dispatcher(token="x")
     _insert_job(disp, "assess-1", "assess", "cancelled", None)
     assert disp.costs() == (
-        200, {"total_usd": 0.0, "by_mode": {}, "jobs_counted": 0})
+        200, {"total_usd": 0.0, "by_mode": {}, "by_repo": {}, "jobs_counted": 0})
 
 
 def test_costs_excludes_archived_job_and_reappears_after_unarchive():
@@ -1092,17 +1095,20 @@ def test_costs_excludes_archived_job_and_reappears_after_unarchive():
     _insert_job(disp, "assess-1", "assess", "succeeded", 5.0)
 
     assert disp.costs() == (
-        200, {"total_usd": 5.0, "by_mode": {"assess": 5.0}, "jobs_counted": 1})
+        200, {"total_usd": 5.0, "by_mode": {"assess": 5.0},
+              "by_repo": {"acme/mono": 5.0}, "jobs_counted": 1})
 
     disp.archive_job("assess-1")
     assert disp.costs() == (
-        200, {"total_usd": 0.0, "by_mode": {}, "jobs_counted": 0})
+        200, {"total_usd": 0.0, "by_mode": {}, "by_repo": {}, "jobs_counted": 0})
     assert disp.costs(include_archived=True) == (
-        200, {"total_usd": 5.0, "by_mode": {"assess": 5.0}, "jobs_counted": 1})
+        200, {"total_usd": 5.0, "by_mode": {"assess": 5.0},
+              "by_repo": {"acme/mono": 5.0}, "jobs_counted": 1})
 
     disp.unarchive_job("assess-1")
     assert disp.costs() == (
-        200, {"total_usd": 5.0, "by_mode": {"assess": 5.0}, "jobs_counted": 1})
+        200, {"total_usd": 5.0, "by_mode": {"assess": 5.0},
+              "by_repo": {"acme/mono": 5.0}, "jobs_counted": 1})
 
 
 def test_costs_http_route_end_to_end():
@@ -1111,7 +1117,8 @@ def test_costs_http_route_end_to_end():
             401, {"error": "unauthorized"})
         status, payload = _call(server, "/costs")
         assert status == 200
-        assert payload == {"total_usd": 0.0, "by_mode": {}, "jobs_counted": 0}
+        assert payload == {
+            "total_usd": 0.0, "by_mode": {}, "by_repo": {}, "jobs_counted": 0}
 
 
 def test_costs_http_route_archived_query_param():
@@ -1136,7 +1143,64 @@ def test_costs_http_route_archived_query_param():
 
         status, payload = _call(server, "/costs?archived=1")
         assert status == 200
-        assert payload == {"total_usd": 4.0, "by_mode": {"assess": 4.0}, "jobs_counted": 1}
+        assert payload == {
+            "total_usd": 4.0, "by_mode": {"assess": 4.0},
+            "by_repo": {"acme/mono": 4.0}, "jobs_counted": 1}
+
+
+# --- costs by_repo (issue #232) -------------------------------------------
+
+
+def test_costs_by_repo_splits_two_repos():
+    # AC1: two jobs against two different repos produce two by_repo entries
+    # with the correct individual costs.
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "assess-1", "assess", "succeeded", 1.0, repo="acme/mono")
+    _insert_job(disp, "assess-2", "assess", "succeeded", 2.0, repo="acme/other")
+    status, payload = disp.costs()
+    assert status == 200
+    assert payload["by_repo"] == {"acme/mono": 1.0, "acme/other": 2.0}
+
+
+def test_costs_by_repo_aggregates_same_repo_across_jobs():
+    # AC2: two jobs against the same repo aggregate into a single by_repo
+    # entry with summed cost, not one row per job.
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "assess-1", "assess", "succeeded", 1.0, repo="acme/mono")
+    _insert_job(disp, "assess-2", "assess", "succeeded", 2.5, repo="acme/mono")
+    status, payload = disp.costs()
+    assert status == 200
+    assert payload["by_repo"] == {"acme/mono": 3.5}
+
+
+def test_costs_by_repo_sums_across_modes_independently_of_by_mode():
+    # AC3: a repo with jobs across multiple modes sums correctly into one
+    # by_repo[repo] total, while by_mode still shows the existing per-mode
+    # split — the two breakdowns are independent, orthogonal groupings of
+    # the same underlying sum.
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "assess-1", "assess", "succeeded", 1.0, repo="acme/mono")
+    _insert_job(disp, "deliver-1", "deliver", "succeeded", 2.0, repo="acme/mono")
+    status, payload = disp.costs()
+    assert status == 200
+    assert payload["by_repo"] == {"acme/mono": 3.0}
+    assert payload["by_mode"] == {"assess": 1.0, "deliver": 2.0}
+    assert payload["total_usd"] == sum(payload["by_repo"].values())
+    assert payload["total_usd"] == sum(payload["by_mode"].values())
+
+
+def test_costs_by_repo_excludes_uncounted_job_states():
+    # AC4: a queued/running/cancelled job for a given repo contributes
+    # nothing to that repo's by_repo entry — the key is simply absent, not
+    # present with 0.0.
+    disp = Dispatcher(token="x")
+    _insert_job(disp, "assess-1", "assess", "queued", None, repo="acme/mono")
+    _insert_job(disp, "assess-2", "assess", "running", None, repo="acme/mono")
+    _insert_job(disp, "assess-3", "assess", "cancelled", None, repo="acme/mono")
+    status, payload = disp.costs()
+    assert status == 200
+    assert "acme/mono" not in payload["by_repo"]
+    assert payload["by_repo"] == {}
 
 
 # --- archive / unarchive (job lifecycle) --------------------------------------
