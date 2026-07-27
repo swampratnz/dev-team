@@ -63,6 +63,32 @@ _JAVA_VERSION_PROPERTIES = (
     "maven.compiler.source",
 )
 
+#: Gradle's modern, unambiguous toolchain API -- identical syntax in both
+#: the Groovy and Kotlin DSLs (``JavaLanguageVersion.of(17)``).
+_GRADLE_TOOLCHAIN_RE = re.compile(r"JavaLanguageVersion\.of\(\s*(\d+)\s*\)")
+
+#: ``sourceCompatibility``/``targetCompatibility`` via ``=`` assignment,
+#: covering the three idiomatic literal forms: a quoted string
+#: (``'17'``), a bare numeric (``17`` or the legacy ``1.8``), and the
+#: ``JavaVersion.VERSION_17`` / ``JavaVersion.VERSION_1_8`` enum. Bounded
+#: digit groups only -- no nested or overlapping quantifiers, so matching
+#: stays linear-time even on adversarial input.
+_GRADLE_SOURCE_COMPATIBILITY_RE = re.compile(
+    r"sourceCompatibility\s*=\s*(?:JavaVersion\.VERSION_(\d+(?:_\d+)?)"
+    r"|['\"]?(\d+(?:\.\d+)?)['\"]?)"
+)
+_GRADLE_TARGET_COMPATIBILITY_RE = re.compile(
+    r"targetCompatibility\s*=\s*(?:JavaVersion\.VERSION_(\d+(?:_\d+)?)"
+    r"|['\"]?(\d+(?:\.\d+)?)['\"]?)"
+)
+
+#: Checked in this priority order: ``sourceCompatibility`` before
+#: ``targetCompatibility``.
+_GRADLE_COMPATIBILITY_PATTERNS = (
+    _GRADLE_SOURCE_COMPATIBILITY_RE,
+    _GRADLE_TARGET_COMPATIBILITY_RE,
+)
+
 
 @dataclass(frozen=True)
 class Runtime:
@@ -308,6 +334,51 @@ def parse_pom_xml_java(text: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _normalize_gradle_java_version(
+    enum_digits: Optional[str], literal: Optional[str]
+) -> Optional[str]:
+    """Reduce a matched ``sourceCompatibility``/``targetCompatibility``
+    capture to endoflife.date's ``java`` cycle identifier.
+
+    ``enum_digits`` (from the ``JavaVersion.VERSION_17`` / ``VERSION_1_8``
+    form) uses ``_`` where the literal form uses ``.`` -- normalised first
+    so both forms share the same legacy-``1.X`` reduction
+    :data:`_LEGACY_JAVA_RE` already applies to ``pom.xml`` values.
+    """
+
+    raw = enum_digits.replace("_", ".") if enum_digits else literal
+    legacy = _LEGACY_JAVA_RE.match(raw)
+    return legacy.group(1) if legacy else _leading_version(raw)
+
+
+def parse_gradle_java(text: str) -> Optional[Tuple[str, str]]:
+    """Gradle ``build.gradle``/``build.gradle.kts``: the pinned Java version.
+
+    Deliberately not a Groovy/Kotlin DSL parser -- a conservative regex
+    extraction of the small set of idiomatic, literal forms real Gradle
+    files use to pin a Java version, mirroring :func:`parse_pom_xml_java`'s
+    "extract-the-literal-or-degrade" contract instead of attempting DSL
+    evaluation (which would mean executing untrusted repository script
+    content -- exactly the risk this module avoids everywhere else).
+
+    Checked in priority order: the toolchain API (modern, unambiguous)
+    first; then ``sourceCompatibility``; then ``targetCompatibility`` only
+    if ``sourceCompatibility`` didn't match. The legacy space-call Groovy
+    syntax (no ``=``), Kotlin DSL's ``.set(...)`` toolchain form, and
+    values sourced from variables/``gradle.properties``/``ext`` blocks are
+    explicit non-goals -- they degrade to ``None``, never a guess.
+    """
+
+    toolchain = _GRADLE_TOOLCHAIN_RE.search(text)
+    if toolchain:
+        return ("java", toolchain.group(1))
+    for pattern in _GRADLE_COMPATIBILITY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return ("java", _normalize_gradle_java_version(*match.groups()))
+    return None
+
+
 _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "package.json": parse_package_json_engines,
     ".nvmrc": parse_nvmrc,
@@ -318,6 +389,8 @@ _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "go.mod": parse_go_mod,
     "composer.json": parse_composer_json_php,
     "pom.xml": parse_pom_xml_java,
+    "build.gradle": parse_gradle_java,
+    "build.gradle.kts": parse_gradle_java,
 }
 
 
