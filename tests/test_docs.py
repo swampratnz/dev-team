@@ -26,6 +26,7 @@ _REQUIRED_HEADINGS = [
     "stuck `blocked` and never resumes",
     "HTTP status quick-reference",
     "My --interactive-pr-comments reply never got answered",
+    "docker_build_verified` / `docker_run_verified` is false",
 ]
 
 # AC4: closed set of secret-shaped literal substrings.
@@ -40,11 +41,19 @@ _BEARER_SECRET_RE = re.compile(
 
 _DISPATCH = _REPO_ROOT / "docs" / "DISPATCH.md"
 _DASHBOARD = _REPO_ROOT / "docs" / "DASHBOARD.md"
+_ENGINE = _REPO_ROOT / "src" / "dev_team" / "engine.py"
 
 # Drift-check: every backtick-fenced `GET|POST /...` route TROUBLESHOOTING.md
 # cites, to verify against the union of docs/DISPATCH.md's and
 # docs/DASHBOARD.md's text (TROUBLESHOOTING.md cross-links both).
 _ROUTE_RE = re.compile(r"`((?:GET|POST) /[\w{}/-]+)`")
+
+# Drift-check: every backtick-fenced `docker-...` event name the docker-gate
+# section cites, to verify each is still a real _event(...) literal in
+# engine.py rather than a name the doc invented or let go stale.
+_DOCKER_EVENT_RE = re.compile(r"`(docker-[a-z-]+)`")
+
+_DOCKER_GATE_HEADING = "docker_build_verified` / `docker_run_verified` is false"
 
 
 def _troubleshooting_text() -> str:
@@ -57,6 +66,17 @@ def _dispatch_text() -> str:
 
 def _dashboard_text() -> str:
     return _DASHBOARD.read_text(encoding="utf-8")
+
+
+def _engine_text() -> str:
+    return _ENGINE.read_text(encoding="utf-8")
+
+
+def _docker_gate_section_text() -> str:
+    text = _troubleshooting_text()
+    start = text.index(_DOCKER_GATE_HEADING)
+    end = text.index("## Dashboard/dispatch HTTP status quick-reference", start)
+    return text[start:end]
 
 
 def _routes_cited_in(text: str) -> set[str]:
@@ -164,3 +184,57 @@ def test_pr_comment_section_documents_the_allowlist_and_failsafe():
 def test_pr_comment_section_cross_links_interaction_doc():
     text = _troubleshooting_text()
     assert "(docs/INTERACTION.md)" in text
+
+
+def test_docker_gate_section_documents_the_scorecard_keys():
+    text = _docker_gate_section_text()
+    assert "docker_build_verified" in text
+    assert "docker_run_verified" in text
+
+
+def test_docker_gate_scorecard_keys_are_still_real_in_engine():
+    engine_text = _engine_text()
+    assert '"docker_build_verified"' in engine_text
+    assert '"docker_run_verified"' in engine_text
+
+
+def test_docker_gate_section_documents_the_cli_flags():
+    from dev_team.cli import build_parser
+
+    text = _docker_gate_section_text()
+    assert "--docker-build-gate" in text
+    assert "--docker-run-gate" in text
+    known_flags = {
+        option
+        for action in build_parser()._actions
+        for option in action.option_strings
+        if option.startswith("--")
+    }
+    assert "--docker-build-gate" in known_flags
+    assert "--docker-run-gate" in known_flags
+
+
+def test_docker_gate_section_documents_the_hardening_flags():
+    text = _docker_gate_section_text()
+    assert "--network none" in text
+    assert "--cap-drop ALL" in text
+    assert "no-new-privileges" in text
+
+
+def test_docker_gate_section_states_advisory_only_and_never_blocks():
+    text = _docker_gate_section_text()
+    assert "advisory only" in text
+    assert "never blocks" in text
+
+
+def test_docker_gate_cited_events_are_real_event_literals_in_engine():
+    engine_text = _engine_text()
+    events = _DOCKER_EVENT_RE.findall(_docker_gate_section_text())
+    assert events
+    for event in events:
+        assert f'"{event}"' in engine_text, event
+
+
+def test_docker_gate_section_does_not_misattribute_the_exited_early_case():
+    text = _docker_gate_section_text()
+    assert "not `docker-run-verified`" in text
