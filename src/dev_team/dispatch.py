@@ -676,9 +676,8 @@ class Dispatcher:
                         try:
                             sweep_expired_archives(
                                 self._dashboard_workspace,
-                                self._purge_ttl_days,
+                                now - self._purge_ttl_days * 86400,
                                 self.purge_job,
-                                clock=self._clock,
                             )
                         except Exception:  # noqa: BLE001 — a failed sweep must not kill the worker
                             # Same containment as the _execute guard below.
@@ -1735,6 +1734,41 @@ class Dispatcher:
             },
         }
 
+    def jobs_purge_preview(self, archived_before: float) -> Tuple[int, Dict[str, Any]]:
+        """The ``GET /jobs/purge`` core: a $0 dry-run, never deletes.
+
+        Mirrors ``GET /foreman/plan`` vs ``POST /foreman/run``'s
+        preview/mutate split. Lists every archived job whose ``archived_at``
+        is at or before ``archived_before`` using the exact same
+        :func:`_archived_job_ids_before` walk :func:`sweep_expired_archives`
+        purges from — never a second, independent eligibility check — but
+        never calls :meth:`purge_job`, so it has no side effects.
+        """
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "purge needs a dashboard workspace"}
+        eligible = _archived_job_ids_before(self._dashboard_workspace, archived_before)
+        return 200, {"eligible": eligible, "count": len(eligible)}
+
+    def jobs_purge(self, archived_before: float) -> Tuple[int, Dict[str, Any]]:
+        """The ``POST /jobs/purge`` core: the on-demand twin of the TTL sweep.
+
+        Calls the same :func:`sweep_expired_archives` the periodic
+        ``--purge-ttl-days`` sweep uses (:meth:`_worker_loop`), passing the
+        operator-supplied ``archived_before`` straight through as the
+        cutoff instead of a policy-derived one. Every deletion still runs
+        through :meth:`purge_job`, so a job racing the periodic sweep over
+        the same id is purged at most once (the shared ``_purging`` claim
+        set), and a still-running job is never force-purged.
+        """
+
+        if self._dashboard_workspace is None:
+            return 409, {"error": "purge needs a dashboard workspace"}
+        purged = sweep_expired_archives(
+            self._dashboard_workspace, archived_before, self.purge_job
+        )
+        return 200, {"purged": purged, "count": len(purged)}
+
     def list_job_findings(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
         """The ``GET /jobs/{id}/findings`` core: the re-checkable claims.
 
@@ -2563,47 +2597,25 @@ class Dispatcher:
         return 200, {"kind": "deliver", **delivery_to_dict(outcome)}
 
 
-def sweep_expired_archives(
-    dashboard_workspace: Optional[Workspace],
-    purge_ttl_days: Optional[int],
-    purge_fn: Callable[[str], Tuple[int, Dict[str, Any]]],
-    *,
-    clock: Callable[[], float] = time.time,
+def _archived_job_ids_before(
+    dashboard_workspace: Workspace, cutoff: float
 ) -> List[str]:
-    """Purge every archived job whose ``archived_at`` is past ``purge_ttl_days``.
+    """Ids of archived jobs whose ``archived_at`` is at or before ``cutoff``.
 
     Walks ``audit/*/meta.json`` via ``dashboard_workspace.list_files()`` —
     the same disk-first enumeration :meth:`Dispatcher.calibration` already
     uses, so a job id is never taken from anything but a real, enumerated
     ``audit/`` entry (a crafted ``../``-shaped subdirectory name is simply
-    never returned by ``list_files()``, so it can never reach ``purge_fn``).
-    Eligibility (archived, TTL-expired) is decided here; the actual deletion,
-    and every existence/running/idempotency check, stays entirely inside
-    ``purge_fn`` (:meth:`Dispatcher.purge_job` in production) — this
-    function has no independent deletion logic of its own. That means a job
-    still ``queued``/``running`` in the registry is never force-purged even
-    if its mirrored ``meta.json`` says ``archived: true`` (``purge_fn``
-    itself refuses it), and two overlapping sweeps (one per
-    ``--max-concurrent-jobs`` worker) racing the same expired job are safe:
-    the second call's ``purge_fn`` finds nothing left to purge and answers
-    a non-200 without raising.
-
-    A missing or malformed ``meta.json``, or a non-numeric ``archived_at``,
-    is treated as not-eligible rather than raising — the same fail-closed
-    posture as :meth:`Dispatcher._read_meta`. A ``purge_fn`` that *raises*
-    (rather than answering a non-200) is contained the same way: that job is
-    skipped and the sweep continues with the next candidate, so one
-    undeletable job can neither abort the rest of the sweep nor, via
-    :meth:`Dispatcher._worker_loop`, kill the worker thread. The next sweep
-    retries it.
-
-    Returns the ids actually purged (``purge_fn`` returned ``200``).
+    never returned by ``list_files()``). A missing or malformed
+    ``meta.json``, or a non-numeric ``archived_at``, is treated as
+    not-eligible rather than raising — the same fail-closed posture as
+    :meth:`Dispatcher._read_meta`. This is the single eligibility
+    implementation shared by :func:`sweep_expired_archives` (which purges
+    what it finds) and the ``GET /jobs/purge`` dry-run (which only lists
+    it) — neither has its own, independent walk.
     """
 
-    if dashboard_workspace is None or purge_ttl_days is None:
-        return []
-    cutoff = clock() - purge_ttl_days * 86400
-    purged: List[str] = []
+    eligible: List[str] = []
     for path in dashboard_workspace.list_files():
         if not path.startswith("audit/") or not path.endswith("/meta.json"):
             continue
@@ -2622,6 +2634,50 @@ def sweep_expired_archives(
             continue
         if archived_at > cutoff:
             continue
+        eligible.append(job_id)
+    return eligible
+
+
+def sweep_expired_archives(
+    dashboard_workspace: Optional[Workspace],
+    cutoff: Optional[float],
+    purge_fn: Callable[[str], Tuple[int, Dict[str, Any]]],
+) -> List[str]:
+    """Purge every archived job whose ``archived_at`` is at or before ``cutoff``.
+
+    ``cutoff`` is an explicit epoch-seconds boundary, computed by the
+    caller — the periodic TTL sweep (:meth:`Dispatcher._worker_loop`)
+    derives it from ``purge_ttl_days`` and its clock; ``POST /jobs/purge``
+    (:meth:`Dispatcher.jobs_purge`) passes the operator-supplied
+    ``archived_before`` straight through. Both callers funnel through this
+    one function, so there is exactly one eligibility/deletion pairing, not
+    two independent implementations.
+
+    Eligibility is decided by :func:`_archived_job_ids_before`; the actual
+    deletion, and every existence/running/idempotency check, stays entirely
+    inside ``purge_fn`` (:meth:`Dispatcher.purge_job` in production) — this
+    function has no independent deletion logic of its own. That means a job
+    still ``queued``/``running`` in the registry is never force-purged even
+    if its mirrored ``meta.json`` says ``archived: true`` (``purge_fn``
+    itself refuses it), and two overlapping sweeps (one per
+    ``--max-concurrent-jobs`` worker, or an on-demand call racing the
+    periodic sweep) racing the same expired job are safe: the second call's
+    ``purge_fn`` finds nothing left to purge and answers a non-200 without
+    raising.
+
+    A ``purge_fn`` that *raises* (rather than answering a non-200) is
+    contained: that job is skipped and the sweep continues with the next
+    candidate, so one undeletable job can neither abort the rest of the
+    sweep nor, via :meth:`Dispatcher._worker_loop`, kill the worker thread.
+    The next sweep retries it.
+
+    Returns the ids actually purged (``purge_fn`` returned ``200``).
+    """
+
+    if dashboard_workspace is None or cutoff is None:
+        return []
+    purged: List[str] = []
+    for job_id in _archived_job_ids_before(dashboard_workspace, cutoff):
         try:
             status, _ = purge_fn(job_id)
         except Exception:  # noqa: BLE001 — one bad job must not stop the sweep
@@ -2722,6 +2778,39 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 return int(values[0])
             except ValueError:
                 return default
+
+        def _required_finite_float_param(
+            self, query: Dict[str, List[str]], name: str
+        ) -> Optional[float]:
+            """A required, finite numeric query param — sends ``400`` and
+            returns ``None`` if it is missing, non-numeric, or infinite/NaN.
+
+            Unlike :meth:`_int_param`'s forgiving default (fine for a
+            read-only paging knob), ``?archived_before=`` gates a bulk
+            deletion: there is no safe default that could stand in for "the
+            operator meant to purge everything", so an absent or malformed
+            value must fail closed rather than silently substitute one. This
+            mirrors the spend-bearing ``POST /foreman/run``'s strict
+            validation over the forgiving clamp its own ``GET`` dry-run
+            (``?max_stories=``) gets. ``float()`` accepts ``"inf"``/``"nan"``
+            as valid numbers, so those are rejected explicitly via
+            :func:`math.isfinite` rather than left to reach the eligibility
+            walk as an all-or-nothing cutoff.
+            """
+
+            values = query.get(name)
+            if not values:
+                self._json(400, {"error": f"{name} is required"})
+                return None
+            try:
+                value = float(values[0])
+            except ValueError:
+                self._json(400, {"error": f"{name} must be a finite number"})
+                return None
+            if not math.isfinite(value):
+                self._json(400, {"error": f"{name} must be a finite number"})
+                return None
+            return value
 
         def _authenticate(self) -> Optional[Tuple[str, Optional[Session]]]:
             """``("operator", None)``, ``("user", session)``, or ``None``.
@@ -2957,6 +3046,23 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 status, payload = dispatcher.foreman_plan(max_stories=max_stories)
                 self._json(status, payload)
                 return
+            if path == "/jobs/purge":
+                # Operator-only, like the destructive POST twin it previews.
+                # An exact-string match, checked here — before the generic
+                # len(parts) == 2 jobs/{id} lookup below — so this never
+                # falls through to that branch and gets mistaken for a
+                # lookup of a job literally named "purge" (real job ids are
+                # always f"{mode}-{timestamp}-{seq}", never that).
+                if not self._operator_only():
+                    return
+                archived_before = self._required_finite_float_param(
+                    parse_qs(split.query), "archived_before"
+                )
+                if archived_before is None:
+                    return
+                status, payload = dispatcher.jobs_purge_preview(archived_before)
+                self._json(status, payload)
+                return
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "jobs":
                 if not self._session_sees(session, parts[1]):
@@ -3029,6 +3135,22 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 job_ids = _foreman_batch_job_ids(status, payload)
                 if job_ids:
                     self._access_log_job_ids = job_ids
+                self._json(status, payload)
+                return
+            if path == "/jobs/purge":
+                # Operator-only (permanent bulk deletion). No collision to
+                # guard against here — unlike do_GET, do_POST has no generic
+                # 2-part jobs/{id} branch, only the 3-part
+                # POST /jobs/{id}/purge below — but the exact-string check
+                # is placed here to mirror do_GET's ordering.
+                if not self._operator_only():
+                    return
+                archived_before = self._required_finite_float_param(
+                    parse_qs(urlsplit(self.path).query), "archived_before"
+                )
+                if archived_before is None:
+                    return
+                status, payload = dispatcher.jobs_purge(archived_before)
                 self._json(status, payload)
                 return
             parts = path.strip("/").split("/")

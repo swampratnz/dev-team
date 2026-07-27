@@ -1959,11 +1959,11 @@ def test_sweep_expired_archives_no_dashboard_workspace_is_noop():
         calls.append(job_id)
         return 200, {}
 
-    assert sweep_expired_archives(None, 7, purge_fn) == []
+    assert sweep_expired_archives(None, 1_000.0, purge_fn) == []
     assert calls == []
 
 
-def test_sweep_expired_archives_ttl_none_is_noop():
+def test_sweep_expired_archives_cutoff_none_is_noop():
     dash = InMemoryWorkspace()
     dash.write_text(
         "audit/assess-x/meta.json",
@@ -1995,7 +1995,7 @@ def test_sweep_expired_archives_purges_only_past_the_ttl_boundary(tmp_path):
         json.dumps({"id": young_id, "archived": True, "archived_at": cutoff + 1}),
     )
 
-    purged = sweep_expired_archives(dash, ttl_days, disp.purge_job, clock=lambda: now)
+    purged = sweep_expired_archives(dash, cutoff, disp.purge_job)
 
     assert purged == [old_id]
     assert not dash.exists(f"audit/{old_id}/meta.json")
@@ -2017,7 +2017,7 @@ def test_sweep_expired_archives_at_the_exact_cutoff_is_purged_inclusive(tmp_path
         json.dumps({"id": job_id, "archived": True, "archived_at": cutoff}),
     )
 
-    purged = sweep_expired_archives(dash, ttl_days, disp.purge_job, clock=lambda: now)
+    purged = sweep_expired_archives(dash, cutoff, disp.purge_job)
 
     assert purged == [job_id]
     assert not dash.exists(f"audit/{job_id}/meta.json")
@@ -2039,7 +2039,7 @@ def test_sweep_expired_archives_never_force_purges_a_running_registry_job(tmp_pa
         json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
     )
 
-    purged = sweep_expired_archives(dash, 1, disp.purge_job, clock=lambda: 10_000_000.0)
+    purged = sweep_expired_archives(dash, 10_000_000.0 - 86400, disp.purge_job)
 
     assert purged == []
     assert dash.exists(f"audit/{job_id}/meta.json")
@@ -2054,7 +2054,7 @@ def test_sweep_expired_archives_never_sweeps_a_non_archived_job(tmp_path):
         json.dumps({"id": job_id, "archived": False, "archived_at": 0.0}),
     )
 
-    purged = sweep_expired_archives(dash, 1, disp.purge_job, clock=lambda: 10_000_000.0)
+    purged = sweep_expired_archives(dash, 10_000_000.0 - 86400, disp.purge_job)
 
     assert purged == []
     assert dash.exists(f"audit/{job_id}/meta.json")
@@ -2079,7 +2079,7 @@ def test_sweep_expired_archives_malformed_or_missing_fields_never_raise(tmp_path
     )
     dash.write_text("audit/unrelated/assessment.md", "# report")
 
-    purged = sweep_expired_archives(dash, 1, disp.purge_job, clock=lambda: 10_000_000.0)
+    purged = sweep_expired_archives(dash, 10_000_000.0 - 86400, disp.purge_job)
 
     assert purged == []
 
@@ -2104,7 +2104,7 @@ def test_sweep_expired_archives_ignores_a_symlinked_audit_escape(tmp_path):
         calls.append(job_id)
         return 200, {}
 
-    purged = sweep_expired_archives(dash, 1, purge_fn, clock=lambda: 10_000_000.0)
+    purged = sweep_expired_archives(dash, 10_000_000.0 - 86400, purge_fn)
 
     assert purged == []
     assert calls == []
@@ -2124,8 +2124,8 @@ def test_sweep_expired_archives_second_racing_pass_finds_nothing_left_to_purge(
         json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
     )
 
-    first = sweep_expired_archives(dash, 1, disp.purge_job, clock=lambda: 10_000_000.0)
-    second = sweep_expired_archives(dash, 1, disp.purge_job, clock=lambda: 10_000_000.0)
+    first = sweep_expired_archives(dash, 10_000_000.0 - 86400, disp.purge_job)
+    second = sweep_expired_archives(dash, 10_000_000.0 - 86400, disp.purge_job)
 
     assert first == [job_id]
     assert second == []
@@ -2152,7 +2152,7 @@ def test_sweep_expired_archives_a_raising_purge_skips_that_job_and_keeps_going(
             raise PermissionError("audit file is not deletable")
         return 200, {}
 
-    purged = sweep_expired_archives(dash, 1, purge_fn, clock=lambda: 10_000_000.0)
+    purged = sweep_expired_archives(dash, 10_000_000.0 - 86400, purge_fn)
 
     assert purged == [good_id]
 
@@ -2264,6 +2264,294 @@ def test_worker_loop_sweep_is_wall_clock_periodic_when_idle(monkeypatch, tmp_pat
         assert len(calls) >= 3, "idle worker never re-swept on a wall-clock timer"
     finally:
         disp.stop()
+
+
+# --- Bulk purge ?archived_before= (#234) -------------------------------------
+
+
+def test_jobs_purge_preview_with_no_dashboard_workspace_is_409():
+    disp = Dispatcher(token="x")
+    assert disp.jobs_purge_preview(0.0) == (
+        409, {"error": "purge needs a dashboard workspace"})
+
+
+def test_jobs_purge_with_no_dashboard_workspace_is_409():
+    disp = Dispatcher(token="x")
+    assert disp.jobs_purge(0.0) == (
+        409, {"error": "purge needs a dashboard workspace"})
+
+
+def test_jobs_purge_preview_lists_only_jobs_at_or_before_cutoff_and_deletes_nothing(
+    tmp_path,
+):
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    old_id, young_id = "assess-old", "assess-young"
+    dash.write_text(
+        f"audit/{old_id}/meta.json",
+        json.dumps({"id": old_id, "archived": True, "archived_at": 100.0}),
+    )
+    dash.write_text(
+        f"audit/{young_id}/meta.json",
+        json.dumps({"id": young_id, "archived": True, "archived_at": 200.0}),
+    )
+
+    status, payload = disp.jobs_purge_preview(150.0)
+
+    assert status == 200
+    assert payload == {"eligible": [old_id], "count": 1}
+    assert dash.exists(f"audit/{old_id}/meta.json")
+    assert dash.exists(f"audit/{young_id}/meta.json")
+
+
+def test_jobs_purge_preview_http_lists_older_job_and_both_jobs_still_reachable(
+    tmp_path,
+):
+    # Acceptance criterion 1: archive two jobs with different archived_at,
+    # dry-run with a cutoff between them, assert only the older job's id is
+    # listed and both jobs still exist (GET /jobs/{id} still 200) afterward.
+    jobs_root = tmp_path / "jobs"
+    now = [1_000_000.0]
+
+    def materialise(spec, dest):
+        Path(dest).mkdir(parents=True, exist_ok=True)
+        (Path(dest) / "README.md").write_text("# repo\n")
+        return LocalWorkspace(dest)
+
+    with running(runner=_assess_runner(), materialise=materialise,
+                 dashboard_workspace=InMemoryWorkspace(),
+                 jobs_root=str(jobs_root), clock=lambda: now[0]) as server:
+        _, older = _call(server, "/jobs", method="POST",
+                          body={"mode": "assess", "repo": "a/one"})
+        assert server.dispatcher.wait(older["id"], 5)
+        assert _call(server, f"/jobs/{older['id']}/archive", method="POST")[0] == 200
+
+        now[0] = 2_000_000.0
+        _, younger = _call(server, "/jobs", method="POST",
+                            body={"mode": "assess", "repo": "a/one"})
+        assert server.dispatcher.wait(younger["id"], 5)
+        assert _call(server, f"/jobs/{younger['id']}/archive", method="POST")[0] == 200
+
+        cutoff = 1_500_000.0
+        status, payload = _call(server, f"/jobs/purge?archived_before={cutoff}")
+
+        assert status == 200
+        assert payload == {"eligible": [older["id"]], "count": 1}
+        assert _call(server, f"/jobs/{older['id']}")[0] == 200
+        assert _call(server, f"/jobs/{younger['id']}")[0] == 200
+
+
+def test_jobs_purge_http_purges_only_jobs_at_or_before_cutoff(tmp_path):
+    # Acceptance criterion 2: POST purges only the job before the cutoff;
+    # verify via GET /jobs/{id} -> 404 for the purged one, 200 for the
+    # other, and its workspace/audit files gone.
+    jobs_root = tmp_path / "jobs"
+    now = [1_000_000.0]
+
+    def materialise(spec, dest):
+        Path(dest).mkdir(parents=True, exist_ok=True)
+        (Path(dest) / "README.md").write_text("# repo\n")
+        return LocalWorkspace(dest)
+
+    with running(runner=_assess_runner(), materialise=materialise,
+                 dashboard_workspace=InMemoryWorkspace(),
+                 jobs_root=str(jobs_root), clock=lambda: now[0]) as server:
+        _, older = _call(server, "/jobs", method="POST",
+                          body={"mode": "assess", "repo": "a/one"})
+        assert server.dispatcher.wait(older["id"], 5)
+        assert _call(server, f"/jobs/{older['id']}/archive", method="POST")[0] == 200
+
+        now[0] = 2_000_000.0
+        _, younger = _call(server, "/jobs", method="POST",
+                            body={"mode": "assess", "repo": "a/one"})
+        assert server.dispatcher.wait(younger["id"], 5)
+        assert _call(server, f"/jobs/{younger['id']}/archive", method="POST")[0] == 200
+
+        cutoff = 1_500_000.0
+        status, payload = _call(
+            server, f"/jobs/purge?archived_before={cutoff}", method="POST"
+        )
+
+        assert status == 200
+        assert payload == {"purged": [older["id"]], "count": 1}
+        assert _call(server, f"/jobs/{older['id']}") == (404, {"error": "unknown job"})
+        assert _call(server, f"/jobs/{younger['id']}")[0] == 200
+        assert not (jobs_root / older["id"]).exists()
+
+
+def test_jobs_purge_routes_require_a_finite_numeric_archived_before(monkeypatch):
+    # Acceptance criteria 3 and 9: missing, non-numeric, or non-finite
+    # (inf/nan) archived_before -> 400 on both routes, and the eligibility
+    # walk never even runs (fail closed, not a silent default). Also covers
+    # a markup/script-shaped string, which must be rejected the same way as
+    # any other non-numeric value.
+    with running(dashboard_workspace=InMemoryWorkspace()) as server:
+        def boom(*args, **kwargs):
+            raise AssertionError("eligibility walk must not run for a bad param")
+
+        monkeypatch.setattr(server.dispatcher, "jobs_purge_preview", boom)
+        monkeypatch.setattr(server.dispatcher, "jobs_purge", boom)
+
+        bad_suffixes = [
+            "",
+            "?archived_before=",
+            "?archived_before=not-a-number",
+            "?archived_before=inf",
+            "?archived_before=-inf",
+            "?archived_before=nan",
+            "?archived_before=%3Cscript%3Ealert(1)%3C/script%3E",
+        ]
+        for method in ("GET", "POST"):
+            for suffix in bad_suffixes:
+                status, payload = _call(server, f"/jobs/purge{suffix}", method=method)
+                assert status == 400, (method, suffix, status, payload)
+                assert "error" in payload
+
+
+def test_jobs_purge_routes_require_operator_auth():
+    # Acceptance criterion 4: unauthenticated -> 401 on both routes
+    # (session-vs-operator 403 is covered by
+    # test_session_is_locked_out_of_operator_routes).
+    with running(dashboard_workspace=InMemoryWorkspace()) as server:
+        assert _call(
+            server, "/jobs/purge?archived_before=0", token=None
+        )[0] == 401
+        assert _call(
+            server, "/jobs/purge?archived_before=0", method="POST", token=None
+        )[0] == 401
+
+
+def test_jobs_purge_never_force_purges_a_running_registry_job(tmp_path):
+    # Acceptance criterion 5.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-still-running"
+    spec = JobSpec(
+        mode="assess", repo="acme/mono", title="t", description="",
+        budget_usd=None, id=job_id,
+    )
+    disp._registry[job_id] = JobRecord(spec=spec, state="running")
+    disp._order.append(job_id)
+    disp._events[job_id] = threading.Event()
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
+    )
+
+    status, payload = disp.jobs_purge(10_000_000.0)
+
+    assert status == 200
+    assert payload == {"purged": [], "count": 0}
+    assert dash.exists(f"audit/{job_id}/meta.json")
+
+
+def test_jobs_purge_discovers_and_purges_a_registry_miss_job(tmp_path):
+    # Acceptance criterion 6: eligibility is decided by walking
+    # audit/*/meta.json on disk, never the in-memory registry -- simulates a
+    # post-restart state (no registry entry at all).
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-post-restart"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
+    )
+
+    status, payload = disp.jobs_purge(10_000_000.0)
+
+    assert status == 200
+    assert payload == {"purged": [job_id], "count": 1}
+    assert not dash.exists(f"audit/{job_id}/meta.json")
+
+
+def test_jobs_purge_calls_the_shared_sweep_expired_archives_function(
+    monkeypatch, tmp_path
+):
+    # Acceptance criterion 7: the on-demand POST route must not carry a
+    # second, independent eligibility/deletion implementation -- it funnels
+    # through the exact same sweep_expired_archives the periodic
+    # --purge-ttl-days sweep uses.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "assess-shared-sweep"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
+    )
+    calls = []
+    real_sweep = dispatch_mod.sweep_expired_archives
+
+    def spying_sweep(dashboard_workspace, cutoff, purge_fn):
+        calls.append((dashboard_workspace, cutoff))
+        return real_sweep(dashboard_workspace, cutoff, purge_fn)
+
+    monkeypatch.setattr(dispatch_mod, "sweep_expired_archives", spying_sweep)
+
+    status, payload = disp.jobs_purge(100.0)
+
+    assert status == 200
+    assert payload == {"purged": [job_id], "count": 1}
+    assert calls == [(dash, 100.0)]
+
+
+def test_jobs_purge_preview_and_purge_empty_result_when_nothing_eligible(tmp_path):
+    # Acceptance criterion 8.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+
+    assert disp.jobs_purge_preview(0.0) == (200, {"eligible": [], "count": 0})
+    assert disp.jobs_purge(0.0) == (200, {"purged": [], "count": 0})
+
+
+def test_jobs_purge_racing_the_ttl_sweep_never_double_purges(tmp_path):
+    # Acceptance criterion 10: an on-demand POST /jobs/purge racing a
+    # scheduled TTL sweep over overlapping eligible ids never double-purges
+    # or raises -- both funnel through purge_job's existing _purging claim
+    # set. Drives both paths concurrently and asserts each id is purged at
+    # most once, with every id purged by exactly one of the two callers.
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    ids = [f"assess-race-{i}" for i in range(10)]
+    for job_id in ids:
+        dash.write_text(
+            f"audit/{job_id}/meta.json",
+            json.dumps({"id": job_id, "archived": True, "archived_at": 0.0}),
+        )
+
+    results = {}
+
+    def run_on_demand():
+        results["on_demand"] = disp.jobs_purge(100.0)
+
+    def run_ttl_sweep():
+        results["ttl_sweep"] = dispatch_mod.sweep_expired_archives(
+            dash, 100.0, disp.purge_job
+        )
+
+    t1 = threading.Thread(target=run_on_demand)
+    t2 = threading.Thread(target=run_ttl_sweep)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    purged_on_demand = set(results["on_demand"][1]["purged"])
+    purged_ttl_sweep = set(results["ttl_sweep"])
+    assert purged_on_demand.isdisjoint(purged_ttl_sweep)
+    assert purged_on_demand | purged_ttl_sweep == set(ids)
+    for job_id in ids:
+        assert not dash.exists(f"audit/{job_id}/meta.json")
+
+
+def test_jobs_purge_get_route_is_reachable_not_swallowed_by_job_lookup():
+    # Acceptance criterion 12: GET /jobs/purge must be routed before the
+    # generic len(parts) == 2 jobs/{id} lookup branch, or it would 404 as a
+    # lookup for a job literally named "purge" instead of returning the
+    # eligible/count shape.
+    with running(dashboard_workspace=InMemoryWorkspace()) as server:
+        status, payload = _call(server, "/jobs/purge?archived_before=0")
+        assert status == 200
+        assert payload == {"eligible": [], "count": 0}
 
 
 # --- cancel (job lifecycle) ----------------------------------------------
@@ -6460,6 +6748,8 @@ def test_session_is_locked_out_of_operator_routes():
             ("POST", "/jobs/assess-x/purge", None),
             ("POST", "/jobs/assess-x/archive", None),
             ("POST", "/jobs/assess-x/unarchive", None),
+            ("GET", "/jobs/purge?archived_before=0", None),
+            ("POST", "/jobs/purge?archived_before=0", None),
             ("POST", "/backlog/story", {"title": "t"}),
             ("PATCH", "/backlog/story/S1", {"title": "t"}),
             ("DELETE", "/backlog/story/S1", None),

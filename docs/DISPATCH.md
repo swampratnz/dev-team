@@ -585,10 +585,62 @@ Off by default (`purge_ttl_days=None`): with no flag, `sweep_expired_archives`
 is never invoked, the worker's queue wait stays a blocking (not polled)
 `get()`, and behaviour is byte-identical to before this feature existed.
 
-### Natural growth (not in v1)
+## Bulk purge on demand (`?archived_before=`)
 
-- Bulk purge (`?archived_before=`) once the single-job primitive has real
-  usage to generalise from.
+The on-demand twin of the TTL sweep above: instead of configuring a standing
+`--purge-ttl-days` policy and waiting up to `_SWEEP_INTERVAL_SECONDS` for the
+next tick, an operator who has just archived a batch of jobs (say, a run of
+test/demo assessments) can reclaim that disk immediately. Mirrors this
+service's own `GET /foreman/plan` vs `POST /foreman/run` split: a `$0`
+preview, and a separate mutating action.
+
+### `GET /jobs/purge?archived_before=<epoch-seconds>` (auth, operator-only) — the $0 dry-run
+
+Lists every archived job whose `archived_at` is at or before
+`archived_before`, without deleting anything:
+
+```json
+{"eligible": ["assess-20260710-090000-1", "assess-20260712-090000-2"], "count": 2}
+```
+
+Uses the exact same disk-based (`audit/*/meta.json` via `list_files()`,
+never the in-memory registry) eligibility walk `sweep_expired_archives`
+purges from — not a second, independent implementation. Registered ahead of
+the generic `GET /jobs/{id}` lookup in the route table, so it is never
+mistaken for a lookup of a job literally named `"purge"` (real job ids are
+always `f"{mode}-{timestamp}-{seq}"`, never that).
+
+### `POST /jobs/purge?archived_before=<epoch-seconds>` (auth, operator-only, no body) — the mutating twin
+
+Purges every archived job whose `archived_at` is at or before
+`archived_before`, by calling the refactored `sweep_expired_archives` — the
+same function the periodic TTL sweep calls, this time with the
+operator-supplied cutoff instead of one derived from `--purge-ttl-days`:
+
+```json
+{"purged": ["assess-20260710-090000-1"], "count": 1}
+```
+
+Every deletion still runs through `purge_job`, so all of its guarantees
+apply unchanged: a still `queued`/`running` job is never force-purged even
+if its mirrored `meta.json` says `archived: true`, and an on-demand call
+racing the periodic TTL sweep over the same id can never double-purge it —
+both share the same `_purging` claim set.
+
+`archived_before` is **required** on both routes and must parse as a finite
+number — missing, non-numeric, or non-finite (`inf`/`nan`) is a `400` before
+either route's eligibility walk ever runs. Unlike the forgiving-default
+clamp `?limit=`/`?offset=`/`?max_stories=` get, there is no implicit
+default: an operator can never accidentally trigger a full purge by omitting
+the query string. This mirrors `POST /foreman/run`'s strict validation over
+its own `GET /foreman/plan` dry-run's forgiving clamp — the spend/deletion-
+bearing route validates strictly, the read-only preview does too here
+because it shares the same required param.
+
+API-only in this version — no dashboard UI affordance (a "purge archived
+before..." button/date-picker) yet; that can follow once the primitive has
+real usage, the same way the single-job archive/purge routes grew their
+dashboard wiring after the API existed first.
 
 ## Finding re-verification (mode `verify` + two read routes)
 
