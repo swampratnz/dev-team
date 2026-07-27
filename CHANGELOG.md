@@ -284,6 +284,26 @@ sections below are reconstructed from the repository history.
   test-path exclusion or single-non-test-impl-file selection: an
   identity/membership-only test file alongside a comparison-only product file
   still only ever mutates the product file.
+- **Mutation-lite now also flips arithmetic operators (`+`↔`-`, `*`↔`/`),
+  closing the last named exclusion in `mutation.py`'s own `_FLIPS` comment**
+  (#226). Previously the candidate walk only ever considered `ast.Compare`
+  and `ast.BoolOp` nodes, so a product file whose only testable branching
+  was an arithmetic expression (`a + b`, `total * rate`) had zero flippable
+  candidates and `_mutation_check` silently skipped it — the same blind
+  spot #197/#219 closed for boolean and identity/membership logic, just for
+  arithmetic. A new `_ARITH_FLIPS` dict (`ast.Add`↔`ast.Sub`,
+  `ast.Mult`↔`ast.Div` — deliberately excluding `FloorDiv`/`Mod`/`Pow`/
+  bitwise/matrix operators) plus a new `visit_BinOp` mirror the shape #197
+  added for `BoolOp`; `_mutation_candidates` gains one `elif` branch scoped
+  to `ast.BinOp` nodes whose operator is a key in `_ARITH_FLIPS`. Selection
+  is unchanged: earliest in source order by `(lineno, col_offset)` across
+  the combined pool, so a `Compare`/`BoolOp` that shares a tied starting
+  position with a nested qualifying `BinOp` still wins (the shallower node,
+  discovered first by `ast.walk`'s breadth-first order). No change to
+  `_mutation_check`'s integration, gate rerun, `finally`-restore,
+  `_stash_lock` sharing, or scorecard counters. A security regression test
+  proves the existing fail-secure restore-on-exception guarantee extends to
+  the new category rather than being merely assumed.
 - **A visual-critique failure is now diagnosable instead of a bare "skipping"**
   (#152, root-cause corrected by adversarial review). The default `--deliver`/
   `--assess` progress stream (`cli.py`'s `_progress_printer`) now renders

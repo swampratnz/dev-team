@@ -1,6 +1,8 @@
-"""Tests for the mutation-lite AST helper (issues #176, #197)."""
+"""Tests for the mutation-lite AST helper (issues #176, #197, #219, #226)."""
 
 from __future__ import annotations
+
+import pytest
 
 from dev_team.mutation import mutate_first_mutant
 
@@ -43,7 +45,7 @@ def test_flips_lte_to_gt():
 
 
 def test_returns_none_for_no_comparison():
-    assert mutate_first_mutant("def f(a, b):\n    return a + b\n") is None
+    assert mutate_first_mutant("def f(a):\n    return a\n") is None
 
 
 def test_returns_none_for_unparseable_source():
@@ -212,7 +214,7 @@ def test_boolop_before_comparison_wins():
 
 
 def test_returns_none_for_no_comparison_or_boolop():
-    assert mutate_first_mutant("def f(a, b):\n    return a + b\n") is None
+    assert mutate_first_mutant("def f(a):\n    return a\n") is None
 
 
 def test_boolop_only_file_now_returns_a_mutant():
@@ -252,3 +254,125 @@ def test_deterministic_across_repeated_calls_for_boolop():
     second = mutate_first_mutant(source)
     assert first is not None
     assert first == second
+
+
+# --- arithmetic-operator flips (issue #226) -------------------------------
+
+
+def test_flips_add_to_sub():
+    mutated = mutate_first_mutant("def f(a, b):\n    return a + b\n")
+    assert mutated is not None
+    assert "a - b" in mutated
+    assert "a + b" not in mutated
+
+
+def test_flips_sub_to_add():
+    mutated = mutate_first_mutant("def f(a, b):\n    return a - b\n")
+    assert mutated is not None
+    assert "a + b" in mutated
+    assert "a - b" not in mutated
+
+
+def test_flips_mult_to_div():
+    mutated = mutate_first_mutant("def f(a, b):\n    return a * b\n")
+    assert mutated is not None
+    assert "a / b" in mutated
+    assert "a * b" not in mutated
+
+
+def test_flips_div_to_mult():
+    mutated = mutate_first_mutant("def f(a, b):\n    return a / b\n")
+    assert mutated is not None
+    assert "a * b" in mutated
+    assert "a / b" not in mutated
+
+
+def test_arith_only_file_now_returns_a_mutant():
+    # Pre-#226: a file whose only flippable construct was an arithmetic
+    # `BinOp` returned `None` (the last named exclusion). This is the
+    # proposal's core new-coverage assertion.
+    source = "def f(a, b):\n    return a + b\n"
+    mutated = mutate_first_mutant(source)
+    assert mutated is not None
+    assert "return a - b" in mutated
+
+
+def test_deterministic_across_repeated_calls_for_arith():
+    source = "def f(a, b):\n    return a + b\n"
+    first = mutate_first_mutant(source)
+    second = mutate_first_mutant(source)
+    assert first is not None
+    assert first == second
+
+
+@pytest.mark.parametrize("op", ["%", "**", "//", "&", "|", "^", "@"])
+def test_out_of_scope_arith_operator_alone_returns_none(op):
+    # `%`/`**`/`//`/bitwise/matrix operators are not in `_ARITH_FLIPS` — a
+    # `BinOp` using one of them, with no other qualifying construct in the
+    # file, must never be selected.
+    source = f"def f(a, b):\n    return a {op} b\n"
+    assert mutate_first_mutant(source) is None
+
+
+def test_out_of_scope_arith_operator_skipped_for_other_candidate():
+    # A `%` `BinOp` coexists with a qualifying `==` comparison: the
+    # out-of-scope operator is never picked, proving `_ARITH_FLIPS`'s
+    # exclusivity rather than merely the absence of any candidate.
+    source = "def f(a, b, c, d):\n    if a == b:\n        return c % d\n    return 0\n"
+    mutated = mutate_first_mutant(source)
+    assert mutated is not None
+    assert "a != b" in mutated
+    assert "c % d" in mutated
+
+
+def test_precedence_compare_beats_nested_arith_binop():
+    # `if a + b < c:` — the outer `Compare` node and the nested `a + b`
+    # `BinOp` share the same starting position; the shallower `Compare`
+    # node is discovered first by `ast.walk`'s BFS order and wins the tie.
+    source = "def f(a, b, c):\n    if a + b < c:\n        return True\n    return False\n"
+    mutated = mutate_first_mutant(source)
+    assert mutated is not None
+    assert "a + b >= c" in mutated
+
+
+def test_precedence_outer_binop_beats_nested_binop():
+    # `a + b - c` parses left-associatively as `BinOp(Sub, BinOp(Add, a, b),
+    # c)` — both the outer `Sub` and the inner `Add` share the same starting
+    # position (both begin at `a`); the shallower outer node is discovered
+    # first by `ast.walk` and wins the tie, so the outer `-` flips, not the
+    # inner `+`.
+    mutated = mutate_first_mutant("def f(a, b, c):\n    return a + b - c\n")
+    assert mutated is not None
+    assert "a + b + c" in mutated
+
+
+def test_arith_before_comparison_wins():
+    source = (
+        "def f(a, b, c, d):\n"
+        "    if a + b:\n"
+        "        return True\n"
+        "    return c == d\n"
+    )
+    mutated = mutate_first_mutant(source)
+    assert mutated is not None
+    assert "a - b" in mutated
+    assert "c == d" in mutated
+
+
+def test_arith_before_boolop_wins():
+    source = "def f(a, b, c):\n    if a * b:\n        return a and c\n    return False\n"
+    mutated = mutate_first_mutant(source)
+    assert mutated is not None
+    assert "a / b" in mutated
+    assert "a and c" in mutated
+
+
+def test_mutation_and_engine_docstrings_mention_arithmetic():
+    # Regression for the doc-drift criterion: both the module-level
+    # `mutation.py` docstring/`_FLIPS` comment and `EngineConfig`'s /
+    # `DeliveryEngine`'s docstrings must list arithmetic alongside
+    # comparison, identity/membership, and boolean flips (#226 criterion 8).
+    import dev_team.mutation as mutation_module
+
+    assert mutation_module.__doc__ is not None
+    assert "arithmetic" in mutation_module.__doc__.lower()

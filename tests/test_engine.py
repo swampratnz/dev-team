@@ -3516,6 +3516,18 @@ def test_mutation_check_defaults_to_false():
     assert EngineConfig().mutation_check is False
 
 
+def test_engine_config_docstring_mentions_all_operator_families():
+    # Doc-drift regression (issue #226 criterion 8): `EngineConfig`'s class
+    # docstring previously listed only comparison and boolean operators,
+    # predating #219's identity/membership addition and now this issue's
+    # arithmetic addition. It must list all four families.
+    doc = (EngineConfig.__doc__ or "").lower()
+    assert "arithmetic" in doc
+    assert "is not" in doc
+    assert "not in" in doc
+    assert "and" in doc and "or" in doc
+
+
 def test_mutation_check_skipped_when_disabled():
     ws = InMemoryWorkspace({"src/x.py": "def f(a, b):\n    return a == b\n"})
     cmd = FakeCommandRunner()
@@ -3757,7 +3769,7 @@ def test_mutation_check_skipped_for_non_python_file():
 
 
 def test_mutation_check_skipped_when_no_mutable_comparison():
-    ws = InMemoryWorkspace({"src/x.py": "def f(a, b):\n    return a + b\n"})
+    ws = InMemoryWorkspace({"src/x.py": "def f(a):\n    return a\n"})
     cmd = FakeCommandRunner()
     engine = _engine(
         ScriptedRunner([]),
@@ -3822,6 +3834,28 @@ def test_mutation_check_restores_file_when_gate_evaluation_raises():
         run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
     # fail-secure: the original content is restored even though evaluation blew up
     assert ws.read_text("src/x.py") == "def f(a, b):\n    return a == b\n"
+
+
+def test_mutation_check_restores_file_when_arith_mutant_evaluation_raises():
+    # SECURITY regression (issue #226 criterion 10): the `_evaluate_mutant`
+    # `try`/`finally` restore is exception-type-agnostic, but this proves it
+    # explicitly for the new arithmetic-operator category rather than
+    # merely assuming it inherits the guarantee from the Compare/BoolOp
+    # categories exercised above.
+    original = "def f(a, b):\n    return a + b\n"
+    ws = InMemoryWorkspace({"src/x.py": original})
+    dod = DefinitionOfDone(gates=[_RaisingGate()])
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True),
+        definition_of_done=dod,
+    )
+    with pytest.raises(RuntimeError):
+        run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
+    # fail-secure: the original content is restored even though evaluation blew up
+    assert ws.read_text("src/x.py") == original
     assert "mutation_survived" not in engine._scorecard
     assert "mutation_killed" not in engine._scorecard
 
