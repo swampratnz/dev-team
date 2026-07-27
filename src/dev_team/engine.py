@@ -195,15 +195,17 @@ class EngineConfig:
       Skipped for dry runs, and whenever verification is remote or degraded
       (re-running those "gates" on reverted code proves nothing).
     - ``mutation_check``: after gates pass, flip the first comparison
-      operator (``==``/``!=``/``<``/``>=``/``>``/``<=``) or boolean operator
-      (``and``/``or``) in the task's one Python product file and re-run the
-      gates; a mutant that still passes is an advisory ``mutation_survived``
-      scorecard signal, never a rejection (unlike ``fail_to_pass_check``,
-      this never gates, retries, or rolls back the task). Off by default —
-      a new, less-proven signal, matching ``visual_review``'s "off by
-      default, advisory-only" opt-in. Skipped for dry runs, non-local
-      verification, non-Python or multi-file changes, and when the file has
-      no mutable comparison or boolean operator.
+      operator (``==``/``!=``/``<``/``>=``/``>``/``<=``/``is``/``is not``/
+      ``in``/``not in``), boolean operator (``and``/``or``), or arithmetic
+      operator (``+``/``-``/``*``/``/``) in the task's one Python product
+      file and re-run the gates; a mutant that still passes is an advisory
+      ``mutation_survived`` scorecard signal, never a rejection (unlike
+      ``fail_to_pass_check``, this never gates, retries, or rolls back the
+      task). Off by default — a new, less-proven signal, matching
+      ``visual_review``'s "off by default, advisory-only" opt-in. Skipped
+      for dry runs, non-local verification, non-Python or multi-file
+      changes, and when the file has no mutable comparison, boolean, or
+      arithmetic operator.
     - ``remote_verify_status`` / ``remote_verify_trigger``: delegate
       verification to an external CI system (see
       :class:`~dev_team.verification.RemoteCIGate`) — the escape hatch for
@@ -346,13 +348,14 @@ class EngineConfig:
     lint_command: Optional[Sequence[str]] = None
     security_scan_command: Optional[Sequence[str]] = None
     fail_to_pass_check: bool = True
-    #: Advisory-only mutation-lite signal: flip the first comparison operator
-    #: in the task's one Python product file and re-run the gates. A
-    #: surviving mutant only increments a scorecard counter — it never
-    #: rejects, retries, or rolls back the task. Off by default: a new,
-    #: less-proven signal that should earn a default separately (mirrors
-    #: ``visual_review``'s off-by-default, never-blocks-the-commit stance).
-    #: See ``docs/BENCHMARKS.md`` ("Mutation-lite scoring") and ROADMAP.
+    #: Advisory-only mutation-lite signal: flip the first comparison,
+    #: boolean, or arithmetic operator in the task's one Python product file
+    #: and re-run the gates. A surviving mutant only increments a scorecard
+    #: counter — it never rejects, retries, or rolls back the task. Off by
+    #: default: a new, less-proven signal that should earn a default
+    #: separately (mirrors ``visual_review``'s off-by-default,
+    #: never-blocks-the-commit stance). See ``docs/BENCHMARKS.md``
+    #: ("Mutation-lite scoring") and ROADMAP.
     mutation_check: bool = False
     remote_verify_status: Optional[Sequence[str]] = None
     remote_verify_trigger: Optional[Sequence[str]] = None

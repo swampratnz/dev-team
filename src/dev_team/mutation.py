@@ -1,4 +1,5 @@
-"""Mutation-lite: flip the first comparison or boolean operator in a source file.
+"""Mutation-lite: flip the first comparison, boolean, or arithmetic operator
+in a source file.
 
 An opt-in, advisory signal (:attr:`~dev_team.engine.EngineConfig.mutation_check`)
 that fills the gap :doc:`../docs/BENCHMARKS.md` names next to the adopted
@@ -6,8 +7,9 @@ fail-to-pass check: a test suite can exercise a code path without ever pinning
 its *behaviour* (e.g. asserting no exception, never asserting on the
 comparison or boolean condition that makes the logic correct). A single
 flipped comparison (``==``↔``!=``, ``<``↔``>=``, ``>``↔``<=``,
-``is``↔``is not``, ``in``↔``not in``) or boolean operator (``and``↔``or``)
-that still passes the existing suite is the textbook signature of that gap.
+``is``↔``is not``, ``in``↔``not in``), boolean operator (``and``↔``or``), or
+arithmetic operator (``+``↔``-``, ``*``↔``/``) that still passes the existing
+suite is the textbook signature of that gap.
 
 This module is a pure, dependency-free AST transform — no subprocess, no
 network, no model call. It never mutates anything on disk itself; the caller
@@ -25,9 +27,7 @@ from typing import Dict, List, Optional, Type, Union
 # opposite, so a mutant that still passes the suite means the suite never
 # distinguished the two. Covers equality/ordering (``==``/``!=``/``<``/``>=``/
 # ``>``/``<=``) and identity/membership (``is``/``is not``/``in``/``not in``)
-# — every ``cmpop`` has a logical-opposite flip here. Arithmetic-operator
-# flips (``+``/``-``, ``*``/``/``) remain out of scope for this v1 (see
-# ROADMAP growth path in the proposal).
+# — every ``cmpop`` has a logical-opposite flip here.
 _FLIPS: Dict[Type[ast.cmpop], Type[ast.cmpop]] = {
     ast.Eq: ast.NotEq,
     ast.NotEq: ast.Eq,
@@ -50,11 +50,23 @@ _BOOL_FLIPS: Dict[Type[ast.boolop], Type[ast.boolop]] = {
     ast.Or: ast.And,
 }
 
-_Mutant = Union[ast.Compare, ast.BoolOp]
+# The arithmetic-operator flips this mutator knows: exactly the two pairs
+# named as v1's deferred follow-up (``+``/``-``, ``*``/``/``). Deliberately
+# excludes every other ``ast.operator`` (``FloorDiv``, ``Mod``, ``Pow``,
+# bitwise ``&``/``|``/``^``, matrix ``@``) — a ``BinOp`` using one of those
+# alone is not a candidate, by construction of not being a key here.
+_ARITH_FLIPS: Dict[Type[ast.operator], Type[ast.operator]] = {
+    ast.Add: ast.Sub,
+    ast.Sub: ast.Add,
+    ast.Mult: ast.Div,
+    ast.Div: ast.Mult,
+}
+
+_Mutant = Union[ast.Compare, ast.BoolOp, ast.BinOp]
 
 
 class _FlipMutant(ast.NodeTransformer):
-    """Replaces one specific ``Compare``/``BoolOp`` node's operator with its flip."""
+    """Replaces one specific ``Compare``/``BoolOp``/``BinOp`` node's operator with its flip."""
 
     def __init__(self, target: _Mutant) -> None:
         self._target = target
@@ -73,9 +85,16 @@ class _FlipMutant(ast.NodeTransformer):
             node.op = ast.copy_location(flipped, node.op)
         return node
 
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        self.generic_visit(node)
+        if node is self._target:
+            flipped = _ARITH_FLIPS[type(node.op)]()
+            node.op = ast.copy_location(flipped, node.op)
+        return node
+
 
 def _mutation_candidates(tree: ast.AST) -> List[_Mutant]:
-    """Every flippable ``Compare``/``BoolOp`` node in ``tree``.
+    """Every flippable ``Compare``/``BoolOp``/``BinOp`` node in ``tree``.
 
     A chained comparison (``a < b < c``, more than one op) is not a
     candidate — conservative by design, mirroring
@@ -84,7 +103,10 @@ def _mutation_candidates(tree: ast.AST) -> List[_Mutant]:
     maps every :class:`ast.cmpop` subtype to its logical opposite, so there
     is no longer an "operator outside ``_FLIPS``" case to guard against
     (unlike the chained-comparison case above). Every ``BoolOp`` node
-    qualifies unconditionally too.
+    qualifies unconditionally too. A ``BinOp`` qualifies only when its
+    operator is a key in :data:`_ARITH_FLIPS` (``+``/``-``/``*``/``/``) —
+    every other :class:`ast.operator` (``%``, ``**``, ``//``, ``&``, ``|``,
+    ``^``, ``@``) is out of scope and never selected.
     """
 
     candidates: List[_Mutant] = []
@@ -95,22 +117,27 @@ def _mutation_candidates(tree: ast.AST) -> List[_Mutant]:
             candidates.append(node)
         elif isinstance(node, ast.BoolOp):
             candidates.append(node)
+        elif isinstance(node, ast.BinOp) and type(node.op) in _ARITH_FLIPS:
+            candidates.append(node)
     return candidates
 
 
 def mutate_first_mutant(source: str) -> Optional[str]:
-    """Flip the first mutable comparison or boolean operator in ``source``.
+    """Flip the first mutable comparison, boolean, or arithmetic operator in
+    ``source``.
 
     Walks the parsed AST for every single-operator comparison using one of
     ``==``/``!=``/``<``/``>=``/``>``/``<=``/``is``/``is not``/``in``/
-    ``not in`` and every boolean operator (``and``/``or``), picks the one
+    ``not in``, every boolean operator (``and``/``or``), and every
+    arithmetic operator using one of ``+``/``-``/``*``/``/``, picks the one
     earliest in source order (by line, then column), flips it to its
-    logical opposite, and returns the unparsed mutated source.
+    logical (or arithmetic) opposite, and returns the unparsed mutated
+    source.
 
     Returns ``None`` — a silent skip, never an error — when ``source`` does
-    not parse, or contains no flippable comparison or boolean operator. This
-    is the common case (a diff that's pure new functions, imports, or
-    dataclass fields) and must never be treated as a failure.
+    not parse, or contains no flippable comparison, boolean, or arithmetic
+    operator. This is the common case (a diff that's pure new functions,
+    imports, or dataclass fields) and must never be treated as a failure.
     """
 
     try:
