@@ -1885,12 +1885,18 @@ class Dispatcher:
         :meth:`_is_archived` returns ``False`` (never raises) when
         ``self._dashboard_workspace is None``, so archived-exclusion is
         simply a no-op until one is configured.
+
+        ``by_repo`` mirrors ``by_mode``: accumulated in the same filtered
+        loop, keyed on ``record.spec.repo`` (a required field on every
+        ``JobSpec``, so there is no missing/empty-repo bucket to handle),
+        and subject to the identical ``include_archived`` behaviour.
         """
 
         with self._lock:
             records = list(self._registry.values())
         total_usd = 0.0
         by_mode: Dict[str, float] = {}
+        by_repo: Dict[str, float] = {}
         jobs_counted = 0
         for record in records:
             if record.cost_usd is None:
@@ -1899,10 +1905,12 @@ class Dispatcher:
                 continue
             total_usd += record.cost_usd
             by_mode[record.spec.mode] = by_mode.get(record.spec.mode, 0.0) + record.cost_usd
+            by_repo[record.spec.repo] = by_repo.get(record.spec.repo, 0.0) + record.cost_usd
             jobs_counted += 1
         return 200, {
             "total_usd": total_usd,
             "by_mode": by_mode,
+            "by_repo": by_repo,
             "jobs_counted": jobs_counted,
         }
 

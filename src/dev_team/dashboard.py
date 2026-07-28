@@ -2184,6 +2184,24 @@ function spendRow(mode, usd) {
   return `<tr><td>${esc(mode)}</td><td>$${esc(usd.toFixed(2))}</td></tr>`;
 }
 
+// The "by repo" sub-table beneath the by-mode table — shown only when more
+// than one repo has spend, unlike calibrationRepoTable's "any non-empty"
+// threshold: a single-repo workspace's by-repo row would just restate the
+// total line above it, adding visual noise for zero information. SECURITY:
+// repo is caller-supplied (POST /jobs) — esc() before innerHTML, same
+// discipline as calibrationRepoRow.
+function spendRepoRow(repo, usd) {
+  return `<tr><td>${esc(repo)}</td><td>$${esc(usd.toFixed(2))}</td></tr>`;
+}
+
+function spendRepoTable(byRepo) {
+  const repos = Object.keys(byRepo || {}).sort();
+  if (repos.length <= 1) return "";
+  const rows = repos.map(r => spendRepoRow(r, byRepo[r])).join("");
+  return `<table class="cal-table cal-by-repo"><thead><tr><th>repo</th><th>spend</th></tr></thead>`
+    + `<tbody>${rows}</tbody></table>`;
+}
+
 function spendPanel(data) {
   const modes = Object.keys(data.by_mode || {}).sort();
   const jobs = data.jobs_counted;
@@ -2192,7 +2210,7 @@ function spendPanel(data) {
   if (!modes.length) return total;
   const rows = modes.map(m => spendRow(m, data.by_mode[m])).join("");
   return total + `<table class="cal-table"><thead><tr><th>mode</th><th>spend</th></tr></thead>`
-    + `<tbody>${rows}</tbody></table>`;
+    + `<tbody>${rows}</tbody></table>` + spendRepoTable(data.by_repo);
 }
 
 async function loadSpend() {

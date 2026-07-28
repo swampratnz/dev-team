@@ -790,16 +790,22 @@ it) — those are the only ones counted:
 
 ```json
 {"total_usd":12.34,"by_mode":{"assess":8.0,"deliver":3.34,"verify":1.0},
- "jobs_counted":15}
+ "by_repo":{"acme/mono":9.34,"acme/other":3.0},"jobs_counted":15}
 ```
 
 `by_mode` includes only modes with at least one counted job (an empty
-registry gives `{"total_usd":0.0,"by_mode":{},"jobs_counted":0}`). Archived
-jobs (see *Archive / unarchive* above) are excluded by default; `?archived=1`
-includes them, matching `GET /jobs`'s toggle. Unlike `/calibration`, `/costs`
-needs **no** dashboard-workspace guard — it works standalone off the
-registry, and archived-exclusion simply no-ops (never excludes anything)
-until `--dashboard-workspace` is configured.
+registry gives `{"total_usd":0.0,"by_mode":{},"by_repo":{},"jobs_counted":0}`).
+`by_repo` is the same idea, one entry per repo with a counted job — every
+`JobSpec` carries a required `repo` field (rejected at submission if empty),
+so there is no missing-repo bucket to handle, unlike calibration's
+disk-sourced `"(unknown)"` case. It's accumulated in the same filtered loop
+as `by_mode`, so it shares that field's archived-exclusion behavior exactly:
+excluded by default, included with `?archived=1`. Archived jobs (see
+*Archive / unarchive* above) are excluded by default; `?archived=1` includes
+them, matching `GET /jobs`'s toggle. Unlike `/calibration`, `/costs` needs
+**no** dashboard-workspace guard — it works standalone off the registry, and
+archived-exclusion simply no-ops (never excludes anything) until
+`--dashboard-workspace` is configured.
 
 ## The backlog foreman
 
