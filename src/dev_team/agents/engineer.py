@@ -103,7 +103,11 @@ Design overview:
 
 
 def _in_place_prompt(
-    task: Task, design: Design, feedback: Optional[Review], conventions: Optional[str]
+    task: Task,
+    design: Design,
+    feedback: Optional[Review],
+    conventions: Optional[str],
+    relevant_code: Optional[str] = None,
 ) -> str:
     """The full agentic-implementation prompt (first turn / cold attempt)."""
 
@@ -116,7 +120,7 @@ write a test that reproduces the problem FIRST, watch it fail, then implement
 until it passes.
 
 {_task_section(task, design)}
-{_conventions_section(conventions)}
+{_conventions_section(conventions)}{_relevant_section(relevant_code)}
 {_feedback_section(feedback)}
 
 When the work is complete, respond with JSON of the form (no file contents —
@@ -206,6 +210,7 @@ Respond with JSON of the form:
         *,
         cwd: str,
         conventions: Optional[str] = None,
+        relevant_code: Optional[str] = None,
         model: Optional[str] = None,
         tools: Optional[Sequence[str]] = None,
     ) -> Implementation:
@@ -214,10 +219,14 @@ Respond with JSON of the form:
         The engineer reads the existing code, makes the changes, writes tests,
         and runs them itself; the returned JSON lists what changed (paths and
         summaries — the workspace itself is the source of truth for content).
+        ``relevant_code`` is the retrieved body of the files most relevant to
+        the task (already fenced as untrusted ``<file-content>`` blocks), the
+        same as :meth:`implement` uses — omitted (``None``) unless retrieval
+        is enabled.
         """
 
         data = await self.ask_json(
-            _in_place_prompt(task, design, feedback, conventions),
+            _in_place_prompt(task, design, feedback, conventions, relevant_code),
             allowed_tools=tools if tools is not None else TOOLS,
             cwd=cwd,
             model=model,
@@ -277,21 +286,24 @@ Respond with JSON of the form:
         feedback: Optional[Review] = None,
         *,
         conventions: Optional[str] = None,
+        relevant_code: Optional[str] = None,
         continued: bool = False,
     ) -> Implementation:
         """Implement over a persistent session, continuing a prior attempt.
 
         The ``session`` already carries the engineer's tools, cwd, system
         prompt, and model, so a turn sends only the prompt. On the first turn
-        (``continued`` is ``False``) the full task/design prompt goes out; on a
-        continuation the model already holds the task and the code it wrote, so
-        only the feedback is sent — re-establishing nothing — which is the token
-        saving session continuity exists for.
+        (``continued`` is ``False``) the full task/design prompt goes out —
+        including ``relevant_code`` when retrieval found any — and on a
+        continuation the model already holds the task and the code it wrote,
+        so only the feedback is sent — re-establishing nothing, including the
+        retrieved context, which is the token saving session continuity
+        exists for.
         """
 
         if continued:
             prompt = _continuation_prompt(feedback)
         else:
-            prompt = _in_place_prompt(task, design, feedback, conventions)
+            prompt = _in_place_prompt(task, design, feedback, conventions, relevant_code)
         data = await self.ask_json(prompt, session=session)
         return parsing.implementation_from_dict(data, task.id)
