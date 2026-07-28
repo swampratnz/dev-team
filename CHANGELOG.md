@@ -5,6 +5,25 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Dispatch
+- **On-demand bulk purge** (`docs/DISPATCH.md`): `GET`/`POST
+  /jobs/purge?archived_before=<epoch-seconds>` — the still-deferred second
+  half of the purge "Natural growth" note, now that the single-job
+  primitive has real usage to generalise from (#184's TTL sweep took the
+  first half). `GET` is a `$0` dry-run listing eligible ids without
+  deleting; `POST` purges them. Both share `sweep_expired_archives`
+  (refactored to take an explicit `cutoff` instead of computing one
+  internally from `purge_ttl_days`) with the periodic TTL sweep — one
+  eligibility/deletion implementation, not two — so every existing
+  guarantee (disk-based `audit/*/meta.json` eligibility, never the
+  in-memory registry; a still-running job's own refusal inside
+  `purge_job`; the shared `_purging` claim set preventing a double-purge
+  when an on-demand call races the periodic sweep) applies unchanged.
+  `archived_before` is required and must be a finite number — missing,
+  non-numeric, or `inf`/`nan` is a `400` before any eligibility walk runs,
+  so an operator can never accidentally trigger a full purge by omitting
+  the query string. Operator-only auth, same as `/costs`/`/calibration`.
+
 ### Assessment
 - **Live EOL/support-status scan covers Gradle Java projects**
   (`eolscan.py`), closing the follow-up #199 explicitly deferred: Java
