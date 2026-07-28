@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 
@@ -42,6 +43,17 @@ _BEARER_SECRET_RE = re.compile(
 _DISPATCH = _REPO_ROOT / "docs" / "DISPATCH.md"
 _DASHBOARD = _REPO_ROOT / "docs" / "DASHBOARD.md"
 _ENGINE = _REPO_ROOT / "src" / "dev_team" / "engine.py"
+_BENCHMARKS = _REPO_ROOT / "docs" / "BENCHMARKS.md"
+_CHANGELOG = _REPO_ROOT / "CHANGELOG.md"
+
+# Regression: #240 deliberately left these two BENCHMARKS.md markers
+# "→ roadmap" (genuinely still-deferred techniques) — a fix to a
+# different bullet must not overcorrect and flip these too. Matched against
+# whitespace-normalized text since the source wraps mid-phrase.
+_STILL_DEFERRED_MARKERS = [
+    "multi-candidate generation with execution-based reranking → roadmap",
+    "Proof-of-vulnerability → roadmap",
+]
 
 # Drift-check: every backtick-fenced `GET|POST /...` route TROUBLESHOOTING.md
 # cites, to verify against the union of docs/DISPATCH.md's and
@@ -81,6 +93,28 @@ def _docker_gate_section_text() -> str:
 
 def _routes_cited_in(text: str) -> set[str]:
     return set(_ROUTE_RE.findall(text))
+
+
+def _benchmarks_text() -> str:
+    return _BENCHMARKS.read_text(encoding="utf-8")
+
+
+def _technical_writer_section_text() -> str:
+    text = _benchmarks_text()
+    start = text.index("## Technical writer")
+    end = text.index("\n## ", start + len("## Technical writer"))
+    return text[start:end]
+
+
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+def _changelog_unreleased_section_text() -> str:
+    text = _CHANGELOG.read_text(encoding="utf-8")
+    start = text.index("## [Unreleased]")
+    end = text.index("\n## [", start + len("## [Unreleased]"))
+    return text[start:end]
 
 
 def test_troubleshooting_doc_exists():
@@ -238,3 +272,35 @@ def test_docker_gate_cited_events_are_real_event_literals_in_engine():
 def test_docker_gate_section_does_not_misattribute_the_exited_early_case():
     text = _docker_gate_section_text()
     assert "not `docker-run-verified`" in text
+
+
+def test_benchmarks_no_longer_claims_doc_claim_checks_are_roadmap():
+    assert "Executable doc-claim checks → roadmap" not in _benchmarks_text()
+
+
+def test_technical_writer_section_names_doc_claim_issues_as_shipped():
+    text = _technical_writer_section_text()
+    assert "✅" in text
+    assert "doc_claim_issues" in text
+
+
+def test_doc_claim_issues_is_real_and_grounded_in_its_shipped_signature():
+    from dev_team.agents import techwriter
+
+    assert hasattr(techwriter, "doc_claim_issues")
+    assert callable(techwriter.doc_claim_issues)
+    params = inspect.signature(techwriter.doc_claim_issues).parameters
+    assert "doc_files" in params
+    assert "known_files" in params
+
+
+def test_benchmarks_deferred_markers_remain_untouched():
+    normalized = _normalize_whitespace(_benchmarks_text())
+    for marker in _STILL_DEFERRED_MARKERS:
+        assert marker in normalized
+
+
+def test_changelog_unreleased_section_mentions_benchmarks_correction():
+    text = _changelog_unreleased_section_text()
+    assert "docs/BENCHMARKS.md" in text
+    assert "Technical writer" in text

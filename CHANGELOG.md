@@ -1085,6 +1085,13 @@ sections below are reconstructed from the repository history.
   keep the heuristic false-positive-free.
 
 ### Documentation
+- **`docs/BENCHMARKS.md` Technical writer correction:** the "Executable
+  doc-claim checks → roadmap" marker was stale — `doc_claim_issues()`
+  (`techwriter.py`) has shipped all four checks (path citations,
+  Python-fence syntax, CLI-flag citations, JSON-fence syntax; #48/#127/#159)
+  and is wired into every delivery unconditionally. Flipped to a ✅ bullet
+  naming the function and its shipping history, matching the doc's existing
+  per-technique style. No production code changed.
 - **Invalid-JSON detection in shipped docs** (`doc_claim_issues`,
   `techwriter.py`): fenced `json` blocks are now parsed with stdlib
   `json.loads`, and a malformed example (trailing comma, unbalanced brace,
