@@ -309,6 +309,7 @@ def _detect_from_manifests(workspace: Workspace) -> ProjectProfile:
             kind="php",
             verify_command=("composer", "test"),
             setup_command=("composer", "install"),
+            security_scan_command=("composer", "audit"),
             reason="composer.json at workspace root",
         )
     marker = sorted(_PYTHON_MARKERS & files)
