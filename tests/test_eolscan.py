@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 
 import pytest
 
 from dev_team.eolscan import (
+    _PARSERS,
     EolScan,
     EolStatus,
     Runtime,
@@ -20,6 +22,7 @@ from dev_team.eolscan import (
     parse_composer_json_php,
     parse_global_json_sdk,
     parse_go_mod,
+    parse_gradle_java,
     parse_nvmrc,
     parse_package_json_engines,
     parse_pom_xml_java,
@@ -381,6 +384,153 @@ def test_scan_eol_reports_status_for_java():
     rendered = scan.render()
     assert "Java 17 (pom.xml)" in rendered
     assert "supported" in rendered
+
+
+# --- parse_gradle_java --------------------------------------------------------------
+
+
+def test_parse_gradle_java_toolchain():
+    text = "java {\n  toolchain {\n    languageVersion = JavaLanguageVersion.of(17)\n  }\n}\n"
+    assert parse_gradle_java(text) == ("java", "17")
+
+
+def test_parse_gradle_java_toolchain_wins_over_source_compatibility():
+    text = (
+        "java { toolchain { languageVersion = JavaLanguageVersion.of(17) } }\n"
+        "sourceCompatibility = '11'\n"
+    )
+    assert parse_gradle_java(text) == ("java", "17")
+
+
+def test_parse_gradle_java_source_wins_over_target_when_both_present():
+    text = "sourceCompatibility = '17'\ntargetCompatibility = '11'\n"
+    assert parse_gradle_java(text) == ("java", "17")
+
+
+def test_parse_gradle_java_target_alone_is_used():
+    text = "targetCompatibility = '17'\n"
+    assert parse_gradle_java(text) == ("java", "17")
+
+
+@pytest.mark.parametrize(
+    "snippet,expected",
+    [
+        ("sourceCompatibility = '17'", ("java", "17")),
+        ("sourceCompatibility = 17", ("java", "17")),
+        ("sourceCompatibility = JavaVersion.VERSION_17", ("java", "17")),
+        ("sourceCompatibility = JavaVersion.VERSION_1_8", ("java", "8")),
+        ("sourceCompatibility = 1.8", ("java", "8")),
+    ],
+)
+def test_parse_gradle_java_value_forms(snippet, expected):
+    assert parse_gradle_java(snippet) == expected
+
+
+@pytest.mark.parametrize(
+    "snippet,expected",
+    [
+        ("sourceCompatibility = '17'", ("java", "17")),
+        ("sourceCompatibility = 17", ("java", "17")),
+        ("sourceCompatibility = JavaVersion.VERSION_17", ("java", "17")),
+    ],
+)
+def test_parse_gradle_java_value_forms_kotlin_dsl_dialect_agnostic(snippet, expected):
+    # Kotlin DSL syntax for these three forms is identical to Groovy's
+    # `=`-assignment form -- confirms the parser is dialect-agnostic for
+    # the forms it covers, exercised against .kts-flavoured surrounding
+    # content (typed block receivers, no semicolons required either way).
+    text = f"java {{\n    {snippet}\n}}\n"
+    assert parse_gradle_java(text) == expected
+
+
+def test_parse_gradle_java_no_match_out_of_scope_forms_returns_none():
+    # Deliberately out-of-scope forms: legacy Groovy space-call (no `=`)
+    # and a value sourced from a variable/`ext` block -- neither is
+    # guessed at.
+    assert parse_gradle_java("sourceCompatibility JavaVersion.VERSION_17") is None
+    assert parse_gradle_java("sourceCompatibility = javaVersion") is None
+    assert parse_gradle_java("targetCompatibility = project.ext.javaVersion") is None
+
+
+def test_parse_gradle_java_empty_file_is_none():
+    assert parse_gradle_java("") is None
+
+
+def test_parse_gradle_java_unrelated_dsl_no_version_directive_is_none():
+    text = "plugins {\n  id 'java'\n}\n\nrepositories {\n  mavenCentral()\n}\n"
+    assert parse_gradle_java(text) is None
+
+
+def test_parse_gradle_java_adversarial_input_never_raises_and_returns_promptly():
+    # A very large file with deeply repeated/nested-looking text designed
+    # to probe catastrophic regex backtracking, plus non-UTF8-decodable
+    # bytes reaching this function as a `str` via mis-decoding (the shape
+    # `workspace.read_text` can hand a parser). The compiled patterns use
+    # only bounded digit groups with no nested/overlapping quantifiers, so
+    # this should resolve in linear time, not hang.
+    hostile = "sourceCompatibility" * 5000 + "=" * 5000 + "(" * 5000
+    hostile += "".join(chr(0xDC00 + (i % 256)) for i in range(2000))  # lone surrogates
+    start = time.monotonic()
+    result = parse_gradle_java(hostile)
+    elapsed = time.monotonic() - start
+    assert result is None
+    assert elapsed < 5.0
+
+    ws = InMemoryWorkspace({"build.gradle": hostile})
+    start = time.monotonic()
+    runtimes = detect_runtimes(ws)
+    elapsed = time.monotonic() - start
+    assert runtimes == []
+    assert elapsed < 5.0
+
+
+def test_gradle_parsers_registered():
+    assert _PARSERS["build.gradle"] is parse_gradle_java
+    assert _PARSERS["build.gradle.kts"] is parse_gradle_java
+
+
+def test_detect_runtimes_java_from_build_gradle():
+    ws = InMemoryWorkspace({"build.gradle": "sourceCompatibility = '17'\n"})
+    assert detect_runtimes(ws) == [
+        Runtime(product="java", version="17", manifest="build.gradle")
+    ]
+
+
+def test_detect_runtimes_java_from_build_gradle_kts_only():
+    ws = InMemoryWorkspace({"build.gradle.kts": "sourceCompatibility = \"17\"\n"})
+    assert detect_runtimes(ws) == [
+        Runtime(product="java", version="17", manifest="build.gradle.kts")
+    ]
+
+
+def test_detect_runtimes_no_gradle_file_unchanged_by_gradle_support():
+    ws = InMemoryWorkspace(
+        {
+            "composer.json": json.dumps({"require": {"php": "^8.1"}}),
+            "go.mod": "module example.com/foo\n\ngo 1.21\n",
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert sorted((r.product, r.version, r.manifest) for r in runtimes) == [
+        ("go", "1.21", "go.mod"),
+        ("php", "8.1", "composer.json"),
+    ]
+
+
+def test_detect_runtimes_pom_and_gradle_both_present_dedupes_to_one_java_runtime():
+    # An unusual but real hybrid-migration state: both build files present.
+    # `detect_runtimes`'s existing per-product dedup picks whichever
+    # manifest sorts first by path -- "build.gradle" < "pom.xml".
+    ws = InMemoryWorkspace(
+        {
+            "pom.xml": _pom("<java.version>11</java.version>"),
+            "build.gradle": "sourceCompatibility = '17'\n",
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert runtimes == [
+        Runtime(product="java", version="17", manifest="build.gradle")
+    ]
 
 
 # --- detect_runtimes ----------------------------------------------------------------

@@ -134,12 +134,17 @@ machinery understands them now:
   claim. The runtime version is parsed from `package.json`
   (`engines.node`), `.nvmrc`, `runtime.txt`, `.python-version`,
   `global.json` (`sdk.version`), `.ruby-version`, `go.mod` (the `go`
-  directive), `composer.json` (`require.php`), or `pom.xml`'s top-level
+  directive), `composer.json` (`require.php`), `pom.xml`'s top-level
   `<properties>` (`maven.compiler.release`/`java.version`/
   `maven.compiler.target`/`maven.compiler.source`, in that priority
-  order); an unresolved release cycle reports `unknown` rather than
-  guessing. Treat EOL findings outside those seven runtimes as a triage
-  list, not a compliance scan.
+  order), or `build.gradle`/`build.gradle.kts` (the Java toolchain API —
+  `JavaLanguageVersion.of(N)` — then `sourceCompatibility`, then
+  `targetCompatibility`; regex-literal extraction only, not a Groovy/
+  Kotlin DSL parser, so the legacy space-call syntax and values sourced
+  from variables/`gradle.properties`/`ext` blocks fall back to model
+  knowledge rather than being guessed at); an unresolved release cycle
+  reports `unknown` rather than guessing. Treat EOL findings outside
+  those seven runtimes as a triage list, not a compliance scan.
 - Phase evidence is as good as what the auditors read: on very large repos
   the deterministic inventory is exact, but agents sample files. The report
   appendix names the **audit blind spots** — top-level directories no
@@ -186,8 +191,10 @@ involved, so their findings are exact and citable:
 - **Live EOL/support-status scan** — Node.js/Python/.NET/Ruby/Go/PHP/Java
   runtime versions detected from `package.json`/`.nvmrc`/`runtime.txt`/
   `.python-version`/`global.json`/`.ruby-version`/`go.mod`/
-  `composer.json`/`pom.xml` are checked against endoflife.date, one
-  request per distinct detected product (`--no-eol-scan` opts out;
+  `composer.json`/`pom.xml`/`build.gradle`/`build.gradle.kts` (Java
+  toolchain/source/target-compatibility literals) are checked against
+  endoflife.date, one request per distinct detected product
+  (`--no-eol-scan` opts out;
   offline or an unresolved release cycle degrades to a labelled
   model-knowledge/`unknown` fallback rather than guessing).
 - **Audit blind spots** — the exact set of top-level directories no phase

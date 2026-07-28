@@ -6,6 +6,24 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### Assessment
+- **Live EOL/support-status scan covers Gradle Java projects**
+  (`eolscan.py`), closing the follow-up #199 explicitly deferred: Java
+  runtime coverage previously came only from Maven's `pom.xml`, so a
+  Gradle-built Java repo got zero live-verified EOL signal even though
+  `profile.py` already detects it for delivery purposes (#145). A new
+  `parse_gradle_java` reads `build.gradle`/`build.gradle.kts` as opaque
+  text — never executed — matching, in priority order, the toolchain API
+  (`JavaLanguageVersion.of(N)`), then `sourceCompatibility`, then
+  `targetCompatibility`, across quoted-string/bare-numeric/`JavaVersion.
+  VERSION_N` literal forms in both the Groovy and Kotlin DSLs. Legacy
+  space-call syntax and values sourced from variables/`gradle.properties`/
+  `ext` blocks are explicit non-goals that degrade to "not detected"
+  rather than being guessed at, the same discipline `parse_pom_xml_java`
+  already applies to unresolved Maven property interpolation. Registered
+  in `_PARSERS["build.gradle"]`/`_PARSERS["build.gradle.kts"]`, both
+  mapping to the already-registered `java` product — no new
+  `endoflife.date` product, no change to `detect_runtimes`'s per-product
+  dedup, `query_eol`, or `scan_eol`.
 - **OSV scan parses PHP `composer.json` `^`/`~`/bare-exact constraints**
   (`depscan.py`), closing the doc-named gap: previously only
   `composer.lock`'s resolved pins were scanned (#186), so a `composer.json`
