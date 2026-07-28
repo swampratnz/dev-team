@@ -123,6 +123,45 @@ def test_user_flag_added_only_when_set():
     assert argv[argv.index("--user") + 1] == "1000:1000"
 
 
+def test_userns_flag_added_only_when_set():
+    plain = _Spy()
+    ContainerCommandRunner(plain).run(["pytest"], cwd="/ws")
+    assert "--userns" not in _argv(plain)
+
+    with_userns = _Spy()
+    ContainerCommandRunner(with_userns, SandboxConfig(user_namespace="auto")).run(
+        ["pytest"], cwd="/ws"
+    )
+    argv = _argv(with_userns)
+    assert argv[argv.index("--userns") + 1] == "auto"
+
+
+def test_userns_not_added_for_git_delegation():
+    spy = _Spy()
+    cfg = SandboxConfig(user_namespace="auto")
+    ContainerCommandRunner(spy, cfg).run(["git", "status"], cwd="/ws")
+    argv = _argv(spy)
+    assert argv == ["git", "status"]  # delegated raw, unwrapped, no --userns
+
+
+def test_userns_combined_with_other_options():
+    spy = _Spy()
+    cfg = SandboxConfig(
+        user="1000:1000",
+        user_namespace="auto",
+        memory="4g",
+        read_only_rootfs=True,
+        tmpfs=("/tmp",),
+    )
+    ContainerCommandRunner(spy, cfg).run(["pytest"], cwd="/ws")
+    argv = _argv(spy)
+    assert argv[argv.index("--user") + 1] == "1000:1000"
+    assert argv[argv.index("--userns") + 1] == "auto"
+    assert argv[argv.index("--memory") + 1] == "4g"
+    assert "--read-only" in argv
+    assert argv[argv.index("--tmpfs") + 1] == "/tmp"
+
+
 def test_hardening_flags_can_be_disabled():
     spy = _Spy()
     cfg = SandboxConfig(

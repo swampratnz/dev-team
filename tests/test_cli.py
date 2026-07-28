@@ -3517,6 +3517,19 @@ def test_main_dispatch_sandbox_tuning_without_sandbox_exits_2(capsys):
     assert "--sandbox-image" in err
 
 
+def test_main_dispatch_sandbox_userns_without_sandbox_exits_2(capsys):
+    # --sandbox-userns must never silently no-op un-sandboxed, same as the
+    # other --sandbox-* tuning flags.
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--dispatch", "--sandbox-userns", "auto"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--sandbox-userns" in err
+
+
 def test_main_deliver_journals_events_for_the_dashboard(tmp_path):
     from helpers import engine_responses
 
@@ -3634,11 +3647,13 @@ def test_sandbox_config_from_flags():
             "--sandbox-image", "node:22",
             "--sandbox-network", "bridge",
             "--sandbox-engine", "podman",
+            "--sandbox-userns", "auto",
             "T", "D",
         ]
     )
     sc = _sandbox_config(args)
     assert (sc.engine, sc.image, sc.network) == ("podman", "node:22", "bridge")
+    assert sc.user_namespace == "auto"
 
 
 def test_sandbox_config_absent_and_defaults():
@@ -3649,6 +3664,7 @@ def test_sandbox_config_absent_and_defaults():
     sc = _sandbox_config(parser.parse_args(["--deliver", "--sandbox", "T", "D"]))
     assert sc is not None
     assert sc.network == "none"  # secure default preserved when not overridden
+    assert sc.user_namespace is None  # --sandbox-userns unset stays unset
 
 
 def test_tracer_helper_returns_none_without_a_run_id():
@@ -3700,6 +3716,17 @@ def test_main_sandbox_tuning_without_sandbox_exits_2(capsys):
     err = capsys.readouterr().err
     assert excinfo.value.code == 2
     assert "--sandbox-image" in err
+
+
+def test_main_sandbox_userns_tuning_without_sandbox_exits_2(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["T", "D", "--deliver", "--sandbox-userns", "auto"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--sandbox-userns" in err
 
 
 def test_main_assess_with_sandbox_succeeds(tmp_path):

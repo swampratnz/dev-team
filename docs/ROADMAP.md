@@ -53,7 +53,11 @@ any Bash/Read/Write/Edit/Glob/Grep call resolving outside its workspace root —
 but that is a check inside the same process, not OS-level isolation, so it
 does not close the remaining open edge: a per-job isolation boundary
 (review S4) — one dispatched job's container can still see another's workspace on
-a shared host; a per-job rootless container/namespace is still the follow-up. A second
+a shared host; a per-job rootless container/namespace is still the follow-up. An
+opt-in `--sandbox-userns` flag now narrows this on rootless podman (each
+container gets its own subordinate UID/GID range via `--userns auto`) — see
+[`docs/SANDBOX.md`](SANDBOX.md) — but it is opt-in, not default, and is not
+true per-job separation on docker, so the gap above is narrowed, not closed. A second
 known-uncovered surface: visual review's served app (`SubprocessAppServer`) runs
 as a bare host subprocess even under `--sandbox` — the engine now logs an
 advisory warning rather than leaving the gap silently assumed-covered (see
