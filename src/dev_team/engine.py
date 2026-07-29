@@ -2055,6 +2055,9 @@ class DeliveryEngine:
             )
             if rebuttal.concedes:
                 self._event("debate", "Engineer concedes; the review stands")
+                self._scorecard["review_debate_conceded"] = (
+                    self._scorecard.get("review_debate_conceded", 0) + 1
+                )
                 return review
             judgment = await self.security.adjudicate(
                 task,
@@ -2068,9 +2071,15 @@ class DeliveryEngine:
         except BudgetExceededError:
             self._budget_exhausted = True
             self._event("budget", "Budget exhausted during review debate; upholding the review")
+            self._scorecard["review_debate_upheld"] = (
+                self._scorecard.get("review_debate_upheld", 0) + 1
+            )
             return review
         if not judgment.overturn:
             self._event("debate", "Judge upholds the review", detail=judgment.rationale)
+            self._scorecard["review_debate_upheld"] = (
+                self._scorecard.get("review_debate_upheld", 0) + 1
+            )
             return review
         if self.interaction is not None:
             context = (
@@ -2087,9 +2096,18 @@ class DeliveryEngine:
             )
             if reply.choice != "overturn":
                 self._event("debate", "Human upheld the review over the judge's overturn")
+                self._scorecard["review_debate_upheld"] = (
+                    self._scorecard.get("review_debate_upheld", 0) + 1
+                )
+                self._scorecard["review_debate_human_overridden"] = (
+                    self._scorecard.get("review_debate_human_overridden", 0) + 1
+                )
                 return review
         self._event("debate", "Review overturned on debate; the change proceeds",
                     detail=judgment.rationale)
+        self._scorecard["review_debate_overturned"] = (
+            self._scorecard.get("review_debate_overturned", 0) + 1
+        )
         return replace(
             review,
             approved=True,
