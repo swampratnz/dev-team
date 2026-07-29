@@ -2517,13 +2517,22 @@ class DeliveryEngine:
         escalation applies only to that cold path; the session's model is
         fixed. ``cwd`` defaults to the engine's own workdir; worktree-mode
         callers pass the task's own worktree path for the cold fallback too.
+
+        ``relevant_code`` (``None`` unless ``--retrieval`` is on) uses the
+        same query shape as the described-mode path
+        (:meth:`_attempt_described`), so the agentic engineer gets the same
+        retrieved context regardless of session reuse or worktree mode.
         """
 
+        relevant_code = self._retrieve_context(
+            "\n".join([task.title, task.description, *task.acceptance_criteria])
+        )
         if session is not None:
             try:
                 implementation = await self.engineer.implement_over_session(
                     session, task, design, feedback,
-                    conventions=self._conventions, continued=continued,
+                    conventions=self._conventions, relevant_code=relevant_code,
+                    continued=continued,
                 )
                 return implementation, session
             except AgentResponseError:
@@ -2539,6 +2548,7 @@ class DeliveryEngine:
             feedback,
             cwd=cwd if cwd is not None else str(self.workdir),
             conventions=self._conventions,
+            relevant_code=relevant_code,
             model=model,
             tools=self.config.engineer_tools,
         )

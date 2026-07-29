@@ -393,6 +393,49 @@ def test_engineer_over_session_continuation_sends_feedback_only():
     assert "read the existing code before changing it" not in prompt
 
 
+def test_engineer_over_session_first_turn_includes_relevant_code():
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    session = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
+    agent = EngineerAgent(_runner(impl_dict()))  # runner unused; the session drives
+    run(
+        agent.implement_over_session(
+            session,
+            _task(["works"]),
+            Design(overview="o"),
+            relevant_code='<file-content path="x.py">the code</file-content>',
+        )
+    )
+    prompt = session.prompts[0]
+    assert "Most relevant existing code" in prompt
+    assert '<file-content path="x.py">the code</file-content>' in prompt
+
+
+def test_engineer_over_session_continuation_never_includes_relevant_code():
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    session = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
+    agent = EngineerAgent(_runner(impl_dict()))
+    feedback = Review(
+        approved=False,
+        summary="needs work",
+        comments=[ReviewComment(severity=Severity.MAJOR, message="fix x")],
+    )
+    run(
+        agent.implement_over_session(
+            session,
+            _task(),
+            Design(overview="o"),
+            feedback,
+            relevant_code='<file-content path="x.py">the code</file-content>',
+            continued=True,
+        )
+    )
+    # a continuation must NOT re-send retrieved context even when given — the
+    # model already holds it (or didn't need it) from the first turn.
+    assert "Most relevant existing code" not in session.prompts[0]
+
+
 def test_base_agent_ask_uses_the_session_not_the_runner():
     from dev_team.sdk import AgentResult, FakeAgentSession
 
@@ -751,6 +794,48 @@ def test_engineer_implement_in_place_uses_tools_and_cwd():
     call = runner.calls[0]
     assert call["cwd"] == "/w"
     assert "Read" in call["allowed_tools"] and "Bash" in call["allowed_tools"]
+
+
+def test_engineer_implement_in_place_includes_relevant_code_when_given():
+    payload = {
+        "summary": "s",
+        "files": [{"path": "x.py", "change_type": "create", "summary": "s"}],
+        "notes": "",
+    }
+    runner = _runner(payload)
+    agent = EngineerAgent(runner)
+    task = Task(id="T1", title="t", description="d", acceptance_criteria=["works"])
+    run(
+        agent.implement_in_place(
+            task,
+            Design(overview="o"),
+            cwd="/w",
+            relevant_code='<file-content path="x.py">the code</file-content>',
+        )
+    )
+    prompt = runner.calls[0]["prompt"]
+    assert "Most relevant existing code" in prompt
+    assert '<file-content path="x.py">the code</file-content>' in prompt
+
+
+def test_engineer_implement_in_place_prompt_unchanged_without_relevant_code():
+    from dev_team.agents.engineer import _in_place_prompt
+
+    task = Task(id="T1", title="t", description="d", acceptance_criteria=["works"])
+    design = Design(overview="o")
+    default_prompt = _in_place_prompt(task, design, None, None)
+    assert default_prompt == _in_place_prompt(task, design, None, None, None)
+    assert "Most relevant existing code" not in default_prompt
+
+    payload = {
+        "summary": "s",
+        "files": [{"path": "x.py", "change_type": "create", "summary": "s"}],
+        "notes": "",
+    }
+    runner = _runner(payload)
+    agent = EngineerAgent(runner)
+    run(agent.implement_in_place(task, design, cwd="/w"))
+    assert runner.calls[0]["prompt"] == default_prompt
 
 
 # --- evidence-based review prompts -----------------------------------------

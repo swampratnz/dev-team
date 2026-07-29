@@ -92,6 +92,16 @@ class SandboxConfig:
     #: ``--user`` value (e.g. ``"1000:1000"``). ``None`` omits the flag and
     #: relies on a rootless engine mapping to the host user.
     user: Optional[str] = None
+    #: ``--userns`` value (e.g. ``"auto"``). ``None`` omits the flag. On
+    #: rootless **podman**, ``"auto"`` allocates each container its own
+    #: subordinate UID/GID range from the operator's configured
+    #: ``/etc/subuid``/``/etc/subgid`` pool, so two containers on the same
+    #: host cannot read each other's files even if one escapes its own mount
+    #: — real per-job isolation. On **docker**, ``--userns`` only accepts
+    #: ``host`` or the daemon's single, globally-configured
+    #: ``userns-remap`` range, so it does *not* give distinct per-container
+    #: ranges there.
+    user_namespace: Optional[str] = None
     #: In-container path the workspace (``cwd``) is bind-mounted to.
     workspace_mount: str = "/workspace"
     #: ``--memory`` ceiling (e.g. ``"2g"``); ``None`` omits it.
@@ -184,6 +194,8 @@ class ContainerCommandRunner:
         run += ["--network", cfg.network]
         if cfg.user is not None:
             run += ["--user", cfg.user]
+        if cfg.user_namespace is not None:
+            run += ["--userns", cfg.user_namespace]
         if cfg.drop_capabilities:
             run += ["--cap-drop", "ALL"]
         if cfg.no_new_privileges:

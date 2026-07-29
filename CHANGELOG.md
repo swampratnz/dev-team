@@ -5,6 +5,14 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Documentation
+- **`docs/ROADMAP.md` item 7 correction:** the closing sentence claiming
+  "the dashboard and Slack adapters remain future work" was stale for its
+  dashboard half — the dashboard's "Pending questions" panel
+  (`docs/DASHBOARD.md`) already shipped. Item 7 now cites that panel by
+  name and keeps the Slack adapter correctly marked as deferred (a new
+  external service credential, out of scope per the standing guardrail).
+
 ### Dispatch
 - **On-demand bulk purge** (`docs/DISPATCH.md`): `GET`/`POST
   /jobs/purge?archived_before=<epoch-seconds>` — the still-deferred second
@@ -24,7 +32,41 @@ sections below are reconstructed from the repository history.
   so an operator can never accidentally trigger a full purge by omitting
   the query string. Operator-only auth, same as `/costs`/`/calibration`.
 
+### Security
+- **Opt-in `--sandbox-userns` for per-job UID/GID separation** (#246):
+  `SandboxConfig` gains `user_namespace`, wired to a new `--sandbox-userns`
+  CLI flag (only valid with `--sandbox`, mirroring `--sandbox-network`).
+  When set, `ContainerCommandRunner` adds `--userns <value>` to the
+  container argv — on rootless **podman**, `--sandbox-userns auto`
+  allocates each container its own subordinate UID/GID range, narrowing
+  the "per-job isolation on a shared host" gap named in `docs/ROADMAP.md`
+  item 1 and `docs/SECURITY.md`. Default (`None`) is unchanged behaviour;
+  on **docker**, `--userns` only accepts `host` or the daemon's single
+  `userns-remap` range, so it is not true per-job separation there — the
+  docs state this asymmetry rather than overclaiming.
+
 ### Assessment
+- **OSV scan covers Maven `pom.xml` dependencies** (`depscan.py`), closing
+  the last ecosystem gap named in `docs/ASSESSMENT.md`'s "Honest
+  limitations": Java's *runtime* already got a live EOL scan through this
+  same file (`eolscan.py:parse_pom_xml_java`, #199/#201) but its
+  *dependencies* never did — Maven was the one scanned ecosystem missing the
+  dependency-CVE half every other stack has. A new `parse_pom_xml_deps`
+  reuses the exact namespace-stripping XML idiom (`tag.rsplit("}", 1)[-1]`)
+  and `except (ET.ParseError, ValueError)` degrade-to-`[]` contract
+  `parse_pom_xml_java` already established for this file format — no new
+  parsing primitive. Only the root's top-level `<dependencies>` block is
+  read (never `<dependencyManagement>` or `<profile>`-scoped blocks, the
+  same conditional-build-context reasoning `parse_pom_xml_java` already
+  applies); each `<dependency>` needs a `<groupId>`, `<artifactId>`, and a
+  literal (non-`${property}`) `<version>` to count as a pin — anything
+  else is skipped, never guessed at. Emits `Dependency("groupId:
+  artifactId", version, "Maven", manifest)`, the OSV.dev-defined
+  ecosystem/name convention. Registered in `_PARSERS["pom.xml"]`; no
+  changes needed to `collect_dependencies`'s traversal, supersede rule, or
+  `_MAX_DEPENDENCIES` truncation — all three already generalise unmodified.
+  `docs/ASSESSMENT.md` updated to name the new coverage and its
+  literal-pins-only limitation.
 - **Live EOL/support-status scan covers Gradle Java projects**
   (`eolscan.py`), closing the follow-up #199 explicitly deferred: Java
   runtime coverage previously came only from Maven's `pom.xml`, so a
@@ -1085,6 +1127,15 @@ sections below are reconstructed from the repository history.
   keep the heuristic false-positive-free.
 
 ### Documentation
+- **`docs/BENCHMARKS.md` no longer contradicts `docs/ROADMAP.md`**: the
+  Engineer section's "session continuity across attempts" bullet and the
+  Product manager / planner section's "Dynamic re-planning on failure"
+  bullet were both still marked `→ roadmap` after the underlying features
+  shipped (ROADMAP #5 and #3 respectively); both now read ✅ and cite the
+  live config surface (`EngineConfig.reuse_engineer_session`,
+  `EngineConfig.max_replan_rounds`). Same class of fix as the
+  `TROUBLESHOOTING.md` correction below, scoped to `BENCHMARKS.md`'s own
+  internal drift against `ROADMAP.md`.
 - **`docs/BENCHMARKS.md` Technical writer correction:** the "Executable
   doc-claim checks → roadmap" marker was stale — `doc_claim_issues()`
   (`techwriter.py`) has shipped all four checks (path citations,

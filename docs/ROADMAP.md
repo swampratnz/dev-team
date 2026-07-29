@@ -53,7 +53,11 @@ any Bash/Read/Write/Edit/Glob/Grep call resolving outside its workspace root —
 but that is a check inside the same process, not OS-level isolation, so it
 does not close the remaining open edge: a per-job isolation boundary
 (review S4) — one dispatched job's container can still see another's workspace on
-a shared host; a per-job rootless container/namespace is still the follow-up. A second
+a shared host; a per-job rootless container/namespace is still the follow-up. An
+opt-in `--sandbox-userns` flag now narrows this on rootless podman (each
+container gets its own subordinate UID/GID range via `--userns auto`) — see
+[`docs/SANDBOX.md`](SANDBOX.md) — but it is opt-in, not default, and is not
+true per-job separation on docker, so the gap above is narrowed, not closed. A second
 known-uncovered surface: visual review's served app (`SubprocessAppServer`) runs
 as a bare host subprocess even under `--sandbox` — the engine now logs an
 advisory warning rather than leaving the gap silently assumed-covered (see
@@ -276,7 +280,12 @@ that loop's channel — `team.interaction` (plan review, approvals) is
 untouched. **Exposure change to weigh before enabling:** this posts the CI
 failure summary as a plain, repo-visible PR comment, a broader audience than
 the terminal or dispatch's bearer-token-gated question endpoint (#87) — see
-`docs/INTERACTION.md`. The dashboard and Slack adapters remain future work.
+`docs/INTERACTION.md`. **Dashboard adapter (shipped):** `docs/DASHBOARD.md`'s
+"Pending questions" panel is the dashboard-side "questions as buttons"
+surface named above, built on the same #87 primitive. **Slack adapter
+(still future work):** deferred because it would require a new external
+service credential, which the standing security guardrail (CLAUDE.md
+§2/§7, `docs/VISION.md`) disallows without an approved pattern.
 
 ## 8. MCP tool provider & group review
 

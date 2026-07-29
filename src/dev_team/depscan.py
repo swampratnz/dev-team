@@ -4,7 +4,8 @@ The risk phase's CVE claims otherwise come from model knowledge — plausible,
 stale, and unverifiable. This module is the deterministic counterpart: exact
 pins are parsed straight out of the manifests (NuGet ``packages.config``,
 ``package.json``, ``requirements.txt``, PEP 621 ``pyproject.toml``,
-``Cargo.toml``, Go ``go.mod``, PHP ``composer.json``) *and* the lockfiles
+``Cargo.toml``, Go ``go.mod``, PHP ``composer.json``, Maven ``pom.xml``)
+*and* the lockfiles
 (``package-lock.json``, ``poetry.lock``, ``Cargo.lock``, NuGet
 ``packages.lock.json``, Ruby ``Gemfile.lock``, PHP ``composer.lock``) and checked against
 the OSV.dev batch API, which covers every major
@@ -188,6 +189,58 @@ def parse_packages_config(text: str, manifest: str) -> List[Dependency]:
         name, version = element.get("id"), element.get("version")
         if name and version:
             deps.append(Dependency(name, version, "NuGet", manifest))
+    return deps
+
+
+def parse_pom_xml_deps(text: str, manifest: str) -> List[Dependency]:
+    """Maven ``pom.xml``: top-level ``<dependencies>`` entries with a literal pin.
+
+    Only the root's top-level ``<dependencies>`` element is read — not
+    ``<dependencyManagement>`` and not per-``<profile>`` dependency blocks —
+    mirroring :func:`eolscan.parse_pom_xml_java`'s scoping rationale (profile
+    activation is conditional, and a ``dependencyManagement`` entry only
+    applies if referenced by an actual dependency; this module has no build
+    context to evaluate either). Namespace-stripped tag comparison
+    (``tag.rsplit("}", 1)[-1]``) is the same idiom :func:`eolscan.parse_pom_xml_java`
+    uses for this identical file format, since Maven POMs declare a default
+    XML namespace plain tag comparison would otherwise miss.
+
+    Only a literal, non-empty ``<version>`` counts as a pin: a
+    ``${property}``-interpolated version (requiring a ``<properties>``
+    lookup or parent-POM inheritance this module has no context for) or a
+    missing ``<version>`` (inherited from ``dependencyManagement``, possibly
+    in a parent POM never fetched) is skipped, never guessed at. A
+    ``<dependency>`` missing ``<groupId>`` or ``<artifactId>`` is skipped too.
+
+    ``ValueError`` is caught alongside ``ET.ParseError`` for the same
+    multi-byte-encoding expat quirk :func:`eolscan.parse_pom_xml_java`
+    documents.
+    """
+
+    try:
+        root = ET.fromstring(text)
+    except (ET.ParseError, ValueError):
+        return []
+    deps = []
+    for child in root:
+        if child.tag.rsplit("}", 1)[-1] != "dependencies":
+            continue
+        for dependency in child:
+            if dependency.tag.rsplit("}", 1)[-1] != "dependency":
+                continue
+            fields: Dict[str, str] = {}
+            for element in dependency:
+                tag = element.tag.rsplit("}", 1)[-1]
+                if tag in ("groupId", "artifactId", "version"):
+                    fields[tag] = (element.text or "").strip()
+            group_id = fields.get("groupId")
+            artifact_id = fields.get("artifactId")
+            version = fields.get("version")
+            if not group_id or not artifact_id or not version:
+                continue
+            if "${" in version:
+                continue
+            deps.append(Dependency(f"{group_id}:{artifact_id}", version, "Maven", manifest))
     return deps
 
 
@@ -629,6 +682,7 @@ _PARSERS = {
     "Gemfile.lock": parse_gemfile_lock,
     "composer.json": parse_composer_json,
     "composer.lock": parse_composer_lock,
+    "pom.xml": parse_pom_xml_deps,
 }
 
 

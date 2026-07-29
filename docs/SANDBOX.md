@@ -79,6 +79,7 @@ runner = ContainerCommandRunner(
         network="none",                        # override for a setup that fetches deps
         memory="2g", cpus="2", pids_limit=512,
         read_only_rootfs=False,                # opt-in; pair with tmpfs when your stack tolerates it
+        user_namespace=None,                   # opt-in per-job UID separation; see below
     ),
 )
 result = runner.run(["pytest", "-q"], cwd="/path/to/workspace")
@@ -97,10 +98,26 @@ dev-team "Health endpoint" "Add /health returning 200" --deliver --workspace ./b
 # a build probe that must restore dependencies needs a network:
 dev-team --assess --workspace /path/to/repo --build-probe \
     --sandbox --sandbox-network bridge --sandbox-engine podman
+
+# per-job UID separation on a shared host (rootless podman only — see below):
+dev-team "Health endpoint" "Add /health returning 200" --deliver --workspace ./build \
+    --sandbox --sandbox-engine podman --sandbox-userns auto
 ```
 
-`--sandbox-image` / `--sandbox-network` / `--sandbox-engine` override the
-matching `SandboxConfig` field; everything else keeps its secure default.
+`--sandbox-image` / `--sandbox-network` / `--sandbox-engine` / `--sandbox-userns`
+override the matching `SandboxConfig` field; everything else keeps its secure
+default.
+
+**`--sandbox-userns auto` requires rootless podman with subuid/subgid ranges
+provisioned for the operator's user** (standard rootless-podman setup). It
+allocates each container its own subordinate UID/GID range, so two jobs'
+containers running concurrently on the same host cannot read each other's
+files even if one escapes its own mount — narrowing the "per-job isolation on
+a shared host" gap named in [`docs/SECURITY.md`](SECURITY.md) and
+[`ROADMAP.md`](ROADMAP.md) item 1. On **docker**, `--userns` only accepts
+`host` or the daemon's single, globally-configured `userns-remap` range — not
+a distinct range per container — so this flag does not give true per-job
+separation there, only whatever the daemon's existing remap already provides.
 
 `--dispatch --sandbox` boxes every dispatched job's gates/build-probe the
 same way `--deliver`/`--assess --sandbox` do — see

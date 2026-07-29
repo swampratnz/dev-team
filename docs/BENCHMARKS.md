@@ -15,7 +15,8 @@ beat either alone, and false-positive suppression is a first-class metric.**
   (prompted); execution-guided repair loops ✅ (gate feedback per attempt);
   per-attempt escalation ✅; multi-candidate generation with execution-based
   reranking → roadmap; retrieval-driven fault localization → roadmap;
-  session continuity across attempts → roadmap.
+  session continuity across attempts ✅ (`EngineConfig.reuse_engineer_session`,
+  on by default — ROADMAP #5).
 
 ## Code reviewer
 - **Benchmarks/metrics:** CRScore, SWR-Bench, CR-Bench; production systems
@@ -87,7 +88,8 @@ beat either alone, and false-positive suppression is a first-class metric.**
 - **Adopted:** INVEST-hardened prompts (verifiable acceptance criteria) ✅;
   deterministic plan lint (missing criteria, unknown/self dependencies,
   duplicates, oversize) with one revision pass ✅; plan quality visible in
-  scorecard + retrospectives ✅. Dynamic re-planning on failure → roadmap.
+  scorecard + retrospectives ✅. Dynamic re-planning on failure ✅
+  (`EngineConfig.max_replan_rounds`, opt-in — ROADMAP #3).
 
 ## Technical writer
 - **Benchmarks:** CodeWikiBench (repo-level docs vs rubrics derived from

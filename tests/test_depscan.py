@@ -22,6 +22,7 @@ from dev_team.depscan import (
     parse_go_mod,
     parse_package_json,
     parse_packages_config,
+    parse_pom_xml_deps,
     parse_pyproject_toml,
     parse_requirements_txt,
     scan_dependencies,
@@ -1027,6 +1028,212 @@ def test_parse_composer_json_rejects_malformed_input():
     ) == []
 
 
+_POM_SPRING_DEP = (
+    "<dependency><groupId>org.springframework</groupId>"
+    "<artifactId>spring-core</artifactId><version>5.3.20</version></dependency>"
+)
+
+
+def test_parse_pom_xml_deps_literal_pin():
+    text = (
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+        f"<dependencies>{_POM_SPRING_DEP}</dependencies>"
+        "</project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert deps == [
+        Dependency("org.springframework:spring-core", "5.3.20", "Maven", "pom.xml")
+    ]
+    assert deps[0].approximate is False
+
+
+def test_parse_pom_xml_deps_skips_property_interpolated_version():
+    text = (
+        "<project><dependencies>"
+        "<dependency><groupId>org.springframework</groupId>"
+        "<artifactId>spring-core</artifactId>"
+        "<version>${spring.version}</version></dependency>"
+        "</dependencies></project>"
+    )
+    assert parse_pom_xml_deps(text, "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_skips_missing_version():
+    text = (
+        "<project><dependencies>"
+        "<dependency><groupId>org.springframework</groupId>"
+        "<artifactId>spring-core</artifactId></dependency>"
+        "</dependencies></project>"
+    )
+    assert parse_pom_xml_deps(text, "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_skips_missing_group_or_artifact_id():
+    missing_group = (
+        "<project><dependencies>"
+        "<dependency><artifactId>spring-core</artifactId>"
+        "<version>5.3.20</version></dependency>"
+        "</dependencies></project>"
+    )
+    missing_artifact = (
+        "<project><dependencies>"
+        "<dependency><groupId>org.springframework</groupId>"
+        "<version>5.3.20</version></dependency>"
+        "</dependencies></project>"
+    )
+    assert parse_pom_xml_deps(missing_group, "pom.xml") == []
+    assert parse_pom_xml_deps(missing_artifact, "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_ignores_dependency_management():
+    text = (
+        "<project>"
+        "<dependencyManagement><dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-only</artifactId>"
+        "<version>1.0.0</version></dependency>"
+        "</dependencies></dependencyManagement>"
+        f"<dependencies>{_POM_SPRING_DEP}</dependencies>"
+        "</project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert [d.name for d in deps] == ["org.springframework:spring-core"]
+
+
+def test_parse_pom_xml_deps_ignores_profile_dependencies():
+    text = (
+        "<project>"
+        f"<dependencies>{_POM_SPRING_DEP}</dependencies>"
+        "<profiles><profile><dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>profile-only</artifactId>"
+        "<version>2.0.0</version></dependency>"
+        "</dependencies></profile></profiles>"
+        "</project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert [d.name for d in deps] == ["org.springframework:spring-core"]
+
+
+def test_parse_pom_xml_deps_multiple_entries_scope_not_filtered():
+    text = (
+        "<project><dependencies>"
+        f"{_POM_SPRING_DEP}"
+        "<dependency><groupId>junit</groupId><artifactId>junit</artifactId>"
+        "<version>4.13.2</version><scope>test</scope></dependency>"
+        "<dependency><groupId>com.example</groupId><artifactId>lib</artifactId>"
+        "<version>1.0.0</version><scope>provided</scope></dependency>"
+        "</dependencies></project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert {(d.name, d.version) for d in deps} == {
+        ("org.springframework:spring-core", "5.3.20"),
+        ("junit:junit", "4.13.2"),
+        ("com.example:lib", "1.0.0"),
+    }
+
+
+def test_parse_pom_xml_deps_skips_non_dependency_children():
+    text = (
+        "<project><dependencies>"
+        "<notADependency><groupId>x</groupId></notADependency>"
+        f"{_POM_SPRING_DEP}"
+        "</dependencies></project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert [d.name for d in deps] == ["org.springframework:spring-core"]
+
+
+def test_parse_pom_xml_deps_malformed_never_raises():
+    assert parse_pom_xml_deps("<project><dependencies>", "pom.xml") == []  # truncated
+    assert parse_pom_xml_deps("not xml at all", "pom.xml") == []
+    assert parse_pom_xml_deps("<not-even-xml", "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_multibyte_encoding_declaration_never_raises(monkeypatch):
+    # Mirrors eolscan.py:parse_pom_xml_java's own regression test: an XML
+    # declaration naming a multi-byte encoding (e.g. UTF-16) fed as a `str`
+    # -- exactly what workspace.read_text hands this function -- makes
+    # CPython's expat binding raise a bare ValueError, not ET.ParseError.
+    # Not reliably reproducible across expat/CPython builds, so pin the
+    # contract directly by forcing ET.fromstring to raise it.
+    import dev_team.depscan as depscan
+
+    def _raise_value_error(_text):
+        raise ValueError("multi-byte encodings are not supported")
+
+    monkeypatch.setattr(depscan.ET, "fromstring", _raise_value_error)
+    text = f"<project><dependencies>{_POM_SPRING_DEP}</dependencies></project>"
+    assert parse_pom_xml_deps(text, "pom.xml") == []
+    ws = InMemoryWorkspace({"pom.xml": text})
+    assert collect_dependencies(ws) == []
+
+
+def test_collect_dependencies_tolerates_unreadable_pom_xml():
+    class _Flaky(InMemoryWorkspace):
+        def read_text(self, path):
+            raise ValueError("bad encoding")
+
+    assert collect_dependencies(_Flaky({"pom.xml": "<project></project>"})) == []
+
+
+def test_collect_dependencies_reads_nested_pom_xml():
+    ws = InMemoryWorkspace(
+        {
+            "module-a/pom.xml": (
+                f"<project><dependencies>{_POM_SPRING_DEP}</dependencies></project>"
+            )
+        }
+    )
+    deps = collect_dependencies(ws)
+    assert [(d.ecosystem, d.name, d.version) for d in deps] == [
+        ("Maven", "org.springframework:spring-core", "5.3.20")
+    ]
+
+
+def test_scan_dependencies_maven_osv_payload_shape():
+    ws = InMemoryWorkspace(
+        {"pom.xml": f"<project><dependencies>{_POM_SPRING_DEP}</dependencies></project>"}
+    )
+    captured = {}
+
+    def fetch(payload):
+        captured["payload"] = payload
+        return {"results": [{}]}
+
+    scan = scan_dependencies(ws, fetch=fetch)
+    assert scan.queried is True
+    assert {
+        "package": {"name": "org.springframework:spring-core", "ecosystem": "Maven"},
+        "version": "5.3.20",
+    } in captured["payload"]["queries"]
+
+
+def test_collect_dependencies_maven_mixed_with_supersede_and_truncation():
+    # Maven entries mix with an existing composer.json/composer.lock
+    # supersede pair, and count toward the shared _MAX_DEPENDENCIES cap like
+    # every other ecosystem -- proving both pre-existing rules generalise
+    # unmodified now that a 14th manifest type is registered.
+    lines = "\n".join(f"pkg{i}==1.0.{i}" for i in range(_MAX_DEPENDENCIES))
+    ws = InMemoryWorkspace(
+        {
+            "pom.xml": f"<project><dependencies>{_POM_SPRING_DEP}</dependencies></project>",
+            "composer.json": json.dumps({"require": {"vendor/pkg": "^9.0"}}),
+            "composer.lock": json.dumps(
+                {"packages": [{"name": "vendor/pkg", "version": "9.2.3"}]}
+            ),
+            "requirements.txt": lines,
+        }
+    )
+    deps = collect_dependencies(ws)
+    triples = {(d.ecosystem, d.name, d.version, d.approximate) for d in deps}
+    assert ("Maven", "org.springframework:spring-core", "5.3.20", False) in triples
+    assert ("Packagist", "vendor/pkg", "9.2.3", False) in triples
+    assert not any(d.ecosystem == "Packagist" and d.approximate for d in deps)
+    scan = scan_dependencies(ws, fetch=_fake_fetch({}))
+    assert scan.truncated == 2
+
+
 def test_parsers_registered_in_parsers_table():
     from dev_team.depscan import _PARSERS
 
@@ -1034,6 +1241,7 @@ def test_parsers_registered_in_parsers_table():
     assert _PARSERS["Gemfile.lock"] is parse_gemfile_lock
     assert _PARSERS["composer.json"] is parse_composer_json
     assert _PARSERS["composer.lock"] is parse_composer_lock
+    assert _PARSERS["pom.xml"] is parse_pom_xml_deps
 
 
 def test_collect_dependencies_reads_go_mod_and_gemfile_lock():
@@ -1167,6 +1375,13 @@ def test_crafted_manifest_content_never_raises():
         parse_composer_lock(
             json.dumps({"packages": [{"name": content, "version": "1.0.0"}]}),
             "composer.lock",
+        )
+        parse_pom_xml_deps(
+            "<project><dependencies><dependency>"
+            f"<groupId>{content}</groupId><artifactId>{content}</artifactId>"
+            f"<version>{content}</version>"
+            "</dependency></dependencies></project>",
+            "pom.xml",
         )
 
 

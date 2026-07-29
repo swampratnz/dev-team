@@ -613,6 +613,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Container CLI to invoke, docker or podman (default docker). "
         "Only with --sandbox.",
     )
+    sandbox.add_argument(
+        "--sandbox-userns",
+        default=None,
+        metavar="MODE",
+        help="Container --userns value (e.g. 'auto'); on rootless podman "
+        "this gives each container its own subordinate UID/GID range, so "
+        "one job's container can't read another's files on a shared host. "
+        "Docker only supports 'host' or its daemon-wide userns-remap "
+        "range, not distinct per-container ranges. Only with --sandbox.",
+    )
     misc.add_argument(
         "--workspace",
         default="./build",
@@ -1116,6 +1126,7 @@ def _validate_args(
         ("--sandbox-image", args.sandbox_image is not None),
         ("--sandbox-network", args.sandbox_network is not None),
         ("--sandbox-engine", args.sandbox_engine is not None),
+        ("--sandbox-userns", args.sandbox_userns is not None),
     ]
     if not args.sandbox:
         extra = [name for name, passed in sandbox_tuning if passed]
@@ -1278,6 +1289,8 @@ def _sandbox_config(args: argparse.Namespace) -> Optional[SandboxConfig]:
         overrides["network"] = args.sandbox_network
     if args.sandbox_engine is not None:
         overrides["engine"] = args.sandbox_engine
+    if args.sandbox_userns is not None:
+        overrides["user_namespace"] = args.sandbox_userns
     return SandboxConfig(**overrides)
 
 
