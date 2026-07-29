@@ -5,6 +5,18 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### QA
+- **Mutation-lite now flips augmented-assignment arithmetic
+  (`total += 1`↔`total -= 1`, `x *= 2`↔`x /= 2`), the exact follow-up #226
+  named as out of scope for itself** (#257). Previously
+  `_mutation_candidates` walked only `ast.Compare`/`ast.BoolOp`/`ast.BinOp`;
+  an `ast.AugAssign` node carries its operator directly with no child
+  `BinOp` for the walk to find, so a product file whose only arithmetic was
+  written with `+=`/`-=`/`*=`/`/=` yielded zero mutation candidates and
+  `_mutation_check` silently skipped the check with no scorecard signal.
+  Reuses `_ARITH_FLIPS` verbatim (same `ast.operator` subtypes as `BinOp`) —
+  no new flip table, no `engine.py` changes.
+
 ### Documentation
 - **`docs/ROADMAP.md` item 7 correction:** the closing sentence claiming
   "the dashboard and Slack adapters remain future work" was stale for its
