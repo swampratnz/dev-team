@@ -18,6 +18,7 @@ from dev_team.depscan import (
     parse_cargo_toml,
     parse_composer_json,
     parse_composer_lock,
+    parse_csproj_package_references,
     parse_gemfile_lock,
     parse_go_mod,
     parse_package_json,
@@ -1407,3 +1408,145 @@ def test_crafted_manifest_content_causes_no_subprocess_or_eval(monkeypatch):
     # None of these crash, and the module never touched subprocess/os.system
     # or eval/exec — verified by the monkeypatched raisers above.
     assert isinstance(scan, DependencyScan)
+
+
+def test_parse_csproj_package_references_attribute_form():
+    text = (
+        '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>'
+        '<PackageReference Include="Newtonsoft.Json" Version="13.0.1" />'
+        '<PackageReference Include="Serilog" Version="2.10.0" />'
+        "</ItemGroup></Project>"
+    )
+    deps = parse_csproj_package_references(text, "App/App.csproj")
+    assert deps == [
+        Dependency("Newtonsoft.Json", "13.0.1", "NuGet", "App/App.csproj", approximate=True),
+        Dependency("Serilog", "2.10.0", "NuGet", "App/App.csproj", approximate=True),
+    ]
+
+
+def test_parse_csproj_package_references_bracket_exact_version():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageReference Include="Newtonsoft.Json" Version="[13.0.1]" />'
+        "</ItemGroup></Project>"
+    )
+    deps = parse_csproj_package_references(text, "App.csproj")
+    assert deps == [Dependency("Newtonsoft.Json", "13.0.1", "NuGet", "App.csproj")]
+    assert deps[0].approximate is False
+
+
+def test_parse_csproj_package_references_version_child_element():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageReference Include="Serilog"><Version>2.10.0</Version></PackageReference>'
+        "</ItemGroup></Project>"
+    )
+    deps = parse_csproj_package_references(text, "App.csproj")
+    assert deps == [
+        Dependency("Serilog", "2.10.0", "NuGet", "App.csproj", approximate=True)
+    ]
+
+
+def test_parse_csproj_package_references_skips_update_reference():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageReference Update="Microsoft.NETCore.App" Version="3.1.0" />'
+        '<PackageReference Include="Serilog" Version="2.10.0" />'
+        "</ItemGroup></Project>"
+    )
+    deps = parse_csproj_package_references(text, "App.csproj")
+    assert [d.name for d in deps] == ["Serilog"]
+
+
+def test_parse_csproj_package_references_skips_central_package_management_form():
+    # No Version attribute and no Version child at all -- the CPM form,
+    # where the version lives in a separate Directory.Packages.props this
+    # parser has no context for. A sibling non-Version child (PrivateAssets)
+    # proves the child-scan loop doesn't mistake it for a Version element.
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageReference Include="Serilog"><PrivateAssets>all</PrivateAssets></PackageReference>'
+        '<PackageReference Include="Newtonsoft.Json" Version="13.0.1" />'
+        "</ItemGroup></Project>"
+    )
+    deps = parse_csproj_package_references(text, "App.csproj")
+    assert [d.name for d in deps] == ["Newtonsoft.Json"]
+
+
+def test_parse_csproj_package_references_skips_range_form():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageReference Include="Serilog" Version="[1.0,2.0)" />'
+        '<PackageReference Include="Other" Version="(,2.0]" />'
+        "</ItemGroup></Project>"
+    )
+    assert parse_csproj_package_references(text, "App.csproj") == []
+
+
+def test_parse_csproj_package_references_skips_unparseable_versions():
+    # Bracket-exact and bare forms both reuse _exact_version's validation;
+    # content that fails it is skipped rather than guessed at, in both forms.
+    bracket_invalid = (
+        "<Project><ItemGroup>"
+        '<PackageReference Include="Foo" Version="[not-a-version]" />'
+        "</ItemGroup></Project>"
+    )
+    bare_invalid = (
+        "<Project><ItemGroup>"
+        '<PackageReference Include="Foo" Version="not-a-version" />'
+        "</ItemGroup></Project>"
+    )
+    assert parse_csproj_package_references(bracket_invalid, "App.csproj") == []
+    assert parse_csproj_package_references(bare_invalid, "App.csproj") == []
+
+
+def test_parse_csproj_package_references_malformed_never_raises():
+    assert parse_csproj_package_references("not xml at all", "App.csproj") == []
+    assert parse_csproj_package_references("<Project><ItemGroup>", "App.csproj") == []
+
+
+def test_collect_dependencies_routes_csproj_by_suffix_alongside_packages_config():
+    ws = InMemoryWorkspace(
+        {
+            "src/MyApp.csproj": (
+                "<Project><ItemGroup>"
+                '<PackageReference Include="Newtonsoft.Json" Version="13.0.1" />'
+                '<PackageReference Include="Serilog" Version="2.10.0" />'
+                "</ItemGroup></Project>"
+            ),
+            "legacy/packages.config": _PACKAGES_CONFIG,
+        }
+    )
+    deps = collect_dependencies(ws)
+    csproj_names = sorted(d.name for d in deps if d.manifest.endswith(".csproj"))
+    packages_config_names = sorted(
+        d.name for d in deps if d.manifest.endswith("packages.config")
+    )
+    assert csproj_names == ["Newtonsoft.Json", "Serilog"]
+    assert packages_config_names == ["FluentAssertions", "Moq"]
+
+
+def test_collect_dependencies_csproj_bare_floor_superseded_by_lockfile_exact_pin():
+    ws = InMemoryWorkspace(
+        {
+            "App.csproj": (
+                "<Project><ItemGroup>"
+                '<PackageReference Include="Newtonsoft.Json" Version="13.0.1" />'
+                "</ItemGroup></Project>"
+            ),
+            "packages.lock.json": json.dumps(
+                {
+                    "dependencies": {
+                        "net6.0": {"Newtonsoft.Json": {"resolved": "13.0.3"}}
+                    }
+                }
+            ),
+        }
+    )
+    deps = collect_dependencies(ws)
+    # The lockfile's exact resolved pin (13.0.3) supersedes the .csproj's
+    # bare-floor pin (13.0.1) -- same dedup rule every other ecosystem uses,
+    # unmodified.
+    assert [(d.name, d.version, d.approximate) for d in deps] == [
+        ("Newtonsoft.Json", "13.0.3", False)
+    ]

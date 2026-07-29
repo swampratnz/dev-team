@@ -2,8 +2,9 @@
 
 The risk phase's CVE claims otherwise come from model knowledge — plausible,
 stale, and unverifiable. This module is the deterministic counterpart: exact
-pins are parsed straight out of the manifests (NuGet ``packages.config``,
-``package.json``, ``requirements.txt``, PEP 621 ``pyproject.toml``,
+pins are parsed straight out of the manifests (NuGet ``packages.config`` and
+SDK-style ``.csproj`` ``<PackageReference>``, ``package.json``,
+``requirements.txt``, PEP 621 ``pyproject.toml``,
 ``Cargo.toml``, Go ``go.mod``, PHP ``composer.json``, Maven ``pom.xml``)
 *and* the lockfiles
 (``package-lock.json``, ``poetry.lock``, ``Cargo.lock``, NuGet
@@ -241,6 +242,61 @@ def parse_pom_xml_deps(text: str, manifest: str) -> List[Dependency]:
             if "${" in version:
                 continue
             deps.append(Dependency(f"{group_id}:{artifact_id}", version, "Maven", manifest))
+    return deps
+
+
+def parse_csproj_package_references(text: str, manifest: str) -> List[Dependency]:
+    """.NET SDK-style ``.csproj``: ``<PackageReference Include=... Version=...>``
+    entries — the modern replacement for ``packages.config`` every
+    ``dotnet new``-scaffolded project (.NET Core/5+ onward) uses.
+
+    Namespace-agnostic tag comparison (``tag.rsplit("}", 1)[-1]``) mirrors
+    :func:`parse_pom_xml_deps`'s idiom for consistency, even though
+    ``.csproj`` carries no XML namespace in practice.
+
+    A bracket-exact version (``[1.2.3]``) is a real pin (``approximate=False``);
+    a bare version (``1.2.3``) is only the floor NuGet resolves as a
+    *minimum*, never a guaranteed exact match (``approximate=True``,
+    mirroring the ``^``/``~`` treatment elsewhere in this module) — both
+    reuse :func:`_exact_version`'s digit-first/alnum-parts validation. Any
+    other bracket/paren range form (``[1.0,2.0)``, ``(,2.0]``, comma lists)
+    needs real resolver semantics this module has no context for and is
+    skipped, never guessed at — as is an ``Update=`` reference (nothing to
+    resolve against here) and a reference with no ``Version`` attribute or
+    child element at all (the Central Package Management form, out of scope
+    — see the module docstring's honest-limitations note).
+    """
+
+    try:
+        root = ET.fromstring(text)
+    except (ET.ParseError, ValueError):
+        return []
+    deps = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "PackageReference":
+            continue
+        name = element.get("Include")
+        if not name:
+            continue
+        raw_version = element.get("Version")
+        if not raw_version:
+            for child in element:
+                if child.tag.rsplit("}", 1)[-1] == "Version":
+                    raw_version = (child.text or "").strip()
+                    break
+        if not raw_version:
+            continue
+        spec = raw_version.strip()
+        if spec.startswith("[") and spec.endswith("]") and "," not in spec:
+            version = _exact_version(spec[1:-1])
+            if version is not None:
+                deps.append(Dependency(name, version, "NuGet", manifest))
+        elif spec.startswith("[") or spec.startswith("("):
+            continue
+        else:
+            version = _exact_version(spec)
+            if version is not None:
+                deps.append(Dependency(name, version, "NuGet", manifest, approximate=True))
     return deps
 
 
@@ -701,6 +757,12 @@ def collect_dependencies(workspace: Workspace) -> List[Dependency]:
     deps: List[Dependency] = []
     for path in sorted(workspace.list_files()):
         parser = _PARSERS.get(path.rsplit("/", 1)[-1])
+        if parser is None and path.endswith(".csproj"):
+            # .csproj filenames vary per project (MyApp.csproj), so the
+            # exact-basename _PARSERS lookup can't route to it alone --
+            # mirrors profile.py:_legacy_dotnet_reason's identical
+            # suffix-based routing for the same fixed-name problem.
+            parser = parse_csproj_package_references
         if parser is None:
             continue
         try:
