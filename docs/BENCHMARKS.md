@@ -132,9 +132,20 @@ beat either alone, and false-positive suppression is a first-class metric.**
   always attempted. Off by default. Under `--sandbox`, this reuses the same
   contained `command_runner` as every other gate — which typically has no
   docker socket/network — so `docker_build_verified=False` there is the
-  expected, harmless outcome, not a bug. Container-native verification
-  (running the shipped health endpoint inside the built image) remains on
-  the roadmap.
+  expected, harmless outcome, not a bug. An opt-in `--docker-run-gate`
+  (`EngineConfig.docker_run_gate`) smoke-tests the built image, unconditionally
+  networkless and hardened, and records an advisory `docker_run_verified`
+  liveness signal. When the deployment plan names a
+  `health_check_command` (the DevOps agent supplies one when the app exposes
+  an HTTP health/readiness route), `docker_run_gate` additionally runs that
+  command **inside the container's own network namespace** via `docker exec`
+  — no new network surface, no published port — and records an advisory
+  `docker_health_verified`/`docker_health_detail` signal, closing the
+  "health endpoint inside the built image" half of container-native
+  verification. The harder host-reachable HTTP-probe variant (curling a
+  *published* port from outside the container) remains on the roadmap,
+  pending the inbound-allowed/outbound-denied network-isolation primitive
+  ROADMAP item 1 already flags as unsupported.
 
 ## The in-house advantage
 

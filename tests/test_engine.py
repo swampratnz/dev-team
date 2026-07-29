@@ -53,6 +53,7 @@ from dev_team.interaction import Reply, ScriptedChannel
 from dev_team.memory import CheckpointStore, RunCheckpoint
 from dev_team.models import (
     Design,
+    DeploymentPlan,
     FeatureRequest,
     Implementation,
     Plan,
@@ -4294,23 +4295,26 @@ def test_devops_ci_workflow_file_is_kept_when_opted_in():
     assert ".github/workflows/ci.yml" in outcome.workspace_files
 
 
-def _devops_response_with_dockerfile(path="Dockerfile", content="FROM python:3.12-slim\n"):
-    return json_response(
-        {
-            "environment": "production",
-            "summary": "containerised",
-            "steps": ["build image"],
-            "rollback": ["previous tag"],
-            "files": [
-                {
-                    "path": path,
-                    "change_type": "create",
-                    "summary": "app image",
-                    "content": content,
-                }
-            ],
-        }
-    )
+def _devops_response_with_dockerfile(
+    path="Dockerfile", content="FROM python:3.12-slim\n", health_check_command=None
+):
+    payload = {
+        "environment": "production",
+        "summary": "containerised",
+        "steps": ["build image"],
+        "rollback": ["previous tag"],
+        "files": [
+            {
+                "path": path,
+                "change_type": "create",
+                "summary": "app image",
+                "content": content,
+            }
+        ],
+    }
+    if health_check_command is not None:
+        payload["health_check_command"] = health_check_command
+    return json_response(payload)
 
 
 def test_docker_build_gate_off_by_default_no_docker_invoked():
@@ -4700,6 +4704,12 @@ def test_docker_run_gate_success_records_scorecard_and_cleans_up():
     assert outcome.scorecard["docker_build_verified"] is True
     assert outcome.scorecard["docker_run_verified"] is True
     assert "docker_run_detail" not in outcome.scorecard
+    # health_check_command unset (today's universal case): no docker exec for
+    # health-checking, and no docker_health_* scorecard keys at all (absent,
+    # not False).
+    assert "docker_health_verified" not in outcome.scorecard
+    assert "docker_health_detail" not in outcome.scorecard
+    assert not [c for c in cmd.calls if c[:2] == ["docker", "exec"]]
     run_calls = [c for c in cmd.calls if c[:2] == ["docker", "run"]]
     inspect_calls = [c for c in cmd.calls if c[:2] == ["docker", "inspect"]]
     stop_calls = [c for c in cmd.calls if c[:2] == ["docker", "stop"]]
@@ -4953,6 +4963,299 @@ def test_docker_run_gate_reuses_sandboxed_command_runner(tmp_path):
     # every command was containerised (rewritten into an outer `docker run`
     # against the sandbox image) rather than executed directly on the host.
     assert all(c[:2] == ["docker", "run"] and "toolchain:1" in c for c in fake.calls)
+
+
+def test_docker_run_gate_health_check_skipped_when_liveness_fails():
+    # ACCEPTANCE: docker_run_verified is not True (container exited early) ->
+    # the health-command exec is never attempted, regardless of the field.
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(
+        health_check_command=["curl", "-sf", "http://localhost:8080/health"]
+    )
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "false\n", "")
+    )
+    cmd.add_rule("docker logs", CommandResult(["docker", "logs"], 0, "crashed", ""))
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_run_verified"] is False
+    assert not [c for c in cmd.calls if c[:2] == ["docker", "exec"]]
+    assert "docker_health_verified" not in outcome.scorecard
+    assert "docker_health_detail" not in outcome.scorecard
+
+
+def test_docker_run_gate_health_check_skipped_when_build_fails():
+    # ACCEPTANCE: docker_run_gate=False path plus docker_build_verified is
+    # not True -> the health-command exec is never attempted either, even
+    # with health_check_command set.
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(
+        health_check_command=["curl", "-sf", "http://localhost:8080/health"]
+    )
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule("docker build", CommandResult(["docker", "build"], 1, "step 2/4 failed", ""))
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_build_verified"] is False
+    assert not [c for c in cmd.calls if c[:2] == ["docker", "exec"]]
+    assert "docker_health_verified" not in outcome.scorecard
+
+
+def test_docker_run_gate_health_check_success():
+    # ACCEPTANCE: health_check_command set, liveness passes, exec exits 0 ->
+    # docker_health_verified True, a docker-health-verified event emitted.
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(
+        health_check_command=["curl", "-sf", "http://localhost:8080/health"]
+    )
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", "")
+    )
+    cmd.add_rule("docker exec", CommandResult(["docker", "exec"], 0, "ok\n", ""))
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_run_verified"] is True
+    assert outcome.scorecard["docker_health_verified"] is True
+    assert "docker_health_detail" not in outcome.scorecard
+    exec_calls = [c for c in cmd.calls if c[:2] == ["docker", "exec"]]
+    run_calls = [c for c in cmd.calls if c[:2] == ["docker", "run"]]
+    assert len(exec_calls) == 1
+    tag = run_calls[0][-1]
+    # [security] exact argv: docker exec <tag> <health_check_command...> —
+    # no options inserted before/interleaved with the fixed tag.
+    assert exec_calls[0] == ["docker", "exec", tag, "curl", "-sf", "http://localhost:8080/health"]
+    verified_events = [e for e in events if e.stage == "docker-health-verified"]
+    assert len(verified_events) == 1
+
+
+def test_docker_run_gate_health_check_failure_records_detail():
+    # ACCEPTANCE: health_check_command set, liveness passes, exec exits
+    # non-zero -> docker_health_verified False, docker_health_detail
+    # populated (truncated), a docker-health-failed event emitted.
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(
+        health_check_command=["curl", "-sf", "http://localhost:8080/health"]
+    )
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", "")
+    )
+    cmd.add_rule(
+        "docker exec",
+        CommandResult(["docker", "exec"], 22, "", "curl: (22) The requested URL returned 500"),
+    )
+    events = []
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        listener=events.append,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_run_verified"] is True
+    assert outcome.scorecard["docker_health_verified"] is False
+    assert "returned 500" in outcome.scorecard["docker_health_detail"]
+    failed_events = [e for e in events if e.stage == "docker-health-failed"]
+    assert len(failed_events) == 1
+    assert "returned 500" in (failed_events[0].detail or "")
+
+
+def test_docker_run_gate_health_check_missing_binary_treated_as_failure():
+    # ACCEPTANCE: the docker exec invocation itself "failing to start" (the
+    # named binary genuinely missing from the image, exit 127) degrades to
+    # docker_health_verified=False with detail — never raised, never a
+    # delivery-blocking exception, identical handling to any other non-zero
+    # exit.
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(
+        health_check_command=["curl", "-sf", "http://localhost:8080/health"]
+    )
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", "")
+    )
+    cmd.add_rule(
+        "docker exec",
+        CommandResult(["docker", "exec"], 127, "", "OCI runtime exec failed: exec: \"curl\": not found"),
+    )
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    assert outcome.scorecard["docker_health_verified"] is False
+    assert "not found" in outcome.scorecard["docker_health_detail"]
+
+
+def test_docker_run_gate_health_check_argv_never_shell_interpreted():
+    # [security] health_check_command reaches docker exec as a list argv,
+    # never joined into a shell string / passed through shell=True — seed a
+    # value containing shell metacharacters and assert the constructed
+    # command list carries them verbatim as separate argv elements.
+    malicious_health_check = ["sh", "-c", "curl -sf http://localhost/health; rm -rf /"]
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(
+        health_check_command=malicious_health_check
+    )
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", "")
+    )
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    exec_calls = [c for c in cmd.calls if c[:2] == ["docker", "exec"]]
+    run_calls = [c for c in cmd.calls if c[:2] == ["docker", "run"]]
+    tag = run_calls[0][-1]
+    assert len(exec_calls) == 1
+    # each metacharacter-bearing element survives as its own argv item — no
+    # shell string was constructed anywhere in the path.
+    assert exec_calls[0] == ["docker", "exec", tag, *malicious_health_check]
+    assert exec_calls[0].count(";") == 0  # never collapsed into one string
+
+
+def test_docker_run_gate_health_check_does_not_alter_run_argv():
+    # [security] the docker run argv that starts the target container
+    # (_DOCKER_RUN_GATE_HARDENING, --network none) is byte-for-byte
+    # unchanged whether or not health_check_command is set — this feature
+    # only adds a step *after* the container is already running.
+    responses = engine_responses()
+    responses["DevOps engineer"] = _devops_response_with_dockerfile(
+        health_check_command=["curl", "-sf", "http://localhost:8080/health"]
+    )
+    ws = InMemoryWorkspace()
+    cmd = GateCycleRunner()
+    cmd.add_rule(
+        "docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", "")
+    )
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(docker_build_gate=True, docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is True
+    run_calls = [c for c in cmd.calls if c[:2] == ["docker", "run"]]
+    assert len(run_calls) == 1
+    tag = run_calls[0][-1]
+    assert run_calls[0] == [
+        "docker", "run", "-d", "--rm", "--network", "none",
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--memory", "2g",
+        "--cpus", "2",
+        "--pids-limit", "512",
+        "--name", tag, tag,
+    ]
+
+
+def test_docker_run_gate_direct_call_without_plan_skips_health_check():
+    # A direct _docker_run_gate() call (no plan argument, as pre-PR callers
+    # and existing unit tests do) behaves exactly as before this feature:
+    # no health_check_command to read means no docker exec is attempted.
+    fake = FakeCommandRunner()
+    fake.add_rule("docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", ""))
+    engine = _engine(
+        ScriptedRunner(by_system_prompt={}),
+        command_runner=fake,
+        config=EngineConfig(docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    engine._scorecard["docker_build_verified"] = True
+    run(engine._docker_run_gate())
+
+    assert not [c for c in fake.calls if c[:2] == ["docker", "exec"]]
+    assert "docker_health_verified" not in engine._scorecard
+
+
+def test_docker_run_gate_explicit_plan_with_empty_health_check_skips_exec():
+    # An explicit DeploymentPlan with health_check_command left empty (the
+    # DevOps agent's default when there's no HTTP health route to name)
+    # behaves identically to no plan at all.
+    fake = FakeCommandRunner()
+    fake.add_rule("docker inspect", CommandResult(["docker", "inspect"], 0, "true\n", ""))
+    engine = _engine(
+        ScriptedRunner(by_system_prompt={}),
+        command_runner=fake,
+        config=EngineConfig(docker_run_gate=True),
+    )
+    engine._docker_run_gate_grace_seconds = 0
+    engine._scorecard["docker_build_verified"] = True
+    plan = DeploymentPlan(environment="production", summary="s")
+    run(engine._docker_run_gate(plan))
+
+    assert not [c for c in fake.calls if c[:2] == ["docker", "exec"]]
+    assert "docker_health_verified" not in engine._scorecard
+
+
+def test_docker_run_gate_no_http_probe_introduced_by_health_check():
+    # SCOPE: the health-check step is a docker exec into the container's own
+    # namespace — nothing resembling a host-side HTTP client call.
+    import inspect as inspect_module
+
+    source = inspect_module.getsource(DeliveryEngine._docker_run_gate)
+    assert "docker exec" in source or '"exec"' in source
+    for token in ("requests.", "httpx.", "urllib.request", "aiohttp."):
+        assert token not in source
 
 
 def test_writer_docs_are_written_to_workspace():

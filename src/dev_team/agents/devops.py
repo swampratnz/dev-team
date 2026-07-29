@@ -22,8 +22,11 @@ a Linux (Ubuntu) host. Where the project lacks them, you author the actual
 deployment artifacts — Dockerfile, CI workflow, service configuration — as
 complete files, matched to the project's real stack and layout. Artifacts you
 author must be correct enough to execute; never invent build steps for tools
-the project does not use. Always respond with a single JSON object and
-nothing else."""
+the project does not use. When the deployment includes a container that
+exposes an HTTP health or readiness route, also name the exact in-container
+check command (e.g. ["curl", "-sf", "http://localhost:8080/health"]) as
+"health_check_command"; otherwise leave it empty. Always respond with a
+single JSON object and nothing else."""
 
 
 class DevOpsAgent(BaseAgent):
@@ -78,6 +81,7 @@ Respond with JSON of the form:
   "summary": "deployment approach",
   "steps": ["..."],
   "rollback": ["..."],
+  "health_check_command": ["curl", "-sf", "http://localhost:8080/health"],
   "files": [
     {{"path": "Dockerfile", "change_type": "create", "summary": "...", "content": "full file content"}}
   ]

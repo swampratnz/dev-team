@@ -285,6 +285,7 @@ def test_deployment_from_dict_defaults_environment():
     plan = parsing.deployment_from_dict({"summary": "s"})
     assert plan.environment == "production"
     assert plan.steps == []
+    assert plan.health_check_command == []
 
 
 def test_deployment_from_dict_full():
@@ -294,11 +295,13 @@ def test_deployment_from_dict_full():
             "summary": "s",
             "steps": ["a"],
             "rollback": ["b"],
+            "health_check_command": ["curl", "-sf", "http://localhost:8080/health"],
         }
     )
     assert plan.environment == "staging"
     assert plan.steps == ["a"]
     assert plan.rollback == ["b"]
+    assert plan.health_check_command == ["curl", "-sf", "http://localhost:8080/health"]
 
 
 def test_security_report_from_dict():

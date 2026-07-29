@@ -241,6 +241,30 @@ sections below are reconstructed from the repository history.
   on a session-turn error, or worktree-mode composition), shipped and
   reviewed under #69/#121 — this only flips the default and renames the
   opt-out flag.
+- **In-container health-command probe for `--docker-run-gate`** (#259),
+  #212's own named follow-up: `DeploymentPlan` gains an optional
+  `health_check_command` field (parsed via the existing `as_str_list`
+  helper, same pattern as `steps`/`rollback` — empty by default, so a
+  DevOps reply omitting it is byte-identical to today), which the DevOps
+  agent supplies when the deployment exposes an HTTP health/readiness
+  route. When `docker_run_gate`'s liveness check passes and the field is
+  non-empty, `_docker_run_gate` runs one further advisory
+  `docker exec <tag> <health_check_command...>` (argv, never a shell
+  string) **inside the already-running, already-networkless, already
+  capability-dropped target container's own namespace** — the target's
+  unconditional `--network none`/hardening invocation is untouched, and no
+  new network surface (published port, host-side HTTP client) is
+  introduced anywhere. Exit `0` records an advisory
+  `docker_health_verified=True` scorecard signal and a
+  `docker-health-verified` event; a non-zero exit (including the command
+  binary being missing from the image) records `docker_health_verified=
+  False` plus a truncated `docker_health_detail` and a `docker-health-failed`
+  event — never raised, never delivery-blocking, mirroring
+  `docker_build_gate`/`docker_run_gate`'s existing advisory-only contract.
+  The harder host-reachable HTTP-probe variant (curling a *published* port)
+  remains explicitly deferred pending `docs/ROADMAP.md` item 1's
+  inbound-allowed/outbound-denied network-isolation primitive.
+  `docs/BENCHMARKS.md`'s DevOps row updated accordingly.
 
 ### Orchestration
 - **`GET /jobs` gains `?repo=`/`?mode=`/`?state=` filters** (#221): three
