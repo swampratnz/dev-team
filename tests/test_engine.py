@@ -6249,3 +6249,107 @@ def test_described_engineer_receives_retrieved_context():
     assert any(
         '<file-content path="src/thing.py">' in c["prompt"] for c in engineer_calls
     )
+
+
+# --- retrieval into the agentic engineer path (#238) ------------------------
+
+
+def _retrieval_task():
+    # Fields overlap plan_dict()'s default task ("Task 1" / "do the thing" /
+    # "it works"), matching the file content below so retrieval ranks it in.
+    return Task(
+        id="T1", title="Task 1", description="do the thing",
+        acceptance_criteria=["it works"],
+    )
+
+
+def _write_retrievable_file(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "thing.py").write_text(
+        "def thing():\n    # it works\n    return 'the thing'\n"
+    )
+
+
+def test_engineer_attempt_cold_path_includes_retrieved_context(tmp_path):
+    _write_retrievable_file(tmp_path)
+    runner = ScriptedRunner([json_response(impl_dict())])
+    eng = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(retrieval=True),
+    )
+    impl, out = run(
+        eng._engineer_attempt(_retrieval_task(), Design(overview="o"), None, None,
+                              continued=False, model=None)
+    )
+    assert isinstance(impl, Implementation)
+    assert out is None
+    assert '<file-content path="src/thing.py">' in runner.calls[0]["prompt"]
+
+
+def test_engineer_attempt_session_path_includes_retrieved_context(tmp_path):
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    _write_retrievable_file(tmp_path)
+    eng = _engine(
+        ScriptedRunner([]),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(retrieval=True),
+    )
+    fake = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
+    session = InstrumentedSession(fake, "engineer")
+    impl, out = run(
+        eng._engineer_attempt(_retrieval_task(), Design(overview="o"), None, session,
+                              continued=False, model=None)
+    )
+    assert isinstance(impl, Implementation)
+    assert out is session
+    assert '<file-content path="src/thing.py">' in fake.prompts[0]
+
+
+def test_engineer_attempt_session_continuation_never_gets_retrieved_context(tmp_path):
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    _write_retrievable_file(tmp_path)
+    eng = _engine(
+        ScriptedRunner([]),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(retrieval=True),
+    )
+    fake = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
+    session = InstrumentedSession(fake, "engineer")
+    run(
+        eng._engineer_attempt(_retrieval_task(), Design(overview="o"), None, session,
+                              continued=True, model=None)
+    )
+    assert "Most relevant existing code" not in fake.prompts[0]
+
+
+def test_engineer_attempt_no_relevant_code_when_retrieval_off(tmp_path):
+    _write_retrievable_file(tmp_path)
+    runner = ScriptedRunner([json_response(impl_dict())])
+    eng = _engine(runner, workspace=LocalWorkspace(str(tmp_path)))  # retrieval off
+    impl, out = run(
+        eng._engineer_attempt(_retrieval_task(), Design(overview="o"), None, None,
+                              continued=False, model=None)
+    )
+    assert isinstance(impl, Implementation)
+    assert "Most relevant existing code" not in runner.calls[0]["prompt"]
+
+
+def test_worktree_engineer_receives_retrieved_context(tmp_path):
+    # Parity with the non-worktree cases above: _develop_task_in_worktree
+    # routes through the same _engineer_attempt, so it must get the same
+    # retrieved context.
+    _write_retrievable_file(tmp_path)
+    cmd = DispatchCommandRunner(rev_shas=["BASE", "TIP"])
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _worktree_engine(tmp_path, runner, cmd, retrieval=True)
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    eng_call = next(
+        c for c in runner.calls if "in the current working directory" in c["prompt"]
+    )
+    assert '<file-content path="src/thing.py">' in eng_call["prompt"]
