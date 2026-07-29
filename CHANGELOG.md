@@ -5,6 +5,14 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Documentation
+- **`docs/ROADMAP.md` item 7 correction:** the closing sentence claiming
+  "the dashboard and Slack adapters remain future work" was stale for its
+  dashboard half — the dashboard's "Pending questions" panel
+  (`docs/DASHBOARD.md`) already shipped. Item 7 now cites that panel by
+  name and keeps the Slack adapter correctly marked as deferred (a new
+  external service credential, out of scope per the standing guardrail).
+
 ### Dispatch
 - **On-demand bulk purge** (`docs/DISPATCH.md`): `GET`/`POST
   /jobs/purge?archived_before=<epoch-seconds>` — the still-deferred second

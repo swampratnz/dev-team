@@ -280,7 +280,12 @@ that loop's channel — `team.interaction` (plan review, approvals) is
 untouched. **Exposure change to weigh before enabling:** this posts the CI
 failure summary as a plain, repo-visible PR comment, a broader audience than
 the terminal or dispatch's bearer-token-gated question endpoint (#87) — see
-`docs/INTERACTION.md`. The dashboard and Slack adapters remain future work.
+`docs/INTERACTION.md`. **Dashboard adapter (shipped):** `docs/DASHBOARD.md`'s
+"Pending questions" panel is the dashboard-side "questions as buttons"
+surface named above, built on the same #87 primitive. **Slack adapter
+(still future work):** deferred because it would require a new external
+service credential, which the standing security guardrail (CLAUDE.md
+§2/§7, `docs/VISION.md`) disallows without an approved pattern.
 
 ## 8. MCP tool provider & group review
 
