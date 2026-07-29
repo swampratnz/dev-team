@@ -1085,6 +1085,15 @@ sections below are reconstructed from the repository history.
   keep the heuristic false-positive-free.
 
 ### Documentation
+- **`docs/BENCHMARKS.md` no longer contradicts `docs/ROADMAP.md`**: the
+  Engineer section's "session continuity across attempts" bullet and the
+  Product manager / planner section's "Dynamic re-planning on failure"
+  bullet were both still marked `→ roadmap` after the underlying features
+  shipped (ROADMAP #5 and #3 respectively); both now read ✅ and cite the
+  live config surface (`EngineConfig.reuse_engineer_session`,
+  `EngineConfig.max_replan_rounds`). Same class of fix as the
+  `TROUBLESHOOTING.md` correction below, scoped to `BENCHMARKS.md`'s own
+  internal drift against `ROADMAP.md`.
 - **Invalid-JSON detection in shipped docs** (`doc_claim_issues`,
   `techwriter.py`): fenced `json` blocks are now parsed with stdlib
   `json.loads`, and a malformed example (trailing comma, unbalanced brace,
