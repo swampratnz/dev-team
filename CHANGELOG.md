@@ -25,6 +25,27 @@ sections below are reconstructed from the repository history.
   the query string. Operator-only auth, same as `/costs`/`/calibration`.
 
 ### Assessment
+- **OSV scan covers Maven `pom.xml` dependencies** (`depscan.py`), closing
+  the last ecosystem gap named in `docs/ASSESSMENT.md`'s "Honest
+  limitations": Java's *runtime* already got a live EOL scan through this
+  same file (`eolscan.py:parse_pom_xml_java`, #199/#201) but its
+  *dependencies* never did — Maven was the one scanned ecosystem missing the
+  dependency-CVE half every other stack has. A new `parse_pom_xml_deps`
+  reuses the exact namespace-stripping XML idiom (`tag.rsplit("}", 1)[-1]`)
+  and `except (ET.ParseError, ValueError)` degrade-to-`[]` contract
+  `parse_pom_xml_java` already established for this file format — no new
+  parsing primitive. Only the root's top-level `<dependencies>` block is
+  read (never `<dependencyManagement>` or `<profile>`-scoped blocks, the
+  same conditional-build-context reasoning `parse_pom_xml_java` already
+  applies); each `<dependency>` needs a `<groupId>`, `<artifactId>`, and a
+  literal (non-`${property}`) `<version>` to count as a pin — anything
+  else is skipped, never guessed at. Emits `Dependency("groupId:
+  artifactId", version, "Maven", manifest)`, the OSV.dev-defined
+  ecosystem/name convention. Registered in `_PARSERS["pom.xml"]`; no
+  changes needed to `collect_dependencies`'s traversal, supersede rule, or
+  `_MAX_DEPENDENCIES` truncation — all three already generalise unmodified.
+  `docs/ASSESSMENT.md` updated to name the new coverage and its
+  literal-pins-only limitation.
 - **Live EOL/support-status scan covers Gradle Java projects**
   (`eolscan.py`), closing the follow-up #199 explicitly deferred: Java
   runtime coverage previously came only from Maven's `pom.xml`, so a

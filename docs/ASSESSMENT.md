@@ -126,7 +126,13 @@ machinery understands them now:
   ranges (lower bound only, superseded by `composer.lock` when present);
   wider forms — OR-lists (`||`), comma-separated AND-lists, and `dev-*`
   branch aliases — still fall back to model knowledge, since resolving them
-  correctly needs Composer's own dependency resolver.
+  correctly needs Composer's own dependency resolver. Maven `pom.xml`
+  top-level `<dependencies>` entries with a literal, non-property `<version>`
+  are live-scanned (ecosystem `Maven`, package name `groupId:artifactId`);
+  `<dependencyManagement>` and `<profile>`-scoped dependency blocks are not
+  read, and a `${property}`-interpolated or inherited (parent-POM/BOM)
+  version is skipped rather than guessed at, so it falls back to model
+  knowledge.
 - **Detected Node.js/Python/.NET/Ruby/Go/PHP/Java runtime versions get a
   live endoflife.date EOL/support-status check; every other EOL/support-
   status judgment (other runtimes, frameworks, libraries) is model
@@ -184,10 +190,11 @@ involved, so their findings are exact and citable:
   reason when preconditions are missing (no git, SDK-style projects).
 - **Live dependency scan** — exact pins from the manifests
   (`packages.config`, `package.json`, `requirements.txt`, `Cargo.toml`,
-  Go `go.mod`) and the lockfiles (`package-lock.json`, `poetry.lock`,
-  `Cargo.lock`, NuGet `packages.lock.json`, Ruby `Gemfile.lock`, PHP
-  `composer.lock`) queried against OSV.dev in one batch (`--no-osv-scan`
-  opts out; offline degrades to a labelled model-knowledge fallback).
+  Go `go.mod`, Maven `pom.xml`) and the lockfiles (`package-lock.json`,
+  `poetry.lock`, `Cargo.lock`, NuGet `packages.lock.json`, Ruby
+  `Gemfile.lock`, PHP `composer.lock`) queried against OSV.dev in one batch
+  (`--no-osv-scan` opts out; offline degrades to a labelled
+  model-knowledge fallback).
 - **Live EOL/support-status scan** — Node.js/Python/.NET/Ruby/Go/PHP/Java
   runtime versions detected from `package.json`/`.nvmrc`/`runtime.txt`/
   `.python-version`/`global.json`/`.ruby-version`/`go.mod`/
