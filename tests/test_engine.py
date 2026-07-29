@@ -2030,6 +2030,7 @@ def test_debate_overturns_a_block_when_the_judge_agrees(tmp_path):
     review = _run_debate(engine)
     assert review.approved is True
     assert "overturned on debate" in review.summary
+    assert engine._scorecard.get("review_debate_overturned") == 1
 
 
 def test_debate_upholds_a_block_when_the_judge_disagrees(tmp_path):
@@ -2039,6 +2040,8 @@ def test_debate_upholds_a_block_when_the_judge_disagrees(tmp_path):
         judgment={"overturn": False, "rationale": "the finding stands"},
     )
     assert _run_debate(engine).approved is False
+    assert engine._scorecard.get("review_debate_upheld") == 1
+    assert "review_debate_human_overridden" not in engine._scorecard
 
 
 def test_debate_short_circuits_when_the_engineer_concedes(tmp_path):
@@ -2052,6 +2055,9 @@ def test_debate_short_circuits_when_the_engineer_concedes(tmp_path):
     assert not any(
         "application security engineer" in (c["system_prompt"] or "") for c in runner.calls
     )
+    assert engine._scorecard.get("review_debate_conceded") == 1
+    for key in ("review_debate_upheld", "review_debate_overturned", "review_debate_human_overridden"):
+        assert key not in engine._scorecard
 
 
 def test_debate_skips_when_there_are_no_blocking_comments(tmp_path):
@@ -2072,6 +2078,13 @@ def test_debate_skips_when_there_are_no_blocking_comments(tmp_path):
     )
     assert out is minor  # returned unchanged; no agent was consulted
     assert runner.calls == []
+    for key in (
+        "review_debate_conceded",
+        "review_debate_upheld",
+        "review_debate_overturned",
+        "review_debate_human_overridden",
+    ):
+        assert key not in engine._scorecard
 
 
 def test_debate_skips_when_budget_already_exhausted(tmp_path):
@@ -2081,6 +2094,13 @@ def test_debate_skips_when_budget_already_exhausted(tmp_path):
     engine._budget_exhausted = True
     assert _run_debate(engine).approved is False
     assert runner.calls == []
+    for key in (
+        "review_debate_conceded",
+        "review_debate_upheld",
+        "review_debate_overturned",
+        "review_debate_human_overridden",
+    ):
+        assert key not in engine._scorecard
 
 
 def test_debate_upholds_and_marks_exhaustion_on_budget_error(tmp_path):
@@ -2097,6 +2117,7 @@ def test_debate_upholds_and_marks_exhaustion_on_budget_error(tmp_path):
     review = _run_debate(engine)
     assert review.approved is False  # fails closed: the block stands
     assert engine._budget_exhausted is True
+    assert engine._scorecard.get("review_debate_upheld") == 1
 
 
 def test_debate_overturn_escalates_to_a_human_who_accepts(tmp_path):
@@ -2110,6 +2131,8 @@ def test_debate_overturn_escalates_to_a_human_who_accepts(tmp_path):
     review = _run_debate(engine)
     assert review.approved is True
     assert channel.questions[0].topic == "review-dispute"
+    assert engine._scorecard.get("review_debate_overturned") == 1
+    assert "review_debate_human_overridden" not in engine._scorecard
 
 
 def test_debate_overturn_escalates_to_a_human_who_upholds(tmp_path):
@@ -2122,6 +2145,8 @@ def test_debate_overturn_escalates_to_a_human_who_upholds(tmp_path):
     )
     # the human overrides the judge's overturn: the block stands
     assert _run_debate(engine).approved is False
+    assert engine._scorecard.get("review_debate_upheld") == 1
+    assert engine._scorecard.get("review_debate_human_overridden") == 1
 
 
 def test_debate_wired_into_delivery_overturns_and_completes(tmp_path):
@@ -2157,6 +2182,7 @@ def test_debate_wired_into_delivery_overturns_and_completes(tmp_path):
     assert outcome.success is True
     assert outcome.task_results[0].attempts == 1
     assert outcome.task_results[0].task.status is TaskStatus.DONE
+    assert outcome.scorecard.get("review_debate_overturned") == 1
 
 
 def test_delivery_outcome_property_edges():
