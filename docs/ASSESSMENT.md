@@ -132,7 +132,16 @@ machinery understands them now:
   `<dependencyManagement>` and `<profile>`-scoped dependency blocks are not
   read, and a `${property}`-interpolated or inherited (parent-POM/BOM)
   version is skipped rather than guessed at, so it falls back to model
-  knowledge.
+  knowledge. NuGet SDK-style `.csproj` `<PackageReference Include=...
+  Version=...>` entries are live-scanned too (inline `Version` attribute or
+  child-element forms only): a bracket-exact version (`[1.2.3]`) is an exact
+  pin, a bare version (`1.2.3`) is a lower-bound floor superseded by an
+  exact pin the same way `package.json`'s `^`/`~` ranges are. Central
+  Package Management (`Directory.Packages.props`, where a versionless
+  `PackageReference` resolves from a separate file) and full NuGet
+  version-range grammar (`[1.0,2.0)`, open bounds, comma lists) still fall
+  back to model knowledge — resolving either needs build-graph or resolver
+  semantics this static parser doesn't have.
 - **Detected Node.js/Python/.NET/Ruby/Go/PHP/Java runtime versions get a
   live endoflife.date EOL/support-status check; every other EOL/support-
   status judgment (other runtimes, frameworks, libraries) is model
@@ -189,7 +198,8 @@ involved, so their findings are exact and citable:
   `dormancy_days` (default 365). Probes skip themselves with a recorded
   reason when preconditions are missing (no git, SDK-style projects).
 - **Live dependency scan** — exact pins from the manifests
-  (`packages.config`, `package.json`, `requirements.txt`, `Cargo.toml`,
+  (`packages.config`, `.csproj` `<PackageReference>`, `package.json`,
+  `requirements.txt`, `Cargo.toml`,
   Go `go.mod`, Maven `pom.xml`) and the lockfiles (`package-lock.json`,
   `poetry.lock`, `Cargo.lock`, NuGet `packages.lock.json`, Ruby
   `Gemfile.lock`, PHP `composer.lock`) queried against OSV.dev in one batch
