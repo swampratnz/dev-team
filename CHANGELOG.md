@@ -31,6 +31,15 @@ sections below are reconstructed from the repository history.
   non-numeric, or `inf`/`nan` is a `400` before any eligibility walk runs,
   so an operator can never accidentally trigger a full purge by omitting
   the query string. Operator-only auth, same as `/costs`/`/calibration`.
+- **`GET /jobs?story_id=`** (`docs/DISPATCH.md`): one more exact-match
+  filter on the job list, mirroring `?repo=`/`?mode=`/`?state=` (#221) —
+  the "Natural growth" item #221 itself deferred, now that the backlog
+  foreman's `story_id`-tagged jobs make it a real, named need. AND-composed
+  with the existing filters and `?archived=`, applied before
+  `?limit=`/`?offset=` pagination; a job with no `story_id` (not
+  foreman-enqueued) never matches a non-empty filter value, and an
+  unrecognised or empty value is lenient (never a `400`), same as every
+  other filter on this route.
 
 ### Security
 - **Opt-in `--sandbox-userns` for per-job UID/GID separation** (#246):

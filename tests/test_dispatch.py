@@ -1017,14 +1017,15 @@ def test_calibration_report_quality_excludes_archived_job_and_reappears_after_un
 # --- costs rollup ---------------------------------------------------------
 
 
-def _insert_job(disp, job_id, mode, state, cost_usd, repo="acme/mono"):
+def _insert_job(disp, job_id, mode, state, cost_usd, repo="acme/mono",
+                 story_id=None):
     """Register a job directly in the registry, bypassing submit/run_job —
     lets one test exercise every state/cost combination with no real clone
     or agent run."""
 
     spec = JobSpec(
         mode=mode, repo=repo, title="T", description="D",
-        budget_usd=None, id=job_id,
+        budget_usd=None, id=job_id, story_id=story_id,
     )
     disp._registry[job_id] = JobRecord(spec=spec, state=state, cost_usd=cost_usd)
     disp._order.append(job_id)
@@ -3828,6 +3829,143 @@ def test_jobs_list_http_route_filters_never_leak_across_tenants():
         session_token = _sign_in(server)
         status, payload = _call(
             server, "/jobs?repo=other/mono&mode=assess&state=queued",
+            token=session_token,
+        )
+        assert status == 200
+        assert payload["jobs"] == []
+
+
+def test_jobs_list_http_route_story_id_query_param():
+    # AC1: ?story_id= narrows the list to jobs tagged with that story,
+    # excluding a differently-tagged job and a plain (story_id=None) job.
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "j1", "deliver", "queued", None,
+                    story_id="S-042")
+        _insert_job(server.dispatcher, "j2", "deliver", "queued", None,
+                    story_id="S-999")
+        _insert_job(server.dispatcher, "j3", "assess", "queued", None)
+
+        status, payload = _call(server, "/jobs?story_id=S-042")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == ["j1"]
+
+
+def test_jobs_list_http_route_story_id_and_repo_compose_with_and():
+    # AC2: two jobs share story_id="S-042" but differ by repo — neither
+    # filter alone is empty, but together (AND, not OR) only one matches.
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "j1", "deliver", "queued", None,
+                    repo="acme/rota", story_id="S-042")
+        _insert_job(server.dispatcher, "j2", "deliver", "queued", None,
+                    repo="other/repo", story_id="S-042")
+        status, payload = _call(
+            server, "/jobs?story_id=S-042&repo=acme/rota"
+        )
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == ["j1"]
+
+
+def test_jobs_list_http_route_story_id_filter_before_limit_offset_slice():
+    # AC3: filtering by story_id happens before pagination, not after.
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "other", "assess", "queued", None,
+                    story_id="S-999")
+        for i in range(4):
+            _insert_job(server.dispatcher, f"m{i}", "assess", "queued", None,
+                        story_id="S-042")
+        status, payload = _call(
+            server, "/jobs?story_id=S-042&limit=1&offset=1"
+        )
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == ["m2"]
+
+
+def test_jobs_list_http_route_story_id_filter_composes_with_archived():
+    # AC4: an archived job matching ?story_id= stays excluded unless
+    # ?archived=1.
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/j1/meta.json",
+        json.dumps({"repo": "acme/rota", "mode": "assess", "id": "j1"}),
+    )
+    with running(dashboard_workspace=dash) as server:
+        _insert_job(server.dispatcher, "j1", "assess", "succeeded", None,
+                    repo="acme/rota", story_id="S-042")
+        _call(server, "/jobs/j1/archive", method="POST")
+
+        status, payload = _call(server, "/jobs?story_id=S-042")
+        assert status == 200
+        assert payload["jobs"] == []
+
+        status, payload = _call(server, "/jobs?story_id=S-042&archived=1")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == ["j1"]
+
+
+def test_jobs_list_http_route_lenient_on_unrecognised_and_empty_story_id():
+    # AC5: an unrecognised ?story_id= never errors, just yields zero
+    # matches; an empty value is treated the same as an absent key
+    # (unfiltered).
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "j1", "assess", "queued", None,
+                    story_id="S-042")
+
+        status, payload = _call(server, "/jobs?story_id=bogus")
+        assert status == 200
+        assert payload["jobs"] == []
+
+        status, payload = _call(server, "/jobs?story_id=")
+        assert status == 200
+        assert [j["id"] for j in payload["jobs"]] == ["j1"]
+
+
+def test_jobs_list_http_route_story_id_never_matches_plain_job():
+    # AC6: a plain, non-foreman job (story_id=None) never matches any
+    # non-empty ?story_id= value — "no story" is "no match", not a
+    # wildcard.
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "j1", "assess", "queued", None)
+
+        status, payload = _call(server, "/jobs?story_id=S-042")
+        assert status == 200
+        assert payload["jobs"] == []
+
+
+def test_jobs_list_http_route_story_id_filter_fuzzed_with_traversal_and_shell_strings():
+    # AC7 [security]: ?story_id= is only ever compared as a plain string —
+    # a path-traversal or shell-metacharacter value must never error or
+    # match anything, proving no filesystem/subprocess use of the value.
+    with running(materialise=_mem_materialise) as server:
+        _insert_job(server.dispatcher, "j1", "assess", "queued", None,
+                    story_id="S-042")
+        for fuzz in ("../../../etc/passwd", "$(rm -rf /)"):
+            status, payload = _call(
+                server, f"/jobs?story_id={urllib.parse.quote(fuzz, safe='')}"
+            )
+            assert status == 200
+            assert payload["jobs"] == []
+
+
+def test_jobs_list_http_route_story_id_filter_never_leaks_across_tenants():
+    # AC8: ?story_id= filtering never surfaces another tenant's job to a
+    # signed-in session, even when it matches the filter — the foreign job
+    # matches story_id and the exact repo= we query with; only tenant
+    # scoping keeps it out.
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth) as server:
+        _insert_job(server.dispatcher, "assess-own", "assess", "queued", None,
+                    repo="acme/mono", story_id="S-042")
+        foreign = JobSpec(mode="assess", repo="other/mono", title="T",
+                          description="", budget_usd=None, id="assess-theirs",
+                          story_id="S-042")
+        with server.dispatcher._lock:
+            server.dispatcher._registry["assess-theirs"] = JobRecord(
+                spec=foreign, state="queued"
+            )
+            server.dispatcher._order.append("assess-theirs")
+        session_token = _sign_in(server)
+        status, payload = _call(
+            server, "/jobs?story_id=S-042&repo=other/mono",
             token=session_token,
         )
         assert status == 200
