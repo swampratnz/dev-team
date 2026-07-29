@@ -332,6 +332,7 @@ def deployment_from_dict(data: Any) -> DeploymentPlan:
         summary=as_str(data, "summary"),
         steps=as_str_list(data, "steps"),
         rollback=as_str_list(data, "rollback"),
+        health_check_command=as_str_list(data, "health_check_command"),
     )
 
 

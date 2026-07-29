@@ -238,9 +238,15 @@ class EngineConfig:
       logs`` when the container exited early, or when the initial ``docker
       run`` itself failed to start) — never a rejection, retry, or rollback.
       ``--network none`` and the hardening flags are unconditional; there is
-      no override. A best-effort ``docker stop``/``docker rmi`` cleanup
-      always runs afterwards, success or failure. Off by default. See
-      ``docs/BENCHMARKS.md`` (DevOps) and ROADMAP.
+      no override. When the container is still running and the deployment
+      plan's ``health_check_command`` is non-empty, one further advisory
+      ``docker exec <tag> <health_check_command...>`` runs inside the
+      container's own network namespace (argv, never a shell string) and
+      records ``docker_health_verified``/``docker_health_detail`` — absent
+      (not ``False``) when the field is empty. A best-effort ``docker
+      stop``/``docker rmi`` cleanup always runs afterwards, success or
+      failure. Off by default. See ``docs/BENCHMARKS.md`` (DevOps) and
+      ROADMAP.
     """
 
     model: Optional[str] = None
@@ -3437,7 +3443,7 @@ class DeliveryEngine:
                 ", ".join(c.path for c in artifacts.files if c.path),
             )
         await self._docker_build_gate()
-        await self._docker_run_gate()
+        await self._docker_run_gate(plan)
         return plan
 
     async def _docker_build_gate(self) -> None:
@@ -3546,7 +3552,7 @@ class DeliveryEngine:
                     detail=cleanup_result.output or None,
                 )
 
-    async def _docker_run_gate(self) -> None:
+    async def _docker_run_gate(self, plan: Optional[DeploymentPlan] = None) -> None:
         """Advisory-only: smoke-test the image ``_docker_build_gate`` built.
 
         Off unless ``docker_run_gate`` is set, and short-circuits unless the
@@ -3581,6 +3587,17 @@ class DeliveryEngine:
         - Still running → ``docker_run_verified = True``.
         - Exited early → ``docker_run_verified = False``, plus a truncated
           ``docker_run_detail`` captured from ``docker logs <tag>``.
+
+        When the container is still running and ``plan.health_check_command``
+        is non-empty, one further advisory step runs *in the container's own
+        network namespace* via ``docker exec <tag> <health_check_command...>``
+        (argv, never a shell string) through the same ``command_runner`` —
+        the target's ``--network none`` invocation above is never touched by
+        this step. Exit code ``0`` → ``docker_health_verified = True``;
+        non-zero (including the health command binary being missing from the
+        image, e.g. exit 127) → ``docker_health_verified = False`` plus a
+        truncated ``docker_health_detail``. When the field is empty (today's
+        default) neither key is set — absent, not ``False``.
 
         Records the outcome as advisory scorecard keys only — it never
         raises, blocks, or rolls back the delivery. A best-effort
@@ -3632,6 +3649,28 @@ class DeliveryEngine:
                 "docker-run-verified",
                 f"advisory docker run stayed up (tag={tag})",
             )
+            health_check_command = list(plan.health_check_command) if plan else []
+            if health_check_command:
+                exec_result = await asyncio.to_thread(
+                    self.command_runner.run,
+                    ["docker", "exec", tag, *health_check_command],
+                    cwd=self.workdir,
+                    timeout=self.config.gate_timeout_seconds,
+                )
+                self._scorecard["docker_health_verified"] = exec_result.ok
+                if exec_result.ok:
+                    self._event(
+                        "docker-health-verified",
+                        f"advisory in-container health check passed (tag={tag})",
+                    )
+                else:
+                    health_detail = _truncate_detail(exec_result.output)
+                    self._scorecard["docker_health_detail"] = health_detail
+                    self._event(
+                        "docker-health-failed",
+                        f"advisory in-container health check failed (tag={tag})",
+                        detail=health_detail,
+                    )
         else:
             logs_result = await asyncio.to_thread(
                 self.command_runner.run,

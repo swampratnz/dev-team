@@ -199,6 +199,7 @@ class DeploymentPlan:
     summary: str
     steps: List[str] = field(default_factory=list)
     rollback: List[str] = field(default_factory=list)
+    health_check_command: List[str] = field(default_factory=list)
 
 
 @dataclass
