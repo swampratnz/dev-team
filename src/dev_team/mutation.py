@@ -8,8 +8,10 @@ its *behaviour* (e.g. asserting no exception, never asserting on the
 comparison or boolean condition that makes the logic correct). A single
 flipped comparison (``==``↔``!=``, ``<``↔``>=``, ``>``↔``<=``,
 ``is``↔``is not``, ``in``↔``not in``), boolean operator (``and``↔``or``), or
-arithmetic operator (``+``↔``-``, ``*``↔``/``) that still passes the existing
-suite is the textbook signature of that gap.
+arithmetic operator (``+``↔``-``, ``*``↔``/``) — on a plain expression
+(``ast.BinOp``) or an augmented assignment (``ast.AugAssign``, e.g.
+``x += 1``) alike — that still passes the existing suite is the textbook
+signature of that gap.
 
 This module is a pure, dependency-free AST transform — no subprocess, no
 network, no model call. It never mutates anything on disk itself; the caller
@@ -53,8 +55,10 @@ _BOOL_FLIPS: Dict[Type[ast.boolop], Type[ast.boolop]] = {
 # The arithmetic-operator flips this mutator knows: exactly the two pairs
 # named as v1's deferred follow-up (``+``/``-``, ``*``/``/``). Deliberately
 # excludes every other ``ast.operator`` (``FloorDiv``, ``Mod``, ``Pow``,
-# bitwise ``&``/``|``/``^``, matrix ``@``) — a ``BinOp`` using one of those
-# alone is not a candidate, by construction of not being a key here.
+# bitwise ``&``/``|``/``^``, matrix ``@``) — a ``BinOp`` or ``AugAssign``
+# using one of those alone is not a candidate, by construction of not being a
+# key here. ``AugAssign.op`` is the same ``ast.operator`` subtype as
+# ``BinOp.op``, so this one table covers both node kinds.
 _ARITH_FLIPS: Dict[Type[ast.operator], Type[ast.operator]] = {
     ast.Add: ast.Sub,
     ast.Sub: ast.Add,
@@ -62,11 +66,11 @@ _ARITH_FLIPS: Dict[Type[ast.operator], Type[ast.operator]] = {
     ast.Div: ast.Mult,
 }
 
-_Mutant = Union[ast.Compare, ast.BoolOp, ast.BinOp]
+_Mutant = Union[ast.Compare, ast.BoolOp, ast.BinOp, ast.AugAssign]
 
 
 class _FlipMutant(ast.NodeTransformer):
-    """Replaces one specific ``Compare``/``BoolOp``/``BinOp`` node's operator with its flip."""
+    """Replaces one specific ``Compare``/``BoolOp``/``BinOp``/``AugAssign`` node's operator with its flip."""
 
     def __init__(self, target: _Mutant) -> None:
         self._target = target
@@ -92,9 +96,16 @@ class _FlipMutant(ast.NodeTransformer):
             node.op = ast.copy_location(flipped, node.op)
         return node
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        self.generic_visit(node)
+        if node is self._target:
+            flipped = _ARITH_FLIPS[type(node.op)]()
+            node.op = ast.copy_location(flipped, node.op)
+        return node
+
 
 def _mutation_candidates(tree: ast.AST) -> List[_Mutant]:
-    """Every flippable ``Compare``/``BoolOp``/``BinOp`` node in ``tree``.
+    """Every flippable ``Compare``/``BoolOp``/``BinOp``/``AugAssign`` node in ``tree``.
 
     A chained comparison (``a < b < c``, more than one op) is not a
     candidate — conservative by design, mirroring
@@ -103,10 +114,11 @@ def _mutation_candidates(tree: ast.AST) -> List[_Mutant]:
     maps every :class:`ast.cmpop` subtype to its logical opposite, so there
     is no longer an "operator outside ``_FLIPS``" case to guard against
     (unlike the chained-comparison case above). Every ``BoolOp`` node
-    qualifies unconditionally too. A ``BinOp`` qualifies only when its
-    operator is a key in :data:`_ARITH_FLIPS` (``+``/``-``/``*``/``/``) —
-    every other :class:`ast.operator` (``%``, ``**``, ``//``, ``&``, ``|``,
-    ``^``, ``@``) is out of scope and never selected.
+    qualifies unconditionally too. A ``BinOp`` or ``AugAssign`` qualifies
+    only when its operator is a key in :data:`_ARITH_FLIPS`
+    (``+``/``-``/``*``/``/``, covering both ``x + y`` and ``x += y`` style
+    arithmetic) — every other :class:`ast.operator` (``%``, ``**``, ``//``,
+    ``&``, ``|``, ``^``, ``@``) is out of scope and never selected.
     """
 
     candidates: List[_Mutant] = []
@@ -119,6 +131,8 @@ def _mutation_candidates(tree: ast.AST) -> List[_Mutant]:
             candidates.append(node)
         elif isinstance(node, ast.BinOp) and type(node.op) in _ARITH_FLIPS:
             candidates.append(node)
+        elif isinstance(node, ast.AugAssign) and type(node.op) in _ARITH_FLIPS:
+            candidates.append(node)
     return candidates
 
 
@@ -129,10 +143,11 @@ def mutate_first_mutant(source: str) -> Optional[str]:
     Walks the parsed AST for every single-operator comparison using one of
     ``==``/``!=``/``<``/``>=``/``>``/``<=``/``is``/``is not``/``in``/
     ``not in``, every boolean operator (``and``/``or``), and every
-    arithmetic operator using one of ``+``/``-``/``*``/``/``, picks the one
-    earliest in source order (by line, then column), flips it to its
-    logical (or arithmetic) opposite, and returns the unparsed mutated
-    source.
+    arithmetic operator using one of ``+``/``-``/``*``/``/`` — whether
+    written as a ``BinOp`` expression (``x + y``) or an augmented assignment
+    (``x += y``) — picks the one earliest in source order (by line, then
+    column), flips it to its logical (or arithmetic) opposite, and returns
+    the unparsed mutated source.
 
     Returns ``None`` — a silent skip, never an error — when ``source`` does
     not parse, or contains no flippable comparison, boolean, or arithmetic

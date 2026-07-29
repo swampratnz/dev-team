@@ -376,3 +376,93 @@ def test_mutation_and_engine_docstrings_mention_arithmetic():
 
     assert mutation_module.__doc__ is not None
     assert "arithmetic" in mutation_module.__doc__.lower()
+
+
+# --- augmented-assignment arithmetic flips (issue #257) -------------------
+
+
+def test_flips_augassign_add_to_sub():
+    mutated = mutate_first_mutant("def f():\n    total = 0\n    total += 1\n    return total\n")
+    assert mutated is not None
+    assert "total -= 1" in mutated
+    assert "total += 1" not in mutated
+
+
+def test_flips_augassign_sub_to_add():
+    mutated = mutate_first_mutant(
+        "def f(step):\n    count = 0\n    count -= step\n    return count\n"
+    )
+    assert mutated is not None
+    assert "count += step" in mutated
+    assert "count -= step" not in mutated
+
+
+def test_flips_augassign_mult_to_div():
+    mutated = mutate_first_mutant("def f():\n    x = 1\n    x *= 2\n    return x\n")
+    assert mutated is not None
+    assert "x /= 2" in mutated
+    assert "x *= 2" not in mutated
+
+
+def test_flips_augassign_div_to_mult():
+    mutated = mutate_first_mutant("def f():\n    y = 1\n    y /= 2\n    return y\n")
+    assert mutated is not None
+    assert "y *= 2" in mutated
+    assert "y /= 2" not in mutated
+
+
+@pytest.mark.parametrize("op", ["//=", "**=", "%=", "&="])
+def test_out_of_scope_augassign_operator_alone_returns_none(op):
+    # Mirrors test_out_of_scope_arith_operator_alone_returns_none for the
+    # AugAssign node kind: `//=`/`**=`/`%=`/bitwise-`&=` etc. are not in
+    # `_ARITH_FLIPS` — a file whose only construct is one of these must
+    # never be selected.
+    source = f"def f(a):\n    x = a\n    x {op} 2\n    return x\n"
+    assert mutate_first_mutant(source) is None
+
+
+def test_augassign_only_file_returns_a_mutant():
+    # Core new-coverage assertion: pre-#257, a file whose only arithmetic
+    # was an augmented assignment yielded zero candidates (`AugAssign` has
+    # no child `BinOp` for the walk to find) and this returned `None`.
+    source = "def f():\n    total = 0\n    total += 1\n    return total\n"
+    mutated = mutate_first_mutant(source)
+    assert mutated is not None
+    assert "total -= 1" in mutated
+
+
+def test_earlier_binop_beats_later_augassign():
+    # Precedence criterion: an earlier BinOp/Compare/BoolOp candidate still
+    # wins over a later AugAssign, per the unchanged (lineno, col_offset)
+    # ordering.
+    source = (
+        "def f(a, b):\n"
+        "    c = a + b\n"
+        "    c += 1\n"
+        "    return c\n"
+    )
+    mutated = mutate_first_mutant(source)
+    assert mutated is not None
+    assert "a - b" in mutated
+    assert "c += 1" in mutated
+
+
+def test_earlier_compare_beats_later_augassign():
+    source = (
+        "def f(a, b):\n"
+        "    if a == b:\n"
+        "        a += 1\n"
+        "    return a\n"
+    )
+    mutated = mutate_first_mutant(source)
+    assert mutated is not None
+    assert "a != b" in mutated
+    assert "a += 1" in mutated
+
+
+def test_deterministic_across_repeated_calls_for_augassign():
+    source = "def f():\n    total = 0\n    total += 1\n    return total\n"
+    first = mutate_first_mutant(source)
+    second = mutate_first_mutant(source)
+    assert first is not None
+    assert first == second

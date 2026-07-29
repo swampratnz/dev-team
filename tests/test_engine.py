@@ -3915,6 +3915,54 @@ def test_mutation_check_restores_file_when_arith_mutant_evaluation_raises():
     assert "mutation_killed" not in engine._scorecard
 
 
+def test_mutation_check_now_checks_augassign_only_product_file():
+    # Pre-#257: a product file whose only arithmetic was an augmented
+    # assignment (`total += 1`) made `mutate_first_mutant` return `None`
+    # (`AugAssign` has no child `BinOp` for the walk to find), so
+    # `_mutation_check` returned early with no gate re-run and no scorecard
+    # change. This is the core new-coverage assertion.
+    ws = InMemoryWorkspace(
+        {"src/x.py": "def f():\n    total = 0\n    total += 1\n    return total\n"}
+    )
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert ws.read_text("src/x.py") == (
+        "def f():\n    total = 0\n    total += 1\n    return total\n"
+    )
+
+
+def test_mutation_check_restores_file_when_augassign_mutant_evaluation_raises():
+    # SECURITY regression (issue #257 criterion 9): the `_evaluate_mutant`
+    # `try`/`finally` restore is exception-type-agnostic, but this proves it
+    # explicitly for the new `AugAssign` category (e.g. a `*=`/`/=` flip
+    # that raises `ZeroDivisionError` at gate-rerun time) rather than merely
+    # assuming it inherits the guarantee from the `BinOp` category exercised
+    # above — the fail-secure "mutated code never persists past the check"
+    # property must extend to augmented assignment, not just be assumed.
+    original = "def f():\n    x = 1\n    x *= 2\n    return x\n"
+    ws = InMemoryWorkspace({"src/x.py": original})
+    dod = DefinitionOfDone(gates=[_RaisingGate()])
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True),
+        definition_of_done=dod,
+    )
+    with pytest.raises(RuntimeError):
+        run(engine._mutation_check(_mutation_impl(), ws, engine.git, None))
+    # fail-secure: the original content is restored even though evaluation blew up
+    assert ws.read_text("src/x.py") == original
+    assert "mutation_survived" not in engine._scorecard
+    assert "mutation_killed" not in engine._scorecard
+
+
 class _FlakyRestoreWorkspace:
     """Wraps a workspace whose Nth write (the restore) fails to simulate a
     disk fault, mirroring how ``_tests_are_vacuous`` tests a failed stash pop.
