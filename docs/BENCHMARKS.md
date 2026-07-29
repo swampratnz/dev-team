@@ -98,7 +98,9 @@ beat either alone, and false-positive suppression is a first-class metric.**
   rates.
 - **Adopted:** docs are shipped artifacts ✅ — real files written into the
   workspace and committed with the feature, grounded in the actual delivered
-  code and aware of existing docs. Executable doc-claim checks → roadmap.
+  code and aware of existing docs. Executable doc-claim checks ✅
+  (`doc_claim_issues()` — path citations, Python-fence syntax, CLI-flag
+  citations, JSON-fence syntax; #48/#127/#159).
 
 ## SRE
 - **Benchmarks:** ITBench (frontier models <50% on SRE incident scenarios),
