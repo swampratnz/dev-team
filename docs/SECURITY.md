@@ -174,14 +174,22 @@ production alone:
   a *single* dispatched job's commands can reach, but ROADMAP item 1 names the
   remaining gap explicitly: one dispatched job's container can still see
   another's workspace on a shared host, because there is no per-job
-  rootless-container or namespace boundary yet. The engineer's own SDK tool
-  loop now has a filesystem-level trust boundary of its own (see *Agent
-  tool-loop containment* above) — deny-by-default outside its workspace root,
-  with the Bash side of that check an evadable heuristic, not a hard
-  guarantee — but that is still an in-process check, not an OS-level
+  rootless-container or namespace boundary yet. An opt-in `--sandbox-userns`
+  flag (`SandboxConfig.user_namespace`) now narrows this on **rootless
+  podman**: `--sandbox-userns auto` allocates each container its own
+  subordinate UID/GID range, so one job's container can't read another's
+  files even if one escapes its own mount — but it is opt-in, not the
+  default, and on **docker** `--userns` only accepts `host` or the daemon's
+  single, globally-configured `userns-remap` range, not a distinct range per
+  container, so it is not true per-job separation there. The engineer's own
+  SDK tool loop now has a filesystem-level trust boundary of its own (see
+  *Agent tool-loop containment* above) — deny-by-default outside its
+  workspace root, with the Bash side of that check an evadable heuristic, not
+  a hard guarantee — but that is still an in-process check, not an OS-level
   isolation boundary: the process-level container/VM recipe in
   `DEPLOYMENT.md` §5d remains the real isolation boundary for a shared host
-  until the per-job container/namespace work lands.
+  until an operator opts into `--sandbox-userns` (podman) or per-job
+  container/namespace work lands more broadly.
 - **The dashboard's unauthenticated-by-default localhost stance.** With
   `DEV_TEAM_DASHBOARD_TOKEN` unset, every dashboard route — including the
   event journal, backlog, memory, and any markdown report, plus recorded

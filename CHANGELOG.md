@@ -24,6 +24,19 @@ sections below are reconstructed from the repository history.
   so an operator can never accidentally trigger a full purge by omitting
   the query string. Operator-only auth, same as `/costs`/`/calibration`.
 
+### Security
+- **Opt-in `--sandbox-userns` for per-job UID/GID separation** (#246):
+  `SandboxConfig` gains `user_namespace`, wired to a new `--sandbox-userns`
+  CLI flag (only valid with `--sandbox`, mirroring `--sandbox-network`).
+  When set, `ContainerCommandRunner` adds `--userns <value>` to the
+  container argv — on rootless **podman**, `--sandbox-userns auto`
+  allocates each container its own subordinate UID/GID range, narrowing
+  the "per-job isolation on a shared host" gap named in `docs/ROADMAP.md`
+  item 1 and `docs/SECURITY.md`. Default (`None`) is unchanged behaviour;
+  on **docker**, `--userns` only accepts `host` or the daemon's single
+  `userns-remap` range, so it is not true per-job separation there — the
+  docs state this asymmetry rather than overclaiming.
+
 ### Assessment
 - **OSV scan covers Maven `pom.xml` dependencies** (`depscan.py`), closing
   the last ecosystem gap named in `docs/ASSESSMENT.md`'s "Honest
