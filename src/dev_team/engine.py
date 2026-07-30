@@ -379,6 +379,21 @@ class EngineConfig:
     #: retries, or rolls back the delivery — see the class docstring for the
     #: full contract.
     docker_run_gate: bool = False
+    #: Ablation flag for measuring the architect's downstream value: when
+    #: ``True``, ``self.architect.design(...)`` is never called and the run
+    #: proceeds with the same stub ``Design(overview="")`` that ``_halted()``
+    #: already constructs for a design-free run. The
+    #: ``design_components_count``/``design_risks_count``/
+    #: ``design_alternatives_count`` scorecard keys are left unset (not
+    #: zeroed) so a benchmark reader can distinguish "ablated" from "designed
+    #: nothing" — ``scores.py``'s delta computation already degrades an
+    #: absent key to ``0``. Off by default: no behavior change for any
+    #: existing caller. The design step is advisory context only; no
+    #: security-relevant gate (``command_runner``, ``DefinitionOfDone``, the
+    #: security-engineer review) reads ``Design``, so this cannot weaken a
+    #: gate. See ``docs/BENCHMARKS.md`` ("Architect") and
+    #: ``dev_team.benchmark``'s ``--compare-architect-ablation``.
+    skip_architect: bool = False
     #: How many rounds of dynamic re-planning to run after the schedule leaves
     #: tasks failed. 0 (the default) keeps the current behaviour — a failed task
     #: just stays failed. When >0, the product manager proposes a mutation
@@ -1271,15 +1286,18 @@ class DeliveryEngine:
                 f"{d.get('title')}: {d.get('decision')}"
                 for d in (snapshot_memory or {}).get("decisions", [])
             ]
-            design = await self.architect.design(
-                request,
-                plan,
-                repo_context=repo_ctx.render() or None,
-                relevant_code=self._retrieve_context(
-                    f"{request.title}\n{request.description}"
-                ),
-                prior_decisions=prior_decisions or None,
-            )
+            if self.config.skip_architect:
+                design = Design(overview="")
+            else:
+                design = await self.architect.design(
+                    request,
+                    plan,
+                    repo_context=repo_ctx.render() or None,
+                    relevant_code=self._retrieve_context(
+                        f"{request.title}\n{request.description}"
+                    ),
+                    prior_decisions=prior_decisions or None,
+                )
         except BudgetExceededError:
             self.tracer.end(run_span, "halted")
             return self._halted(request, "budget exhausted before any task work began")
@@ -1295,9 +1313,10 @@ class DeliveryEngine:
             consequences=design.rationale,
         )
         self._event("designed", "Design ready")
-        self._scorecard["design_components_count"] = len(design.components)
-        self._scorecard["design_risks_count"] = len(design.risks)
-        self._scorecard["design_alternatives_count"] = len(design.alternatives)
+        if not self.config.skip_architect:
+            self._scorecard["design_components_count"] = len(design.components)
+            self._scorecard["design_risks_count"] = len(design.risks)
+            self._scorecard["design_alternatives_count"] = len(design.alternatives)
 
         if self.config.frontend_craft and looks_like_frontend(request, design):
             # A web UI delivery: fold the design baseline into the conventions

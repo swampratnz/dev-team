@@ -73,13 +73,16 @@ beat either alone, and false-positive suppression is a first-class metric.**
   run-level ✅:** `design_components_count`/`design_risks_count`/
   `design_alternatives_count` scorecard keys, set right after each successful
   design, trended run-over-run via the existing `ScoreHistory` delta
-  mechanism alongside `total_attempts`. This is *not yet* the per-task
-  with/without-design attribution the original gap named: the architect runs
-  exactly once per whole plan today (no opt-out), and `Design` carries no
-  task-linkage field, so only a run-level signal is buildable now. A true
-  per-task comparison remains future work pending an architect opt-out flag
-  that would create a genuine "without design" population to compare
-  against.
+  mechanism alongside `total_attempts`. **Run-level with/without-design
+  ablation, shipped ✅:** `EngineConfig.skip_architect` (opt-in, off by
+  default) skips the architect call entirely and runs with the same stub
+  `Design(overview="")` a halted run already produces, creating a genuine
+  "without design" population; `dev-team-benchmark --compare-architect-ablation`
+  runs the fixed case set twice — once normally, once with
+  `skip_architect=True` — and prints the pass-rate, mean-attempts, and cost
+  deltas between the two populations. This is still run-level, not per-task:
+  `Design` carries no task-linkage field, so splitting the ablation within a
+  single plan (some tasks designed, some not) remains future work.
 
 ## Product manager / planner
 - **Benchmarks:** PlanBench/ACPBench (formal planning), INVEST-based

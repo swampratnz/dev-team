@@ -3050,6 +3050,103 @@ def test_design_thoroughness_scorecard_leaves_other_keys_unaffected():
     }
 
 
+# --- architect ablation flag (skip_architect, issue #267) ------------------
+
+
+def test_skip_architect_false_or_omitted_calls_architect_exactly_once():
+    """Unchanged behavior: the flag off (the default) still designs once."""
+    for config in (EngineConfig(), EngineConfig(skip_architect=False)):
+        runner = ScriptedRunner(by_system_prompt=engine_responses())
+        engine = _engine(runner, config=config)
+        outcome = run(engine.deliver(_request()))
+        arch_calls = [
+            c for c in runner.calls if "software architect" in (c["system_prompt"] or "")
+        ]
+        assert len(arch_calls) == 1
+        assert outcome.scorecard["design_components_count"] == 1
+
+
+def test_skip_architect_true_never_calls_architect():
+    responses = engine_responses()
+    del responses["software architect"]  # if the engine called it anyway, this would raise
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(runner, config=EngineConfig(skip_architect=True))
+    outcome = run(engine.deliver(_request()))
+    assert not any(
+        "software architect" in (c["system_prompt"] or "") for c in runner.calls
+    )
+    # the run proceeds with the same stub Design(overview="") _halted() uses
+    assert outcome.design.overview == ""
+    assert outcome.design.rationale == ""
+    assert outcome.design.components == []
+    assert outcome.design.risks == []
+    assert outcome.design.alternatives == []
+
+
+def test_skip_architect_true_omits_design_thoroughness_scorecard_keys():
+    responses = engine_responses()
+    del responses["software architect"]
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(runner, config=EngineConfig(skip_architect=True))
+    outcome = run(engine.deliver(_request()))
+    # absent, not zeroed: a benchmark reader must be able to tell "ablated"
+    # apart from "designed nothing" (test_design_thoroughness_scorecard_zero_for_empty_design_lists)
+    assert "design_components_count" not in outcome.scorecard
+    assert "design_risks_count" not in outcome.scorecard
+    assert "design_alternatives_count" not in outcome.scorecard
+
+
+def test_skip_architect_true_completes_full_run_with_stub_design():
+    responses = engine_responses()
+    del responses["software architect"]
+    runner = ScriptedRunner(by_system_prompt=responses)
+    engine = _engine(runner, config=EngineConfig(skip_architect=True))
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert outcome.tasks_complete is True
+    assert outcome.blackboard.decisions[0].decision == ""
+    assert outcome.blackboard.decisions[0].consequences == ""
+
+
+def test_skip_architect_does_not_affect_gate_pipeline_invocation_counts():
+    """Ablating the architect cannot skip or weaken a security-relevant gate.
+
+    The design step is advisory context only; no security-relevant path
+    (command_runner gates, DefinitionOfDone, the security-engineer review)
+    reads Design, so an otherwise-identical task must exercise them exactly
+    the same number of times, with the same pass/fail semantics, whether or
+    not the architect ran.
+    """
+
+    results = {}
+    for skip in (False, True):
+        responses = engine_responses()
+        if skip:
+            del responses["software architect"]
+        runner = ScriptedRunner(by_system_prompt=responses)
+        cmd = GateCycleRunner()
+        engine = _engine(
+            runner, command_runner=cmd, config=EngineConfig(skip_architect=skip)
+        )
+        outcome = run(engine.deliver(_request()))
+        security_calls = [
+            c
+            for c in runner.calls
+            if "application security engineer" in (c["system_prompt"] or "")
+        ]
+        results[skip] = (
+            outcome.success,
+            outcome.security.approved,
+            len(cmd.calls),
+            len(security_calls),
+        )
+
+    assert results[False][0] == results[True][0] is True
+    assert results[False][1] == results[True][1] is True
+    assert results[False][2] == results[True][2]
+    assert results[False][3] == results[True][3]
+
+
 def test_reviewer_receives_lint_findings():
     cmd = GateCycleRunner()
     cmd.add_rule("ruff", CommandResult(["ruff"], 1, "src/x.py:1:1 F401 unused import", ""))
