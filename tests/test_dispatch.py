@@ -4377,6 +4377,228 @@ def test_failed_job_status_and_result():
         }
 
 
+# --- job/result: registry-miss disk-first fallback (#265) --------------------
+#
+# A service restart drops the in-memory registry entirely. The tests below
+# never insert a registry record, simulating exactly that -- GET /jobs/{id}
+# and GET /jobs/{id}/result must fall back to the mirrored assess-success
+# files on disk (meta.json + assessment.json[+assessment.md]) rather than
+# answering a blanket 404, the same disk-first pattern #184/#234 already
+# established for purge eligibility (see the "purge: registry-miss
+# disk-first fallback" section above).
+
+
+def _write_assessment_mirror(
+    dash,
+    job_id,
+    *,
+    mode="assess",
+    repo="acme/mono",
+    cost_usd=1.5,
+    success=True,
+    classification="dependency-surgery",
+    executive_summary="All clear",
+    report_path="audit/x/assessment.md",
+    report_markdown="# report",
+):
+    """Write the meta.json/assessment.json[/assessment.md] trio a real
+    successful assess run would have mirrored (see _mirror_meta /
+    _mirror_assessment_json / _mirror_report)."""
+
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "repo": repo, "mode": mode}),
+    )
+    dash.write_text(
+        f"audit/{job_id}/assessment.json",
+        json.dumps(
+            {
+                "success": success,
+                "classification": classification,
+                "executive_summary": executive_summary,
+                "report_path": report_path,
+                "cost_usd": cost_usd,
+            }
+        ),
+    )
+    if report_markdown is not None:
+        dash.write_text(f"audit/{job_id}/assessment.md", report_markdown)
+
+
+def test_disk_status_and_result_are_none_without_a_dashboard_workspace():
+    # Criterion 2: no dashboard workspace configured -> unchanged 404 path.
+    disp = Dispatcher(token="x")
+    assert disp.disk_status("ghost") is None
+    assert disp.disk_result("ghost") is None
+
+
+def test_disk_status_and_result_are_none_with_no_meta_at_all():
+    # Criterion 3: a genuinely unknown id (no meta.json mirrored at all).
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.disk_status("ghost") is None
+    assert disp.disk_result("ghost") is None
+
+
+def test_disk_status_and_result_are_none_with_corrupt_meta():
+    # Criterion 3: a corrupt meta.json degrades to the same 404 via
+    # _read_meta's existing fail-closed posture -- not a new code path.
+    dash = InMemoryWorkspace()
+    dash.write_text("audit/assess-corrupt-meta/meta.json", "{not json")
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.disk_status("assess-corrupt-meta") is None
+    assert disp.disk_result("assess-corrupt-meta") is None
+
+
+def test_disk_status_and_result_do_not_fabricate_success_without_assessment_json():
+    # Criterion 4: meta.json present (job never reached success, or predates
+    # this fix) but no assessment.json -- must never claim a succeeded state.
+    dash = InMemoryWorkspace()
+    job_id = "assess-never-finished"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "repo": "acme/mono", "mode": "assess"}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.disk_status(job_id) is None
+    assert disp.disk_result(job_id) is None
+
+
+def test_disk_status_and_result_are_none_with_corrupt_assessment_json():
+    # Criterion 9: a corrupt assessment.json mirror is treated as "no
+    # assessment" (case 4's behaviour), never a 500.
+    dash = InMemoryWorkspace()
+    job_id = "assess-corrupt-assessment"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "repo": "acme/mono", "mode": "assess"}),
+    )
+    dash.write_text(f"audit/{job_id}/assessment.json", "{not json")
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.disk_status(job_id) is None
+    assert disp.disk_result(job_id) is None
+
+
+def test_disk_status_and_result_reconstruct_from_disk_after_registry_miss():
+    # Criterion 5: meta.json + assessment.json + assessment.md present ->
+    # both disk_status and disk_result serve a reconstructed 200.
+    dash = InMemoryWorkspace()
+    job_id = "assess-restart-survivor"
+    _write_assessment_mirror(dash, job_id, cost_usd=2.5)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+
+    assert disp.disk_status(job_id) == {
+        "id": job_id,
+        "mode": "assess",
+        "repo": "acme/mono",
+        "state": "succeeded",
+        "started": None,
+        "ended": None,
+        "cost_usd": 2.5,
+        "error": None,
+        "progress": [],
+    }
+    assert disp.disk_result(job_id) == (
+        200,
+        {
+            "kind": "assess",
+            "success": True,
+            "classification": "dependency-surgery",
+            "executive_summary": "All clear",
+            "report_path": "audit/x/assessment.md",
+            "report_markdown": "# report",
+            "cost_usd": 2.5,
+        },
+    )
+
+
+def test_disk_result_with_no_mirrored_report_markdown():
+    # Criterion 6: assessment.md absent -> report_markdown: None, no error.
+    dash = InMemoryWorkspace()
+    job_id = "assess-no-report"
+    _write_assessment_mirror(dash, job_id, report_markdown=None)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.disk_result(job_id)
+    assert status == 200
+    assert payload["report_markdown"] is None
+
+
+def test_disk_status_and_result_none_for_a_deliver_mode_mirror():
+    # Criterion 7: deliver/verify jobs never mirror assessment.json, so they
+    # stay permanently 404 post-restart -- a named, honest asymmetry.
+    dash = InMemoryWorkspace()
+    job_id = "deliver-post-restart"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "repo": "acme/mono", "mode": "deliver"}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.disk_status(job_id) is None
+    assert disp.disk_result(job_id) is None
+
+
+def test_job_and_result_routes_fall_back_to_disk_after_registry_miss():
+    # HTTP-level wiring: _job/_result actually reach disk_status/disk_result
+    # on a registry miss, and serve the same shape a live assess-success
+    # job would.
+    dash = InMemoryWorkspace()
+    job_id = "assess-http-restart"
+    _write_assessment_mirror(dash, job_id, cost_usd=0.75)
+    with running(dashboard_workspace=dash) as server:
+        status, job = _call(server, f"/jobs/{job_id}")
+        assert status == 200
+        assert job["state"] == "succeeded"
+        assert job["mode"] == "assess"
+        assert job["repo"] == "acme/mono"
+        assert job["cost_usd"] == 0.75
+        assert job["started"] is None
+        assert job["progress"] == []
+
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["kind"] == "assess"
+        assert result["success"] is True
+        assert result["report_markdown"] == "# report"
+
+
+def test_job_and_result_routes_still_404_on_meta_only_registry_miss():
+    dash = InMemoryWorkspace()
+    job_id = "assess-http-unfinished"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "repo": "acme/mono", "mode": "assess"}),
+    )
+    with running(dashboard_workspace=dash) as server:
+        assert _call(server, f"/jobs/{job_id}") == (404, {"error": "unknown job"})
+        assert _call(server, f"/jobs/{job_id}/result") == (
+            404,
+            {"error": "unknown job"},
+        )
+
+
+def test_session_foreign_tenant_registry_miss_job_still_404s_pre_fallback():
+    # Criterion 8 [security]: the tenant-scoping gate runs BEFORE the new
+    # disk-fallback code -- a foreign tenant's restart-surviving job (a real
+    # meta.json + assessment.json mirror on disk) still 404s exactly like a
+    # nonexistent job, never reaching disk_status/disk_result at all.
+    oauth, _ = _oauth_fixture()
+    dash = InMemoryWorkspace()
+    job_id = "assess-foreign-restart-survivor"
+    _write_assessment_mirror(dash, job_id, repo="other/mono")
+    with running(oauth=oauth, dashboard_workspace=dash) as server:
+        session_token = _sign_in(server)
+        assert _call(server, f"/jobs/{job_id}", token=session_token) == (
+            404,
+            {"error": "unknown job"},
+        )
+        assert _call(server, f"/jobs/{job_id}/result", token=session_token) == (
+            404,
+            {"error": "unknown job"},
+        )
+        # the operator (no session) still sees the restart-surviving job
+        assert _call(server, f"/jobs/{job_id}")[0] == 200
+
+
 def test_post_jobs_with_backlog_true_flows_to_stories():
     dash = InMemoryWorkspace()
     with running(

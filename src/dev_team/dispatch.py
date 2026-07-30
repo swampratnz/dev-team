@@ -2609,6 +2609,92 @@ class Dispatcher:
             }
         return 200, {"kind": "deliver", **delivery_to_dict(outcome)}
 
+    def _read_disk_assessment(
+        self, job_id: str
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """``(meta, assessment)`` for a restart-survived, succeeded assess job.
+
+        ``None`` unless both ``audit/<id>/meta.json`` and
+        ``audit/<id>/assessment.json`` are present and parse — the same
+        fail-closed posture as :meth:`_read_meta`. A missing dashboard
+        workspace, a genuinely unknown id, a non-assess job (``deliver``/
+        ``verify`` never mirror ``assessment.json``), a job that never
+        reached success, or a corrupt ``assessment.json`` (see
+        :meth:`make_backlog`) are all indistinguishable from "nothing to
+        reconstruct" here — never a 500, never a fabricated success.
+        """
+
+        meta = self._read_meta(job_id)
+        if meta is None:
+            return None
+        path = f"audit/{job_id}/assessment.json"
+        if not self._exists(path):
+            return None
+        try:
+            assessment = json.loads(self._dashboard_workspace.read_text(path))
+        except (OSError, ValueError, WorkspaceError):
+            return None
+        return meta, assessment
+
+    def disk_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """The ``GET /jobs/{id}`` payload reconstructed from disk.
+
+        Used only after a registry miss (a service restart lost the
+        in-memory :class:`JobRecord`) — see :meth:`_read_disk_assessment`
+        for when this returns ``None`` rather than fabricating a
+        ``succeeded`` state. ``started``/``ended``/``progress`` are honestly
+        ``None``/empty: unlike ``repo``/``mode``/``cost_usd`` they were never
+        mirrored to disk (named limitation, see docs/DISPATCH.md).
+        """
+
+        found = self._read_disk_assessment(job_id)
+        if found is None:
+            return None
+        meta, assessment = found
+        return {
+            "id": job_id,
+            "mode": meta.get("mode"),
+            "repo": meta.get("repo"),
+            "state": "succeeded",
+            "started": None,
+            "ended": None,
+            "cost_usd": assessment.get("cost_usd"),
+            "error": None,
+            "progress": [],
+        }
+
+    def disk_result(self, job_id: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """The ``GET /jobs/{id}/result`` ``(status_code, payload)`` from disk.
+
+        Used only after a registry miss; see :meth:`_read_disk_assessment`
+        for the presence rules. Mirrors the shape the live assess-success
+        branch of :meth:`result` returns, sourced from the mirrored dict
+        directly rather than by calling :meth:`result` itself: that method
+        dereferences ``outcome`` by attribute (``outcome.success``, ...) —
+        the live in-process ``AssessmentOutcome``'s shape — whereas the
+        mirrored ``assessment.json`` on disk is a plain dict.
+        """
+
+        found = self._read_disk_assessment(job_id)
+        if found is None:
+            return None
+        _, assessment = found
+        report_path = f"audit/{job_id}/assessment.md"
+        report_markdown = (
+            self._dashboard_workspace.read_text(report_path)
+            if self._exists(report_path)
+            else None
+        )
+        return 200, {
+            "kind": "assess",
+            "success": assessment.get("success"),
+            "classification": assessment.get("classification"),
+            "executive_summary": assessment.get("executive_summary"),
+            "report_path": assessment.get("report_path"),
+            "report_markdown": report_markdown,
+            "cost_usd": assessment.get("cost_usd"),
+        }
+
 
 def _archived_job_ids_before(
     dashboard_workspace: Workspace, cutoff: float
@@ -3389,17 +3475,30 @@ def _make_handler(dispatcher: Dispatcher) -> type:
 
         def _job(self, job_id: str) -> None:
             record = dispatcher.get(job_id)
-            if record is None:
+            if record is not None:
+                self._json(200, dispatcher.status(record))
+                return
+            # Registry miss: the service may have restarted since this job
+            # ran. Fall back to disk (assess-mode jobs only — see
+            # Dispatcher.disk_status) rather than 404ing a job that
+            # actually succeeded.
+            payload = dispatcher.disk_status(job_id)
+            if payload is None:
                 self._json(404, {"error": "unknown job"})
                 return
-            self._json(200, dispatcher.status(record))
+            self._json(200, payload)
 
         def _result(self, job_id: str) -> None:
             record = dispatcher.get(job_id)
-            if record is None:
+            if record is not None:
+                status, payload = dispatcher.result(record)
+                self._json(status, payload)
+                return
+            found = dispatcher.disk_result(job_id)
+            if found is None:
                 self._json(404, {"error": "unknown job"})
                 return
-            status, payload = dispatcher.result(record)
+            status, payload = found
             self._json(status, payload)
 
     return Handler

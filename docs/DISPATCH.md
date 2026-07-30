@@ -236,6 +236,20 @@ submitted with.
 `progress` is the last 12 journalled events from the job's workspace. Unknown
 id → `404 {"error":"unknown job"}`.
 
+**Restart survival:** the in-memory job registry is lost on a service
+restart (see *Dashboard visibility* above), so a registry miss here is not
+automatically "unknown" — a **succeeded assess job** (the only mode that
+mirrors `meta.json` **and** `assessment.json` to the dashboard workspace,
+see *Purge* → *Registry-miss fallback* for the same pattern) is
+reconstructed from those two files instead of 404ing: `state` reads
+`"succeeded"`, `id`/`mode`/`repo`/`cost_usd` come from disk, and
+`started`/`ended`/`progress` are honestly `null`/`[]` — they were never
+mirrored, so this payload is not byte-identical to the live one, only
+schema-compatible. A `deliver`/`verify`-mode job, or an assess job that
+never reached success (or predates this fallback), still 404s permanently
+after a restart — mirroring `deliver`/`verify` metadata is a possible
+follow-up, not yet done.
+
 ### `GET /jobs/{id}/result` (auth) — result
 
 - **succeeded**, assess:
@@ -257,6 +271,15 @@ id → `404 {"error":"unknown job"}`.
 State machine: `queued → running → succeeded | failed`, plus `queued →
 cancelled` (see *Cancel* below) — `cancelled` is reachable only from
 `queued`, never from `running`.
+
+**Restart survival:** same registry-miss fallback as `GET /jobs/{id}` above
+— a succeeded assess job's result is rendered from `assessment.json` (plus
+`assessment.md` for `report_markdown`, `null` if that mirror is absent) with
+the same `success`/`classification`/`executive_summary`/`report_path`/
+`cost_usd` shape the live path returns. Anything short of that (no
+`meta.json`, or `meta.json` without a corroborating `assessment.json`) still
+404s — this endpoint never fabricates a `queued`/`running`/`failed`/
+`cancelled` result it cannot actually reconstruct from disk.
 
 ### `POST /jobs/{id}/backlog` (auth, no body) — generate the backlog later
 
