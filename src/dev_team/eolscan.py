@@ -408,6 +408,33 @@ def parse_rust_toolchain_toml(text: str) -> Optional[Tuple[str, str]]:
     return ("rust", version) if version else None
 
 
+def parse_cargo_toml_rust_version(text: str) -> Optional[Tuple[str, str]]:
+    """Cargo ``Cargo.toml``: ``[package].rust-version`` (the MSRV field).
+
+    Only a literal string value counts -- the ``rust-version.workspace =
+    true`` inheritance form is a ``bool`` at that key, not a ``str``, and
+    degrades to ``None`` same as every other non-string-typed value in this
+    module, never guessed at. Reuses the same ``tomllib`` parsing primitive
+    :func:`parse_rust_toolchain_toml` and :func:`depscan.parse_cargo_toml`
+    already use for this exact file -- this module's own, separate
+    ``_PARSERS`` table, so there is no collision with :mod:`depscan`'s
+    identically-named registration.
+    """
+
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    package = data.get("package")
+    if not isinstance(package, dict):
+        return None
+    rust_version = package.get("rust-version")
+    if not isinstance(rust_version, str):
+        return None
+    version = _leading_version(rust_version)
+    return ("rust", version) if version else None
+
+
 _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "package.json": parse_package_json_engines,
     ".nvmrc": parse_nvmrc,
@@ -421,7 +448,20 @@ _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "build.gradle": parse_gradle_java,
     "build.gradle.kts": parse_gradle_java,
     "rust-toolchain.toml": parse_rust_toolchain_toml,
+    "Cargo.toml": parse_cargo_toml_rust_version,
 }
+
+#: Scoped, single-purpose override of the plain alphabetical-first-wins
+#: dedup below: when a workspace carries both ``Cargo.toml`` (an MSRV
+#: *floor*, via :func:`parse_cargo_toml_rust_version`) and
+#: ``rust-toolchain.toml`` (the actually-pinned toolchain channel, via
+#: :func:`parse_rust_toolchain_toml`), the pinned channel is the more
+#: precise signal and must win even though ``"Cargo.toml"`` sorts first.
+#: Deliberately not a general per-product priority table -- this is the one
+#: real collision the ``Cargo.toml`` parser introduces; every other
+#: product's manifests keep today's plain sorted-first-wins behaviour.
+_RUST_PRECEDENCE_MANIFEST = "rust-toolchain.toml"
+_RUST_PRECEDENCE_OVERRIDABLE_MANIFEST = "Cargo.toml"
 
 
 def detect_runtimes(workspace: Workspace) -> List[Runtime]:
@@ -430,13 +470,20 @@ def detect_runtimes(workspace: Workspace) -> List[Runtime]:
     When more than one recognised file agrees on the same product (e.g.
     both ``.nvmrc`` and ``package.json``'s ``engines.node``), only the
     first (in sorted path order) is kept — a second live query for the
-    same product would be redundant, not more informative.
+    same product would be redundant, not more informative. One narrow
+    exception: for the ``rust`` product only, a ``rust-toolchain.toml``
+    match replaces an already-kept ``Cargo.toml`` match (see
+    :data:`_RUST_PRECEDENCE_MANIFEST`) — the pinned toolchain channel is
+    more precise than the MSRV floor, even though ``"Cargo.toml"`` sorts
+    first alphabetically. Every other product's collisions keep the plain
+    sorted-first-wins rule unchanged.
     """
 
-    seen: set = set()
+    seen: Dict[str, int] = {}
     runtimes: List[Runtime] = []
     for path in sorted(workspace.list_files()):
-        parser = _PARSERS.get(path.rsplit("/", 1)[-1])
+        name = path.rsplit("/", 1)[-1]
+        parser = _PARSERS.get(name)
         if parser is None:
             continue
         try:
@@ -447,9 +494,18 @@ def detect_runtimes(workspace: Workspace) -> List[Runtime]:
         if result is None:
             continue
         product, version = result
-        if product not in _SUPPORTED_PRODUCTS or product in seen:
+        if product not in _SUPPORTED_PRODUCTS:
             continue
-        seen.add(product)
+        if product in seen:
+            index = seen[product]
+            if (
+                product == "rust"
+                and name == _RUST_PRECEDENCE_MANIFEST
+                and runtimes[index].manifest == _RUST_PRECEDENCE_OVERRIDABLE_MANIFEST
+            ):
+                runtimes[index] = Runtime(product=product, version=version, manifest=path)
+            continue
+        seen[product] = len(runtimes)
         runtimes.append(Runtime(product=product, version=version, manifest=path))
     return runtimes
 

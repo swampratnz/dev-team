@@ -161,10 +161,16 @@ machinery understands them now:
   `[toolchain].channel` (a concrete version only — a named channel like
   `stable`/`beta`/`nightly`, or a dated nightly like
   `nightly-2024-01-15`, falls back to model knowledge rather than being
-  guessed at; the legacy plain-text `rust-toolchain` file and `Cargo.toml`'s
-  `rust-version` MSRV are not read); an unresolved release cycle reports
-  `unknown` rather than guessing. Treat EOL findings outside those eight
-  runtimes as a triage list, not a compliance scan.
+  guessed at) or `Cargo.toml`'s `[package].rust-version` MSRV field (the
+  `rust-version.workspace = true` inheritance form is a `bool`, not a
+  `str`, at that key, and falls back to model knowledge rather than being
+  guessed at). When a repo carries both Rust manifests, the
+  `rust-toolchain.toml`-pinned channel wins over the `Cargo.toml` MSRV
+  floor — the pinned channel is what the repo is actually built and tested
+  with, while the MSRV is only a compatibility minimum. The legacy
+  plain-text `rust-toolchain` file remains not read; an unresolved release
+  cycle reports `unknown` rather than guessing. Treat EOL findings outside
+  those eight runtimes as a triage list, not a compliance scan.
 - Phase evidence is as good as what the auditors read: on very large repos
   the deterministic inventory is exact, but agents sample files. The report
   appendix names the **audit blind spots** — top-level directories no
@@ -215,8 +221,10 @@ involved, so their findings are exact and citable:
   `.python-version`/`global.json`/`.ruby-version`/`go.mod`/
   `composer.json`/`pom.xml`/`build.gradle`/`build.gradle.kts` (Java
   toolchain/source/target-compatibility literals)/`rust-toolchain.toml`
-  (`[toolchain].channel`) are checked against endoflife.date, one request
-  per distinct detected product (`--no-eol-scan` opts out;
+  (`[toolchain].channel`)/`Cargo.toml` (`[package].rust-version` MSRV,
+  superseded by a `rust-toolchain.toml` channel when both are present) are
+  checked against endoflife.date, one request per distinct detected
+  product (`--no-eol-scan` opts out;
   offline or an unresolved release cycle degrades to a labelled
   model-knowledge/`unknown` fallback rather than guessing).
 - **Audit blind spots** — the exact set of top-level directories no phase

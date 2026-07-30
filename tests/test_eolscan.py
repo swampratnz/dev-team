@@ -19,6 +19,7 @@ from dev_team.eolscan import (
     _http_fetch,
     _match_cycle,
     detect_runtimes,
+    parse_cargo_toml_rust_version,
     parse_composer_json_php,
     parse_global_json_sdk,
     parse_go_mod,
@@ -578,6 +579,70 @@ def test_parse_rust_toolchain_toml_non_string_channel_is_none():
     assert parse_rust_toolchain_toml("[toolchain]\nchannel = 175\n") is None
 
 
+# --- parse_cargo_toml_rust_version -------------------------------------------------
+
+
+def test_parse_cargo_toml_rust_version_two_component():
+    text = '[package]\nname = "foo"\nrust-version = "1.70"\n'
+    assert parse_cargo_toml_rust_version(text) == ("rust", "1.70")
+
+
+def test_parse_cargo_toml_rust_version_three_component():
+    text = '[package]\nname = "foo"\nrust-version = "1.70.1"\n'
+    assert parse_cargo_toml_rust_version(text) == ("rust", "1.70.1")
+
+
+def test_parse_cargo_toml_rust_version_malformed_toml_is_none():
+    assert parse_cargo_toml_rust_version("[package") is None  # truncated TOML
+    assert parse_cargo_toml_rust_version("not toml at all ===") is None
+    assert parse_cargo_toml_rust_version("") is None
+
+
+def test_parse_cargo_toml_rust_version_missing_package_table_is_none():
+    assert parse_cargo_toml_rust_version('[dependencies]\nserde = "1"\n') is None
+
+
+def test_parse_cargo_toml_rust_version_missing_rust_version_key_is_none():
+    assert parse_cargo_toml_rust_version('[package]\nname = "foo"\n') is None
+
+
+def test_parse_cargo_toml_rust_version_non_string_value_is_none():
+    assert parse_cargo_toml_rust_version("[package]\nrust-version = 170\n") is None
+
+
+def test_parse_cargo_toml_rust_version_workspace_inheritance_is_none():
+    # `rust-version.workspace = true` -- a `bool`, not a `str`, at that key.
+    text = '[package]\nname = "foo"\nrust-version.workspace = true\n'
+    assert parse_cargo_toml_rust_version(text) is None
+
+
+def test_crafted_cargo_toml_rust_version_never_parses_to_a_version():
+    malicious = ["; rm -rf /", "../../etc/passwd", "$(whoami)", "`id`"]
+    for value in malicious:
+        text = f'[package]\nrust-version = "{value}"\n'
+        assert parse_cargo_toml_rust_version(text) is None
+
+
+def test_parse_cargo_toml_rust_version_adversarial_payloads_never_raise_or_hang():
+    oversized_non_version = "not-a-version-" + ("9" * 100_000)
+    payloads = [
+        "[package",  # truncated TOML
+        "[package]\nrust-version = [1, 2, 3]\n",  # array, not a string
+        "[package]\nrust-version = { major = 1 }\n",  # table, not a string
+        f'[package]\nrust-version = "{oversized_non_version}"\n',  # oversized string
+        "[a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p]\n" * 200,  # deeply nested tables
+    ]
+    start = time.monotonic()
+    for text in payloads:
+        assert parse_cargo_toml_rust_version(text) is None
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0
+
+
+def test_cargo_toml_rust_version_parser_registered():
+    assert _PARSERS["Cargo.toml"] is parse_cargo_toml_rust_version
+
+
 def test_rust_toolchain_toml_parser_registered():
     assert _PARSERS["rust-toolchain.toml"] is parse_rust_toolchain_toml
 
@@ -621,6 +686,63 @@ def test_detect_runtimes_no_rust_toolchain_toml_unchanged_by_rust_support():
     assert sorted((r.product, r.version, r.manifest) for r in runtimes) == [
         ("go", "1.21", "go.mod"),
         ("php", "8.1", "composer.json"),
+    ]
+
+
+# --- detect_runtimes: Cargo.toml / rust-toolchain.toml precedence -----------------
+#
+# Four explicit cases per the tightened acceptance criteria: only-Cargo.toml
+# (new coverage), only-rust-toolchain.toml (regression guard, byte-identical
+# to pre-existing behaviour), both-present (the new precedence rule), and an
+# existing non-rust collision left untouched (proves the fix is scoped to
+# the rust product only, not a general reordering).
+
+
+def test_detect_runtimes_rust_case_a_only_cargo_toml():
+    ws = InMemoryWorkspace(
+        {"Cargo.toml": '[package]\nname = "foo"\nrust-version = "1.70"\n'}
+    )
+    assert detect_runtimes(ws) == [
+        Runtime(product="rust", version="1.70", manifest="Cargo.toml")
+    ]
+
+
+def test_detect_runtimes_rust_case_b_only_rust_toolchain_toml_unchanged():
+    ws = InMemoryWorkspace(
+        {"rust-toolchain.toml": '[toolchain]\nchannel = "1.75.0"\n'}
+    )
+    assert detect_runtimes(ws) == [
+        Runtime(product="rust", version="1.75.0", manifest="rust-toolchain.toml")
+    ]
+
+
+def test_detect_runtimes_rust_case_c_both_present_toolchain_wins():
+    ws = InMemoryWorkspace(
+        {
+            "Cargo.toml": '[package]\nname = "foo"\nrust-version = "1.70"\n',
+            "rust-toolchain.toml": '[toolchain]\nchannel = "1.75.0"\n',
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert runtimes == [
+        Runtime(product="rust", version="1.75.0", manifest="rust-toolchain.toml")
+    ]
+
+
+def test_detect_runtimes_rust_case_d_other_collision_unaffected():
+    # .nvmrc vs. package.json's engines.node: an existing, non-rust
+    # multi-manifest collision. ".nvmrc" sorts before "package.json", so
+    # today's plain alphabetical-first-wins rule must still apply -- the
+    # rust-only precedence fix must not touch this ordering.
+    ws = InMemoryWorkspace(
+        {
+            ".nvmrc": "18.17.0",
+            "package.json": json.dumps({"engines": {"node": "^20.0.0"}}),
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert runtimes == [
+        Runtime(product="nodejs", version="18.17.0", manifest=".nvmrc")
     ]
 
 
