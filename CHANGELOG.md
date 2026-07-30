@@ -17,6 +17,21 @@ sections below are reconstructed from the repository history.
   Reuses `_ARITH_FLIPS` verbatim (same `ast.operator` subtypes as `BinOp`) —
   no new flip table, no `engine.py` changes.
 
+### Dashboard
+- **Clickable repo rows in the Calibration/Spend by-repo tables now scope
+  the Runs/Reports panels**, the follow-up #223 and #232 both named as
+  further-out future work when they shipped those tables' own `by_repo`
+  breakdowns (#269). Each run and report-owning job now carries a `"repo"`
+  field (`"(unknown)"` when its `meta.json` is missing or has an empty
+  `repo`, the same sentinel `by_repo` already used) in `GET /api/state`;
+  clicking a repo row in either by-repo table toggles a client-side
+  `filters.repo` that hides non-matching Runs/Reports entries, and the
+  existing "clear filters" control now clears it alongside
+  `filters.agent`/`filters.run`. Purely additive — `runsPanel`/`reports`
+  render byte-identical HTML when no repo is scoped, no new HTTP route, no
+  new escaping primitive (reuses the same `esc()` already relied on for
+  `data-path`/`data-run`).
+
 ### Documentation
 - **`docs/ROADMAP.md` item 7 correction:** the closing sentence claiming
   "the dashboard and Slack adapters remain future work" was stale for its
