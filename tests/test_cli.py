@@ -2964,12 +2964,13 @@ def test_main_dashboard_defaults_and_ctrl_c(tmp_path, monkeypatch):
     original_init = _FakeDashboardServer.__init__
 
     def interrupting_init(self, workspace, *, host, port, token=None,
-                          dispatch_url=None, dispatch_token=None,
+                          dispatch_url=None, dispatch_token=None, secure=False,
                           auth_rate_limit_threshold=None,
                           auth_rate_limit_window_seconds=None,
                           auth_rate_limit_lockout_seconds=None):
         original_init(self, workspace, host=host, port=port, token=token,
                       dispatch_url=dispatch_url, dispatch_token=dispatch_token,
+                      secure=secure,
                       auth_rate_limit_threshold=auth_rate_limit_threshold,
                       auth_rate_limit_window_seconds=auth_rate_limit_window_seconds,
                       auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds)
@@ -3120,6 +3121,8 @@ def test_main_dashboard_flag_validation():
         ["--dispatch", "--dispatch-url", "http://127.0.0.1:8738"],
         ["T", "D", "--allow-unauthenticated-dashboard"],
         ["--dispatch", "--allow-unauthenticated-dashboard"],
+        ["T", "D", "--dashboard-cookie-secure"],
+        ["--dispatch", "--dashboard-cookie-secure"],
     ):
         with pytest.raises(SystemExit) as excinfo:
             main(argv, runner=ScriptedRunner([]))
@@ -3156,6 +3159,48 @@ def test_main_dashboard_dispatch_url_defaults_and_empty_token_is_none(
     assert server.dispatch_url == "http://127.0.0.1:8738"
     assert server.dispatch_token is None
     assert "dispatch-tok" not in capsys.readouterr().err
+
+
+def test_main_dashboard_cookie_secure_flag_passes_secure_true(tmp_path, monkeypatch):
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DASHBOARD_TOKEN", "dash-tok")
+    code = main(
+        ["--dashboard", "--workspace", str(tmp_path), "--dashboard-cookie-secure"],
+        runner=None,
+    )
+    assert code == 0
+    (server,) = _FakeDashboardServer.instances
+    assert server.secure is True
+
+
+def test_main_dashboard_cookie_secure_defaults_to_false(tmp_path, monkeypatch):
+    # Regression: the flag omitted must stay byte-identical to prior behaviour.
+    monkeypatch.setattr("dev_team.cli.DashboardServer", _FakeDashboardServer)
+    _FakeDashboardServer.instances.clear()
+    monkeypatch.setenv("DEV_TEAM_DASHBOARD_TOKEN", "dash-tok")
+    code = main(["--dashboard", "--workspace", str(tmp_path)], runner=None)
+    assert code == 0
+    (server,) = _FakeDashboardServer.instances
+    assert server.secure is False
+
+
+def test_dashboard_cookie_secure_help_matches_sibling_style():
+    # Acceptance criterion: --dashboard-cookie-secure's --help text mirrors
+    # --allow-unauthenticated-dashboard's style (opt-in framing, TLS/HTTPS
+    # rationale, and what happens if you leave it off).
+    parser = build_parser()
+    sibling = next(
+        a for a in parser._actions if a.dest == "allow_unauthenticated_dashboard"
+    )
+    cookie_secure = next(
+        a for a in parser._actions if a.dest == "dashboard_cookie_secure"
+    )
+    assert sibling.__class__ is cookie_secure.__class__  # both store_true
+    assert "With --dashboard:" in sibling.help
+    assert "With --dashboard:" in cookie_secure.help
+    assert "TLS" in cookie_secure.help or "HTTPS" in cookie_secure.help
+    assert "Secure" in cookie_secure.help
 
 
 # --- dispatch service -------------------------------------------------------------

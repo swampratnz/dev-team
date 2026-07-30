@@ -117,7 +117,10 @@ Both HTTP surfaces require a bearer token compared with `hmac.compare_digest`
   [`docs/DISPATCH.md`](DISPATCH.md).
 - **Dashboard** — with `DEV_TEAM_DASHBOARD_TOKEN` set, every route requires it
   (bearer header for API callers, a `HttpOnly; SameSite=Strict` session cookie
-  for browsers). Implemented in `dev_team.dashboard._tokens_match` /
+  for browsers). Pass `--dashboard-cookie-secure` to also mark that cookie
+  `Secure` (TLS-only) when the dashboard is fronted by HTTPS — opt-in, since a
+  `Secure` cookie is silently never stored by the browser over plain HTTP.
+  Implemented in `dev_team.dashboard._tokens_match` /
   `dev_team.dashboard._make_handler`. Left unset, the dashboard stays
   open — see the gap this leaves, below. See [`docs/DASHBOARD.md`](DASHBOARD.md).
 - **Dashboard → dispatch proxy** is deliberately narrow: only
