@@ -29,6 +29,7 @@ from dev_team.eolscan import (
     parse_python_version,
     parse_ruby_version,
     parse_runtime_txt,
+    parse_rust_toolchain_toml,
     query_eol,
     scan_eol,
 )
@@ -530,6 +531,147 @@ def test_detect_runtimes_pom_and_gradle_both_present_dedupes_to_one_java_runtime
     runtimes = detect_runtimes(ws)
     assert runtimes == [
         Runtime(product="java", version="17", manifest="build.gradle")
+    ]
+
+
+# --- parse_rust_toolchain_toml ----------------------------------------------------
+
+
+def test_parse_rust_toolchain_toml_concrete_version():
+    text = '[toolchain]\nchannel = "1.75.0"\n'
+    assert parse_rust_toolchain_toml(text) == ("rust", "1.75.0")
+
+
+def test_parse_rust_toolchain_toml_two_component_version():
+    text = '[toolchain]\nchannel = "1.75"\n'
+    assert parse_rust_toolchain_toml(text) == ("rust", "1.75")
+
+
+@pytest.mark.parametrize("channel", ["stable", "beta", "nightly"])
+def test_parse_rust_toolchain_toml_named_channel_is_none(channel):
+    text = f'[toolchain]\nchannel = "{channel}"\n'
+    assert parse_rust_toolchain_toml(text) is None
+
+
+def test_parse_rust_toolchain_toml_dated_nightly_is_none():
+    # Leads with letters, not a dotted-numeric version -- `_leading_version`
+    # correctly degrades this rather than misparsing "2024" as the version.
+    text = '[toolchain]\nchannel = "nightly-2024-01-15"\n'
+    assert parse_rust_toolchain_toml(text) is None
+
+
+def test_parse_rust_toolchain_toml_malformed_never_raises():
+    assert parse_rust_toolchain_toml("[toolchain") is None  # truncated TOML
+    assert parse_rust_toolchain_toml("not toml at all ===") is None
+    assert parse_rust_toolchain_toml("") is None
+
+
+def test_parse_rust_toolchain_toml_missing_toolchain_table_is_none():
+    assert parse_rust_toolchain_toml('[profile]\nname = "default"\n') is None
+
+
+def test_parse_rust_toolchain_toml_missing_channel_is_none():
+    assert parse_rust_toolchain_toml('[toolchain]\ncomponents = ["rustfmt"]\n') is None
+
+
+def test_parse_rust_toolchain_toml_non_string_channel_is_none():
+    assert parse_rust_toolchain_toml("[toolchain]\nchannel = 175\n") is None
+
+
+def test_rust_toolchain_toml_parser_registered():
+    assert _PARSERS["rust-toolchain.toml"] is parse_rust_toolchain_toml
+
+
+def test_rust_added_to_display_names_and_supported_products():
+    import dev_team.eolscan as eolscan
+
+    assert eolscan._DISPLAY_NAMES["rust"] == "Rust"
+    assert "rust" in eolscan._SUPPORTED_PRODUCTS
+
+
+def test_detect_runtimes_rust_from_rust_toolchain_toml():
+    ws = InMemoryWorkspace({"rust-toolchain.toml": '[toolchain]\nchannel = "1.75.0"\n'})
+    assert detect_runtimes(ws) == [
+        Runtime(product="rust", version="1.75.0", manifest="rust-toolchain.toml")
+    ]
+
+
+def test_detect_runtimes_rust_alongside_another_product_no_cross_interference():
+    ws = InMemoryWorkspace(
+        {
+            "rust-toolchain.toml": '[toolchain]\nchannel = "1.75.0"\n',
+            "go.mod": "module example.com/foo\n\ngo 1.21\n",
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert sorted((r.product, r.version, r.manifest) for r in runtimes) == [
+        ("go", "1.21", "go.mod"),
+        ("rust", "1.75.0", "rust-toolchain.toml"),
+    ]
+
+
+def test_detect_runtimes_no_rust_toolchain_toml_unchanged_by_rust_support():
+    ws = InMemoryWorkspace(
+        {
+            "composer.json": json.dumps({"require": {"php": "^8.1"}}),
+            "go.mod": "module example.com/foo\n\ngo 1.21\n",
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert sorted((r.product, r.version, r.manifest) for r in runtimes) == [
+        ("go", "1.21", "go.mod"),
+        ("php", "8.1", "composer.json"),
+    ]
+
+
+def test_scan_eol_reports_status_for_rust():
+    ws = InMemoryWorkspace(
+        {"rust-toolchain.toml": '[toolchain]\nchannel = "1.75.0"\n'}
+    )
+
+    def fetch(product):
+        assert product == "rust"
+        return [{"cycle": "1.75", "eol": _FUTURE_EOL}]
+
+    scan = scan_eol(ws, fetch=fetch)
+    assert scan.queried is True
+    by_product = {s.runtime.product: s for s in scan.statuses}
+    assert by_product["rust"].end_of_life is False
+    rendered = scan.render()
+    assert "Rust 1.75.0 (rust-toolchain.toml)" in rendered
+    assert "supported" in rendered
+
+
+def test_crafted_rust_toolchain_channel_never_parses_to_a_version():
+    malicious = ["; rm -rf /", "../../etc/passwd", "$(whoami)", "`id`"]
+    for channel in malicious:
+        text = f'[toolchain]\nchannel = "{channel}"\n'
+        assert parse_rust_toolchain_toml(text) is None
+
+
+def test_detect_runtimes_seven_prior_products_unaffected_by_rust_support():
+    # Regression guard: adding an eighth product must not change detection
+    # for the seven products already registered before this change.
+    ws = InMemoryWorkspace(
+        {
+            ".nvmrc": "18.17.0",
+            ".python-version": "3.11.4",
+            "global.json": json.dumps({"sdk": {"version": "8.0.100"}}),
+            ".ruby-version": "3.2.0",
+            "go.mod": "module example.com/foo\n\ngo 1.21.3\n",
+            "composer.json": json.dumps({"require": {"php": "^8.1"}}),
+            "pom.xml": _pom("<maven.compiler.release>17</maven.compiler.release>"),
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert sorted((r.product, r.version) for r in runtimes) == [
+        ("dotnet", "8.0.100"),
+        ("go", "1.21.3"),
+        ("java", "17"),
+        ("nodejs", "18.17.0"),
+        ("php", "8.1"),
+        ("python", "3.11.4"),
+        ("ruby", "3.2.0"),
     ]
 
 
