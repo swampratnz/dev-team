@@ -79,6 +79,13 @@ anything — the data stays on disk and is fully restorable with
   `GET /api/state?archived=1`, which reveals archived runs, reports, and
   backlog stories (each marked with a dashed "archived" chip) alongside the
   live ones.
+- The **Runs** panel can also be scoped to a single repo — click a repo row
+  in the Calibration or Spend by-repo table (see *Calibration* and *Spend*
+  below) and only that repo's runs stay visible; click it again (or "clear
+  filters") to see every run again. This composes independently with
+  "show archived" and with the existing run-click-to-filter-Activity
+  behavior — narrowing by repo never changes which runs exist, only which
+  are shown.
 - Each **run row** and **report row** carries an archive/unarchive button.
   Clicking it POSTs `/api/jobs/{id}/archive` or `/api/jobs/{id}/unarchive`
   through the dashboard — the same narrow-proxy pattern the board write path
@@ -163,6 +170,15 @@ toggle as the rest of the panel (same request, same flag — no separate
 control), and it's omitted entirely when there are no verifications yet,
 matching the panel's existing empty state.
 
+Each by-repo row is clickable (mouse, or Enter/Space when focused) —
+clicking one scopes the **Runs** and **Reports** panels to that repo,
+hiding every run/report belonging to a different one; clicking the same
+row again (or the existing "clear filters" button next to the Activity
+feed's filters, which now covers this too) clears the scope back to
+everything. This is purely a client-side rendering filter over data the
+page already has (each run and report carries the same repo-or-`"(unknown)"`
+lookup this table uses) — no new HTTP request.
+
 ### Score history
 
 The **Score history** block (in the Memory & conventions panel, next to
@@ -198,6 +214,14 @@ evidence string a *model* wrote, not a deterministic path like
 `innerHTML` — the same precedent the Access log panel's `path` field
 already established for caller/model-influenced text.
 
+Like the Runs panel, the **Reports** panel can be scoped to a single repo
+by clicking a repo row in the Calibration or Spend by-repo table — only
+reports filed under that repo's jobs stay visible. A report with no owning
+job (a bare, non-dispatch `audit/assessment.md`) or whose job has no
+`meta.json`/an empty `repo` groups under the `"(unknown)"` bucket, same as
+Calibration's and Spend's by-repo tables, so clicking that bucket (when
+present) surfaces exactly those.
+
 ### Spend
 
 The **Spend** panel (next to Memory & conventions) shows the dispatch
@@ -230,6 +254,12 @@ has spend — a single-repo workspace's by-repo row would just restate the
 total line already shown above it, adding visual noise for zero information.
 It shares the same archived-job exclusion as the rest of the panel (same
 request, same flag — no separate control).
+
+Like the Calibration by-repo table, each row here is clickable too and
+scopes the **Runs** and **Reports** panels to that repo the same way —
+one shared `filters.repo` behind both tables, so scoping from either panel
+(or clearing it) is reflected in the other's rows and in the Runs/Reports
+lists identically.
 
 ### Access log
 

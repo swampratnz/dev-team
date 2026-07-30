@@ -402,15 +402,20 @@ def _report_meta_state(workspace: Workspace) -> Dict[str, Dict]:
 
     Reads ``audit/<job_id>/assessment.json`` straight off the shared
     workspace tree — the same "no dispatch proxy needed" pattern
-    :func:`_calibration_state` already uses. A job id is present in the
-    returned map only when its ``assessment.json`` exists, parses, and has
-    the expected shapes; anything else (missing file, malformed JSON,
-    wrong-typed fields) omits that job id entirely rather than fabricating
-    a misleading ``0`` that could read as "clean". Each entry carries both
-    the ``*_count`` fields the Reports panel's chips need and the raw
-    ``blind_spots``/``broken_citations`` values the report modal's "Audit
-    quality" detail block renders — riding the same already-fetched
-    ``/api/state`` payload rather than a second request.
+    :func:`_calibration_state` already uses. Every job id owning at least
+    one report gets an entry — at minimum a ``"repo"`` field (via
+    :func:`_job_meta_index`, the same "(unknown)" sentinel
+    :func:`_calibration_state`'s ``by_repo`` already established for a
+    missing/empty ``repo``), so the Reports panel's client-side repo-scoping
+    has something to filter on for every report, not just the ones with
+    quality data. The ``*_count`` fields the Reports panel's chips need and
+    the raw ``blind_spots``/``broken_citations`` values the report modal's
+    "Audit quality" detail block renders are added on top only when
+    ``assessment.json`` exists, parses, and has the expected shapes;
+    anything else (missing file, malformed JSON, wrong-typed fields) just
+    leaves those fields off rather than fabricating a misleading ``0`` that
+    could read as "clean" — riding the same already-fetched ``/api/state``
+    payload rather than a second request.
     """
 
     meta: Dict[str, Dict] = {}
@@ -419,7 +424,12 @@ def _report_meta_state(workspace: Workspace) -> Dict[str, Dict]:
         for job_id in (_report_job_id(path) for path in _report_paths(workspace))
         if job_id is not None
     }
+    meta_index = _job_meta_index(workspace)
     for job_id in job_ids:
+        entry: Dict[str, object] = {
+            "repo": meta_index.get(job_id, {}).get("repo") or "(unknown)"
+        }
+        meta[job_id] = entry
         try:
             data = json.loads(workspace.read_text(f"audit/{job_id}/assessment.json"))
         except (OSError, ValueError, WorkspaceError):
@@ -434,12 +444,10 @@ def _report_meta_state(workspace: Workspace) -> Dict[str, Dict]:
             isinstance(v, list) for v in broken_citations.values()
         ):
             continue
-        meta[job_id] = {
-            "blind_spot_count": len(blind_spots),
-            "broken_citation_count": sum(len(v) for v in broken_citations.values()),
-            "blind_spots": blind_spots,
-            "broken_citations": broken_citations,
-        }
+        entry["blind_spot_count"] = len(blind_spots)
+        entry["broken_citation_count"] = sum(len(v) for v in broken_citations.values())
+        entry["blind_spots"] = blind_spots
+        entry["broken_citations"] = broken_citations
     return meta
 
 
@@ -457,6 +465,17 @@ def collect_state(
     ``include_archived=True`` (``GET /api/state?archived=1``) reveals them
     again; ``archived_jobs`` always lists every archived id so the UI can
     render a toggle regardless of which view is showing.
+
+    Each run summary carries a ``"repo"`` field (a third, independent
+    :func:`_job_meta_index` parse pass, alongside the ones
+    :func:`_archived_job_ids` and :func:`_calibration_state` already make —
+    consistent with this module's existing "cheap, re-parse per consumer"
+    style rather than a threading refactor): ``"(unknown)"`` when the run's
+    id has no matching ``meta.json`` or an empty ``repo`` there (e.g. a
+    ``deliver``-mode run, never mirrored per ``docs/DASHBOARD.md``), the
+    same sentinel :func:`_calibration_state`'s ``by_repo`` already
+    established. This lets the Runs panel scope itself to a repo clicked in
+    the Calibration/Spend by-repo tables.
     """
 
     archived = _archived_job_ids(workspace)
@@ -468,12 +487,16 @@ def collect_state(
     if hide:
         reports = [p for p in reports if _report_job_id(p) not in hide]
     root = getattr(workspace, "root", None)
+    runs = _run_summaries(events)
+    meta_index = _job_meta_index(workspace)
+    for run in runs:
+        run["repo"] = meta_index.get(run["id"], {}).get("repo") or "(unknown)"
     return {
         "generated_at": clock(),
         "workspace": str(root) if root is not None else "(in-memory)",
         "agents": _agent_cards(events),
         "activity": list(reversed(events[-_FEED_LIMIT:])),
-        "runs": _run_summaries(events),
+        "runs": runs,
         "backlog": _backlog_state(workspace, hide=hide),
         "memory": _memory_state(workspace),
         "conventions": _conventions_state(workspace),
@@ -1789,7 +1812,7 @@ function renderMarkdown(src) {
 
 // ---- views ----
 let state = null;
-const filters = { agent: "", run: "" };
+const filters = { agent: "", run: "", repo: "" };
 // Run ids loadQuestion most recently found pending — runsPanel's own
 // unconditional-every-2.5s re-render consults this so it renders the
 // waiting chip itself instead of overwriting the chip loadQuestion set
@@ -1874,7 +1897,7 @@ function syncFilters(s) {
 }
 
 function syncClear() {
-  $("f-clear").hidden = !(filters.agent || filters.run);
+  $("f-clear").hidden = !(filters.agent || filters.run || filters.repo);
 }
 
 function feed(s) {
@@ -1938,7 +1961,8 @@ function runsPanel(s) {
   const archivedSet = new Set(s.archived_jobs || []);
   const runningSet = new Set(runningJobIds(s));
   for (const id of pendingIds) if (!runningSet.has(id)) pendingIds.delete(id);
-  put($("runs"), s.runs.map(r => {
+  const visible = filters.repo ? s.runs.filter(r => r.repo === filters.repo) : s.runs;
+  put($("runs"), visible.map(r => {
     const cost = parseCost(r.last_message);
     const dur = (r.started != null && r.ended != null) ? fmtDur(r.ended - r.started) : "";
     const isArchived = archivedSet.has(r.id);
@@ -2142,12 +2166,16 @@ function calibrationSummary(cal) {
     + `${esc(cal.report_quality_jobs_counted)} audits</div>`;
 }
 
-// One "by repo" row: repo label plus its verdict counts. SECURITY: repo is
-// caller-supplied via POST /jobs (untrusted), mirrored verbatim into
-// meta.json — esc() before innerHTML, same discipline as every other panel.
+// One "by repo" row: repo label plus its verdict counts, clickable to scope
+// the Runs/Reports panels to this repo. SECURITY: repo is caller-supplied
+// via POST /jobs (untrusted), mirrored verbatim into meta.json — esc()
+// before innerHTML/attribute construction, same discipline as every other
+// panel (data-path/data-run use the exact same esc()).
 function calibrationRepoRow(repo, b) {
   const rate = b.confirm_rate === null ? "\\u2014" : `${Math.round(b.confirm_rate * 100)}%`;
-  return `<tr><td>${esc(repo)}</td><td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td>`
+  return `<tr class="repo-row" data-repo="${esc(repo)}" `
+    + `role="button" tabindex="0" title="scope Runs/Reports to ${esc(repo)}">`
+    + `<td>${esc(repo)}</td><td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td>`
     + `<td>${esc(b.needs_context)}</td><td>${esc(rate)}</td></tr>`;
 }
 
@@ -2187,11 +2215,14 @@ function spendRow(mode, usd) {
 // The "by repo" sub-table beneath the by-mode table — shown only when more
 // than one repo has spend, unlike calibrationRepoTable's "any non-empty"
 // threshold: a single-repo workspace's by-repo row would just restate the
-// total line above it, adding visual noise for zero information. SECURITY:
-// repo is caller-supplied (POST /jobs) — esc() before innerHTML, same
-// discipline as calibrationRepoRow.
+// total line above it, adding visual noise for zero information. Clickable
+// to scope the Runs/Reports panels, same as calibrationRepoRow. SECURITY:
+// repo is caller-supplied (POST /jobs) — esc() before innerHTML/attribute
+// construction, same discipline as calibrationRepoRow.
 function spendRepoRow(repo, usd) {
-  return `<tr><td>${esc(repo)}</td><td>$${esc(usd.toFixed(2))}</td></tr>`;
+  return `<tr class="repo-row" data-repo="${esc(repo)}" `
+    + `role="button" tabindex="0" title="scope Runs/Reports to ${esc(repo)}">`
+    + `<td>${esc(repo)}</td><td>$${esc(usd.toFixed(2))}</td></tr>`;
 }
 
 function spendRepoTable(byRepo) {
@@ -2432,7 +2463,10 @@ function reports(s) {
   if (!s.reports.length) { put($("reports"), '<span class="muted">no assessment reports</span>'); return; }
   const archivedSet = new Set(s.archived_jobs || []);
   const reportMeta = s.report_meta || {};
-  put($("reports"), s.reports.map(p => {
+  const visible = filters.repo
+    ? s.reports.filter(p => (reportMeta[reportJobId(p)] || {}).repo === filters.repo)
+    : s.reports;
+  put($("reports"), visible.map(p => {
     const jobId = reportJobId(p);
     const isArchived = jobId && archivedSet.has(jobId);
     const metaChips = reportMetaChips(jobId ? reportMeta[jobId] : null);
@@ -2812,6 +2846,13 @@ function toggleRun(id) {
   if (filters.run) $("activity-title").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+// ---- repo (Calibration/Spend by-repo row) -> Runs/Reports cross-filter ----
+function toggleRepo(repo) {
+  filters.repo = filters.repo === repo ? "" : repo;
+  if (state) { runsPanel(state); reports(state); }
+  syncClear();
+}
+
 // ---- job archive / unarchive (forwarded via /api/jobs/{id}/... proxy) ----
 async function archiveJob(id, action) {
   try {
@@ -2870,10 +2911,10 @@ $("f-run").addEventListener("change", e => {
   syncClear();
 });
 $("f-clear").addEventListener("click", () => {
-  filters.agent = filters.run = "";
+  filters.agent = filters.run = filters.repo = "";
   $("f-agent").value = "";
   $("f-run").value = "";
-  if (state) { feed(state); runsPanel(state); }
+  if (state) { feed(state); runsPanel(state); reports(state); }
   syncClear();
 });
 $("reports").addEventListener("click", e => {
@@ -2881,6 +2922,22 @@ $("reports").addEventListener("click", e => {
   if (arch) { archiveJob(arch.dataset.archjob, arch.dataset.archAction); return; }
   const btn = e.target.closest("[data-path]");
   if (btn) openModal(btn.dataset.path);
+});
+$("memory").addEventListener("click", e => {
+  const row = e.target.closest("[data-repo]");
+  if (row) toggleRepo(row.dataset.repo);
+});
+$("memory").addEventListener("keydown", e => {
+  const row = e.target.closest("[data-repo]");
+  if (row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleRepo(row.dataset.repo); }
+});
+$("spend").addEventListener("click", e => {
+  const row = e.target.closest("[data-repo]");
+  if (row) toggleRepo(row.dataset.repo);
+});
+$("spend").addEventListener("keydown", e => {
+  const row = e.target.closest("[data-repo]");
+  if (row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleRepo(row.dataset.repo); }
 });
 $("agents").addEventListener("click", e => {
   const card = e.target.closest("[data-role]");

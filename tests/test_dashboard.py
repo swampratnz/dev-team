@@ -84,6 +84,55 @@ def test_run_summaries_tolerate_missing_timestamps():
     assert runs[0]["ended"] is None
 
 
+# --- run/report repo attribution, click-to-scope (issue #269) ----------------------
+
+
+def test_collect_state_runs_carry_repo_from_meta_json():
+    """AC1: a run whose id matches a job with meta.json carries that repo."""
+
+    ws = InMemoryWorkspace()
+    _journal(ws, AgentEvent("qa", "test", "assessed"), run="assess-a")
+    ws.write_text(
+        "audit/assess-a/meta.json", json.dumps({"id": "assess-a", "repo": "acme/rota"})
+    )
+    state = collect_state(ws)
+    assert state["runs"][0]["repo"] == "acme/rota"
+
+
+def test_collect_state_runs_unknown_repo_when_no_meta_json():
+    """AC2: a run with no matching meta.json (e.g. a deliver-mode run, never
+
+    mirrored per docs/DASHBOARD.md) yields "(unknown)", not a missing key
+    or None.
+    """
+
+    ws = InMemoryWorkspace()
+    _journal(ws, AgentEvent("engineer", "implement", "delivered"), run="deliver-old")
+    state = collect_state(ws)
+    assert state["runs"][0]["repo"] == "(unknown)"
+
+
+def test_collect_state_runs_same_repo_carried_independently_not_aggregated():
+    """AC4: two runs of the same repo each carry that repo's value on their
+
+    own entry — no aggregation into a summed count, unlike calibration/
+    spend's by_repo shape.
+    """
+
+    ws = InMemoryWorkspace()
+    _journal(ws, AgentEvent("qa", "test", "first"), run="assess-a")
+    _journal(ws, AgentEvent("qa", "test", "second"), run="assess-b")
+    ws.write_text(
+        "audit/assess-a/meta.json", json.dumps({"id": "assess-a", "repo": "acme/rota"})
+    )
+    ws.write_text(
+        "audit/assess-b/meta.json", json.dumps({"id": "assess-b", "repo": "acme/rota"})
+    )
+    state = collect_state(ws)
+    repos = {r["id"]: r["repo"] for r in state["runs"]}
+    assert repos == {"assess-a": "acme/rota", "assess-b": "acme/rota"}
+
+
 def test_collect_state_backlog_epics_points_and_orphans():
     ws = InMemoryWorkspace()
     store = BacklogStore(ws)
@@ -1086,11 +1135,18 @@ def test_dashboard_html_calibration_by_repo_panel():
     # Static desk-check of the "by repo" sub-table JS (CI has no browser),
     # mirroring test_dashboard_html_spend_panel's approach. SECURITY: repo
     # is caller-supplied (POST /jobs), mirrored verbatim into meta.json, so
-    # every field must flow through esc() before innerHTML — same
-    # discipline as the existing per-phase calibrationRow.
+    # every field must flow through esc() before innerHTML/attribute
+    # construction — same discipline as the existing per-phase
+    # calibrationRow. Also covers #269's click-to-scope affordance: a
+    # data-repo attribute (repo-scoping click target for Runs/Reports).
     assert "function calibrationRepoTable(byRepo)" in DASHBOARD_HTML
     assert 'if (!repos.length) return ""' in DASHBOARD_HTML
-    assert "<tr><td>${esc(repo)}</td><td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td>" in DASHBOARD_HTML
+    assert '`<tr class="repo-row" data-repo="${esc(repo)}" `' in DASHBOARD_HTML
+    assert (
+        '+ `role="button" tabindex="0" title="scope Runs/Reports to ${esc(repo)}">`'
+        in DASHBOARD_HTML
+    )
+    assert "<td>${esc(repo)}</td><td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td>" in DASHBOARD_HTML
     assert "<td>${esc(b.needs_context)}</td>" in DASHBOARD_HTML
     assert "cal-table cal-by-repo" in DASHBOARD_HTML
     assert "calibrationRepoTable(cal.by_repo)" in DASHBOARD_HTML
@@ -1118,14 +1174,46 @@ def test_report_meta_state_counts_blind_spots_and_broken_citations():
     assert meta["assess-a"]["broken_citation_count"] == 1
     assert meta["assess-a"]["blind_spots"] == ["legacy/", "vendor/"]
     assert meta["assess-a"]["broken_citations"] == {"security": ["Web.config"], "qa": []}
+    # no meta.json for assess-a -> "(unknown)" sentinel, same as by_repo (AC3)
+    assert meta["assess-a"]["repo"] == "(unknown)"
 
 
-def test_report_meta_state_missing_assessment_json_omits_job():
+def test_report_meta_state_attaches_repo_from_meta_json():
+    """AC1/AC3: report_meta[job_id]["repo"] mirrors the job's meta.json repo."""
+
     from dev_team.dashboard import _report_meta_state
 
     ws = InMemoryWorkspace()
     ws.write_text("audit/assess-a/assessment.md", "# report")
-    assert _report_meta_state(ws) == {}
+    ws.write_text(
+        "audit/assess-a/meta.json", json.dumps({"id": "assess-a", "repo": "acme/rota"})
+    )
+    meta = _report_meta_state(ws)
+    assert meta["assess-a"]["repo"] == "acme/rota"
+
+
+def test_report_meta_state_missing_assessment_json_still_carries_repo():
+    """AC3: a report whose job has no meta.json still gets a report_meta
+
+    entry — just the "(unknown)" repo sentinel and none of the quality
+    fields — so the Reports panel's repo-scoping filter has something to
+    match against for every report, not just ones with quality data.
+    """
+
+    from dev_team.dashboard import _report_meta_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/assess-a/assessment.md", "# report")
+    assert _report_meta_state(ws) == {"assess-a": {"repo": "(unknown)"}}
+
+
+def test_report_meta_state_meta_json_with_empty_repo_yields_unknown():
+    from dev_team.dashboard import _report_meta_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/assess-a/assessment.md", "# report")
+    ws.write_text("audit/assess-a/meta.json", json.dumps({"id": "assess-a", "repo": ""}))
+    assert _report_meta_state(ws) == {"assess-a": {"repo": "(unknown)"}}
 
 
 def test_report_meta_state_tolerates_malformed_or_wrong_typed_json():
@@ -1156,7 +1244,17 @@ def test_report_meta_state_tolerates_malformed_or_wrong_typed_json():
         json.dumps({"blind_spots": [], "broken_citations": {"qa": "not a list"}}),
     )
 
-    assert _report_meta_state(ws) == {}
+    meta = _report_meta_state(ws)
+    # malformed/wrong-typed assessment.json omits the quality fields, but
+    # every job still carries the "repo" sentinel (AC3) since none has a
+    # meta.json here.
+    assert meta == {
+        "bad-json": {"repo": "(unknown)"},
+        "not-a-dict": {"repo": "(unknown)"},
+        "bad-blind-spots": {"repo": "(unknown)"},
+        "bad-broken-citations-type": {"repo": "(unknown)"},
+        "bad-broken-citations-value": {"repo": "(unknown)"},
+    }
 
 
 def test_report_meta_state_ignores_report_paths_with_no_job_id():
@@ -1186,6 +1284,31 @@ def test_collect_state_report_meta_key_matches_report_meta_state_and_is_additive
     state = collect_state(ws)
     assert state["report_meta"] == _report_meta_state(ws)
     assert state["reports"] == ["audit/assess-a/assessment.md"]
+
+
+def test_report_meta_state_same_repo_carried_independently_not_aggregated():
+    """AC4: two reports of the same repo each carry that repo's value on
+
+    their own job entry — no aggregation into a summed count, unlike
+    calibration/spend's by_repo shape.
+    """
+
+    from dev_team.dashboard import _report_meta_state
+
+    ws = InMemoryWorkspace()
+    ws.write_text("audit/assess-a/assessment.md", "# report a")
+    ws.write_text(
+        "audit/assess-a/meta.json", json.dumps({"id": "assess-a", "repo": "acme/rota"})
+    )
+    ws.write_text("audit/assess-b/assessment.md", "# report b")
+    ws.write_text(
+        "audit/assess-b/meta.json", json.dumps({"id": "assess-b", "repo": "acme/rota"})
+    )
+    meta = _report_meta_state(ws)
+    assert meta == {
+        "assess-a": {"repo": "acme/rota"},
+        "assess-b": {"repo": "acme/rota"},
+    }
 
 
 # --- agent history -----------------------------------------------------------------
@@ -2244,13 +2367,118 @@ def test_dashboard_html_spend_by_repo_panel():
     # AC8 + AC9 + AC10: static desk-check of the Spend panel's "by repo"
     # sub-table JS (CI has no browser), mirroring
     # test_dashboard_html_calibration_by_repo_panel's approach. SECURITY:
-    # repo is caller-supplied (POST /jobs) — esc() before innerHTML, same
-    # discipline as spendRow/calibrationRepoRow.
+    # repo is caller-supplied (POST /jobs) — esc() before innerHTML/attribute
+    # construction, same discipline as spendRow/calibrationRepoRow. Also
+    # covers #269's click-to-scope affordance: a data-repo attribute.
     assert "function spendRepoTable(byRepo)" in DASHBOARD_HTML
     assert 'if (repos.length <= 1) return "";' in DASHBOARD_HTML
-    assert "<tr><td>${esc(repo)}</td><td>$${esc(usd.toFixed(2))}</td></tr>" in DASHBOARD_HTML
+    assert '`<tr class="repo-row" data-repo="${esc(repo)}" `' in DASHBOARD_HTML
+    assert (
+        '+ `role="button" tabindex="0" title="scope Runs/Reports to ${esc(repo)}">`'
+        in DASHBOARD_HTML
+    )
+    assert "<td>${esc(repo)}</td><td>$${esc(usd.toFixed(2))}</td></tr>" in DASHBOARD_HTML
     assert "cal-table cal-by-repo" in DASHBOARD_HTML
     assert "spendRepoTable(data.by_repo)" in DASHBOARD_HTML
+
+
+# --- repo click-to-scope: Calibration/Spend rows -> Runs/Reports (issue #269) ------
+
+
+def test_dashboard_html_filters_repo_defaults_unset():
+    """AC5: filters.repo is "" (unset) on initial page load, before any
+
+    repo row is clicked — explicit initial-state assertion.
+    """
+
+    assert 'const filters = { agent: "", run: "", repo: "" };' in DASHBOARD_HTML
+
+
+def test_dashboard_html_repo_row_click_toggles_filter_and_rerenders():
+    """AC6: clicking a repo row sets filters.repo and re-renders Runs/
+
+    Reports; clicking the same row again clears it back to "" — mirroring
+    toggleRun's existing toggle behavior.
+    """
+
+    assert "function toggleRepo(repo) {" in DASHBOARD_HTML
+    assert 'filters.repo = filters.repo === repo ? "" : repo;' in DASHBOARD_HTML
+    assert "if (state) { runsPanel(state); reports(state); }" in DASHBOARD_HTML
+
+    # wired from both by-repo tables (Calibration lives in #memory, Spend in
+    # #spend), mouse and keyboard (Enter/Space), matching the [role=button
+    # tabindex=0] markup calibrationRepoRow/spendRepoRow render.
+    for container in ('$("memory")', '$("spend")'):
+        assert f'{container}.addEventListener("click", e => {{\n  const row = e.target.closest("[data-repo]");\n  if (row) toggleRepo(row.dataset.repo);\n}});' in DASHBOARD_HTML
+        assert (
+            f'{container}.addEventListener("keydown", e => {{\n'
+            '  const row = e.target.closest("[data-repo]");\n'
+            '  if (row && (e.key === "Enter" || e.key === " ")) '
+            "{ e.preventDefault(); toggleRepo(row.dataset.repo); }\n})"
+        ) in DASHBOARD_HTML
+
+
+def test_dashboard_html_runs_panel_filters_by_repo():
+    """AC6/AC7: runsPanel filters s.runs to the selected repo before mapping,
+
+    falling back to the unfiltered list byte-identically when filters.repo
+    is unset (the repo field is consumed only for filtering, never rendered
+    as new markup on the row).
+    """
+
+    assert (
+        "const visible = filters.repo ? s.runs.filter(r => r.repo === filters.repo) : s.runs;"
+        in DASHBOARD_HTML
+    )
+    assert "put($(\"runs\"), visible.map(r => {" in DASHBOARD_HTML
+    # the row template itself is unchanged — no repo text/markup added
+    assert 'data-run="${esc(r.id)}"' in DASHBOARD_HTML
+
+
+def test_dashboard_html_reports_panel_filters_by_repo():
+    """AC6/AC7: reports() filters s.reports to the selected repo (via each
+
+    report's owning job's report_meta.repo) before mapping, same
+    byte-identical-when-unfiltered contract as runsPanel.
+    """
+
+    assert (
+        "const visible = filters.repo\n"
+        "    ? s.reports.filter(p => (reportMeta[reportJobId(p)] || {}).repo === filters.repo)\n"
+        "    : s.reports;"
+    ) in DASHBOARD_HTML
+    assert 'put($("reports"), visible.map(p => {' in DASHBOARD_HTML
+
+
+def test_dashboard_html_repo_row_escapes_attribute_and_text():
+    """AC8 [security]: a repo value containing HTML/attribute-breaking
+
+    characters (e.g. ``foo" onmouseover="alert(1)`` or
+    ``'<img src=x onerror=alert(1)>'``) must render in the clickable row's
+    ``data-repo`` attribute and visible text only in escaped, inert form —
+    mirroring #223's/#232's identical by-repo-table security discipline,
+    now extended to the new attribute this issue adds.
+    """
+
+    assert 'data-repo="${esc(repo)}"' in DASHBOARD_HTML
+    # never the raw, unescaped repo value in the attribute or cell text
+    assert 'data-repo="${repo}"' not in DASHBOARD_HTML
+    assert "<td>${repo}</td>" not in DASHBOARD_HTML
+
+
+def test_dashboard_html_clear_filters_covers_repo():
+    """AC10: the existing "clear filters" control clears filters.repo
+
+    alongside filters.agent/filters.run in one click, and syncClear's
+    visibility condition is shown whenever any of the three is set.
+    """
+
+    assert "$(\"f-clear\").hidden = !(filters.agent || filters.run || filters.repo);" in DASHBOARD_HTML
+    assert "filters.agent = filters.run = filters.repo = \"\";" in DASHBOARD_HTML
+    assert (
+        'if (state) { feed(state); runsPanel(state); reports(state); }'
+        in DASHBOARD_HTML
+    )
 
 
 # --- the access log proxy (GET /api/access-log → dispatch GET /access-log) ---
