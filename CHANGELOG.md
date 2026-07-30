@@ -5,6 +5,24 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Assessment
+- **Live EOL scan now reads `Cargo.toml`'s `[package].rust-version` (MSRV),
+  the named follow-up #261 deliberately deferred** (#273). Previously a
+  Rust repo with a `Cargo.toml` but no `rust-toolchain.toml` — most real
+  Rust projects, since `rust-toolchain.toml` is opt-in CI-pinning while
+  `Cargo.toml` is mandatory — got zero live-verified Rust EOL signal.
+  `parse_cargo_toml_rust_version` reuses the same `tomllib` primitive
+  `parse_rust_toolchain_toml` and `depscan.parse_cargo_toml` already trust
+  for this file, in its own module-local `_PARSERS["Cargo.toml"]` entry
+  (no collision with `depscan`'s identically-named registration); the
+  `rust-version.workspace = true` inheritance form (a `bool`, not a `str`,
+  at that key) degrades to `None`, never guessed. `detect_runtimes` gained
+  a narrowly-scoped precedence rule, for the `rust` product only: when a
+  workspace carries both manifests, the `rust-toolchain.toml`-pinned
+  channel wins over the `Cargo.toml` MSRV floor even though `"Cargo.toml"`
+  sorts first alphabetically — every other product's manifest collisions
+  keep today's plain sorted-first-wins behaviour.
+
 ### QA
 - **Mutation-lite now flips augmented-assignment arithmetic
   (`total += 1`↔`total -= 1`, `x *= 2`↔`x /= 2`), the exact follow-up #226
