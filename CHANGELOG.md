@@ -5,6 +5,23 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Dashboard
+- **Queue panel + cancel button** (`docs/DASHBOARD.md`), #39's own
+  named-but-unfiled UI follow-up: `GET /api/queue` proxies to the dispatch
+  service's `GET /jobs?state=queued`, closing the gap where a merely-queued
+  job (registered by `submit()` but not yet reached by `run_job`) had no
+  `audit/{id}/meta.json` yet and was therefore invisible to the disk-mirror-
+  sourced Runs panel. `"cancel"` joins `_JOBS_PROXY_ACTIONS`
+  (`archive`/`unarchive`/`purge`), forwarding `POST /api/jobs/{id}/cancel`
+  to the already-shipped `cancel_job` (#39) — a single-click button (no
+  two-step confirm, unlike purge: a queued job hasn't touched the workspace
+  or spent budget yet). Both are narrow, dashboard-session-gated proxies of
+  the existing shape; the dispatch service's own `409`-on-non-queued check
+  in `cancel_job` remains the actual security boundary, not the button's
+  visibility. Fetched once on load plus manual refresh, same
+  on-demand-only discipline as Spend/Access log/Foreman plan — no new
+  polling.
+
 ### QA
 - **Mutation-lite now flips augmented-assignment arithmetic
   (`total += 1`↔`total -= 1`, `x *= 2`↔`x /= 2`), the exact follow-up #226

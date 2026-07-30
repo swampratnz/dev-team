@@ -536,12 +536,16 @@ _JOBS_PROXY_PREFIX = "/api/jobs/"
 #: The only actions the jobs proxy will forward. ``purge`` is archive-gated
 #: server-side (the dispatch service's own ``purge_job`` refuses a
 #: non-archived job with 409) — the proxy's job here is only to keep the
-#: forwarding surface narrow, not to re-enforce that gate. ``question``/
-#: ``answer`` are a separate pair of routes (see :meth:`Handler._question`/
+#: forwarding surface narrow, not to re-enforce that gate. ``cancel`` is
+#: state-gated the same way (``cancel_job`` 409s on a non-``queued`` job) —
+#: the dashboard only ever renders the cancel button for entries
+#: ``GET /api/queue`` returned, but that server-side check, not the button's
+#: visibility, is the actual security boundary. ``question``/``answer`` are
+#: a separate pair of routes (see :meth:`Handler._question`/
 #: :meth:`Handler._proxy_answer`) — not folded into this set because they
 #: are a GET and a body-forwarding POST, a different shape than these
 #: no-body actions.
-_JOBS_PROXY_ACTIONS = frozenset({"archive", "unarchive", "purge"})
+_JOBS_PROXY_ACTIONS = frozenset({"archive", "unarchive", "purge", "cancel"})
 
 #: How long a proxied board write may take end to end. The dispatch cores are
 #: pure disk transforms, so anything slower means the service is wedged.
@@ -951,6 +955,8 @@ def _make_handler(
                 self._access_log(parts.query)
             elif parts.path == "/api/foreman/plan":
                 self._foreman_plan(parts.query)
+            elif parts.path == "/api/queue":
+                self._queue()
             elif parts.path.startswith(_JOBS_PROXY_PREFIX):
                 self._question(parts.path)
             else:
@@ -1041,6 +1047,26 @@ def _make_handler(
                 else "/foreman/plan"
             )
             self._proxy("GET", suffix, None)
+
+        # -- queue: a sixth narrow read-only proxy, same shape as the spend
+        # rollup/access log/foreman plan above. Scope is exactly this one
+        # path (see do_GET's exact-match dispatch above). Proxies to
+        # GET /jobs?state=queued (the exact-match filter #221 shipped) —
+        # collect_state() only ever walks the disk-mirrored audit/ tree, and
+        # _mirror_meta (the call that first writes audit/{id}/meta.json)
+        # fires only inside run_job, so a merely-submit()'d job is otherwise
+        # invisible to the dashboard. Its write sibling is "cancel" in
+        # _JOBS_PROXY_ACTIONS above, not a new route.
+
+        def _queue(self) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "queue not configured"}),
+                )
+                return
+            self._proxy("GET", "/jobs?state=queued", None)
 
         # -- foreman run: the write sibling of the plan dry-run above, a
         # body-forwarding proxy shaped like :meth:`_proxy_answer`. Scope is
@@ -1597,6 +1623,11 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
       <label class="archtoggle"><input type="checkbox" id="show-archived" aria-label="show archived jobs"> show archived</label>
     </div>
     <div class="runs" id="runs"><div class="panel muted">no runs recorded</div></div>
+    <div class="section-head">
+      <h2>Queue</h2>
+      <button id="queue-refresh" class="ghost">refresh</button>
+    </div>
+    <div class="runs" id="queue"><div class="panel muted">loading&hellip;</div></div>
   </div>
   <div>
     <h2>Memory &amp; conventions</h2>
@@ -1956,6 +1987,52 @@ function runsPanel(s) {
       ${runningSet.has(r.id) ? `<div class="question" id="q-${esc(r.id)}"></div>` : ""}
     </div>`;
   }).join(""));
+}
+
+// One "cancel" button for a queued (not yet running) job, forwarded through
+// the same /api/jobs/{id}/... proxy as archive/unarchive (see archiveButton
+// above). No two-step confirm (unlike purgeButton): a queued job hasn't
+// touched the workspace or spent budget yet, so cancelling it is closer to
+// archiveButton's reversible single-click precedent than purgebtn's
+// irreversible-delete one.
+function cancelButton(id) {
+  return `<button class="archbtn" data-canceljob="${esc(id)}" title="cancel this queued job">cancel</button>`;
+}
+
+// The Queue panel: jobs sitting in ``queued`` state, from GET /api/queue —
+// invisible to runsPanel/collect_state above, which only ever walks the
+// disk-mirrored audit/ tree (a queued job has no audit/{id}/ dir yet).
+// Fetched once on load plus manual refresh only, same on-demand-not-polled
+// discipline as Spend/Access log/Foreman plan below (a queued job changes
+// state at most as fast as the single worker drains it — docs/DISPATCH.md).
+// SECURITY: id/mode/repo/story_id are dispatch-service job metadata (never
+// secrets) — esc() before innerHTML, same discipline as every other panel.
+function queueRow(j) {
+  const story = j.story_id ? ` <span class="muted">${esc(j.story_id)}</span>` : "";
+  return `<div class="run">
+    <div class="top"><code>${esc(j.id)}</code></div>
+    <div class="meta"><span>${esc(j.mode)}</span><span>${esc(j.repo)}</span>${story}${cancelButton(j.id)}</div>
+  </div>`;
+}
+
+function queuePanel(data) {
+  const jobs = data.jobs || [];
+  if (!jobs.length) return '<div class="panel muted">queue is empty</div>';
+  return jobs.map(queueRow).join("");
+}
+
+async function loadQueue() {
+  try {
+    const res = await fetch("/api/queue");
+    if (res.status === 501) {
+      put($("queue"), '<div class="panel muted">queue not configured</div>');
+      return;
+    }
+    if (!res.ok) throw new Error(String(res.status));
+    put($("queue"), queuePanel(await res.json()));
+  } catch (err) {
+    put($("queue"), '<div class="panel muted">failed to load queue</div>');
+  }
 }
 
 // ---- pending question panel (interactive deliver jobs) --------------------
@@ -2830,6 +2907,15 @@ async function purgeJob(id) {
   } catch (err) { showBoardError("purge failed: " + err.message); }
 }
 
+// ---- job cancel (queued jobs only; forwarded via the same jobs proxy) ----
+async function cancelJob(id) {
+  try {
+    const res = await fetch("/api/jobs/" + encodeURIComponent(id) + "/cancel", { method: "POST" });
+    if (!res.ok) throw new Error(String(res.status));
+    await loadQueue();
+  } catch (err) { showBoardError("cancel failed: " + err.message); }
+}
+
 // ---- wiring ----
 $("runs").addEventListener("click", e => {
   const answer = e.target.closest("[data-answer]");
@@ -2855,6 +2941,11 @@ $("runs").addEventListener("keydown", e => {
   const card = e.target.closest("[data-run]");
   if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleRun(card.dataset.run); }
 });
+$("queue").addEventListener("click", e => {
+  const cancel = e.target.closest("[data-canceljob]");
+  if (cancel) cancelJob(cancel.dataset.canceljob);
+});
+$("queue-refresh").addEventListener("click", loadQueue);
 $("show-archived").addEventListener("change", e => {
   showArchived = e.target.checked;
   refresh();
@@ -3002,6 +3093,7 @@ setInterval(refresh, 2500);
 loadSpend();
 loadAccessLog();
 loadForemanPlan();
+loadQueue();
 pollQuestions();
 setInterval(pollQuestions, 5000);
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") pollQuestions(); });

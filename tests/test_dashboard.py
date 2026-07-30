@@ -16,6 +16,7 @@ from dev_team.authguard import FailedAuthTracker
 from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.conventions import ConventionsProfile, ConventionsStore
 from dev_team.dashboard import (
+    _JOBS_PROXY_ACTIONS,
     DASHBOARD_HTML,
     LOGIN_HTML,
     DashboardServer,
@@ -2073,6 +2074,82 @@ def test_jobs_proxy_purge_requires_dashboard_auth_first(proxy_server, monkeypatc
     assert seen == []
 
 
+# --- the job cancel proxy (/api/jobs/{id}/cancel → dispatch) -----------------
+# #271: cancel folds into the same no-body-action proxy as archive/unarchive/
+# purge above (see _JOBS_PROXY_ACTIONS) — same shape, same tests.
+
+
+def test_jobs_proxy_forwards_cancel(proxy_server, monkeypatch):
+    # AC4
+    seen = _capture_urlopen(
+        monkeypatch, status=200, body=b'{"id": "assess-a", "state": "cancelled"}'
+    )
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/cancel", headers=AUTH
+    )
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"id": "assess-a", "state": "cancelled"}
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/jobs/assess-a/cancel"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+
+
+def test_jobs_proxy_relays_a_cancel_rejection(proxy_server, monkeypatch):
+    # AC5: a 409 (job not queued) relayed verbatim, unmodified.
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/jobs/assess-a/cancel", 409, "Conflict", None,
+        io.BytesIO(b'{"error": "job is not queued"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/cancel", headers=AUTH
+    )
+    assert status == 409
+    assert json.loads(body) == {"error": "job is not queued"}
+
+
+def test_jobs_proxy_cancel_unconfigured_is_501(token_server, monkeypatch):
+    # AC6
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "POST", "/api/jobs/assess-a/cancel", headers=AUTH
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "job actions not configured"}
+    assert seen == []
+
+
+def test_jobs_proxy_cancel_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    # AC8 [security]: unauthenticated POST /api/jobs/{id}/cancel answers 401
+    # before any proxy call is attempted — the dashboard auth gate, not just
+    # cancel_job's own 409-on-non-queued check, guards this write path.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/cancel"
+    )
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+def test_jobs_proxy_actions_grew_by_exactly_cancel(proxy_server, monkeypatch):
+    # AC7: _JOBS_PROXY_ACTIONS is exactly {archive, unarchive, purge, cancel}
+    # — an action outside this set (e.g. a still-unknown "submit") is still
+    # 404, proving the proxy did not become a general passthrough.
+    assert _JOBS_PROXY_ACTIONS == {"archive", "unarchive", "purge", "cancel"}
+    seen = _capture_urlopen(monkeypatch)
+    status, _, body = _request(
+        proxy_server, "POST", "/api/jobs/assess-a/submit", headers=AUTH
+    )
+    assert status == 404
+    assert json.loads(body) == {"error": "not found"}
+    assert seen == []
+
+
 def test_dashboard_html_purge_button_and_confirm_flow():
     # The "delete permanently" action only renders for an already-archived
     # job (purgeButton returns "" otherwise), forwards through the same
@@ -2611,6 +2688,155 @@ def test_foreman_plan_route_scope_is_exact_match_only(proxy_server, monkeypatch)
         status, _, _ = _request(proxy_server, "GET", path, headers=AUTH)
         assert status == 404
     assert seen == []
+
+
+# --- the queue proxy (GET /api/queue → dispatch GET /jobs?state=queued) ------
+# #271: a sixth narrow read-only proxy, same shape as spend/access-log/
+# foreman-plan above. Its write sibling is "cancel" in _JOBS_PROXY_ACTIONS
+# (see the job cancel proxy tests above), not a new route.
+
+
+def test_queue_proxy_forwards_and_relays_verbatim(proxy_server, monkeypatch):
+    # AC1: proxies to GET /jobs?state=queued and relays the body verbatim.
+    seen = _capture_urlopen(
+        monkeypatch,
+        status=200,
+        body=b'{"jobs": ['
+        b'{"id": "assess-a", "state": "queued", "mode": "assess", "repo": "acme/rota"},'
+        b'{"id": "assess-b", "state": "running", "mode": "assess", "repo": "acme/rota"}'
+        b"]}",
+    )
+    status, headers, body = _request(proxy_server, "GET", "/api/queue", headers=AUTH)
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {
+        "jobs": [
+            {"id": "assess-a", "state": "queued", "mode": "assess", "repo": "acme/rota"},
+            {"id": "assess-b", "state": "running", "mode": "assess", "repo": "acme/rota"},
+        ]
+    }
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/jobs?state=queued"
+    assert request.get_method() == "GET"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.data is None
+
+
+def test_queue_proxy_unconfigured_is_501(token_server, monkeypatch):
+    # AC2: no dispatch_url/dispatch_token wired → 501, no outbound request.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(token_server, "GET", "/api/queue", headers=AUTH)
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "queue not configured"}
+    assert seen == []
+
+
+def test_queue_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    # AC3
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(proxy_server, "GET", "/api/queue")
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+def test_queue_proxy_url_without_token_stays_unconfigured(monkeypatch):
+    # A dispatch URL alone (no dispatch token) must not forward: still 501,
+    # matching every other proxy's own behaviour.
+    seen = _capture_urlopen(monkeypatch)
+    srv = DashboardServer(
+        InMemoryWorkspace(), port=0, token=TOKEN, dispatch_url=DISPATCH_URL
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, body = _request(srv, "GET", "/api/queue", headers=AUTH)
+        assert status == 501
+        assert json.loads(body) == {"error": "queue not configured"}
+        assert seen == []
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
+
+
+def test_queue_proxy_unreachable_dispatch_is_502(proxy_server, monkeypatch):
+    _capture_urlopen(monkeypatch, error=urllib.error.URLError("refused"))
+    status, _, body = _request(proxy_server, "GET", "/api/queue", headers=AUTH)
+    assert status == 502
+    assert json.loads(body) == {"error": "dispatch service unreachable"}
+    assert "refused" not in body  # no internals leak
+
+
+def test_queue_proxy_relays_a_dispatch_rejection_verbatim(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/jobs?state=queued", 400, "Bad Request", None,
+        io.BytesIO(b'{"error": "bad state filter"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(proxy_server, "GET", "/api/queue", headers=AUTH)
+    assert status == 400
+    assert json.loads(body) == {"error": "bad state filter"}
+
+
+def test_queue_proxy_never_echoes_the_dispatch_token(proxy_server, monkeypatch):
+    # SECURITY: matches every other proxy's own non-leak assertion — the
+    # dispatch bearer token must never reach the browser.
+    _capture_urlopen(monkeypatch, body=b'{"jobs": []}')
+    status, headers, body = _request(proxy_server, "GET", "/api/queue", headers=AUTH)
+    assert status == 200
+    assert DISPATCH_TOKEN not in body
+    assert DISPATCH_TOKEN not in str(headers)
+
+
+def test_queue_route_scope_is_exact_match_only(proxy_server, monkeypatch):
+    # SECURITY/scope: only exactly /api/queue is the route — a path that
+    # merely starts with it falls through to the ordinary 404, never
+    # forwarded to the dispatch service (no general dispatch passthrough).
+    seen = _capture_urlopen(monkeypatch)
+    for path in ("/api/queue/", "/api/queue/extra", "/api/queue2"):
+        status, _, _ = _request(proxy_server, "GET", path, headers=AUTH)
+        assert status == 404
+    assert seen == []
+
+
+def test_dashboard_html_queue_panel_and_cancel_button():
+    # AC9: DASHBOARD_HTML contains the queue-panel render function, a
+    # data-canceljob button template, and a queue-refresh control. AC10: an
+    # empty queue renders a "queue is empty" message, mirroring runsPanel's
+    # own "no runs recorded" empty state.
+    assert 'id="queue-refresh"' in DASHBOARD_HTML
+    assert '<div class="runs" id="queue">' in DASHBOARD_HTML
+    assert "function queuePanel(data)" in DASHBOARD_HTML
+    assert 'data-canceljob="${esc(id)}"' in DASHBOARD_HTML
+    assert "queue is empty" in DASHBOARD_HTML
+    assert "queue not configured" in DASHBOARD_HTML
+    assert 'fetch("/api/queue")' in DASHBOARD_HTML
+    assert (
+        'fetch("/api/jobs/" + encodeURIComponent(id) + "/cancel", { method: "POST" })'
+        in DASHBOARD_HTML
+    )
+    assert '$("queue-refresh").addEventListener("click", loadQueue)' in DASHBOARD_HTML
+    assert (
+        '$("queue").addEventListener("click", e => {\n'
+        '  const cancel = e.target.closest("[data-canceljob]");\n'
+        '  if (cancel) cancelJob(cancel.dataset.canceljob);\n'
+        "});" in DASHBOARD_HTML
+    )
+    # esc() discipline: job id/mode/repo/story_id are dispatch-service job
+    # metadata (never secrets, but not to be trusted as pre-sanitised HTML
+    # either) — same discipline as every other panel.
+    assert "${esc(j.id)}" in DASHBOARD_HTML
+    assert "${esc(j.mode)}" in DASHBOARD_HTML
+    assert "${esc(j.repo)}" in DASHBOARD_HTML
+
+    # manual-refresh-only discipline: never inside the 2.5s /api/state poll.
+    refresh_start = DASHBOARD_HTML.index("async function refresh()")
+    refresh_end = DASHBOARD_HTML.index("refresh();", refresh_start)
+    assert "/api/queue" not in DASHBOARD_HTML[refresh_start:refresh_end]
+    assert "setInterval(loadQueue" not in DASHBOARD_HTML
+    assert "\nloadQueue();" in DASHBOARD_HTML
 
 
 # --- the foreman run proxy (POST /api/foreman/run → dispatch POST /foreman/run) --
@@ -3237,8 +3463,9 @@ def test_dashboard_html_run_card_waiting_chip():
     #    interval/timer — loadQuestion/pollQuestions still perform exactly
     #    the one GET /api/jobs/{id}/question request per running job per
     #    5s tick that they did before this change, and the page still has
-    #    exactly the same total number of fetch(/setInterval( call sites.
-    assert DASHBOARD_HTML.count("fetch(") == 14
+    #    exactly the same total number of fetch(/setInterval( call sites
+    #    (16: the prior 14 plus #271's loadQueue and cancelJob).
+    assert DASHBOARD_HTML.count("fetch(") == 16
     assert DASHBOARD_HTML.count("setInterval(") == 3
     assert body.count("fetch(") == 1  # loadQuestion's one existing request
     assert "setInterval(pollQuestions, 5000)" in DASHBOARD_HTML

@@ -30,6 +30,7 @@ workspace on every request.
 | **Score history** — the last 8 delivery runs with headline metrics and signed deltas from the run before | `.dev_team/score-history.json` |
 | **Spend** — total spend and a per-mode breakdown, fetched on demand | the dispatch service's `GET /costs` (proxied, see *Spend* below) |
 | **Access log** — recent dispatch HTTP requests (method/path/status), fetched on demand | the dispatch service's `GET /access-log` (proxied, see *Access log* below) |
+| **Queue** — jobs still `queued` (not yet running), fetched on demand, each with a cancel button | the dispatch service's `GET /jobs?state=queued` (proxied, see *Queue* below) |
 | **Reports** — every `audit/*.md`, viewable in place, with blind-spot/broken-citation count chips (see *Report quality chips* below) | the workspace tree |
 
 Runs, Reports, and the Kanban board all exclude **archived** jobs by
@@ -102,6 +103,42 @@ that is a UX nicety, not the security boundary: the dispatch service's own
 non-archived job) regardless of what the browser sends. Purge is **not
 idempotent** — a second call on an already-purged job answers `404`, the
 job having left every listing for good.
+
+### Queue
+
+`collect_state()` (the Runs panel's source) only ever walks the
+disk-mirrored `audit/` tree — `_mirror_meta`, the call that first writes
+`audit/{id}/meta.json`, fires only inside `run_job`, so a job that has only
+reached `submit()` (state `queued`) has no `audit/` directory yet and is
+invisible to the Runs panel by construction, not merely un-actionable. The
+**Queue** panel (below Runs) closes that gap: `GET /api/queue` forwards to
+the dispatch service's live in-memory registry via `GET /jobs?state=queued`
+(the exact-match filter [`docs/DISPATCH.md`](DISPATCH.md) documents) and
+relays the `{"jobs": [...]}` body verbatim — the same narrow read-only proxy
+shape as Spend/Access log/Foreman plan above.
+
+Same on-demand-only discipline as those three: fetched **once on page load
+plus a manual refresh button**, never part of the 2.5s `/api/state` poll — a
+queued job changes state at most as fast as the single worker drains it
+(strictly one job at a time, see [`docs/DISPATCH.md`](DISPATCH.md)), nowhere
+near frequent enough to need poll-cadence freshness. Without a dispatch
+URL/token configured, `GET /api/queue` answers `501` and the panel renders a
+muted "not configured" state; an empty queue (`{"jobs": []}`) renders a
+muted "queue is empty" state rather than a blank panel.
+
+Each row carries a single-click **cancel** button — no two-step confirm
+(unlike purge above): a queued job hasn't touched the workspace or spent
+budget yet, so cancelling it is the direct, reversible-in-intent inverse of
+"I changed my mind about this submission," closer to the archive button's
+single-click precedent than purge's irreversible-delete one. Clicking it
+POSTs `/api/jobs/{id}/cancel` through the same narrow jobs proxy
+archive/unarchive/purge use (see *The board write model* below) — cancel is
+simply a fourth action in that proxy's allow-list, not a new route. The
+button only ever renders for an entry `GET /api/queue` returned (state
+`queued` by the filter itself), but that is a UX nicety, not the security
+boundary: the dispatch service's own `cancel_job` re-enforces the
+`queued`-only gate server-side (`409` on a job that has already started or
+finished) regardless of what the browser sends.
 
 ### Story detail (click a backlog story)
 
@@ -442,11 +479,11 @@ narrow proxy to the **dispatch service**, which owns every backlog write:
 browser ──(dashboard token)──▶ dashboard /api/backlog/* ──(dispatch token)──▶ dispatch /backlog/*
 ```
 
-Archive/unarchive/purge (above) is a second, equally narrow proxy of the
-same shape:
+Archive/unarchive/purge/cancel (above) is a second, equally narrow proxy of
+the same shape:
 
 ```
-browser ──(dashboard token)──▶ dashboard /api/jobs/{id}/archive|unarchive|purge ──(dispatch token)──▶ dispatch /jobs/{id}/archive|unarchive|purge
+browser ──(dashboard token)──▶ dashboard /api/jobs/{id}/archive|unarchive|purge|cancel ──(dispatch token)──▶ dispatch /jobs/{id}/archive|unarchive|purge|cancel
 ```
 
 The Spend panel's `GET /api/costs` (above) is a third, read-only proxy of
@@ -485,6 +522,13 @@ proxy — the write half of the same panel:
 browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(dispatch token)──▶ dispatch POST /foreman/run
 ```
 
+The Queue panel's `GET /api/queue` (above) is an eighth, read-only proxy of
+the same shape:
+
+```
+browser ──(dashboard token)──▶ dashboard GET /api/queue ──(dispatch token)──▶ dispatch GET /jobs?state=queued
+```
+
 - **The proxy** (`--dashboard` with `--dispatch-url`, default
   `http://127.0.0.1:8738`): authorised `POST`/`PATCH`/`DELETE` requests
   under `/api/backlog/` are forwarded — same method, same JSON body — to
@@ -498,11 +542,11 @@ browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(
   read-only and writes answer `501 {"error": "board editing not
   configured"}`.
 - The same `--dispatch-url`/`DEV_TEAM_DISPATCH_TOKEN` configuration also
-  gates the archive/unarchive/purge proxy: `/api/jobs/{id}/archive`,
-  `/api/jobs/{id}/unarchive`, and `/api/jobs/{id}/purge` are the **only**
-  actions forwarded (never a general `/api/jobs/*` passthrough), and
-  without a token they answer `501 {"error": "job actions not
-  configured"}`.
+  gates the archive/unarchive/purge/cancel proxy: `/api/jobs/{id}/archive`,
+  `/api/jobs/{id}/unarchive`, `/api/jobs/{id}/purge`, and
+  `/api/jobs/{id}/cancel` are the **only** actions forwarded (never a
+  general `/api/jobs/*` passthrough), and without a token they answer
+  `501 {"error": "job actions not configured"}`.
 - Same again for `GET /api/costs`: forwarded verbatim to `<dispatch-url>
   /costs` (`?archived=1` passed through unchanged, any other/absent value
   excludes archived jobs, matching `GET /jobs`), and without a token it
@@ -515,7 +559,7 @@ browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(
   `501 {"error": "access log not configured"}`. Scope is **exactly
   `/api/access-log`** — no path parameter, no other dispatch route
   reachable through it.
-- Last, `GET /api/jobs/{id}/question` and `POST /api/jobs/{id}/answer`:
+- `GET /api/jobs/{id}/question` and `POST /api/jobs/{id}/answer`:
   forwarded verbatim to `<dispatch-url>/jobs/{id}/question|answer`
   (including the dispatch service's own `404`/`400`/`409` cases); without a
   token both answer `501` (`{"error": "pending question not configured"}`
@@ -530,7 +574,7 @@ browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(
   dispatch service itself clamps it to `[1, 10]`), and without a token it
   answers `501 {"error": "foreman plan not configured"}`. Scope is
   **exactly `/api/foreman/plan`** — no path parameter.
-- Last, `POST /api/foreman/run`: forwarded verbatim to `<dispatch-url>
+- `POST /api/foreman/run`: forwarded verbatim to `<dispatch-url>
   /foreman/run` (`202`/`200` success, `400` validation rejection, `500`
   compensated-cancel, `502` unreachable — all relayed unchanged), and
   without a token it answers `501 {"error": "foreman run not
@@ -540,6 +584,11 @@ browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(
   never forwarded. The dashboard adds no validation of its own; the
   dispatch service remains the sole enforcer of `budget_usd`/`max_stories`
   bounds.
+- Last, `GET /api/queue`: forwarded verbatim to `<dispatch-url>
+  /jobs?state=queued` (no other query parameter), and without a token it
+  answers `501 {"error": "queue not configured"}`. Scope is **exactly
+  `/api/queue`** — no path parameter, no other dispatch route reachable
+  through it.
 - **Auth is layered**: the browser authenticates to the dashboard
   (dashboard token / cookie, checked first); the dashboard process — not
   the browser — holds the dispatch bearer token. Both comparisons are
