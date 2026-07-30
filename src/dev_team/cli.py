@@ -375,6 +375,16 @@ def build_parser() -> argparse.ArgumentParser:
         "a token is set or the bind is loopback.",
     )
     serving.add_argument(
+        "--dashboard-cookie-secure",
+        action="store_true",
+        help="With --dashboard: mark the session cookie Secure (TLS-only) — "
+        "set this when the dashboard is served over HTTPS (e.g. behind a "
+        "TLS-terminating reverse proxy), so the session cookie is never sent "
+        "over a plain connection. Leave off for the plain-HTTP default; a "
+        "Secure cookie is never stored by the browser over plain HTTP, which "
+        "would silently break login.",
+    )
+    serving.add_argument(
         "--dashboard-workspace",
         default=None,
         metavar="DIR",
@@ -1028,6 +1038,8 @@ def _validate_args(
         parser.error(
             "--allow-unauthenticated-dashboard: only valid with --dashboard"
         )
+    if args.dashboard_cookie_secure and not args.dashboard:
+        parser.error("--dashboard-cookie-secure: only valid with --dashboard")
     if args.dashboard_workspace is not None and not args.dispatch:
         parser.error("--dashboard-workspace: only valid with --dispatch")
     if args.dispatch_url is not None and not args.dashboard:
@@ -1948,6 +1960,7 @@ def _serve_dashboard(args) -> int:
         auth_rate_limit_threshold=args.auth_rate_limit_threshold,
         auth_rate_limit_window_seconds=args.auth_rate_limit_window_seconds,
         auth_rate_limit_lockout_seconds=args.auth_rate_limit_lockout_seconds,
+        secure=args.dashboard_cookie_secure,
     )
     print(
         f"dev-team dashboard for {args.workspace} at {server.url} "

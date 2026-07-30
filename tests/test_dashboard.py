@@ -1568,6 +1568,32 @@ def test_login_cookie_is_secure_when_tls_enabled():
         thread.join(timeout=5)
 
 
+def test_secure_cookie_flag_does_not_affect_bearer_token_auth():
+    # Security criterion: secure=True only changes the Set-Cookie attributes
+    # emitted by POST /login and /logout — bearer-token auth on every other
+    # route (the /api/* surface) must behave identically either way.
+    ws = InMemoryWorkspace(
+        {"audit/assessment.md": "# the report\n\nClassification: rebuild"}
+    )
+    _journal(ws, AgentEvent("engineer", "implement", "building"))
+    srv = DashboardServer(ws, port=0, token=TOKEN, secure=True)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        status, _, body = _request(srv, "GET", "/", headers=auth)
+        assert status == 200
+        assert "<title>dev-team dashboard</title>" in body
+        status, _, body = _request(srv, "GET", "/api/state", headers=auth)
+        assert status == 200
+        assert json.loads(body)["activity"][0]["message"] == "building"
+        status, _, _ = _request(srv, "GET", "/api/state", headers={"Authorization": "Bearer wrong"})
+        assert status == 401
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
+
+
 def test_post_routing_respects_auth(token_server):
     # unknown POSTs are gated exactly like GETs ...
     status, _, body = _request(token_server, "POST", "/api/state")

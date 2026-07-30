@@ -403,7 +403,11 @@ DEV_TEAM_DASHBOARD_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsa
 - **Browsers** get a login page on any unauthenticated page request; a
   correct token sets a `devteam_dash` session cookie
   (`HttpOnly; SameSite=Strict; Path=/`) and redirects to the dashboard.
-  `POST /logout` clears it.
+  `POST /logout` clears it. Pass `--dashboard-cookie-secure` to also mark
+  the cookie `Secure` (TLS-only) when the dashboard is fronted by HTTPS
+  (e.g. behind a TLS-terminating reverse proxy) — leave it off for the
+  plain-HTTP default, since a `Secure` cookie is never stored by the
+  browser over plain HTTP and would silently break login.
 - **API callers** send `Authorization: Bearer <token>`; unauthenticated
   `/api/*` requests get `401 {"error": "unauthorized"}`.
 - Comparison is constant-time (`hmac.compare_digest`), the token is never
