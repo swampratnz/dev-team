@@ -67,6 +67,26 @@ sections below are reconstructed from the repository history.
   docs state this asymmetry rather than overclaiming.
 
 ### Assessment
+- **Live EOL/support-status scan extended to Rust (`rust-toolchain.toml`)
+  runtimes** (#261, `eolscan.py`): closes the last runtime gap the PHP EOL
+  issue explicitly named and deferred alongside Java ("Java/Rust EOL support
+  is real future work but a separate proposal") — Java shipped
+  (`parse_pom_xml_java`, `parse_gradle_java`); Rust never did, despite
+  already being first-class elsewhere (`profile.py` detection,
+  `depscan.py`'s OSV.dev dependency scan for `Cargo.toml`/`Cargo.lock`). A
+  new `parse_rust_toolchain_toml` reads `[toolchain].channel` via
+  `tomllib` (the same stdlib parsing primitive `depscan.py` already uses
+  for `Cargo.toml` — no new dependency), extracting only a concrete,
+  version-shaped value through the existing `_leading_version` helper: a
+  named channel (`stable`/`beta`/`nightly`) or a dated nightly
+  (`nightly-2024-01-15`) degrades to "not detected" rather than being
+  guessed at, and malformed TOML is caught the same way
+  `depscan.parse_cargo_toml` already handles this file format. Registered
+  in `_PARSERS["rust-toolchain.toml"]` and `_DISPLAY_NAMES["rust"]` — no
+  changes to `detect_runtimes`'s dedup, `query_eol`, or `scan_eol`. The
+  legacy plain-text `rust-toolchain` file and `Cargo.toml`'s `rust-version`
+  (MSRV) are deliberately deferred, mirroring the same "one manifest, ship,
+  grow later" pattern PHP/Java/Gradle already followed.
 - **OSV scan covers Maven `pom.xml` dependencies** (`depscan.py`), closing
   the last ecosystem gap named in `docs/ASSESSMENT.md`'s "Honest
   limitations": Java's *runtime* already got a live EOL scan through this

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+import tomllib
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ _DISPLAY_NAMES = {
     "go": "Go",
     "php": "PHP",
     "java": "Java",
+    "rust": "Rust",
 }
 
 #: The only products this module understands (every audited repo has
@@ -379,6 +381,33 @@ def parse_gradle_java(text: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def parse_rust_toolchain_toml(text: str) -> Optional[Tuple[str, str]]:
+    """Rustup ``rust-toolchain.toml``: ``[toolchain].channel``, if version-shaped.
+
+    ``channel`` can be a concrete version (``"1.75.0"``, ``"1.75"``), a
+    named channel (``"stable"``/``"beta"``/``"nightly"``), or a dated
+    nightly (``"nightly-2024-01-15"``) -- only the concrete-version form
+    resolves via the shared :func:`_leading_version` helper; the named and
+    dated-nightly forms degrade to ``None`` rather than being guessed at,
+    same discipline as every other parser in this module. Malformed TOML is
+    caught the same way :func:`depscan.parse_cargo_toml` already handles
+    ``Cargo.toml``'s identical ``tomllib`` parsing.
+    """
+
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    toolchain = data.get("toolchain")
+    if not isinstance(toolchain, dict):
+        return None
+    channel = toolchain.get("channel")
+    if not isinstance(channel, str):
+        return None
+    version = _leading_version(channel)
+    return ("rust", version) if version else None
+
+
 _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "package.json": parse_package_json_engines,
     ".nvmrc": parse_nvmrc,
@@ -391,6 +420,7 @@ _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "pom.xml": parse_pom_xml_java,
     "build.gradle": parse_gradle_java,
     "build.gradle.kts": parse_gradle_java,
+    "rust-toolchain.toml": parse_rust_toolchain_toml,
 }
 
 
