@@ -331,6 +331,24 @@ sections below are reconstructed from the repository history.
   decision document instead of the text proposal.
 
 ### Delivery
+- **N-way independent votes for review-debate adjudication** (#279), porting
+  #129's `--verify-votes` variance-reduction pattern to the ROADMAP #8 debate
+  mechanism that #129 explicitly declined to touch. New `EngineConfig
+  .review_debate_votes` / CLI `--review-debate-votes N` (default `1`, capped
+  at `MAX_REVIEW_DEBATE_VOTES=5`, only valid with `--review-debate`): at
+  `N > 1`, `DeliveryEngine._debate_review` fires `N` independent
+  `SecurityEngineerAgent.adjudicate()` calls concurrently (no vote sees
+  another's verdict) and `_debate_plurality` folds them into one verdict.
+  **Fail-secure, and stricter than `--verify-votes`:** an exact tie, or a
+  budget-truncated result with no majority among the votes that completed,
+  always upholds the block — it can never overturn, unlike `--verify-votes`'
+  symmetric tie->`needs-context`, because failing secure on a security block
+  means staying blocked. `review_debate_vote_count`/`review_debate_max_agreement`
+  land on the scorecard only when all `N` requested votes complete (never on
+  a `votes=1` run or a budget-truncated one), and the `review-dispute` human-
+  escalation question now surfaces the tally (e.g. "3-2 plurality to
+  overturn") instead of a bare verdict when `N > 1`. `votes=1` (the default)
+  is byte-identical to today: one call, no new scorecard keys.
 - **A new opt-in, advisory docker-build verification gate closes
   `docs/BENCHMARKS.md`'s named "Artifact execution gates ... can be added
   today via `CommandGate` ... but not wired" DevOps gap** (#196). After

@@ -31,6 +31,7 @@ import asyncio
 import fnmatch
 import itertools
 import os
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -107,9 +108,11 @@ from .models import (
     FileChange,
     Implementation,
     Plan,
+    Rebuttal,
     ReliabilityReport,
     Review,
     ReviewComment,
+    ReviewJudgment,
     SecurityReport,
     Severity,
     Task,
@@ -146,6 +149,13 @@ _INTERNAL_PREFIX = ".dev_team/"
 # docker-build gate's image tag) so two engines building the same repo's
 # Dockerfile concurrently on one host can't collide.
 _RUN_ID_COUNTER = itertools.count()
+
+#: Hard ceiling on ``EngineConfig.review_debate_votes``'s fan-out, mirroring
+#: :data:`~dev_team.assessment.MAX_VERIFY_VOTES`'s rationale exactly: all
+#: votes run *concurrently* (``asyncio.gather``), so an uncapped value would
+#: let one debate fan out an unbounded burst of concurrent agentic calls
+#: against the shared Max pool (issue #279, porting #129's precedent).
+MAX_REVIEW_DEBATE_VOTES = 5
 
 
 @dataclass
@@ -321,6 +331,20 @@ class EngineConfig:
     #: security review at commit still runs regardless, so nothing unvetted
     #: ships. See ROADMAP #8.
     review_debate: bool = False
+    #: N-way independent adjudication votes for ``review_debate`` (mirrors
+    #: ``--verify-votes``'s variance-reduction pattern, scoped to the debate's
+    #: single adjudicate() call — issue #279). Default ``1``: byte-identical to
+    #: today, one call, no new scorecard keys. At ``N > 1``, ``N`` independent
+    #: ``adjudicate()`` calls run concurrently (no vote sees another's verdict)
+    #: and the plurality wins; a tie (or a budget-truncated result with no
+    #: majority among the passes that completed) resolves to **uphold, never
+    #: overturn** — stricter than ``--verify-votes``'s tie->``needs-context``,
+    #: since the two directions here are not symmetric: failing secure on a
+    #: security block means staying blocked. ``review_debate_vote_count`` /
+    #: ``review_debate_max_agreement`` are recorded on the scorecard only when
+    #: all ``N`` requested votes complete. Only meaningful with
+    #: ``review_debate=True``; capped at :data:`MAX_REVIEW_DEBATE_VOTES`.
+    review_debate_votes: int = 1
     branch: Optional[str] = None
     use_branch: bool = True
     allow_dirty_baseline: bool = False
@@ -407,6 +431,14 @@ class EngineConfig:
             raise ValueError("max_replan_rounds must be non-negative")
         if self.visual_fix_rounds < 0:
             raise ValueError("visual_fix_rounds must be non-negative")
+        if self.review_debate_votes < 1:
+            raise ValueError("review_debate_votes must be at least 1")
+        if self.review_debate_votes > MAX_REVIEW_DEBATE_VOTES:
+            raise ValueError(
+                f"review_debate_votes must be at most {MAX_REVIEW_DEBATE_VOTES}"
+            )
+        if self.review_debate_votes != 1 and not self.review_debate:
+            raise ValueError("review_debate_votes requires review_debate")
         if not 0.0 <= self.finalization_reserve_fraction < 1.0:
             raise ValueError("finalization_reserve_fraction must be in [0.0, 1.0)")
         if self.retrieval_token_budget < 0:
@@ -2021,6 +2053,93 @@ class DeliveryEngine:
             self.git.commit("fix(dev-team): address visual review findings")
             return True
 
+    def _uphold_debate_on_budget_exhaustion(self, review: Review) -> Review:
+        """Fail-secure fallback: the debate cannot reach a verdict.
+
+        Shared by every arity — budget ran out before the engineer's
+        rebuttal, before the single ``adjudicate()`` call
+        (``review_debate_votes == 1``), or (at ``> 1``) every vote in the
+        fan-out. Same outcome regardless: the block stands.
+        """
+
+        self._budget_exhausted = True
+        self._event("budget", "Budget exhausted during review debate; upholding the review")
+        self._scorecard["review_debate_upheld"] = (
+            self._scorecard.get("review_debate_upheld", 0) + 1
+        )
+        return review
+
+    async def _adjudicate_vote(
+        self,
+        task: Task,
+        implementation: Implementation,
+        review: Review,
+        rebuttal: Rebuttal,
+        *,
+        file_contents: Mapping[str, str],
+        diff: Optional[str],
+        cwd: Optional[str],
+    ) -> Optional[ReviewJudgment]:
+        """One independent ``adjudicate()`` vote for the ``votes > 1`` fan-out.
+
+        Identical construction to the single-vote call — no vote sees another
+        vote's verdict or rationale. Returns ``None`` (never raises) on budget
+        exhaustion, mirroring ``verify_finding``'s ``_verify_pass`` isolation,
+        so the votes that did complete still decide the result via
+        :meth:`_debate_plurality`.
+        """
+
+        try:
+            return await self.security.adjudicate(
+                task,
+                implementation,
+                review,
+                rebuttal,
+                file_contents=file_contents,
+                diff=diff,
+                workspace_root=cwd,
+            )
+        except BudgetExceededError:
+            return None
+
+    def _debate_plurality(
+        self, passes: Sequence[ReviewJudgment]
+    ) -> Tuple[ReviewJudgment, int]:
+        """Fold independent ``adjudicate()`` votes into one plurality verdict.
+
+        A tie — including an exact 2-way split — resolves to uphold, never
+        overturn: unlike ``--verify-votes``'s tie->``needs-context`` (a
+        neutral verdict), the two directions here are not symmetric, so an
+        inconclusive vote must never guess at overturning a security block.
+        Returns the folded judgment and ``max_agreement`` (the winning
+        verdict's vote count, out of ``len(passes)``).
+        """
+
+        tally = Counter(p.overturn for p in passes)
+        top_count = max(tally.values())
+        winners = [verdict for verdict, count in tally.items() if count == top_count]
+        if len(winners) > 1:
+            overturn_votes = tally.get(True, 0)
+            uphold_votes = tally.get(False, 0)
+            return (
+                ReviewJudgment(
+                    overturn=False,
+                    rationale=(
+                        f"{len(passes)} independent votes split with no plurality "
+                        f"({overturn_votes} to overturn, {uphold_votes} to uphold); "
+                        "resolved to uphold — a tie must never overturn a security "
+                        "block."
+                    ),
+                ),
+                top_count,
+            )
+        overturn = winners[0]
+        winning_pass = next(p for p in passes if p.overturn == overturn)
+        return (
+            ReviewJudgment(overturn=overturn, rationale=winning_pass.rationale),
+            top_count,
+        )
+
     async def _debate_review(
         self,
         task: Task,
@@ -2042,6 +2161,10 @@ class DeliveryEngine:
         judge's ruling applies. The security review at commit runs regardless,
         so an overturned change is still vetted before it ships. Budget
         exhaustion during the debate fails closed — the block is upheld.
+
+        ``config.review_debate_votes`` (default ``1``) opts into N-way
+        adjudication: see :meth:`_adjudicate_vote` and
+        :meth:`_debate_plurality`.
         """
 
         if not review.blocking_comments or self._budget_exhausted:
@@ -2059,28 +2182,55 @@ class DeliveryEngine:
                 file_contents=file_contents,
                 workspace_root=cwd,
             )
-            if rebuttal.concedes:
-                self._event("debate", "Engineer concedes; the review stands")
-                self._scorecard["review_debate_conceded"] = (
-                    self._scorecard.get("review_debate_conceded", 0) + 1
-                )
-                return review
-            judgment = await self.security.adjudicate(
-                task,
-                implementation,
-                review,
-                rebuttal,
-                file_contents=file_contents,
-                diff=diff,
-                workspace_root=cwd,
-            )
         except BudgetExceededError:
-            self._budget_exhausted = True
-            self._event("budget", "Budget exhausted during review debate; upholding the review")
-            self._scorecard["review_debate_upheld"] = (
-                self._scorecard.get("review_debate_upheld", 0) + 1
+            return self._uphold_debate_on_budget_exhaustion(review)
+        if rebuttal.concedes:
+            self._event("debate", "Engineer concedes; the review stands")
+            self._scorecard["review_debate_conceded"] = (
+                self._scorecard.get("review_debate_conceded", 0) + 1
             )
             return review
+
+        votes_requested = self.config.review_debate_votes
+        tally: Optional[str] = None
+        if votes_requested <= 1:
+            try:
+                judgment = await self.security.adjudicate(
+                    task,
+                    implementation,
+                    review,
+                    rebuttal,
+                    file_contents=file_contents,
+                    diff=diff,
+                    workspace_root=cwd,
+                )
+            except BudgetExceededError:
+                return self._uphold_debate_on_budget_exhaustion(review)
+        else:
+            outcomes = await asyncio.gather(
+                *(
+                    self._adjudicate_vote(
+                        task,
+                        implementation,
+                        review,
+                        rebuttal,
+                        file_contents=file_contents,
+                        diff=diff,
+                        cwd=cwd,
+                    )
+                    for _ in range(votes_requested)
+                )
+            )
+            passes = [outcome for outcome in outcomes if outcome is not None]
+            if not passes:
+                return self._uphold_debate_on_budget_exhaustion(review)
+            judgment, max_agreement = self._debate_plurality(passes)
+            vote_count = len(passes)
+            tally = f"{max_agreement}-{vote_count - max_agreement} plurality to overturn"
+            if vote_count == votes_requested:
+                self._scorecard["review_debate_vote_count"] = vote_count
+                self._scorecard["review_debate_max_agreement"] = max_agreement
+
         if not judgment.overturn:
             self._event("debate", "Judge upholds the review", detail=judgment.rationale)
             self._scorecard["review_debate_upheld"] = (
@@ -2098,6 +2248,7 @@ class DeliveryEngine:
                     task.id,
                     context=context,
                     asked_by=self.roster.display_name("security-engineer"),
+                    tally=tally,
                 ),
             )
             if reply.choice != "overturn":

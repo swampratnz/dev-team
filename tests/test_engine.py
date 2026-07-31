@@ -22,6 +22,7 @@ from helpers import (
 from dev_team.backlog import BacklogStore, ItemStatus
 from dev_team.budget import Budget, BudgetExceededError
 from dev_team.engine import (
+    MAX_REVIEW_DEBATE_VOTES,
     _MAX_EVIDENCE_CHARS,
     _MAX_HANDOFF_ARTIFACTS,
     _MAX_HANDOFF_PER_KIND,
@@ -1971,6 +1972,34 @@ def test_engine_config_rejects_negative_visual_fix_rounds():
         EngineConfig(visual_fix_rounds=-1)
 
 
+def test_engine_config_default_review_debate_votes_is_one():
+    assert EngineConfig().review_debate_votes == 1
+
+
+def test_engine_config_rejects_review_debate_votes_below_one():
+    with pytest.raises(ValueError, match="review_debate_votes"):
+        EngineConfig(review_debate=True, review_debate_votes=0)
+
+
+def test_engine_config_rejects_review_debate_votes_above_cap():
+    with pytest.raises(ValueError, match="review_debate_votes"):
+        EngineConfig(
+            review_debate=True, review_debate_votes=MAX_REVIEW_DEBATE_VOTES + 1
+        )
+
+
+def test_engine_config_accepts_review_debate_votes_at_cap():
+    config = EngineConfig(
+        review_debate=True, review_debate_votes=MAX_REVIEW_DEBATE_VOTES
+    )
+    assert config.review_debate_votes == MAX_REVIEW_DEBATE_VOTES
+
+
+def test_engine_config_rejects_review_debate_votes_without_review_debate():
+    with pytest.raises(ValueError, match="review_debate_votes"):
+        EngineConfig(review_debate_votes=2)
+
+
 # -- structured review debate (ROADMAP #8a) ----------------------------------
 
 
@@ -2184,6 +2213,229 @@ def test_debate_wired_into_delivery_overturns_and_completes(tmp_path):
     assert outcome.task_results[0].attempts == 1
     assert outcome.task_results[0].task.status is TaskStatus.DONE
     assert outcome.scorecard.get("review_debate_overturned") == 1
+
+
+# -- N-way review-debate adjudication votes (issue #279) ---------------------
+
+
+def _debate_votes_engine(tmp_path, *, judgments, votes=None, rebuttal=None, interaction=None):
+    """A debate engine whose adjudicate() calls consume ``judgments`` in order.
+
+    The engineer's rebuttal is served via ``by_system_prompt`` (a single,
+    fixed call); the ``N`` adjudicate() calls fall through to the plain
+    queue, one judgment per call, in the order ``asyncio.gather`` fires them
+    (deterministic here since no call actually suspends before returning —
+    the same assumption ``verify_finding``'s own vote tests rely on).
+    """
+
+    runner = ScriptedRunner(
+        responses=[json_response(j) for j in judgments],
+        by_system_prompt={
+            "senior software engineer": json_response(
+                rebuttal or {"concedes": False, "rebuttal": "the input is validated upstream"}
+            ),
+        },
+    )
+    engine = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(
+            review_debate=True, review_debate_votes=votes or len(judgments)
+        ),
+        interaction=interaction,
+    )
+    return engine, runner
+
+
+def test_debate_votes_plurality_overturns(tmp_path):
+    # 3 overturn / 2 uphold at N=5 -> overturn, vote_count=5, max_agreement=3.
+    judgments = [
+        {"overturn": True, "rationale": "verified"},
+        {"overturn": True, "rationale": "verified"},
+        {"overturn": False, "rationale": "stands"},
+        {"overturn": True, "rationale": "verified"},
+        {"overturn": False, "rationale": "stands"},
+    ]
+    engine, runner = _debate_votes_engine(tmp_path, judgments=judgments)
+    review = _run_debate(engine)
+    assert review.approved is True
+    assert engine._scorecard.get("review_debate_overturned") == 1
+    assert engine._scorecard.get("review_debate_vote_count") == 5
+    assert engine._scorecard.get("review_debate_max_agreement") == 3
+    # rebuttal (1 call) + 5 independent adjudicate votes
+    assert len(runner.calls) == 6
+
+
+def test_debate_votes_exact_tie_upholds_never_overturns(tmp_path):
+    # Security/fail-secure: N=2, 1 overturn / 1 uphold -> upheld, never
+    # overturned. Load-bearing assertion for the whole proposal.
+    judgments = [
+        {"overturn": True, "rationale": "verified"},
+        {"overturn": False, "rationale": "stands"},
+    ]
+    engine, runner = _debate_votes_engine(tmp_path, judgments=judgments)
+    review = _run_debate(engine)
+    assert review.approved is False
+    assert engine._scorecard.get("review_debate_upheld") == 1
+    assert "review_debate_overturned" not in engine._scorecard
+    # full quorum (2 of 2) still records the tally, even though tied
+    assert engine._scorecard.get("review_debate_vote_count") == 2
+    assert engine._scorecard.get("review_debate_max_agreement") == 1
+
+
+def test_debate_votes_plurality_upholds(tmp_path):
+    # 3 uphold / 2 overturn at N=5 -> upheld (majority, not a tie).
+    judgments = [
+        {"overturn": False, "rationale": "stands"},
+        {"overturn": True, "rationale": "verified"},
+        {"overturn": False, "rationale": "stands"},
+        {"overturn": True, "rationale": "verified"},
+        {"overturn": False, "rationale": "stands"},
+    ]
+    engine, runner = _debate_votes_engine(tmp_path, judgments=judgments)
+    review = _run_debate(engine)
+    assert review.approved is False
+    assert engine._scorecard.get("review_debate_upheld") == 1
+    assert engine._scorecard.get("review_debate_vote_count") == 5
+    assert engine._scorecard.get("review_debate_max_agreement") == 3
+
+
+def test_debate_votes_partial_budget_exhaustion_no_majority_upholds(tmp_path):
+    # Security/fail-secure: budget runs out after fewer than N passes
+    # complete, with no majority among the completed passes -> upheld, never
+    # overturned on an inconclusive partial tally. Of 4 requested votes, only
+    # 2 complete (the other 2 exhaust the budget), split 1 overturn / 1
+    # uphold — a tie among the completed passes.
+    _REBUTTAL = json_response({"concedes": False, "rebuttal": "validated upstream"})
+    _OUTCOMES = [
+        BudgetExceededError(9.0, 1.0),
+        json_response({"overturn": True, "rationale": "verified"}),
+        BudgetExceededError(9.0, 1.0),
+        json_response({"overturn": False, "rationale": "stands"}),
+    ]
+
+    class _PartialRunner:
+        def __init__(self):
+            self._adjudicate_calls = 0
+
+        async def run(self, prompt, *, system_prompt=None, allowed_tools=None,
+                      model=None, cwd=None):
+            if system_prompt and "senior software engineer" in system_prompt:
+                return AgentResult(text=_REBUTTAL, num_turns=1)
+            outcome = _OUTCOMES[self._adjudicate_calls]
+            self._adjudicate_calls += 1
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return AgentResult(text=outcome, num_turns=1)
+
+    engine = _engine(
+        _PartialRunner(),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(review_debate=True, review_debate_votes=4),
+    )
+    review = _run_debate(engine)
+    assert review.approved is False
+    assert engine._scorecard.get("review_debate_upheld") == 1
+    # only 2 of 4 requested votes completed: never treated as a full tally
+    assert "review_debate_vote_count" not in engine._scorecard
+    assert "review_debate_max_agreement" not in engine._scorecard
+
+
+def test_debate_votes_all_exhausted_upholds_and_marks_budget_exhausted(tmp_path):
+    class _AllExhaustedRunner:
+        async def run(self, prompt, *, system_prompt=None, allowed_tools=None,
+                      model=None, cwd=None):
+            if system_prompt and "senior software engineer" in system_prompt:
+                return AgentResult(
+                    text=json_response(
+                        {"concedes": False, "rebuttal": "validated upstream"}
+                    ),
+                    num_turns=1,
+                )
+            raise BudgetExceededError(9.0, 1.0)
+
+    engine = _engine(
+        _AllExhaustedRunner(),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(review_debate=True, review_debate_votes=3),
+    )
+    review = _run_debate(engine)
+    assert review.approved is False  # fails closed: the block stands
+    assert engine._budget_exhausted is True
+    assert engine._scorecard.get("review_debate_upheld") == 1
+    assert "review_debate_vote_count" not in engine._scorecard
+    assert "review_debate_max_agreement" not in engine._scorecard
+
+
+def test_debate_votes_single_vote_budget_exhaustion_during_adjudicate_upholds(tmp_path):
+    # votes=1's own adjudicate() call can still exhaust the budget
+    # independently of the rebuttal call; same fail-secure fallback applies.
+    class _AdjudicateExhaustedRunner:
+        async def run(self, prompt, *, system_prompt=None, allowed_tools=None,
+                      model=None, cwd=None):
+            if system_prompt and "senior software engineer" in system_prompt:
+                return AgentResult(
+                    text=json_response(
+                        {"concedes": False, "rebuttal": "validated upstream"}
+                    ),
+                    num_turns=1,
+                )
+            raise BudgetExceededError(9.0, 1.0)
+
+    engine = _engine(
+        _AdjudicateExhaustedRunner(),
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(review_debate=True),
+    )
+    review = _run_debate(engine)
+    assert review.approved is False
+    assert engine._budget_exhausted is True
+    assert engine._scorecard.get("review_debate_upheld") == 1
+
+
+def test_debate_votes_default_omits_vote_fields_regression(tmp_path):
+    # Acceptance criterion: votes=1 (the default/unset) is byte-identical to
+    # today — no new counters written even on an overturn.
+    engine, runner = _debate_engine(
+        tmp_path,
+        rebuttal={"concedes": False, "rebuttal": "the input is validated upstream"},
+        judgment={"overturn": True, "rationale": "verified against the code"},
+    )
+    review = _run_debate(engine)
+    assert review.approved is True
+    assert len(runner.calls) == 2  # exactly one rebuttal + one adjudicate call
+    assert "review_debate_vote_count" not in engine._scorecard
+    assert "review_debate_max_agreement" not in engine._scorecard
+
+
+def test_debate_votes_dispute_question_surfaces_the_tally(tmp_path):
+    channel = ScriptedChannel(script=[Reply(choice="overturn")])
+    judgments = [
+        {"overturn": True, "rationale": "verified"},
+        {"overturn": True, "rationale": "verified"},
+        {"overturn": False, "rationale": "stands"},
+    ]
+    engine, runner = _debate_votes_engine(
+        tmp_path, judgments=judgments, interaction=channel
+    )
+    review = _run_debate(engine)
+    assert review.approved is True
+    assert channel.questions[0].topic == "review-dispute"
+    assert "2-1 plurality to overturn" in channel.questions[0].prompt
+
+
+def test_debate_single_vote_dispute_question_keeps_unchanged_wording(tmp_path):
+    channel = ScriptedChannel(script=[Reply(choice="overturn")])
+    engine, runner = _debate_engine(
+        tmp_path,
+        rebuttal={"concedes": False, "rebuttal": "validated"},
+        judgment={"overturn": True, "rationale": "ok"},
+        interaction=channel,
+    )
+    _run_debate(engine)
+    assert channel.questions[0].prompt == (
+        "The review debate would overturn the block on T1. Accept it?"
+    )
 
 
 def test_delivery_outcome_property_edges():
