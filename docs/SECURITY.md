@@ -100,10 +100,14 @@ leak another job's layout back to the model.
 Read/Write/Edit/Glob are checked deterministically against the tool call's
 own structured path argument — no false positives or negatives. **Bash is
 different: it is a best-effort string scan for path-like tokens (absolute
-paths, `..` segments, `cd` targets), not a shell parser, and is evadable by a
-sufficiently adversarial one-liner** (environment-variable expansion,
-base64, `eval`, and similar tricks are not defeated by it). It is
-defense-in-depth, not a hard boundary — treat it accordingly.
+paths, `..` segments, `cd` targets, and `~`/`~user` home-directory
+references), not a shell parser, and is evadable by a sufficiently
+adversarial one-liner** (environment-variable expansion, base64, `eval`, and
+similar tricks are not defeated by it). A `~`-prefixed token is expanded the
+same way a shell would before the in-root check runs; if expansion can't
+resolve a home directory, the token is denied rather than allowed to fall
+through as a plain relative path. It is defense-in-depth, not a hard
+boundary — treat it accordingly.
 
 ## HTTP surface auth
 
