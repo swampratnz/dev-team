@@ -520,7 +520,7 @@ def test_run_job_mirrors_events_and_report_into_the_dashboard_workspace():
     assert dash.read_text("audit/assess-dash/assessment.md")
 
 
-def test_run_job_deliver_mirrors_events_but_writes_no_report():
+def test_run_job_deliver_mirrors_meta_and_delivery_json_but_writes_no_report():
     dash = InMemoryWorkspace()
     disp = Dispatcher(
         token="x",
@@ -534,8 +534,16 @@ def test_run_job_deliver_mirrors_events_but_writes_no_report():
     spec.id = "deliver-dash"
     asyncio.run(disp.run_job(JobRecord(spec=spec)))
     assert read_events(dash), "deliver events should still reach the dashboard"
-    # A delivery outcome has no report_markdown, so nothing is written to audit/.
-    assert not any(p.startswith("audit/") for p in dash.list_files())
+    # A delivery outcome has no report_markdown, so _mirror_report's assess-only
+    # write never happens for a deliver job.
+    assert not dash.exists("audit/deliver-dash/assessment.md")
+    assert not dash.exists("audit/deliver-dash/assessment.json")
+    # But the structured outcome + repo identity ARE now mirrored (issue #275),
+    # the same restart-survival role assessment.json/meta.json play for assess.
+    meta = json.loads(dash.read_text("audit/deliver-dash/meta.json"))
+    assert meta == {"repo": "acme/mono", "mode": "deliver", "id": "deliver-dash"}
+    delivery = json.loads(dash.read_text("audit/deliver-dash/delivery.json"))
+    assert delivery["success"] is True
 
 
 def test_run_job_records_transcripts_into_the_dashboard_workspace():
@@ -1408,6 +1416,24 @@ def test_purge_removes_workspace_audit_files_and_backlog_stories(tmp_path):
     survivors = store.load().stories
     assert [s.id for s in survivors] == [other.id]
     assert disp.get(job_id) is None
+
+
+def test_purge_removes_a_deliver_jobs_delivery_json(tmp_path):
+    # delivery.json carries the same Restricted classification as
+    # assessment.json (repo slugs, PR URLs, cost, task summaries) -- purge,
+    # the "permanent deletion" route, must not leave it behind (issue #275
+    # extends _AUDIT_FILES to cover it).
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"))
+    job_id = "deliver-purge"
+    _seed_terminal_job(disp, job_id, archived=True)
+    dash.write_text(f"audit/{job_id}/delivery.json", json.dumps({"success": True}))
+
+    status, payload = disp.purge_job(job_id)
+    assert status == 200
+    assert payload["removed"]["audit"] is True
+    assert not dash.exists(f"audit/{job_id}/delivery.json")
 
 
 def test_purge_no_transcripts_ever_recorded_reports_removed_false(tmp_path):
@@ -4425,6 +4451,58 @@ def _write_assessment_mirror(
         dash.write_text(f"audit/{job_id}/assessment.md", report_markdown)
 
 
+def _delivery_payload(
+    *,
+    success=True,
+    pull_request_url="https://github.com/acme/mono/pull/42",
+    pull_request_number=42,
+    cost_usd=3.25,
+):
+    """A representative ``delivery_to_dict`` dict, as ``_mirror_delivery_json``
+    would have written it for a real successful deliver run."""
+
+    return {
+        "request": {"title": "F", "description": "d", "constraints": []},
+        "success": success,
+        "plan_summary": "plan",
+        "design_overview": "design",
+        "tasks": [],
+        "security_approved": True,
+        "security_scanner_failed": False,
+        "production_ready": True,
+        "committed": True,
+        "visual_summary": None,
+        "visual_findings": None,
+        "pull_request_url": pull_request_url,
+        "pull_request_number": pull_request_number,
+        "checks_state": "success",
+        "checks_failed": [],
+        "budget_exhausted": False,
+        "resumed_task_ids": [],
+        "cost_usd": cost_usd,
+        "workspace_files": [],
+        "branch": "feature/f",
+        "halted_reason": None,
+        "baseline_green": True,
+        "scorecard": {},
+        "unverified_claims": [],
+    }
+
+
+def _write_delivery_mirror(dash, job_id, *, repo="acme/mono", **payload_kwargs):
+    """Write the meta.json/delivery.json pair a real successful deliver run
+    would have mirrored (see _mirror_meta / _mirror_delivery_json)."""
+
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "repo": repo, "mode": "deliver"}),
+    )
+    dash.write_text(
+        f"audit/{job_id}/delivery.json",
+        json.dumps(_delivery_payload(**payload_kwargs)),
+    )
+
+
 def test_disk_status_and_result_are_none_without_a_dashboard_workspace():
     # Criterion 2: no dashboard workspace configured -> unchanged 404 path.
     disp = Dispatcher(token="x")
@@ -4523,14 +4601,76 @@ def test_disk_result_with_no_mirrored_report_markdown():
     assert payload["report_markdown"] is None
 
 
-def test_disk_status_and_result_none_for_a_deliver_mode_mirror():
-    # Criterion 7: deliver/verify jobs never mirror assessment.json, so they
-    # stay permanently 404 post-restart -- a named, honest asymmetry.
+def test_disk_status_and_result_none_for_a_deliver_job_missing_its_delivery_json():
+    # Criterion 3: a deliver job's meta.json survived (mode-agnostic
+    # _mirror_meta) but delivery.json never got written -- a deliver job
+    # that never reached success, or predates this fix. Must never claim a
+    # succeeded state.
     dash = InMemoryWorkspace()
-    job_id = "deliver-post-restart"
+    job_id = "deliver-never-finished"
     dash.write_text(
         f"audit/{job_id}/meta.json",
         json.dumps({"id": job_id, "repo": "acme/mono", "mode": "deliver"}),
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.disk_status(job_id) is None
+    assert disp.disk_result(job_id) is None
+
+
+def test_disk_status_and_result_are_none_with_corrupt_delivery_json():
+    # Corrupt delivery.json mirror is treated as "no delivery" (the case
+    # above's behaviour), never a 500 -- the deliver-mode analogue of
+    # test_disk_status_and_result_are_none_with_corrupt_assessment_json.
+    dash = InMemoryWorkspace()
+    job_id = "deliver-corrupt"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "repo": "acme/mono", "mode": "deliver"}),
+    )
+    dash.write_text(f"audit/{job_id}/delivery.json", "{not json")
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    assert disp.disk_status(job_id) is None
+    assert disp.disk_result(job_id) is None
+
+
+def test_disk_status_and_result_reconstruct_from_disk_for_a_deliver_job():
+    # Criterion 4: meta.json (mode: deliver) + delivery.json present -> both
+    # disk_status and disk_result serve a reconstructed 200, disk_result
+    # matching the live deliver-success branch's payload shape field-for-
+    # field (result()'s {"kind": "deliver", **delivery_to_dict(outcome)}).
+    dash = InMemoryWorkspace()
+    job_id = "deliver-restart-survivor"
+    _write_delivery_mirror(dash, job_id, cost_usd=4.0)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+
+    assert disp.disk_status(job_id) == {
+        "id": job_id,
+        "mode": "deliver",
+        "repo": "acme/mono",
+        "state": "succeeded",
+        "started": None,
+        "ended": None,
+        "cost_usd": 4.0,
+        "error": None,
+        "progress": [],
+    }
+    assert disp.disk_result(job_id) == (
+        200,
+        {"kind": "deliver", **_delivery_payload(cost_usd=4.0)},
+    )
+
+
+def test_disk_status_and_result_none_for_a_verify_mode_mirror():
+    # Criterion 6: verify jobs never mirror a delivery.json/assessment.json
+    # (their verdict is appended to the SOURCE job's verifications.jsonl
+    # instead, see _mirror_verification) -- a verify job's own self-lookup
+    # stays permanently 404 post-restart. A named, honest remaining gap
+    # (docs/DISPATCH.md): it does not silently pass by accident.
+    dash = InMemoryWorkspace()
+    job_id = "verify-post-restart"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "repo": "acme/mono", "mode": "verify"}),
     )
     disp = Dispatcher(token="x", dashboard_workspace=dash)
     assert disp.disk_status(job_id) is None
@@ -4561,6 +4701,27 @@ def test_job_and_result_routes_fall_back_to_disk_after_registry_miss():
         assert result["report_markdown"] == "# report"
 
 
+def test_job_and_result_routes_fall_back_to_disk_for_a_deliver_job():
+    # HTTP-level wiring: _job/_result reach disk_status/disk_result for a
+    # restart-surviving deliver job too, not just assess (issue #275).
+    dash = InMemoryWorkspace()
+    job_id = "deliver-http-restart"
+    _write_delivery_mirror(dash, job_id, cost_usd=1.25)
+    with running(dashboard_workspace=dash) as server:
+        status, job = _call(server, f"/jobs/{job_id}")
+        assert status == 200
+        assert job["state"] == "succeeded"
+        assert job["mode"] == "deliver"
+        assert job["repo"] == "acme/mono"
+        assert job["cost_usd"] == 1.25
+
+        status, result = _call(server, f"/jobs/{job_id}/result")
+        assert status == 200
+        assert result["kind"] == "deliver"
+        assert result["success"] is True
+        assert result["pull_request_url"] == "https://github.com/acme/mono/pull/42"
+
+
 def test_job_and_result_routes_still_404_on_meta_only_registry_miss():
     dash = InMemoryWorkspace()
     job_id = "assess-http-unfinished"
@@ -4585,6 +4746,28 @@ def test_session_foreign_tenant_registry_miss_job_still_404s_pre_fallback():
     dash = InMemoryWorkspace()
     job_id = "assess-foreign-restart-survivor"
     _write_assessment_mirror(dash, job_id, repo="other/mono")
+    with running(oauth=oauth, dashboard_workspace=dash) as server:
+        session_token = _sign_in(server)
+        assert _call(server, f"/jobs/{job_id}", token=session_token) == (
+            404,
+            {"error": "unknown job"},
+        )
+        assert _call(server, f"/jobs/{job_id}/result", token=session_token) == (
+            404,
+            {"error": "unknown job"},
+        )
+        # the operator (no session) still sees the restart-surviving job
+        assert _call(server, f"/jobs/{job_id}")[0] == 200
+
+
+def test_session_foreign_tenant_registry_miss_deliver_job_still_404s_pre_fallback():
+    # Criterion 8 [security]: same tenant-scoping guarantee as the assess
+    # case above, for a restart-surviving DELIVER job -- the higher-stakes
+    # case this issue exists for (a real committed PR outcome).
+    oauth, _ = _oauth_fixture()
+    dash = InMemoryWorkspace()
+    job_id = "deliver-foreign-restart-survivor"
+    _write_delivery_mirror(dash, job_id, repo="other/mono")
     with running(oauth=oauth, dashboard_workspace=dash) as server:
         session_token = _sign_in(server)
         assert _call(server, f"/jobs/{job_id}", token=session_token) == (

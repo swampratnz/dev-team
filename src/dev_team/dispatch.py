@@ -184,7 +184,13 @@ _TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 #: The exact ``audit/<id>/`` files a purge removes, each through
 #: :meth:`Workspace.delete` (never a raw filesystem call against the
 #: dashboard workspace — see :meth:`Dispatcher.purge_job`).
-_AUDIT_FILES = ("assessment.md", "assessment.json", "meta.json", "verifications.jsonl")
+_AUDIT_FILES = (
+    "assessment.md",
+    "assessment.json",
+    "delivery.json",
+    "meta.json",
+    "verifications.jsonl",
+)
 
 # A sentinel the worker loop treats as "stop draining and exit".
 _SHUTDOWN = object()
@@ -1236,6 +1242,8 @@ class Dispatcher:
                 approval=PolicyApprovalGate(block_risks=("high",)),
                 **kwargs,
             )
+            self._mirror_delivery_json(spec.id, outcome)
+            self._mirror_meta(spec)
         return outcome, outcome.cost_usd
 
     async def _run_verify(
@@ -1343,6 +1351,25 @@ class Dispatcher:
         self._dashboard_workspace.write_text(
             f"audit/{job_id}/assessment.json",
             json.dumps(outcome_to_dict(outcome), indent=2),
+        )
+
+    def _mirror_delivery_json(self, job_id: str, outcome: Any) -> None:
+        """Persist the structured deliver result into the dashboard workspace.
+
+        ``audit/<id>/delivery.json`` (the exact ``delivery_to_dict`` shape
+        the live ``/result`` deliver branch and CLI ``--json`` output
+        already use) is what makes ``GET /jobs/{id}``/``/result`` restart-
+        safe for a succeeded deliver job — the same role
+        ``assessment.json`` plays for assess (see
+        :meth:`_mirror_assessment_json`). No-op when no dashboard
+        workspace is configured (mirrors :meth:`_mirror_assessment_json`).
+        """
+
+        if self._dashboard_workspace is None:
+            return
+        self._dashboard_workspace.write_text(
+            f"audit/{job_id}/delivery.json",
+            json.dumps(delivery_to_dict(outcome), indent=2),
         )
 
     def _mirror_meta(self, spec: JobSpec) -> None:
@@ -2609,48 +2636,60 @@ class Dispatcher:
             }
         return 200, {"kind": "deliver", **delivery_to_dict(outcome)}
 
-    def _read_disk_assessment(
+    # mode -> the mirrored outcome file that must exist for a restart-safe
+    # disk fallback. ``verify`` has no entry: its own self-lookup stays the
+    # named, honest remaining gap — its verdict already survives via the
+    # SOURCE job's restart-safe ``verifications.jsonl`` (see
+    # docs/DISPATCH.md).
+    _DISK_OUTCOME_FILES = {"assess": "assessment.json", "deliver": "delivery.json"}
+
+    def _read_disk_outcome(
         self, job_id: str
     ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
-        """``(meta, assessment)`` for a restart-survived, succeeded assess job.
+        """``(meta, outcome)`` for a restart-survived, succeeded assess/deliver job.
 
-        ``None`` unless both ``audit/<id>/meta.json`` and
-        ``audit/<id>/assessment.json`` are present and parse — the same
-        fail-closed posture as :meth:`_read_meta`. A missing dashboard
-        workspace, a genuinely unknown id, a non-assess job (``deliver``/
-        ``verify`` never mirror ``assessment.json``), a job that never
-        reached success, or a corrupt ``assessment.json`` (see
-        :meth:`make_backlog`) are all indistinguishable from "nothing to
-        reconstruct" here — never a 500, never a fabricated success.
+        ``None`` unless ``audit/<id>/meta.json`` is present, parses, AND its
+        ``mode`` has a matching mirror file (``assess`` -> ``assessment.json``,
+        ``deliver`` -> ``delivery.json``, see :data:`_DISK_OUTCOME_FILES`) that
+        is also present and parses — the same fail-closed posture as
+        :meth:`_read_meta`. A missing dashboard workspace, a genuinely unknown
+        id, a ``verify`` job (no matching mirror file at all — the named
+        remaining gap), a job that never reached success, or a corrupt mirror
+        file (see :meth:`make_backlog`) are all indistinguishable from
+        "nothing to reconstruct" here — never a 500, never a fabricated
+        success.
         """
 
         meta = self._read_meta(job_id)
         if meta is None:
             return None
-        path = f"audit/{job_id}/assessment.json"
+        filename = self._DISK_OUTCOME_FILES.get(meta.get("mode"))
+        if filename is None:
+            return None
+        path = f"audit/{job_id}/{filename}"
         if not self._exists(path):
             return None
         try:
-            assessment = json.loads(self._dashboard_workspace.read_text(path))
+            outcome = json.loads(self._dashboard_workspace.read_text(path))
         except (OSError, ValueError, WorkspaceError):
             return None
-        return meta, assessment
+        return meta, outcome
 
     def disk_status(self, job_id: str) -> Optional[Dict[str, Any]]:
         """The ``GET /jobs/{id}`` payload reconstructed from disk.
 
         Used only after a registry miss (a service restart lost the
-        in-memory :class:`JobRecord`) — see :meth:`_read_disk_assessment`
+        in-memory :class:`JobRecord`) — see :meth:`_read_disk_outcome`
         for when this returns ``None`` rather than fabricating a
         ``succeeded`` state. ``started``/``ended``/``progress`` are honestly
         ``None``/empty: unlike ``repo``/``mode``/``cost_usd`` they were never
         mirrored to disk (named limitation, see docs/DISPATCH.md).
         """
 
-        found = self._read_disk_assessment(job_id)
+        found = self._read_disk_outcome(job_id)
         if found is None:
             return None
-        meta, assessment = found
+        meta, outcome = found
         return {
             "id": job_id,
             "mode": meta.get("mode"),
@@ -2658,7 +2697,7 @@ class Dispatcher:
             "state": "succeeded",
             "started": None,
             "ended": None,
-            "cost_usd": assessment.get("cost_usd"),
+            "cost_usd": outcome.get("cost_usd"),
             "error": None,
             "progress": [],
         }
@@ -2666,19 +2705,24 @@ class Dispatcher:
     def disk_result(self, job_id: str) -> Optional[Tuple[int, Dict[str, Any]]]:
         """The ``GET /jobs/{id}/result`` ``(status_code, payload)`` from disk.
 
-        Used only after a registry miss; see :meth:`_read_disk_assessment`
-        for the presence rules. Mirrors the shape the live assess-success
+        Used only after a registry miss; see :meth:`_read_disk_outcome`
+        for the presence rules. Mirrors the shape the matching live-success
         branch of :meth:`result` returns, sourced from the mirrored dict
         directly rather than by calling :meth:`result` itself: that method
-        dereferences ``outcome`` by attribute (``outcome.success``, ...) —
-        the live in-process ``AssessmentOutcome``'s shape — whereas the
-        mirrored ``assessment.json`` on disk is a plain dict.
+        dereferences ``outcome`` by attribute (the live in-process
+        ``AssessmentOutcome``/``DeliveryOutcome`` shape) whereas the mirrored
+        JSON on disk is a plain dict. A ``deliver`` mirror is already exactly
+        the ``delivery_to_dict`` shape, so it is spread through unchanged;
+        an ``assess`` mirror is rendered field-by-field, same as before this
+        method learned a second mode.
         """
 
-        found = self._read_disk_assessment(job_id)
+        found = self._read_disk_outcome(job_id)
         if found is None:
             return None
-        _, assessment = found
+        meta, outcome = found
+        if meta.get("mode") == "deliver":
+            return 200, {"kind": "deliver", **outcome}
         report_path = f"audit/{job_id}/assessment.md"
         report_markdown = (
             self._dashboard_workspace.read_text(report_path)
@@ -2687,12 +2731,12 @@ class Dispatcher:
         )
         return 200, {
             "kind": "assess",
-            "success": assessment.get("success"),
-            "classification": assessment.get("classification"),
-            "executive_summary": assessment.get("executive_summary"),
-            "report_path": assessment.get("report_path"),
+            "success": outcome.get("success"),
+            "classification": outcome.get("classification"),
+            "executive_summary": outcome.get("executive_summary"),
+            "report_path": outcome.get("report_path"),
             "report_markdown": report_markdown,
-            "cost_usd": assessment.get("cost_usd"),
+            "cost_usd": outcome.get("cost_usd"),
         }
 
 
