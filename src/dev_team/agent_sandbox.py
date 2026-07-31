@@ -16,9 +16,11 @@ the same real-path/symlink-escape check as ``execution.py``'s
 
 Read/Write/Edit/Glob/Grep are checked deterministically against the tool
 call's structured path argument. Bash is checked with a best-effort string
-scan for path-like tokens — this is explicitly defense-in-depth, not a hard
-guarantee: a determined one-liner (env expansion, base64, ``eval``) can still
-evade it. Anything the scan cannot positively resolve as in-root is denied.
+scan for path-like tokens (absolute paths, ``..`` segments, and
+``~``/``~user`` home-directory references) — this is explicitly
+defense-in-depth, not a hard guarantee: a determined one-liner (env
+expansion, base64, ``eval``) can still evade it. Anything the scan cannot
+positively resolve as in-root is denied.
 """
 
 from __future__ import annotations
@@ -83,11 +85,13 @@ def _resolves_within(root_real: str, candidate: str) -> bool:
 
 
 def _looks_like_escape(token: str) -> bool:
-    """Whether ``token`` is an absolute path or contains a literal ``..``
-    path segment — the two shapes a Bash argument can use to leave the
-    workspace root."""
+    """Whether ``token`` is an absolute path, contains a literal ``..`` path
+    segment, or is a ``~``/``~user`` home-directory reference — the three
+    shapes a Bash argument can use to leave the workspace root."""
 
     if token.startswith("/"):
+        return True
+    if token.startswith("~"):
         return True
     return ".." in token.split("/")
 
@@ -98,12 +102,32 @@ def _bash_escape_tokens(command: str) -> List[str]:
     return [t for t in _SHELL_SPLIT.split(command) if t and _looks_like_escape(t)]
 
 
+def _expand_bash_token(token: str) -> Optional[str]:
+    """Expand a Bash escape ``token`` the same way a shell would, before it is
+    resolved against the workspace root. Only ``~``/``~user`` tokens need
+    expansion; other tokens pass through unchanged. ``os.path.expanduser``
+    silently returns its input unchanged when it cannot resolve a home
+    directory (e.g. no ``HOME`` and no passwd entry) — treat that as a failed
+    expansion and return ``None`` rather than letting the still-``~``-prefixed
+    token fall through to :func:`_resolves_within`'s workspace-relative-join
+    branch, which would wrongly treat it as a plain relative path and could
+    allow it."""
+
+    if not token.startswith("~"):
+        return token
+    expanded = os.path.expanduser(token)
+    if expanded == token or expanded.startswith("~"):
+        return None
+    return expanded
+
+
 def _check_bash(root_real: str, tool_input: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     command = tool_input.get("command")
     if not isinstance(command, str):
         return _deny("unable to inspect this Bash call's command")
     for token in _bash_escape_tokens(command):
-        if not _resolves_within(root_real, token):
+        candidate = _expand_bash_token(token)
+        if candidate is None or not _resolves_within(root_real, candidate):
             return _deny("Bash command references a path outside the job workspace")
     return None
 

@@ -240,6 +240,90 @@ def test_bash_non_string_command_is_denied(tmp_path):
     assert _is_denied(result)
 
 
+# --- Bash: tilde home-directory escape (#281) ------------------------------
+
+
+def test_looks_like_escape_detects_tilde_shapes():
+    assert agent_sandbox._looks_like_escape("~")
+    assert agent_sandbox._looks_like_escape("~/x")
+    assert agent_sandbox._looks_like_escape("~otheruser/x")
+    # existing shapes unchanged
+    assert agent_sandbox._looks_like_escape("/abs")
+    assert agent_sandbox._looks_like_escape("../x")
+    assert not agent_sandbox._looks_like_escape("relative/x")
+
+
+def test_bash_tilde_home_dir_escape_is_denied(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    hook = _hook(str(root))
+    result = _call(hook, "Bash", {"command": "cat ~/.ssh/id_rsa"})
+    assert _is_denied(result)
+
+
+def test_bash_tilde_other_user_escape_is_denied(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    hook = _hook(str(root))
+    result = _call(hook, "Bash", {"command": "cp secret.txt ~otheruser/"})
+    assert _is_denied(result)
+
+
+def test_bash_tilde_in_root_is_allowed(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    hook = _hook(str(home))
+    result = _call(hook, "Bash", {"command": "cat ~/notes.txt"})
+    assert result == {}
+
+
+def test_bash_tilde_expansion_failure_fails_closed(tmp_path, monkeypatch):
+    # Simulate an environment where expanduser cannot resolve a home
+    # directory (no HOME, no passwd entry): it returns its input unchanged.
+    # The still-"~"-prefixed token must be denied, never treated as an
+    # ordinary workspace-relative path.
+    root = tmp_path / "root"
+    root.mkdir()
+    hook = _hook(str(root))
+    monkeypatch.setattr(agent_sandbox.os.path, "expanduser", lambda p: p)
+    result = _call(hook, "Bash", {"command": "cat ~/file.txt"})
+    assert _is_denied(result)
+
+
+def test_bash_tilde_denial_reason_never_contains_an_absolute_path(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    hook = _hook(str(root))
+    result = _call(hook, "Bash", {"command": "cat ~/.ssh/id_rsa"})
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert str(home) not in reason
+    assert str(root) not in reason
+
+
+def test_path_tools_treat_literal_tilde_as_relative_not_expanded(tmp_path):
+    # Read/Write/Edit/Glob/Grep take a structured path argument straight from
+    # the model, never shell-interpreted — a literal "~" there is just a
+    # directory named "~" relative to the root, not a home-directory
+    # reference. Tilde expansion is Bash-only by design (see module docstring).
+    hook = _hook(str(tmp_path))
+    for tool, key in (
+        ("Read", "file_path"),
+        ("Write", "file_path"),
+        ("Edit", "file_path"),
+        ("Glob", "path"),
+        ("Grep", "path"),
+    ):
+        result = _call(hook, tool, {key: "~", "pattern": "TODO"})
+        assert result == {}
+
+
 # --- unrelated tools pass through untouched -------------------------------
 
 
