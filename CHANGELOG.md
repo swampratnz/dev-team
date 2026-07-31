@@ -26,6 +26,19 @@ sections below are reconstructed from the repository history.
   external service credential, out of scope per the standing guardrail).
 
 ### Dispatch
+- **Restart-recover `GET /jobs/{id}` and `/result` for succeeded deliver
+  jobs too** (#275): extends #265's assess-only disk fallback to `deliver` —
+  a succeeded deliver job's outcome (including `pull_request_url`) now
+  mirrors to `audit/{id}/delivery.json`, so a service restart no longer
+  permanently 404s a job that represents real committed work and possibly
+  an open PR. `_read_disk_assessment`/`disk_status`/`disk_result` are
+  generalised into a `meta.json["mode"]` dispatch (`_read_disk_outcome`)
+  shared by both modes; `verify` has no matching mirror file and is
+  unaffected — its own self-lookup remains the named, lower-severity
+  remaining gap (the verdict itself already survives via the source job's
+  `verifications.jsonl`). `delivery.json` also joins the file set
+  `POST /jobs/{id}/purge` removes, so a purged deliver job's mirrored
+  outcome doesn't linger on disk.
 - **On-demand bulk purge** (`docs/DISPATCH.md`): `GET`/`POST
   /jobs/purge?archived_before=<epoch-seconds>` — the still-deferred second
   half of the purge "Natural growth" note, now that the single-job

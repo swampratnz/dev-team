@@ -109,11 +109,15 @@ an assess run mirrors its report to `DIR/audit/<job-id>/assessment.md` for the
 Reports panel, **its structured result to
 `DIR/audit/<job-id>/assessment.json`** (the exact `outcome_to_dict` shape),
 and **its repo identity to `DIR/audit/<job-id>/meta.json`**
-(`{"repo","mode","id"}`). That JSON is the disk-keyed record
-`POST /jobs/{id}/backlog`, `GET /jobs/{id}/findings`, and the `verify` mode
-read later — the in-memory job registry is lost on a service restart, but
-the persisted assessments are not (`meta.json` is how a verify job knows
-which repository to re-clone after a restart). Verify verdicts append to
+(`{"repo","mode","id"}`). A deliver run mirrors the analogous **structured
+result to `DIR/audit/<job-id>/delivery.json`** (the exact `delivery_to_dict`
+shape) and the same `meta.json`, but has no markdown report. That JSON is the
+disk-keyed record `POST /jobs/{id}/backlog`, `GET /jobs/{id}/findings`, the
+`verify` mode, and `GET /jobs/{id}`/`GET /jobs/{id}/result`'s restart-survival
+fallback (see below) read later — the in-memory job registry is lost on a
+service restart, but the persisted assess/deliver outcomes are not
+(`meta.json` is also how a verify job knows which repository to re-clone
+after a restart). Verify verdicts append to
 `DIR/audit/<source-job-id>/verifications.jsonl`, which is what
 `GET /jobs/{id}/verifications` reads. The job's own workspace stays the source of truth; this
 is a read-only visibility copy (the shared backlog in `DIR` is the one
@@ -238,17 +242,23 @@ id → `404 {"error":"unknown job"}`.
 
 **Restart survival:** the in-memory job registry is lost on a service
 restart (see *Dashboard visibility* above), so a registry miss here is not
-automatically "unknown" — a **succeeded assess job** (the only mode that
-mirrors `meta.json` **and** `assessment.json` to the dashboard workspace,
-see *Purge* → *Registry-miss fallback* for the same pattern) is
-reconstructed from those two files instead of 404ing: `state` reads
-`"succeeded"`, `id`/`mode`/`repo`/`cost_usd` come from disk, and
-`started`/`ended`/`progress` are honestly `null`/`[]` — they were never
-mirrored, so this payload is not byte-identical to the live one, only
-schema-compatible. A `deliver`/`verify`-mode job, or an assess job that
-never reached success (or predates this fallback), still 404s permanently
-after a restart — mirroring `deliver`/`verify` metadata is a possible
-follow-up, not yet done.
+automatically "unknown" — a **succeeded assess or deliver job** (the modes
+that mirror `meta.json` **and** a matching outcome file — `assessment.json`
+for assess, `delivery.json` for deliver — to the dashboard workspace, see
+*Purge* → *Registry-miss fallback* for the same pattern) is reconstructed
+from those two files instead of 404ing: `state` reads `"succeeded"`,
+`id`/`mode`/`repo`/`cost_usd` come from disk, and `started`/`ended`/`progress`
+are honestly `null`/`[]` — they were never mirrored, so this payload is not
+byte-identical to the live one, only schema-compatible. An assess or deliver
+job that never reached success (or predates this fallback) still 404s
+permanently after a restart, as does a corrupt outcome mirror — never a
+`500`, never a fabricated success. A **verify** job's own self-lookup is the
+one remaining gap: it has no outcome mirror of its own, so it still 404s
+permanently after a restart. This is lower severity than it looks — the
+verdict itself is not lost, because `_run_verify` always appends it to the
+**source** job's restart-safe `verifications.jsonl`, readable via `GET
+/jobs/{source}/verifications` below regardless of what happens to the verify
+job's own id.
 
 ### `GET /jobs/{id}/result` (auth) — result
 
@@ -276,10 +286,16 @@ cancelled` (see *Cancel* below) — `cancelled` is reachable only from
 — a succeeded assess job's result is rendered from `assessment.json` (plus
 `assessment.md` for `report_markdown`, `null` if that mirror is absent) with
 the same `success`/`classification`/`executive_summary`/`report_path`/
-`cost_usd` shape the live path returns. Anything short of that (no
-`meta.json`, or `meta.json` without a corroborating `assessment.json`) still
-404s — this endpoint never fabricates a `queued`/`running`/`failed`/
-`cancelled` result it cannot actually reconstruct from disk.
+`cost_usd` shape the live path returns. A succeeded **deliver** job's result
+is rendered the same way from `delivery.json` — the exact `delivery_to_dict`
+shape the live path already returns, so `{"kind":"deliver", …}` is
+byte-identical whether served from the registry or reconstructed from disk.
+Anything short of that (no `meta.json`, a `meta.json` without a corroborating
+outcome file, or a corrupt one) still 404s — this endpoint never fabricates a
+`queued`/`running`/`failed`/`cancelled` result it cannot actually reconstruct
+from disk. A verify job's own `/result` still 404s post-restart for the same
+reason noted above; its verdict survives one hop away, via the source job's
+`verifications.jsonl`.
 
 ### `POST /jobs/{id}/backlog` (auth, no body) — generate the backlog later
 
@@ -480,9 +496,10 @@ v1 removes five things, each independently testable:
   directory already sits outside the `Workspace` abstraction (the same raw
   path join the worker itself uses to materialise it);
 - the `audit/{id}/` mirror in the dashboard workspace (`assessment.md`,
-  `assessment.json`, `meta.json`, `verifications.jsonl`) — each removed
-  through `Workspace.delete()`, **never** a raw filesystem call, so the
-  existing traversal/symlink-escape guard on that abstraction still applies;
+  `assessment.json`, `delivery.json`, `meta.json`, `verifications.jsonl`) —
+  each removed through `Workspace.delete()`, **never** a raw filesystem call,
+  so the existing traversal/symlink-escape guard on that abstraction still
+  applies;
 - the `.dev_team/transcripts/{id}/` directory in the dashboard workspace, if
   `--record-transcripts` was ever on for this job — removed in one call
   through `Workspace.delete_dir()`, the same guarded abstraction as the
