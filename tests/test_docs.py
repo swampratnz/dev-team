@@ -1,4 +1,6 @@
-"""Structural and secret-hygiene checks for docs/TROUBLESHOOTING.md."""
+"""Structural and secret-hygiene checks for docs/TROUBLESHOOTING.md and
+docs/INTERACTION.md.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +10,7 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _TROUBLESHOOTING = _REPO_ROOT / "docs" / "TROUBLESHOOTING.md"
+_INTERACTION = _REPO_ROOT / "docs" / "INTERACTION.md"
 
 # AC2: cross-referenced repo paths the runbook names must actually exist.
 _CROSS_REFERENCED_PATHS = [
@@ -70,6 +73,38 @@ _DOCKER_GATE_HEADING = "docker_build_verified` / `docker_run_verified` is false"
 
 def _troubleshooting_text() -> str:
     return _TROUBLESHOOTING.read_text(encoding="utf-8")
+
+
+def _interaction_text() -> str:
+    return _INTERACTION.read_text(encoding="utf-8")
+
+
+def _interactive_runs_section_text() -> str:
+    text = _interaction_text()
+    start = text.index("## Interactive runs")
+    end = text.index("\n## Supervising CI fixes", start)
+    return text[start:end]
+
+
+def _replan_review_subsection_text() -> str:
+    text = _interactive_runs_section_text()
+    start = text.index("**Replan review**")
+    end = text.index("5. **Triage review**", start)
+    return text[start:end]
+
+
+def _triage_review_subsection_text() -> str:
+    text = _interactive_runs_section_text()
+    start = text.index("**Triage review**")
+    end = text.index("6. **Review dispute**", start)
+    return text[start:end]
+
+
+def _review_dispute_subsection_text() -> str:
+    text = _interactive_runs_section_text()
+    start = text.index("**Review dispute**")
+    end = text.index("Every prompt shows a default first", start)
+    return text[start:end]
 
 
 def _dispatch_text() -> str:
@@ -304,3 +339,89 @@ def test_changelog_unreleased_section_mentions_benchmarks_correction():
     text = _changelog_unreleased_section_text()
     assert "docs/BENCHMARKS.md" in text
     assert "Technical writer" in text
+
+
+def test_interaction_doc_exists():
+    assert _INTERACTION.is_file(), _INTERACTION
+
+
+def test_interactive_runs_section_documents_replan_review():
+    text = _replan_review_subsection_text()
+    assert "Apply this re-plan for T2?" in text
+    assert "[apply]" in text
+    assert "[revise]" in text
+    assert "[reject]" in text
+    assert "reject" in text
+
+
+def test_interactive_runs_section_documents_triage_review():
+    text = _triage_review_subsection_text()
+    assert "Apply the triaged route (deliver)?" in text
+    assert "[apply]" in text
+    assert "[abort]" in text
+    assert "abort" in text
+
+
+def test_interactive_runs_section_documents_review_dispute():
+    text = _review_dispute_subsection_text()
+    assert "Accept it?" in text
+    assert "[overturn]" in text
+    assert "[uphold]" in text
+    assert "uphold" in text
+
+
+def test_replan_review_doc_fail_safe_matches_the_shipped_question():
+    from dev_team.interaction import replan_review_question
+    from dev_team.replan import Replan, ReplanAction
+
+    question = replan_review_question(Replan(ReplanAction.DROP, "T2"), asked_by="Priya")
+    assert question.fail_safe_key == "reject"
+    assert {choice.key for choice in question.choices} == {"apply", "revise", "reject"}
+
+
+def test_triage_review_doc_fail_safe_matches_the_shipped_question():
+    from dev_team.interaction import triage_review_question
+
+    question = triage_review_question("deliver", context="the proposal", asked_by="intake")
+    assert question.fail_safe_key == "abort"
+    assert {choice.key for choice in question.choices} == {"apply", "abort"}
+
+
+def test_review_dispute_doc_fail_safe_matches_the_shipped_question():
+    from dev_team.interaction import review_dispute_question
+
+    question = review_dispute_question("T3", context="findings", asked_by="Sasha")
+    assert question.fail_safe_key == "uphold"
+    assert {choice.key for choice in question.choices} == {"overturn", "uphold"}
+
+
+def test_interactive_runs_section_documents_the_cli_flags():
+    from dev_team.cli import build_parser
+
+    text = _interactive_runs_section_text()
+    cited_flags = ["--max-replan-rounds", "--intake", "--intake-apply", "--review-debate"]
+    for flag in cited_flags:
+        assert flag in text, flag
+    known_flags = {
+        option
+        for action in build_parser()._actions
+        for option in action.option_strings
+        if option.startswith("--")
+    }
+    for flag in cited_flags:
+        assert flag in known_flags, flag
+
+
+def test_interaction_doc_still_documents_the_pre_existing_question_types():
+    text = _interaction_text()
+    assert "Plan review" in text
+    assert "Task-failure escalation" in text
+    assert "Approvals" in text
+    assert "--interactive-pr-comment-author" in text
+
+
+def test_interaction_has_no_secret_shaped_content():
+    text = _interaction_text()
+    for literal in _SECRET_LITERALS:
+        assert literal not in text, literal
+    assert _BEARER_SECRET_RE.search(text) is None

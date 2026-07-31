@@ -42,14 +42,59 @@ An interactive run pauses at the moments a human actually wants a say:
    policy gates (`push`, `deploy`, `rm`), ask for a yes/no with the risk and
    detail shown.
 
+4. **Replan review** (`--max-replan-rounds N`) — when a task exhausts its
+   attempts and the product manager proposes splitting, replacing, or
+   dropping it (dynamic re-planning), each round asks before the plan is
+   rewritten:
+
+   ```text
+   Priya asks: Apply this re-plan for T2?
+   [apply] apply the re-plan  [revise] propose a different re-plan  [reject] leave the task failed >
+   ```
+
+   `revise` takes free-text feedback and loops until you apply or reject.
+   Autonomous default: `apply` — matching the unattended path, where the
+   manager re-plans without asking. **EOF fail-safe: `reject`** — a detached
+   run must not silently rewrite its own plan and push work down a new path
+   no human blessed.
+
+5. **Triage review** (`--intake --interactive`) — when `--intake` routes
+   free text to a mode (`--assess`/`--deliver`/`--dispatch`/...), this
+   confirms applying that route before anything runs:
+
+   ```text
+   intake asks: Apply the triaged route (deliver)?
+   [apply] run the routed mode now  [abort] stop; nothing is run >
+   ```
+
+   Autonomous default: `apply` — matching `--intake-apply`'s unattended
+   posture. **EOF fail-safe: `abort`** — a detached run must not start work
+   (and spend) on a route no human confirmed.
+
+6. **Review dispute** (`--review-debate`) — when the review-debate mechanism
+   would overturn a major/critical blocking review, this asks before the
+   overturn is accepted:
+
+   ```text
+   Sasha asks: The review debate would overturn the block on T3. Accept it?
+   [overturn] accept the overturn and let the change proceed  [uphold] keep the changes-requested verdict >
+   ```
+
+   Autonomous default: `overturn` — matching the autonomous path, where the
+   judge's ruling is applied when no human is watching. **EOF fail-safe:
+   `uphold`** — a detached run must not drop a reviewer's block that no
+   human blessed.
+
 Every prompt shows a default first, for a present human who just presses
 enter — but a closed stdin does **not** silently take that default. A
 detached interactive run (piped, `nohup`, a CI or oneshot unit with no
 terminal) **fails closed**: on EOF each question falls back to its *fail-safe*
 choice, not its default. Plan review aborts before any work (or spend beyond
-planning) starts, and every approval — the feature commit and each gated
-`push`/`deploy`/`rm` — is denied. So a run that loses its human never
-degrades to autonomous and never crashes on the missing input; it stops.
+planning) starts, every approval — the feature commit and each gated
+`push`/`deploy`/`rm` — is denied, a proposed re-plan is rejected, a triaged
+route is aborted, and an overturned review reverts to upheld. So a run that
+loses its human never degrades to autonomous and never crashes on the
+missing input; it stops.
 (The one prompt whose fail-safe *is* its default is failed-task escalation:
 it falls back to `skip`, leaving the task failed rather than retrying blind.)
 On resume from a checkpoint the plan is *not* re-reviewed: it was approved by
