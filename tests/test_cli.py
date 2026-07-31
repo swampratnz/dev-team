@@ -521,6 +521,83 @@ def test_main_review_debate_rejected_without_deliver(capsys):
     assert "--review-debate" in err and "--deliver" in err
 
 
+def test_engine_config_threads_review_debate_votes():
+    from dev_team.cli import _engine_config, build_parser
+
+    on = build_parser().parse_args(
+        ["T", "D", "--deliver", "--review-debate", "--review-debate-votes", "3"]
+    )
+    assert _engine_config(on).review_debate_votes == 3
+    off = build_parser().parse_args(["T", "D", "--deliver", "--review-debate"])
+    assert _engine_config(off).review_debate_votes == 1
+
+
+def test_main_review_debate_votes_flag_requires_review_debate(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["Login", "Add login", "--deliver", "--review-debate-votes", "3"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--review-debate-votes" in err and "--review-debate" in err
+
+
+def test_main_review_debate_votes_zero_and_negative_rejected():
+    for value in ("0", "-1"):
+        with pytest.raises(SystemExit) as excinfo:
+            main(
+                [
+                    "Login", "Add login", "--deliver", "--review-debate",
+                    "--review-debate-votes", value,
+                ],
+                runner=ScriptedRunner([]),
+            )
+        assert excinfo.value.code == 2
+
+
+def test_main_review_debate_votes_above_cap_rejected():
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "Login", "Add login", "--deliver", "--review-debate",
+                "--review-debate-votes", "6",
+            ],
+            runner=ScriptedRunner([]),
+        )
+    assert excinfo.value.code == 2
+
+
+def test_main_review_debate_votes_at_cap_accepted():
+    from dev_team.cli import _engine_config, build_parser
+
+    args = build_parser().parse_args(
+        [
+            "T", "D", "--deliver", "--review-debate",
+            "--review-debate-votes", "5",
+        ]
+    )
+    assert _engine_config(args).review_debate_votes == 5
+
+
+def test_main_review_debate_votes_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["Login", "Add login", "--review-debate", "--review-debate-votes", "3"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--review-debate" in err and "--deliver" in err
+
+
+def test_main_help_documents_review_debate_votes(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "--review-debate-votes" in out
+
+
 def test_main_visual_fix_rounds_rejected_without_visual_review(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(

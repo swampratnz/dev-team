@@ -31,7 +31,7 @@ from .dashboard import DashboardServer
 from .checks import ChecksError, GitHubChecksReader, watch_checks
 from .delivery_target import DeliveryTargetError, publish_pull_request, push_branch
 from .dispatch import DispatchServer
-from .engine import EngineConfig
+from .engine import MAX_REVIEW_DEBATE_VOTES, EngineConfig
 from .errors import DevTeamError
 from .eventlog import EventLog, compose
 from .events import AgentEvent, Listener
@@ -809,6 +809,18 @@ def build_parser() -> argparse.ArgumentParser:
         "supervises the overturn when an interaction channel is attached; the "
         "security review at commit still runs; off by default; with --deliver).",
     )
+    delivery.add_argument(
+        "--review-debate-votes",
+        type=int,
+        default=1,
+        metavar="N",
+        help="With --review-debate: run N independent adjudication passes "
+        "concurrently instead of one, and take the plurality verdict (a tie "
+        "resolves to uphold, never overturn — stricter than --verify-votes' "
+        "tie behaviour, since an inconclusive vote must never guess at "
+        "overturning a security block). Default 1 (unchanged behaviour); "
+        f"capped at {MAX_REVIEW_DEBATE_VOTES}.",
+    )
     misc.add_argument(
         "--budget-usd",
         type=float,
@@ -1162,6 +1174,12 @@ def _validate_args(
         parser.error("--serve-command must contain a '{port}' placeholder")
     if args.visual_fix_rounds < 0:
         parser.error("--visual-fix-rounds must be non-negative")
+    if args.review_debate_votes != 1 and not args.review_debate:
+        parser.error("--review-debate-votes: only valid with --review-debate")
+    if args.review_debate_votes < 1:
+        parser.error("--review-debate-votes: must be at least 1")
+    if args.review_debate_votes > MAX_REVIEW_DEBATE_VOTES:
+        parser.error(f"--review-debate-votes: must be at most {MAX_REVIEW_DEBATE_VOTES}")
     if not args.assess:
         assess_only = [
             ("--exclude", args.exclude_globs is not None),
@@ -1253,6 +1271,7 @@ def _reject_deliver_only_flags(
         ("--screenshot-routes", args.screenshot_routes is not None),
         ("--visual-fix-rounds", args.visual_fix_rounds != 0),
         ("--review-debate", args.review_debate),
+        ("--review-debate-votes", args.review_debate_votes != 1),
         ("--max-concurrency", args.max_concurrency != parser.get_default("max_concurrency")),
         ("--no-commit", args.no_commit),
         (
@@ -1343,6 +1362,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         ),
         visual_fix_rounds=args.visual_fix_rounds,
         review_debate=args.review_debate,
+        review_debate_votes=args.review_debate_votes,
         remote_verify_status=(
             tuple(shlex.split(args.remote_verify_status))
             if args.remote_verify_status

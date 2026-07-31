@@ -370,18 +370,28 @@ def ci_fix_question(
     )
 
 
-def review_dispute_question(task_id: str, *, context: str, asked_by: str) -> Question:
+def review_dispute_question(
+    task_id: str, *, context: str, asked_by: str, tally: Optional[str] = None
+) -> Question:
     """Supervise a debate whose judge would overturn a blocking review.
 
     Default (unattended :class:`AutoChannel`) answer: overturn — matching the
     autonomous path, where the judge's ruling is applied when no human is
     watching. With no input available (EOF) the fail-safe is ``uphold``: a
     detached run must not drop a reviewer's block that no human blessed.
+
+    ``tally`` (e.g. ``"3-2 plurality to overturn"``) surfaces the N-way
+    adjudication vote's agreement strength when ``review_debate_votes > 1``,
+    so a supervising human sees more than a binary outcome; ``None`` (the
+    single-vote default) keeps today's wording unchanged.
     """
 
+    prompt = f"The review debate would overturn the block on {task_id}"
+    prompt += f" ({tally})" if tally is not None else ""
+    prompt += ". Accept it?"
     return Question(
         topic="review-dispute",
-        prompt=f"The review debate would overturn the block on {task_id}. Accept it?",
+        prompt=prompt,
         choices=(
             Choice("overturn", "accept the overturn and let the change proceed"),
             Choice("uphold", "keep the changes-requested verdict"),

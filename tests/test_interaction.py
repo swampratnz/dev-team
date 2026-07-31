@@ -386,6 +386,21 @@ def test_review_dispute_question_defaults_to_overturn_and_fails_safe_to_uphold()
     assert question.asked_by == "Sasha"
     assert "T3" in question.prompt
     assert question.context == "findings + rationale"
+    # no tally given -> today's single-verdict wording, unchanged
+    assert question.prompt == "The review debate would overturn the block on T3. Accept it?"
+
+
+def test_review_dispute_question_surfaces_the_vote_tally_when_given():
+    question = review_dispute_question(
+        "T3",
+        context="findings + rationale",
+        asked_by="Sasha",
+        tally="3-2 plurality to overturn",
+    )
+    assert question.prompt == (
+        "The review debate would overturn the block on T3 "
+        "(3-2 plurality to overturn). Accept it?"
+    )
 
 
 def test_triage_review_question_defaults_to_apply_and_fails_safe_to_abort():
