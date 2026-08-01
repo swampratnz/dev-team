@@ -53,6 +53,24 @@ sections below are reconstructed from the repository history.
   unrecognised or empty value is lenient (never a `400`), same as every
   other filter on this route.
 
+### Dashboard
+- **Bulk-purge UI for archived jobs** (#285, `docs/DASHBOARD.md`): a
+  "purge archived before..." date input and preview/confirm button next to
+  the Runs panel, closing the dashboard-affordance gap #234's own body and
+  `docs/DISPATCH.md` deferred when the `GET`/`POST
+  /jobs/purge?archived_before=` primitive shipped. Two new narrow proxies,
+  `GET`/`POST /api/jobs/purge`, mirror every other dispatch proxy on this
+  page — `archived_before` forwarded unchanged, `501` unconfigured, `502`
+  unreachable, scope exactly `/api/jobs/purge` (checked ahead of the
+  per-job `/api/jobs/{id}/...` routes so it can never be mistaken for a job
+  literally named "purge"). The button follows the same two-step
+  preview-then-arm/confirm pattern as the Foreman-run form and the
+  single-job purge button: the first click fetches the dry-run count and
+  arms the button with it stated in the label, only the second click issues
+  the destructive `POST`, and editing the date after arming disarms it so
+  the label can never go stale. No `dispatch.py` changes — the backend
+  primitive and its validation/locking are unchanged.
+
 ### Security
 - **Opt-in `--sandbox-userns` for per-job UID/GID separation** (#246):
   `SandboxConfig` gains `user_namespace`, wired to a new `--sandbox-userns`

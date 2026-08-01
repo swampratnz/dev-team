@@ -2918,6 +2918,271 @@ def test_dashboard_html_foreman_run_form():
     assert 'btn.disabled = !$("foreman-run-budget").value;' in foreman_run_fn_body
 
 
+# --- the bulk-purge proxy (GET/POST /api/jobs/purge → dispatch) -------------
+
+
+def test_jobs_purge_preview_proxy_forwards_and_relays_verbatim(proxy_server, monkeypatch):
+    # AC1
+    seen = _capture_urlopen(
+        monkeypatch, body=b'{"eligible": ["assess-1", "assess-2"], "count": 2}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/jobs/purge?archived_before=1700000000",
+        headers=AUTH,
+    )
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"eligible": ["assess-1", "assess-2"], "count": 2}
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/jobs/purge?archived_before=1700000000"
+    assert request.get_method() == "GET"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.data is None
+
+
+def test_jobs_purge_preview_proxy_relays_a_400_missing_archived_before(proxy_server, monkeypatch):
+    # AC2: no dashboard-side re-validation — the missing-param 400 comes from
+    # dispatch, relayed unchanged, and no query string at all is forwarded.
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/jobs/purge", 400, "Bad Request", None,
+        io.BytesIO(b'{"error": "archived_before is required"}'),
+    )
+    seen = _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(proxy_server, "GET", "/api/jobs/purge", headers=AUTH)
+    assert status == 400
+    assert json.loads(body) == {"error": "archived_before is required"}
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/jobs/purge"
+
+
+def test_jobs_purge_preview_proxy_relays_a_400_non_finite_archived_before(proxy_server, monkeypatch):
+    # AC2: a non-finite value is forwarded verbatim; dispatch's own
+    # finite-number check rejects it, relayed unchanged.
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/jobs/purge?archived_before=nan", 400, "Bad Request", None,
+        io.BytesIO(b'{"error": "archived_before must be a finite number"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(
+        proxy_server, "GET", "/api/jobs/purge?archived_before=nan", headers=AUTH
+    )
+    assert status == 400
+    assert json.loads(body) == {"error": "archived_before must be a finite number"}
+
+
+def test_jobs_purge_proxy_forwards_and_relays_200(proxy_server, monkeypatch):
+    # AC3
+    seen = _capture_urlopen(monkeypatch, body=b'{"purged": ["assess-1"], "count": 1}')
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/purge?archived_before=1700000000",
+        headers=AUTH,
+    )
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"purged": ["assess-1"], "count": 1}
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/jobs/purge?archived_before=1700000000"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+
+
+def test_jobs_purge_proxy_relays_a_400_missing_archived_before(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/jobs/purge", 400, "Bad Request", None,
+        io.BytesIO(b'{"error": "archived_before is required"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(proxy_server, "POST", "/api/jobs/purge", headers=AUTH)
+    assert status == 400
+    assert json.loads(body) == {"error": "archived_before is required"}
+
+
+def test_jobs_purge_preview_proxy_unconfigured_is_501(token_server, monkeypatch):
+    # AC4: no dispatch_url/dispatch_token wired — 501, no outbound call.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "GET", "/api/jobs/purge?archived_before=1700000000", headers=AUTH
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "bulk purge not configured"}
+    assert seen == []
+
+
+def test_jobs_purge_proxy_unconfigured_is_501(token_server, monkeypatch):
+    # AC4
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "POST", "/api/jobs/purge?archived_before=1700000000", headers=AUTH
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "bulk purge not configured"}
+    assert seen == []
+
+
+def test_jobs_purge_proxy_url_without_token_stays_unconfigured(monkeypatch):
+    # AC4: a dispatch URL alone (no dispatch token) must not forward.
+    seen = _capture_urlopen(monkeypatch)
+    srv = DashboardServer(
+        InMemoryWorkspace(), port=0, token=TOKEN, dispatch_url=DISPATCH_URL
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, body = _request(
+            srv, "GET", "/api/jobs/purge?archived_before=1700000000", headers=AUTH
+        )
+        assert status == 501
+        assert json.loads(body) == {"error": "bulk purge not configured"}
+        assert seen == []
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
+
+
+def test_jobs_purge_preview_proxy_unreachable_dispatch_is_502(proxy_server, monkeypatch):
+    # AC5
+    _capture_urlopen(monkeypatch, error=urllib.error.URLError("refused"))
+    status, _, body = _request(
+        proxy_server, "GET", "/api/jobs/purge?archived_before=1700000000", headers=AUTH
+    )
+    assert status == 502
+    assert json.loads(body) == {"error": "dispatch service unreachable"}
+    assert "refused" not in body  # no internals leak
+
+
+def test_jobs_purge_proxy_unreachable_dispatch_is_502(proxy_server, monkeypatch):
+    # AC5
+    _capture_urlopen(monkeypatch, error=urllib.error.URLError("refused"))
+    status, _, body = _request(
+        proxy_server, "POST", "/api/jobs/purge?archived_before=1700000000", headers=AUTH
+    )
+    assert status == 502
+    assert json.loads(body) == {"error": "dispatch service unreachable"}
+    assert "refused" not in body  # no internals leak
+
+
+def test_jobs_purge_route_scope_is_exact_match_only(proxy_server, monkeypatch):
+    # AC6/SECURITY: only exactly /api/jobs/purge is this route — a path that
+    # merely starts with it (or a job id literally named "purge") falls
+    # through to the ordinary 404, never forwarded to the dispatch service.
+    seen = _capture_urlopen(monkeypatch)
+    for path in ("/api/jobs/purge/extra", "/api/jobs/purgeSomething"):
+        status, _, _ = _request(
+            proxy_server, "GET", path + "?archived_before=1700000000", headers=AUTH
+        )
+        assert status == 404
+        status, _, _ = _request(
+            proxy_server, "POST", path + "?archived_before=1700000000", headers=AUTH
+        )
+        assert status == 404
+    assert seen == []
+
+
+def test_jobs_purge_preview_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    # AC7: dispatch IS configured, but the caller never authenticated to the
+    # dashboard — 401 first, and nothing is ever forwarded.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/jobs/purge?archived_before=1700000000"
+    )
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+def test_jobs_purge_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    # AC7
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/purge?archived_before=1700000000"
+    )
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+def test_jobs_purge_proxy_never_echoes_the_dispatch_token(proxy_server, monkeypatch):
+    # SECURITY: the dispatch bearer token must never reach the browser, in
+    # the response body or in any header.
+    _capture_urlopen(monkeypatch, body=b'{"purged": [], "count": 0}')
+    status, headers, body = _request(
+        proxy_server, "POST", "/api/jobs/purge?archived_before=1700000000",
+        headers=AUTH,
+    )
+    assert status == 200
+    assert DISPATCH_TOKEN not in body
+    assert DISPATCH_TOKEN not in str(headers)
+
+
+def test_jobs_purge_regression_get_state_still_works(proxy_server, monkeypatch):
+    # Adding the exact-match purge route ahead of the per-job jobs prefix
+    # must not disturb /api/state or a real job id's own routes.
+    status, _, body = _request(proxy_server, "GET", "/api/state", headers=AUTH)
+    assert status == 200
+    assert json.loads(body)["runs"] == []
+
+
+def test_dashboard_html_jobs_purge_form():
+    # AC8: preview populates the confirm button's label with the exact
+    # returned count; editing the date input after arming reverts the button
+    # to its unarmed "preview" state (disarm-on-edit, same as the
+    # Foreman-run form); the confirm click is disabled for the duration of
+    # an in-flight request (no double-submit).
+    assert '<input type="date" id="jobs-purge-before"' in DASHBOARD_HTML
+    assert (
+        '<button id="jobs-purge-btn" class="ghost" disabled>preview</button>'
+        in DASHBOARD_HTML
+    )
+    assert '<div class="panel" id="jobs-purge-result"></div>' in DASHBOARD_HTML
+
+    assert 'fetch("/api/jobs/purge?archived_before=" + epoch)' in DASHBOARD_HTML
+    assert (
+        'fetch("/api/jobs/purge?archived_before=" + epoch, { method: "POST" })'
+        in DASHBOARD_HTML
+    )
+    assert (
+        "btn.textContent = `confirm: permanently delete ${esc(data.count)}"
+        " archived jobs?`;" in DASHBOARD_HTML
+    )
+
+    before_listener = DASHBOARD_HTML.index(
+        '$("jobs-purge-before").addEventListener("input"'
+    )
+    before_listener_end = DASHBOARD_HTML.index("});", before_listener)
+    before_listener_body = DASHBOARD_HTML[before_listener:before_listener_end]
+    assert 'btn.dataset.armed = "";' in before_listener_body
+    assert 'btn.textContent = "preview";' in before_listener_body
+    assert 'btn.disabled = !$("jobs-purge-before").value;' in before_listener_body
+
+    assert '$("jobs-purge-btn").addEventListener("click"' in DASHBOARD_HTML
+    assert "if (btn.dataset.armed) { jobsPurgeConfirm(); return; }" in DASHBOARD_HTML
+
+    # Minor/double-click guard: both the preview and the destructive confirm
+    # request disable the button for their in-flight duration.
+    preview_fn = DASHBOARD_HTML.index("async function jobsPurgePreview()")
+    preview_fn_end = DASHBOARD_HTML.index("\n}\n", preview_fn)
+    preview_fn_body = DASHBOARD_HTML[preview_fn:preview_fn_end]
+    assert "btn.disabled = true;" in preview_fn_body
+    assert 'btn.disabled = !$("jobs-purge-before").value;' in preview_fn_body
+
+    confirm_fn = DASHBOARD_HTML.index("async function jobsPurgeConfirm()")
+    confirm_fn_end = DASHBOARD_HTML.index("\n}\n", confirm_fn)
+    confirm_fn_body = DASHBOARD_HTML[confirm_fn:confirm_fn_end]
+    assert "btn.disabled = true;" in confirm_fn_body
+    assert 'btn.textContent = "preview";' in confirm_fn_body
+
+    # SECURITY: eligible/purged job ids go through esc() before innerHTML,
+    # same discipline as every other panel.
+    assert "function jobsPurgeIdRow(id) {" in DASHBOARD_HTML
+    assert "return `<li>${esc(id)}</li>`;" in DASHBOARD_HTML
+    assert "function jobsPurgePanel(data, ok) {" in DASHBOARD_HTML
+    assert 'if (!ok) return `<span class="muted">${esc(data.error)}</span>`;' in DASHBOARD_HTML
+
+
 # --- the pending-question proxy (GET /api/jobs/{id}/question → dispatch) -----
 
 
@@ -3233,12 +3498,14 @@ def test_dashboard_html_run_card_waiting_chip():
     assert 'if (STAGE_GOOD.has(s)) return chip("\\u2713 finished", "done");' in DASHBOARD_HTML
     assert 'return chip("\\u25B6 running", "active");' in DASHBOARD_HTML
 
-    # 6. Cost-story regression: no new fetch( call site and no new
-    #    interval/timer — loadQuestion/pollQuestions still perform exactly
-    #    the one GET /api/jobs/{id}/question request per running job per
-    #    5s tick that they did before this change, and the page still has
-    #    exactly the same total number of fetch(/setInterval( call sites.
-    assert DASHBOARD_HTML.count("fetch(") == 14
+    # 6. Cost-story regression: no new interval/timer, and loadQuestion/
+    #    pollQuestions still perform exactly the one GET
+    #    /api/jobs/{id}/question request per running job per 5s tick that
+    #    they did before this change. The total fetch( count below is 16,
+    #    not 14: jobsPurgePreview/jobsPurgeConfirm (bulk-purge form) each add
+    #    one on-demand-only call, never folded into the setInterval poll —
+    #    same "explicit click only" discipline as every other proxied panel.
+    assert DASHBOARD_HTML.count("fetch(") == 16
     assert DASHBOARD_HTML.count("setInterval(") == 3
     assert body.count("fetch(") == 1  # loadQuestion's one existing request
     assert "setInterval(pollQuestions, 5000)" in DASHBOARD_HTML
