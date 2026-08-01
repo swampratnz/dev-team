@@ -12,11 +12,18 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle guard, types only
     from .engine import DeliveryOutcome
 
 # GitHub's recognised closing keywords, immediately followed by an issue
-# reference (``#123`` or ``GH-123``). GitHub auto-closes the referenced issue
-# when a PR body containing this adjacency merges to the default branch.
+# reference. GitHub auto-closes the referenced issue when a PR body
+# containing this adjacency merges to the default branch. Per GitHub's
+# "linking a pull request to an issue" docs, the reference may be a bare
+# ``#123``/``GH-123``, a cross-repo shorthand (``owner/repo#123``), or the
+# issue's full URL (``https://github.com/owner/repo/issues/123``).
 _CLOSING_KEYWORD_RE = re.compile(
     r"\b(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
-    r"(\s*)(#\d+|GH-\d+)",
+    r"(\s*)"
+    r"(#\d+"
+    r"|GH-\d+"
+    r"|[\w.-]+/[\w.-]+#\d+"
+    r"|https?://github\.com/[^/\s]+/[^/\s]+/issues/\d+)",
     re.IGNORECASE,
 )
 # Raw markdown link/image syntax: ``[text](url)`` or ``![alt](url)``. Both

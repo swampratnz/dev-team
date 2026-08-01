@@ -66,13 +66,16 @@ sections below are reconstructed from the repository history.
   scans. New `report._sanitize_visual_text` (reusing `fences.ZERO_WIDTH_SPACE`,
   the same invisible-break idiom `fences.defuse` uses for prompt fences)
   breaks the adjacency a GitHub closing keyword (`close(s|d)`, `fix(es|ed)`,
-  `resolve(s|d)`) needs with a following `#<digits>`/`GH-<digits>` reference,
-  and neutralizes raw markdown link/image syntax and HTML tags — so an
-  injected finding can no longer auto-close an issue or render as a live
-  link/image/collapsible block. `delivery_to_dict`'s JSON `visual_summary`/
-  `visual_findings` are intentionally left raw (JSON is data, not rendered
-  markup); this is a defense-in-depth internal-consistency fix, not a
-  response to an observed exploit.
+  `resolve(s|d)`) needs with a following issue reference — a bare
+  `#<digits>`/`GH-<digits>`, the cross-repo shorthand `owner/repo#<digits>`,
+  or the issue's full `https://github.com/<owner>/<repo>/issues/<digits>`
+  URL, all three forms GitHub's closing-keyword parser recognises — and
+  neutralizes raw markdown link/image syntax and HTML tags — so an injected
+  finding can no longer auto-close an issue (same-repo or cross-repo) or
+  render as a live link/image/collapsible block. `delivery_to_dict`'s JSON
+  `visual_summary`/`visual_findings` are intentionally left raw (JSON is
+  data, not rendered markup); this is a defense-in-depth internal-consistency
+  fix, not a response to an observed exploit.
 - **Opt-in `--sandbox-userns` for per-job UID/GID separation** (#246):
   `SandboxConfig` gains `user_namespace`, wired to a new `--sandbox-userns`
   CLI flag (only valid with `--sandbox`, mirroring `--sandbox-network`).

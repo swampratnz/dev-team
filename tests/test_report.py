@@ -305,6 +305,34 @@ def test_render_delivery_summary_defuses_closing_keyword_in_visual_findings():
     assert data["visual_findings"][0]["issue"] == "Closes #999 unexpectedly"
 
 
+def test_render_delivery_summary_defuses_cross_repo_and_url_closing_references():
+    from dev_team.models import Severity
+    from dev_team.visualreview import VisualFinding, VisualReport
+
+    report = VisualReport(
+        findings=[
+            VisualFinding(
+                route="/",
+                issue="Fixes octo/other#999 unexpectedly",
+                severity=Severity.MAJOR,
+            )
+        ],
+        summary="Closes https://github.com/octo/other/issues/123 already",
+        routes=["/"],
+    )
+    outcome = _outcome(visual=report)
+    text = render_delivery_summary(outcome)
+    assert "Fixes octo/other#999" not in text
+    assert "Closes https://github.com/octo/other/issues/123" not in text
+    # surrounding benign text is preserved
+    assert "unexpectedly" in text
+    assert "already" in text
+    # the JSON boundary stays raw/unsanitized (AC4) — the two consumers differ
+    data = delivery_to_dict(outcome)
+    assert data["visual_summary"] == "Closes https://github.com/octo/other/issues/123 already"
+    assert data["visual_findings"][0]["issue"] == "Fixes octo/other#999 unexpectedly"
+
+
 def test_render_delivery_summary_neutralizes_markdown_and_html_in_visual_findings():
     from dev_team.models import Severity
     from dev_team.visualreview import VisualFinding, VisualReport
