@@ -5,6 +5,25 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Engineer
+- **Candidate rescue** — opt-in `--candidate-rescue N` /
+  `EngineConfig.candidate_rescue_count` (0 = off, the default; capped at 5 —
+  `MAX_CANDIDATE_RESCUE`, mirroring `--verify-votes`'s cost story for the same
+  "N independent LLM/agent passes, shared budget" shape). Once a task
+  exhausts its ordinary attempts and a retry is declined (unattended, or a
+  human accepts the failure), tries up to N independent, feedback-free
+  candidates — each a fresh cold engineer attempt in its own worktree, no
+  conditioning on the accumulated review/gate feedback the exhausted
+  sequential retries already tried — stopping at the first candidate whose
+  gates pass (execution-based reranking, first-green-wins) and merging it
+  exactly as `_develop_task_in_worktree` does; every candidate's
+  worktree/branch is removed whether it wins or not, and no candidate going
+  green (or a budget cut mid-loop) returns the original failed result
+  untouched. Closes the one remaining unclaimed line in `docs/BENCHMARKS.md`'s
+  Engineer row ("multi-candidate generation with execution-based reranking",
+  previously marked "→ roadmap"); complementary to, not a replacement for,
+  `EngineConfig.reuse_engineer_session`'s sequential refinement (#291).
+
 ### QA
 - **Mutation-lite now flips augmented-assignment arithmetic
   (`total += 1`↔`total -= 1`, `x *= 2`↔`x /= 2`), the exact follow-up #226

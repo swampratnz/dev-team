@@ -50,6 +50,10 @@ def test_stale_roadmap_markers_are_gone():
     text = _benchmarks_text()
     assert "session continuity across attempts → roadmap" not in text
     assert "Dynamic re-planning on failure → roadmap" not in text
+    assert (
+        "multi-candidate generation with execution-based\n  reranking → roadmap"
+        not in text
+    )
 
 
 def test_engineer_section_documents_session_continuity_as_shipped():
@@ -66,12 +70,22 @@ def test_pm_section_documents_dynamic_replanning_as_shipped():
     assert "ROADMAP #3" in text
 
 
+def test_engineer_section_documents_candidate_rescue_as_shipped():
+    # #291: the one previously-unclaimed BENCHMARKS.md Engineer-row line.
+    text = _section_text("Engineer")
+    assert "multi-candidate generation with execution-based" in text
+    assert "reranking ✅" in text
+    assert "EngineConfig.candidate_rescue_count" in text
+    assert "--candidate-rescue" in text
+
+
 def test_cited_config_fields_are_real_on_engineconfig():
     from dev_team.engine import EngineConfig
 
     field_names = {f.name for f in dataclasses.fields(EngineConfig)}
     assert "reuse_engineer_session" in field_names
     assert "max_replan_rounds" in field_names
+    assert "candidate_rescue_count" in field_names
 
 
 def test_cited_cli_flags_are_real_on_build_parser():
@@ -85,14 +99,11 @@ def test_cited_cli_flags_are_real_on_build_parser():
     }
     assert "--no-reuse-engineer-session" in known_flags
     assert "--max-replan-rounds" in known_flags
+    assert "--candidate-rescue" in known_flags
 
 
 def test_still_deferred_techniques_were_not_overcorrected():
     text = _benchmarks_text()
-    assert (
-        "multi-candidate generation with execution-based\n  reranking → roadmap"
-        in text
-    )
     assert "Proof-of-vulnerability → roadmap" in text
 
 

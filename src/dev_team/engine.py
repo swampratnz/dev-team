@@ -147,6 +147,14 @@ _INTERNAL_PREFIX = ".dev_team/"
 # Dockerfile concurrently on one host can't collide.
 _RUN_ID_COUNTER = itertools.count()
 
+#: Hard ceiling on ``EngineConfig.candidate_rescue_count`` / CLI
+#: ``--candidate-rescue``, mirroring ``assessment.MAX_VERIFY_VOTES``'s
+#: accepted cost story for the same "N independent LLM/agent passes, shared
+#: budget" shape: each rescue candidate is a full cold engineer attempt plus a
+#: gate run, so an uncapped value could turn one exhausted task into an
+#: unbounded worst-case cost.
+MAX_CANDIDATE_RESCUE = 5
+
 
 @dataclass
 class EngineConfig:
@@ -387,6 +395,20 @@ class EngineConfig:
     #: budget. A human supervises each mutation when an interaction channel is
     #: attached; otherwise it applies autonomously. See ``docs/ROADMAP.md`` #3.
     max_replan_rounds: int = 0
+    #: When a task exhausts every ordinary attempt and a retry is declined (no
+    #: interaction channel, or a human accepts the failure), try this many
+    #: independent, feedback-free candidates — each a fresh engineer session in
+    #: its own worktree, cold (no accumulated review/gate feedback) — before
+    #: accepting the failure. Stops at the first candidate whose gates pass
+    #: (execution-based reranking, first-green-wins); every candidate's
+    #: worktree/branch is removed whether it wins or not. 0 (the default) keeps
+    #: today's behaviour byte-identical: a task that exhausts its attempts and
+    #: gets no retry guidance just stays failed. Complementary to, not a
+    #: replacement for, ``reuse_engineer_session``'s sequential refinement:
+    #: this is the "multi-candidate generation with execution-based
+    #: reranking" technique named in ``docs/BENCHMARKS.md``. See
+    #: :data:`MAX_CANDIDATE_RESCUE` for the cap and ``docs/ROADMAP.md``.
+    candidate_rescue_count: int = 0
     #: When set (and the workspace is real), the commands the engine runs — the
     #: gates, setup, and scans, i.e. the arbitrary-code-execution surface — are
     #: boxed in a container per this config. git porcelain self-delegates to the
@@ -405,6 +427,12 @@ class EngineConfig:
             raise ValueError("remote_verify_max_polls must be at least 1")
         if self.max_replan_rounds < 0:
             raise ValueError("max_replan_rounds must be non-negative")
+        if self.candidate_rescue_count < 0:
+            raise ValueError("candidate_rescue_count must be non-negative")
+        if self.candidate_rescue_count > MAX_CANDIDATE_RESCUE:
+            raise ValueError(
+                f"candidate_rescue_count must be at most {MAX_CANDIDATE_RESCUE}"
+            )
         if self.visual_fix_rounds < 0:
             raise ValueError("visual_fix_rounds must be non-negative")
         if not 0.0 <= self.finalization_reserve_fraction < 1.0:
@@ -2376,6 +2404,10 @@ class DeliveryEngine:
                 return result
             feedback = await self._escalate_failure(task, result)
             if feedback is None:
+                if self.config.candidate_rescue_count:
+                    rescued = await self._rescue_task(task, design, result)
+                    if rescued.succeeded:
+                        return rescued
                 return result
 
     async def _attempt_task(
@@ -2668,6 +2700,95 @@ class DeliveryEngine:
             async with self._integration_lock:
                 self.git.worktree_remove(wt_path)
                 self.git.delete_branch(task_branch)
+
+    async def _rescue_task(
+        self, task: Task, design: Design, prior_result: TaskResult
+    ) -> TaskResult:
+        """Try up to ``candidate_rescue_count`` independent candidates before
+        accepting ``prior_result`` as the task's final, failed outcome.
+
+        Called only from :meth:`_develop_task`, once the ordinary attempt loop
+        is exhausted and a retry was declined (no interaction channel, or a
+        human accepted the failure) — never as a parallel cost multiplier on
+        every task. Each candidate is a single *cold* engineer attempt (a
+        freshly opened session, ``feedback=None``, ``continued=False`` — no
+        conditioning on the accumulated review/gate feedback the exhausted
+        sequential retries already tried) in its own worktree, mirroring
+        :meth:`_develop_task_in_worktree`'s isolation and gate/merge calls.
+        Stops at the first candidate whose gates pass and merges it
+        (execution-based reranking, first-green-wins); every candidate's
+        worktree/branch is removed whether it wins or not. Returns
+        ``prior_result`` unchanged if no candidate goes green.
+        """
+
+        for i in range(self.config.candidate_rescue_count):
+            wt_path = f"{self.workdir}/.dev_team/worktrees/{task.id.lower()}-rescue-{i}"
+            task_branch = (
+                f"{self._branch or 'dev-team'}-task-{task.id.lower()}-rescue-{i}"
+            )
+            async with self._integration_lock:  # worktree creation mutates .git
+                self.git.worktree_remove(wt_path)
+                self.git.worktree_prune()
+                self.git.worktree_add(wt_path, task_branch)
+            arena_ws = LocalWorkspace(wt_path)
+            arena_git = GitRepo(self.command_runner, cwd=wt_path)
+            # A fresh session per candidate — never the exhausted task's own
+            # session — is the whole point: an independent sample, not a
+            # continuation of the feedback loop that already failed.
+            session = self._open_engineer_session(cwd=wt_path)
+            try:
+                task.status = TaskStatus.IN_PROGRESS
+                span = self.tracer.start("task", task.id, attempt=f"rescue-{i + 1}")
+                try:
+                    implementation, session = await self._engineer_attempt(
+                        task, design, None, session,
+                        continued=False, model=None, cwd=wt_path,
+                    )
+                    done, review, test_report, _ = await self._integrate(
+                        task, implementation, span,
+                        workspace=arena_ws, git=arena_git, cwd=wt_path,
+                    )
+                except BudgetExceededError:
+                    raise
+                except DevTeamError as exc:
+                    # See the mirrored catch in _develop_task_in_worktree: a
+                    # known failure mode must not crash the rescue loop —
+                    # count it as a losing candidate and move to the next one.
+                    done = False
+                    self.tracer.end(span, "error")
+                    self._event(
+                        "engineer",
+                        f"{task.id} rescue candidate {i + 1} failed unexpectedly",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+                if not done:
+                    continue
+
+                merged, merge_feedback = await self._merge_task(
+                    task, arena_git, task_branch
+                )
+                if merged:
+                    task.status = TaskStatus.DONE
+                    self._record_progress(task)
+                    self.tracer.end(span, "done")
+                    return TaskResult(
+                        task,
+                        prior_result.attempts + i + 1,
+                        implementation,
+                        review,
+                        test_report,
+                    )
+                self._journal_rejection(task, span, "merge", merge_feedback.summary)
+                self.tracer.end(span, "merge-gates-failed")
+            finally:
+                if session is not None:
+                    await session.aclose()
+                async with self._integration_lock:
+                    self.git.worktree_remove(wt_path)
+                    self.git.delete_branch(task_branch)
+
+        task.status = TaskStatus.FAILED
+        return prior_result
 
     async def _merge_task(
         self, task: Task, arena_git: GitRepo, task_branch: str
