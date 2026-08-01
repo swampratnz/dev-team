@@ -26,12 +26,25 @@ _CLOSING_KEYWORD_RE = re.compile(
     r"|https?://github\.com/[^/\s]+/[^/\s]+/issues/\d+)",
     re.IGNORECASE,
 )
-# Raw markdown link/image syntax: ``[text](url)`` or ``![alt](url)``. Both
-# share the ``](`` adjacency that turns the preceding brackets into a live
-# link/image once rendered.
+# Raw markdown inline link/image syntax: ``[text](url)`` or ``![alt](url)``.
+# Both share the ``](`` adjacency that turns the preceding brackets into a
+# live link/image once rendered.
 _MARKDOWN_LINK_RE = re.compile(r"\]\(")
+# CommonMark reference-style link/image usage: ``[text][label]`` (and the
+# collapsed ``[text][]`` form) share the ``][`` adjacency with the preceding
+# bracket. Also covers the alternate ``[label]:`` reference-definition
+# adjacency (``]:``), so a would-be definition line can't bind a label to a
+# URL either.
+_MARKDOWN_REF_RE = re.compile(r"\]([:\[])")
 # A raw HTML tag opening, e.g. ``<details>`` or ``</summary>``.
 _HTML_TAG_RE = re.compile(r"<(/?[A-Za-z])")
+# Any line break embedded in a single free-text field. Each sanitized field
+# is rendered as (part of) exactly one line in the summary; an embedded
+# newline would otherwise let injected text start a new line of its own —
+# forging an extra "Security:"/"Reliability:"-style summary line, or letting
+# a CommonMark link reference definition (which must be the sole content of
+# its line) land on one.
+_NEWLINE_RE = re.compile(r"\r\n|\r|\n")
 
 
 def _sanitize_visual_text(text: str) -> str:
@@ -50,10 +63,12 @@ def _sanitize_visual_text(text: str) -> str:
     literal adjacency left to re-break) and never alters non-matching text.
     """
 
+    text = _NEWLINE_RE.sub(" ", text)
     text = _CLOSING_KEYWORD_RE.sub(
         lambda m: m.group(1) + ZERO_WIDTH_SPACE + m.group(2) + m.group(3), text
     )
     text = _MARKDOWN_LINK_RE.sub("]" + ZERO_WIDTH_SPACE + "(", text)
+    text = _MARKDOWN_REF_RE.sub(lambda m: "]" + ZERO_WIDTH_SPACE + m.group(1), text)
     text = _HTML_TAG_RE.sub(lambda m: "<" + ZERO_WIDTH_SPACE + m.group(1), text)
     return text
 
