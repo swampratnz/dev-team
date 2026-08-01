@@ -14,7 +14,9 @@ beat either alone, and false-positive suppression is a first-class metric.**
 - **Winning techniques:** reproduce-first (failing test before the patch) ✅
   (prompted); execution-guided repair loops ✅ (gate feedback per attempt);
   per-attempt escalation ✅; multi-candidate generation with execution-based
-  reranking → roadmap; retrieval-driven fault localization → roadmap;
+  reranking → roadmap; retrieval-driven fault localization ✅
+  (`EngineConfig.retrieval` / `--retrieval`, wired into the agentic engineer
+  path for both the session-reuse and worktree call sites);
   session continuity across attempts ✅ (`EngineConfig.reuse_engineer_session`,
   on by default — ROADMAP #5).
 
