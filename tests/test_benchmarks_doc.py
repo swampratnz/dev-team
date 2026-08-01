@@ -59,6 +59,14 @@ def test_engineer_section_documents_session_continuity_as_shipped():
     assert "ROADMAP #5" in text
 
 
+def test_engineer_section_documents_retrieval_as_shipped():
+    text = _section_text("Engineer")
+    assert "retrieval-driven fault localization → roadmap" not in text
+    assert "retrieval-driven fault localization ✅" in text
+    assert "EngineConfig.retrieval" in text
+    assert "--retrieval" in text
+
+
 def test_pm_section_documents_dynamic_replanning_as_shipped():
     text = _section_text("Product manager / planner")
     assert "Dynamic re-planning on failure ✅" in text
@@ -72,6 +80,7 @@ def test_cited_config_fields_are_real_on_engineconfig():
     field_names = {f.name for f in dataclasses.fields(EngineConfig)}
     assert "reuse_engineer_session" in field_names
     assert "max_replan_rounds" in field_names
+    assert "retrieval" in field_names
 
 
 def test_cited_cli_flags_are_real_on_build_parser():
@@ -85,6 +94,7 @@ def test_cited_cli_flags_are_real_on_build_parser():
     }
     assert "--no-reuse-engineer-session" in known_flags
     assert "--max-replan-rounds" in known_flags
+    assert "--retrieval" in known_flags
 
 
 def test_still_deferred_techniques_were_not_overcorrected():
@@ -100,3 +110,4 @@ def test_changelog_unreleased_mentions_the_benchmarks_correction():
     text = _unreleased_section_text()
     assert "docs/BENCHMARKS.md" in text
     assert "ROADMAP.md" in text
+    assert "retrieval" in text

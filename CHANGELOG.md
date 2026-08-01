@@ -18,6 +18,13 @@ sections below are reconstructed from the repository history.
   no new flip table, no `engine.py` changes.
 
 ### Documentation
+- **`docs/BENCHMARKS.md` Engineer-section correction:** "retrieval-driven
+  fault localization → roadmap" was stale — #239 (closing #238) already
+  wired `EngineConfig.retrieval` / `--retrieval`'s deterministic BM25
+  retriever into `EngineerAgent`'s agentic implement path for both the
+  session-reuse and worktree `_engineer_attempt` call sites. The bullet now
+  reads ✅ and cites the real config field and flag, matching the
+  ROADMAP.md item 7 correction above.
 - **`docs/ROADMAP.md` item 7 correction:** the closing sentence claiming
   "the dashboard and Slack adapters remain future work" was stale for its
   dashboard half — the dashboard's "Pending questions" panel
