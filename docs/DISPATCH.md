@@ -96,7 +96,9 @@ the CLI's `--watch-checks`:
 
 `400` for missing/unparseable `repo`/`ref`; `502` when GitHub cannot be
 read (rate limit, bad credential, App not installed); signed-in sessions
-are held to the same installation boundary as job submission (403).
+are held to the same installation boundary as job submission (403). The
+dashboard's **Checks** panel is a thin, on-demand proxy of this route —
+see [`docs/DASHBOARD.md`](DASHBOARD.md).
 
 ## Dashboard visibility
 
