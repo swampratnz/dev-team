@@ -103,6 +103,48 @@ non-archived job) regardless of what the browser sends. Purge is **not
 idempotent** — a second call on an already-purged job answers `404`, the
 job having left every listing for good.
 
+### Bulk purge (multiple archived jobs)
+
+The single-job purge button above reclaims disk one job at a time; an
+operator clearing out a whole batch (e.g. after a run of test/demo
+assessments) previously had no dashboard affordance for the bulk primitive
+`docs/DISPATCH.md`'s *Bulk purge on demand* section describes and shipped
+API-only — only a hand-crafted `curl` against the dispatch service, which
+the dashboard is specifically designed to keep the bearer token out of
+reach of (see *The board write model* below).
+
+A small form under the **Runs** panel exposes it: a date input plus a
+single button that starts as "preview". The first click calls the
+read-only `GET /api/jobs/purge?archived_before=<epoch>` dry-run (the date
+converted to a Unix epoch client-side) and, on success, **arms** the
+button with a label stating the exact count about to be deleted (e.g.
+"confirm: permanently delete 7 archived jobs?") and lists the eligible
+ids below; only the second click issues the destructive `POST
+/api/jobs/purge?archived_before=<epoch>` — the same two-step arm/confirm
+pattern the Foreman-run form and the single-job purge button both already
+use (CLAUDE.md §1: a bulk, hard-to-reverse action always needs an explicit,
+correctly-labelled human click). Editing the date after arming disarms the
+button back to its plain "preview" label, so the on-screen count can never
+go stale relative to what a click would submit; the button is also
+disabled for the duration of any in-flight request, so a rapid double-click
+cannot fire two overlapping requests.
+
+Both routes are narrow proxies of the same shape as every other one on this
+page: `archived_before` is forwarded unchanged (the dashboard adds no
+validation of its own — the dispatch service alone enforces the
+required/finite check, so a missing or non-finite value comes back as the
+same `400` it always has), scope is **exactly `/api/jobs/purge`** — checked
+before the per-job `/api/jobs/{id}/...` routes, so a path that merely
+starts with it (`/api/jobs/purge/extra`, `/api/jobs/purgeSomething`) is the
+ordinary `404`, never confused with a job literally named "purge" (real job
+ids are always `f"{mode}-{timestamp}-{seq}"`) — and without a dispatch
+URL/token configured both answer `501` and no outbound call is attempted.
+The preview is fetched only on the operator's explicit click, never folded
+into the 2.5s `/api/state` poll, for the same open-tabs×poll-cadence reason
+Spend/Access log/Foreman plan already avoid it. Eligible/purged job ids
+render through `esc()` before `innerHTML`, same discipline as every other
+panel.
+
 ### Story detail (click a backlog story)
 
 Every backlog story is clickable (mouse or Enter/Space). The modal shows
@@ -485,6 +527,14 @@ proxy — the write half of the same panel:
 browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(dispatch token)──▶ dispatch POST /foreman/run
 ```
 
+The bulk-purge form (above) adds an eighth pair, the same read-only/mutating
+shape as archive/unarchive/purge:
+
+```
+browser ──(dashboard token)──▶ dashboard GET /api/jobs/purge ──(dispatch token)──▶ dispatch GET /jobs/purge
+browser ──(dashboard token)──▶ dashboard POST /api/jobs/purge ──(dispatch token)──▶ dispatch POST /jobs/purge
+```
+
 - **The proxy** (`--dashboard` with `--dispatch-url`, default
   `http://127.0.0.1:8738`): authorised `POST`/`PATCH`/`DELETE` requests
   under `/api/backlog/` are forwarded — same method, same JSON body — to
@@ -540,6 +590,17 @@ browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(
   never forwarded. The dashboard adds no validation of its own; the
   dispatch service remains the sole enforcer of `budget_usd`/`max_stories`
   bounds.
+- Last, `GET /api/jobs/purge` and `POST /api/jobs/purge`: both forward
+  `?archived_before=` unchanged to `<dispatch-url>/jobs/purge` (including the
+  dispatch service's own `400` for a missing/non-numeric/non-finite value),
+  and without a token both answer `501 {"error": "bulk purge not
+  configured"}`, no outbound call attempted. Scope is **exactly
+  `/api/jobs/purge`** — checked ahead of the per-job
+  `/api/jobs/{id}/archive|unarchive|purge` routes, so a path that merely
+  starts with it (`/api/jobs/purge/extra`, `/api/jobs/purgeSomething`) is the
+  ordinary `404`, never forwarded (a real job id is never literally
+  "purge"). The dashboard adds no validation of its own; the dispatch
+  service alone enforces the required/finite `archived_before` check.
 - **Auth is layered**: the browser authenticates to the dashboard
   (dashboard token / cookie, checked first); the dashboard process — not
   the browser — holds the dispatch bearer token. Both comparisons are
@@ -601,3 +662,6 @@ the bearer header when a token is set):
   requires dashboard auth).
 - `POST /api/foreman/run` — the foreman-run proxy described above (body
   forwarded verbatim; same auth and `501` gating; requires dashboard auth).
+- `GET /api/jobs/purge` / `POST /api/jobs/purge` — the bulk-purge proxy
+  described above (`?archived_before=` forwarded unchanged; same auth and
+  `501` gating; requires dashboard auth).

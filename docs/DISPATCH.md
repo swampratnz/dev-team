@@ -664,10 +664,11 @@ its own `GET /foreman/plan` dry-run's forgiving clamp — the spend/deletion-
 bearing route validates strictly, the read-only preview does too here
 because it shares the same required param.
 
-API-only in this version — no dashboard UI affordance (a "purge archived
-before..." button/date-picker) yet; that can follow once the primitive has
-real usage, the same way the single-job archive/purge routes grew their
-dashboard wiring after the API existed first.
+The dashboard now has a UI affordance for this primitive — a "purge archived
+before..." date input and preview/confirm button next to the Runs panel,
+the same way the single-job archive/purge routes grew their dashboard
+wiring after the API existed first (see `docs/DASHBOARD.md`, *Bulk purge
+(multiple archived jobs)*).
 
 ## Finding re-verification (mode `verify` + two read routes)
 

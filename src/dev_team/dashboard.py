@@ -553,6 +553,16 @@ _PROXY_TIMEOUT = 30.0
 #: the ordinary 404, same exact-scope discipline as ``/api/foreman/plan``.
 _FOREMAN_RUN_PATH = "/api/foreman/run"
 
+#: The one exact path the bulk-purge preview (GET) and mutating (POST) proxy
+#: answers on — checked with ``==`` before the general ``_JOBS_PROXY_PREFIX``
+#: prefix match, so ``/api/jobs/purge`` is never mistaken for a per-job
+#: ``/api/jobs/{id}/...`` route (a real job id is always
+#: ``f"{mode}-{timestamp}-{seq}"``, never literally "purge") and
+#: ``/api/jobs/purge/extra``/``/api/jobs/purgeSomething`` (not an exact
+#: match) fall through to the ordinary 404, same discipline as
+#: ``_FOREMAN_RUN_PATH`` above.
+_JOBS_PURGE_PATH = "/api/jobs/purge"
+
 
 def _session_cookie(value: str, *, secure: bool, max_age: Optional[int] = None) -> str:
     """Build the ``Set-Cookie`` header for the session cookie.
@@ -630,9 +640,11 @@ def _make_handler(
     /api/foreman/plan`` is forwarded to the dispatch service's ``GET
     /foreman/plan`` backlog-foreman dry-run, and ``POST /api/foreman/run`` is
     forwarded to the dispatch service's ``POST /foreman/run`` enqueue route;
-    with either unset all eight stay unavailable and answer ``501``. The
-    dispatch token is only ever sent to ``dispatch_url`` — never logged or
-    reflected.
+    ``GET /api/jobs/purge`` is forwarded to the dispatch service's ``GET
+    /jobs/purge`` bulk-purge dry-run preview, and ``POST /api/jobs/purge`` is
+    forwarded to its mutating twin; with either unset all nine stay
+    unavailable and answer ``501``. The dispatch token is only ever sent to
+    ``dispatch_url`` — never logged or reflected.
     """
 
     guard = auth_guard if auth_guard is not None else FailedAuthTracker(
@@ -790,6 +802,8 @@ def _make_handler(
                 pass  # response already sent by _guard_and_authorise
             elif path.startswith(_BACKLOG_PROXY_PREFIX):
                 self._proxy_backlog("POST", path)
+            elif path == _JOBS_PURGE_PATH:
+                self._jobs_purge()
             elif path.startswith(_JOBS_PROXY_PREFIX):
                 self._proxy_jobs(path)
             elif path == _FOREMAN_RUN_PATH:
@@ -951,6 +965,8 @@ def _make_handler(
                 self._access_log(parts.query)
             elif parts.path == "/api/foreman/plan":
                 self._foreman_plan(parts.query)
+            elif parts.path == _JOBS_PURGE_PATH:
+                self._jobs_purge_preview(parts.query)
             elif parts.path.startswith(_JOBS_PROXY_PREFIX):
                 self._question(parts.path)
             else:
@@ -1066,6 +1082,49 @@ def _make_handler(
                 length = 0
             body = self.rfile.read(length) if length > 0 else None
             self._proxy("POST", "/foreman/run", body)
+
+        # -- bulk purge: a read-only preview (this method) and its mutating
+        # twin below, mirroring the foreman plan/run pair's shape — a $0
+        # dry-run GET plus a destructive POST, both narrow proxies scoped to
+        # exactly ``/api/jobs/purge`` (see :data:`_JOBS_PURGE_PATH` and
+        # ``do_GET``/``do_POST``'s exact-match dispatch, checked before the
+        # per-job ``_JOBS_PROXY_PREFIX`` routes). ``archived_before`` is
+        # forwarded unchanged — the dashboard adds no validation of its own,
+        # same "thin pass-through" discipline as every other proxy above; the
+        # dispatch service alone enforces the required/finite check.
+
+        def _jobs_purge_preview(self, query: str) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "bulk purge not configured"}),
+                )
+                return
+            archived_before = parse_qs(query).get("archived_before", [""])[0]
+            suffix = (
+                f"/jobs/purge?archived_before={quote(archived_before, safe='')}"
+                if archived_before
+                else "/jobs/purge"
+            )
+            self._proxy("GET", suffix, None)
+
+        def _jobs_purge(self) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "bulk purge not configured"}),
+                )
+                return
+            query = urlsplit(self.path).query
+            archived_before = parse_qs(query).get("archived_before", [""])[0]
+            suffix = (
+                f"/jobs/purge?archived_before={quote(archived_before, safe='')}"
+                if archived_before
+                else "/jobs/purge"
+            )
+            self._proxy("POST", suffix, b"")
 
         # -- pending question: a narrow read-only proxy, same shape as the
         # spend rollup above. Scope is exactly /api/jobs/{id}/question — any
@@ -1597,6 +1656,11 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
       <label class="archtoggle"><input type="checkbox" id="show-archived" aria-label="show archived jobs"> show archived</label>
     </div>
     <div class="runs" id="runs"><div class="panel muted">no runs recorded</div></div>
+    <div class="filters">
+      <input type="date" id="jobs-purge-before" class="qtext" aria-label="purge archived jobs before this date">
+      <button id="jobs-purge-btn" class="ghost" disabled>preview</button>
+    </div>
+    <div class="panel" id="jobs-purge-result"></div>
   </div>
   <div>
     <h2>Memory &amp; conventions</h2>
@@ -2830,6 +2894,67 @@ async function purgeJob(id) {
   } catch (err) { showBoardError("purge failed: " + err.message); }
 }
 
+// ---- bulk purge (archived jobs, forwarded via the /api/jobs/purge proxy) --
+// Preview-then-arm/confirm, mirroring the foreman-run form: the first click
+// calls the read-only GET preview and arms the button with the exact count
+// about to be deleted; only the second click issues the destructive POST.
+// Editing the date after arming disarms it (see the "wiring" input listener
+// below), so the label can never go stale relative to what a click would
+// submit. SECURITY: eligible/purged job ids are workspace-derived strings
+// already shown verbatim in the Runs panel — esc() before innerHTML, same
+// discipline as every other panel.
+function jobsPurgeIdRow(id) {
+  return `<li>${esc(id)}</li>`;
+}
+
+function jobsPurgePanel(data, ok) {
+  if (!ok) return `<span class="muted">${esc(data.error)}</span>`;
+  const ids = data.purged || data.eligible || [];
+  if (!ids.length) return '<span class="muted">no archived jobs to purge</span>';
+  return `<ul class="list">${ids.map(jobsPurgeIdRow).join("")}</ul>`;
+}
+
+function jobsPurgeEpoch() {
+  const dateVal = $("jobs-purge-before").value;
+  return dateVal ? Math.floor(new Date(dateVal).getTime() / 1000) : null;
+}
+
+async function jobsPurgePreview() {
+  const btn = $("jobs-purge-btn");
+  const epoch = jobsPurgeEpoch();
+  if (epoch === null) return;
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/jobs/purge?archived_before=" + epoch);
+    const data = await res.json();
+    if (res.ok) {
+      btn.dataset.armed = "1";
+      btn.textContent = `confirm: permanently delete ${esc(data.count)} archived jobs?`;
+    }
+    put($("jobs-purge-result"), jobsPurgePanel(data, res.ok));
+  } catch (err) {
+    put($("jobs-purge-result"), '<span class="muted">bulk purge preview failed</span>');
+  }
+  btn.disabled = !$("jobs-purge-before").value;
+}
+
+async function jobsPurgeConfirm() {
+  const btn = $("jobs-purge-btn");
+  const epoch = jobsPurgeEpoch();
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/jobs/purge?archived_before=" + epoch, { method: "POST" });
+    const data = await res.json();
+    put($("jobs-purge-result"), jobsPurgePanel(data, res.ok));
+    if (res.ok) await refresh();
+  } catch (err) {
+    put($("jobs-purge-result"), '<span class="muted">bulk purge failed</span>');
+  }
+  btn.dataset.armed = "";
+  btn.textContent = "preview";
+  btn.disabled = !$("jobs-purge-before").value;
+}
+
 // ---- wiring ----
 $("runs").addEventListener("click", e => {
   const answer = e.target.closest("[data-answer]");
@@ -2962,6 +3087,17 @@ $("foreman-run-btn").addEventListener("click", () => {
   const maxStories = $("foreman-run-max-stories").value || "3";
   btn.dataset.armed = "1";
   btn.textContent = `confirm: enqueue up to ${maxStories} stories at $${budget}/story?`;
+});
+$("jobs-purge-before").addEventListener("input", () => {
+  const btn = $("jobs-purge-btn");
+  btn.dataset.armed = "";
+  btn.textContent = "preview";
+  btn.disabled = !$("jobs-purge-before").value;
+});
+$("jobs-purge-btn").addEventListener("click", () => {
+  const btn = $("jobs-purge-btn");
+  if (btn.dataset.armed) { jobsPurgeConfirm(); return; }
+  jobsPurgePreview();
 });
 document.addEventListener("keydown", e => { if (e.key === "Escape") { closeModal(); closeAgent(); closeStory(); } });
 
