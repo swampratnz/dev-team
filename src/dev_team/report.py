@@ -2,12 +2,53 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, Dict
 
+from .fences import ZERO_WIDTH_SPACE
 from .models import ProjectResult, TaskResult
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, types only
     from .engine import DeliveryOutcome
+
+# GitHub's recognised closing keywords, immediately followed by an issue
+# reference (``#123`` or ``GH-123``). GitHub auto-closes the referenced issue
+# when a PR body containing this adjacency merges to the default branch.
+_CLOSING_KEYWORD_RE = re.compile(
+    r"\b(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
+    r"(\s*)(#\d+|GH-\d+)",
+    re.IGNORECASE,
+)
+# Raw markdown link/image syntax: ``[text](url)`` or ``![alt](url)``. Both
+# share the ``](`` adjacency that turns the preceding brackets into a live
+# link/image once rendered.
+_MARKDOWN_LINK_RE = re.compile(r"\]\(")
+# A raw HTML tag opening, e.g. ``<details>`` or ``</summary>``.
+_HTML_TAG_RE = re.compile(r"<(/?[A-Za-z])")
+
+
+def _sanitize_visual_text(text: str) -> str:
+    """Neutralise a visual-review free-text field for the PR-body sink.
+
+    ``text`` is model output derived from reading a screenshot of an
+    untrusted, cloned repo's served app, so it is untrusted (see
+    ``visualreview._report_from_payload``). ``engine._render_visual_findings``
+    already defuses this same text against the ``visual-findings`` prompt
+    fence before it re-enters an agent prompt; this covers the other named
+    consumer, ``render_delivery_summary``, which renders it as the literal
+    GitHub PR body. Unlike a prompt fence, the PR body's live syntax is
+    GitHub's closing-keyword parser and CommonMark markup, so a different
+    neutralisation target — but the same invisible zero-width-space-break
+    idiom ``fences.defuse`` uses, which is inherently idempotent (there is no
+    literal adjacency left to re-break) and never alters non-matching text.
+    """
+
+    text = _CLOSING_KEYWORD_RE.sub(
+        lambda m: m.group(1) + ZERO_WIDTH_SPACE + m.group(2) + m.group(3), text
+    )
+    text = _MARKDOWN_LINK_RE.sub("]" + ZERO_WIDTH_SPACE + "(", text)
+    text = _HTML_TAG_RE.sub(lambda m: "<" + ZERO_WIDTH_SPACE + m.group(1), text)
+    return text
 
 
 def _task_to_dict(result: TaskResult) -> Dict[str, Any]:
@@ -177,10 +218,19 @@ def render_delivery_summary(outcome: "DeliveryOutcome") -> str:
     if outcome.visual is not None:
         count = len(outcome.visual.findings)
         state = "clean" if count == 0 else f"{count} finding(s)"
-        summary = f" — {outcome.visual.summary}" if outcome.visual.summary else ""
+        # outcome.visual.summary and each finding's route/issue are model output
+        # derived from reading a screenshot of an untrusted repo's served app
+        # (see _sanitize_visual_text's docstring), and this text becomes the
+        # literal GitHub PR body — sanitize before it renders as live markup.
+        visual_summary = (
+            _sanitize_visual_text(outcome.visual.summary) if outcome.visual.summary else ""
+        )
+        summary = f" — {visual_summary}" if visual_summary else ""
         lines.append(f"Visual (advisory): {state}{summary}")
         for finding in outcome.visual.findings:
-            lines.append(f"  [{finding.severity.value}] {finding.route}: {finding.issue}")
+            route = _sanitize_visual_text(finding.route)
+            issue = _sanitize_visual_text(finding.issue)
+            lines.append(f"  [{finding.severity.value}] {route}: {issue}")
     lines.append(f"Committed: {'yes' if outcome.committed else 'no'}")
     if outcome.pull_request_url:
         lines.append(f"Pull request: {outcome.pull_request_url}")

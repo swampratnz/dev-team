@@ -54,6 +54,25 @@ sections below are reconstructed from the repository history.
   other filter on this route.
 
 ### Security
+- **`render_delivery_summary` (the literal GitHub PR body) now sanitizes
+  visual-review free text, matching the fix-prompt sink** (#289):
+  `outcome.visual.summary` and each finding's `route`/`issue` are model
+  output derived from reading a screenshot of a served app running from an
+  untrusted, cloned repo — `visualreview.py`'s own docstring already names
+  them untrusted, and `engine.py::_render_visual_findings` already defuses
+  them before they re-enter an agent prompt. `report.py::render_delivery_summary`
+  was the one named consumer left unsanitized, and its output becomes the
+  literal PR body a human reviews and that GitHub's closing-keyword parser
+  scans. New `report._sanitize_visual_text` (reusing `fences.ZERO_WIDTH_SPACE`,
+  the same invisible-break idiom `fences.defuse` uses for prompt fences)
+  breaks the adjacency a GitHub closing keyword (`close(s|d)`, `fix(es|ed)`,
+  `resolve(s|d)`) needs with a following `#<digits>`/`GH-<digits>` reference,
+  and neutralizes raw markdown link/image syntax and HTML tags — so an
+  injected finding can no longer auto-close an issue or render as a live
+  link/image/collapsible block. `delivery_to_dict`'s JSON `visual_summary`/
+  `visual_findings` are intentionally left raw (JSON is data, not rendered
+  markup); this is a defense-in-depth internal-consistency fix, not a
+  response to an observed exploit.
 - **Opt-in `--sandbox-userns` for per-job UID/GID separation** (#246):
   `SandboxConfig` gains `user_namespace`, wired to a new `--sandbox-userns`
   CLI flag (only valid with `--sandbox`, mirroring `--sandbox-network`).

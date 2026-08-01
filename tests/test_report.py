@@ -279,6 +279,77 @@ def test_delivery_report_surfaces_visual_findings():
     assert "[major] /: unstyled body text" in text
 
 
+def test_render_delivery_summary_defuses_closing_keyword_in_visual_findings():
+    from dev_team.models import Severity
+    from dev_team.visualreview import VisualFinding, VisualReport
+
+    report = VisualReport(
+        findings=[
+            VisualFinding(
+                route="/", issue="Closes #999 unexpectedly", severity=Severity.MAJOR
+            )
+        ],
+        summary="Fixes #123 already",
+        routes=["/"],
+    )
+    outcome = _outcome(visual=report)
+    text = render_delivery_summary(outcome)
+    assert "Closes #999" not in text
+    assert "Fixes #123" not in text
+    # surrounding benign text is preserved
+    assert "unexpectedly" in text
+    assert "already" in text
+    # the JSON boundary stays raw/unsanitized (AC4) — the two consumers differ
+    data = delivery_to_dict(outcome)
+    assert data["visual_summary"] == "Fixes #123 already"
+    assert data["visual_findings"][0]["issue"] == "Closes #999 unexpectedly"
+
+
+def test_render_delivery_summary_neutralizes_markdown_and_html_in_visual_findings():
+    from dev_team.models import Severity
+    from dev_team.visualreview import VisualFinding, VisualReport
+
+    report = VisualReport(
+        findings=[
+            VisualFinding(
+                route="/",
+                issue="click [here](https://evil.example) or <details>hidden</details>",
+                severity=Severity.MINOR,
+            )
+        ],
+        summary="",
+        routes=["/"],
+    )
+    outcome = _outcome(visual=report)
+    text = render_delivery_summary(outcome)
+    assert "[here](https://evil.example)" not in text
+    assert "<details>" not in text
+    assert "</details>" not in text
+    # surrounding benign text is preserved
+    assert "click" in text
+    assert "hidden" in text
+
+
+def test_render_delivery_summary_neutralizes_combined_visual_injection():
+    from dev_team.models import Severity
+    from dev_team.visualreview import VisualFinding, VisualReport
+
+    payload = "Closes #999 [click](http://evil.example) <details>hidden</details>"
+    report = VisualReport(
+        findings=[VisualFinding(route="/", issue=payload, severity=Severity.CRITICAL)],
+        summary="",
+        routes=["/"],
+    )
+    outcome = _outcome(visual=report)
+    text = render_delivery_summary(outcome)
+    assert "Closes #999" not in text
+    assert "[click](http://evil.example)" not in text
+    assert "<details>" not in text
+    # the raw payload survives untouched in the JSON export (AC4)
+    data = delivery_to_dict(outcome)
+    assert data["visual_findings"][0]["issue"] == payload
+
+
 def test_delivery_report_visual_clean_and_absent():
     from dev_team.visualreview import VisualReport
 
