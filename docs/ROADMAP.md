@@ -148,6 +148,26 @@ when an interaction channel is attached; otherwise it applies autonomously.
 Bounded by the round count and the budget; the per-task retry-with-guidance
 escalation (`_escalate_failure`) is unchanged and sits underneath it.
 
+**Also shipped — candidate rescue (BENCHMARKS.md's "multi-candidate generation
+with execution-based reranking"):** a sibling, one-level-lower mechanism for
+the same "don't just accept a failed task" problem — this re-plans the task
+graph; candidate rescue instead resamples the *same* task's implementation.
+Opt-in via `EngineConfig.candidate_rescue_count` / `--candidate-rescue N`
+(default 0 = off, capped at 5 — `MAX_CANDIDATE_RESCUE`, mirroring
+`--verify-votes`'s cost story for the same "N independent LLM/agent passes,
+shared budget" shape). Fires only once the ordinary attempt loop
+(`max_task_attempts`) is exhausted and `_escalate_failure` returns no retry
+guidance (declined or unattended) — never as a parallel cost multiplier on
+every task. Each candidate (`_develop_task`'s new `_rescue_task`) is one cold,
+independent engineer attempt — a freshly opened session, no feedback from the
+exhausted sequential retries — in its own worktree, gated by the same
+`_integrate` / `_merge_task` calls `_develop_task_in_worktree` uses; the loop
+stops at the first candidate whose gates pass (first-green-wins) and merges
+it, and every candidate's worktree/branch is removed whether it wins or not.
+No candidate going green (or a budget cut mid-loop) returns the original
+failed result untouched — never a fabricated success. Independent of, and
+composable with, both worktree mode and this section's re-planning.
+
 ## 4. Retrieval + context budgeting
 
 **Why:** large repos exceed any context window. The v0.5 repo map is a capped

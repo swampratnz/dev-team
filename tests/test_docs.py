@@ -46,12 +46,14 @@ _ENGINE = _REPO_ROOT / "src" / "dev_team" / "engine.py"
 _BENCHMARKS = _REPO_ROOT / "docs" / "BENCHMARKS.md"
 _CHANGELOG = _REPO_ROOT / "CHANGELOG.md"
 
-# Regression: #240 deliberately left these two BENCHMARKS.md markers
-# "→ roadmap" (genuinely still-deferred techniques) — a fix to a
-# different bullet must not overcorrect and flip these too. Matched against
-# whitespace-normalized text since the source wraps mid-phrase.
+# Regression: #240 deliberately left these BENCHMARKS.md markers "→ roadmap"
+# (genuinely still-deferred techniques) — a fix to a different bullet must not
+# overcorrect and flip these too. Matched against whitespace-normalized text
+# since the source wraps mid-phrase. #291 shipped multi-candidate generation
+# with execution-based reranking (`--candidate-rescue`), so that marker moved
+# out of this still-deferred list — see test_benchmarks_doc.py for its own
+# drift check against the shipped feature.
 _STILL_DEFERRED_MARKERS = [
-    "multi-candidate generation with execution-based reranking → roadmap",
     "Proof-of-vulnerability → roadmap",
 ]
 

@@ -29,6 +29,7 @@ from dev_team.engine import (
     DeliveryEngine,
     DeliveryOutcome,
     EngineConfig,
+    MAX_CANDIDATE_RESCUE,
     _dod_to_test_report,
     _is_test_path,
     _prior_context,
@@ -48,6 +49,7 @@ from dev_team.execution import (
     LocalWorkspace,
     SubprocessCommandRunner,
 )
+from dev_team.errors import AgentResponseError
 from dev_team.git import GitRepo
 from dev_team.interaction import Reply, ScriptedChannel
 from dev_team.memory import CheckpointStore, RunCheckpoint
@@ -62,6 +64,7 @@ from dev_team.models import (
     Task,
     TaskResult,
     TaskStatus,
+    TestReport,
 )
 from dev_team.replan import Replan, ReplanAction
 from dev_team.sdk import AgentResult
@@ -6730,3 +6733,444 @@ def test_worktree_engineer_receives_retrieved_context(tmp_path):
         c for c in runner.calls if "in the current working directory" in c["prompt"]
     )
     assert '<file-content path="src/thing.py">' in eng_call["prompt"]
+
+
+# --- candidate rescue (--candidate-rescue, issue #291) -----------------------
+
+
+class _WorktreeOpSpy(DispatchCommandRunner):
+    """Records ``git worktree add|remove`` ops as ``(op, path)`` in call order."""
+
+    def __init__(self):
+        super().__init__()
+        self.ops = []
+
+    def run(self, command, *, cwd=None, timeout=None):
+        args = list(command)
+        if len(args) >= 3 and args[0] == "git" and args[1] == "worktree" and (
+            args[2] in ("add", "remove")
+        ):
+            self.ops.append((args[2], args[-1]))
+        return super().run(command, cwd=cwd, timeout=timeout)
+
+
+def _rescue_engine(tmp_path, cmd=None, runner=None, **config_kwargs):
+    return _engine(
+        runner if runner is not None else ScriptedRunner([]),
+        workspace=LocalWorkspace(str(tmp_path)),
+        command_runner=cmd if cmd is not None else _WorktreeOpSpy(),
+        config=EngineConfig(**config_kwargs),
+    )
+
+
+async def _green_integrate(t, impl, span, *, workspace=None, git=None, cwd=None):
+    return (
+        True,
+        Review(approved=True, summary="ok"),
+        TestReport(passed=True, coverage=1.0, summary="ok"),
+        None,
+    )
+
+
+async def _red_integrate(t, impl, span, *, workspace=None, git=None, cwd=None):
+    return False, Review(approved=False, summary="bad"), None, None
+
+
+def test_engine_config_defaults_candidate_rescue_off():
+    assert EngineConfig().candidate_rescue_count == 0
+
+
+def test_engine_config_rejects_negative_candidate_rescue():
+    with pytest.raises(ValueError, match="candidate_rescue_count"):
+        EngineConfig(candidate_rescue_count=-1)
+
+
+def test_engine_config_rejects_candidate_rescue_above_cap():
+    with pytest.raises(ValueError, match="candidate_rescue_count"):
+        EngineConfig(candidate_rescue_count=MAX_CANDIDATE_RESCUE + 1)
+
+
+def test_candidate_rescue_requires_agentic():
+    with pytest.raises(ValueError, match="candidate_rescue_count"):
+        DeliveryEngine(
+            ScriptedRunner([]),
+            workspace=InMemoryWorkspace(),
+            command_runner=FakeCommandRunner(),
+            config=EngineConfig(candidate_rescue_count=1),
+        )
+
+
+def test_develop_task_never_rescues_when_count_is_zero(tmp_path, monkeypatch):
+    # Acceptance criterion 2: candidate_rescue_count == 0 is byte-identical to
+    # today's behaviour — _rescue_task must never even be called.
+    engine = _rescue_engine(tmp_path, candidate_rescue_count=0)
+    task, failed = _failed("T1")
+    design = Design(overview="o")
+
+    async def fake_attempt(t, d, feedback):
+        return failed
+
+    async def no_retry(t, r):
+        return None
+
+    async def explode(t, d, prior):
+        raise AssertionError("_rescue_task must not run when candidate_rescue_count is 0")
+
+    monkeypatch.setattr(engine, "_attempt_task", fake_attempt)
+    monkeypatch.setattr(engine, "_escalate_failure", no_retry)
+    monkeypatch.setattr(engine, "_rescue_task", explode)
+
+    result = run(engine._develop_task(task, design))
+    assert result is failed
+    assert result.succeeded is False
+
+
+def test_develop_task_skips_rescue_while_a_human_retry_is_in_play(tmp_path, monkeypatch):
+    # Acceptance criterion 8: the retry-with-guidance path takes precedence —
+    # _rescue_task only runs on the round where feedback comes back None.
+    engine = _rescue_engine(tmp_path, candidate_rescue_count=2)
+    task, _ = _failed("T1")
+    design = Design(overview="o")
+
+    async def fake_attempt(t, d, feedback):
+        t.status = TaskStatus.FAILED
+        return TaskResult(t, attempts=1)
+
+    monkeypatch.setattr(engine, "_attempt_task", fake_attempt)
+
+    escalate_calls = []
+
+    async def fake_escalate(t, r):
+        escalate_calls.append(r)
+        if len(escalate_calls) == 1:
+            return Review(approved=False, summary="human guidance")
+        return None
+
+    monkeypatch.setattr(engine, "_escalate_failure", fake_escalate)
+
+    rescue_calls = []
+
+    async def fake_rescue(t, d, prior):
+        rescue_calls.append(prior)
+        t.status = TaskStatus.DONE
+        return TaskResult(t, attempts=prior.attempts + 1)
+
+    monkeypatch.setattr(engine, "_rescue_task", fake_rescue)
+
+    result = run(engine._develop_task(task, design))
+
+    assert len(escalate_calls) == 2
+    assert len(rescue_calls) == 1  # never on round 1 (retry granted), only round 2
+    assert result.succeeded is True
+
+
+def test_develop_task_returns_rescued_result_when_rescue_succeeds(tmp_path, monkeypatch):
+    engine = _rescue_engine(tmp_path, candidate_rescue_count=1)
+    task, failed = _failed("T1")
+    design = Design(overview="o")
+
+    async def fake_attempt(t, d, feedback):
+        return failed
+
+    async def no_retry(t, r):
+        return None
+
+    rescued = TaskResult(task, attempts=failed.attempts + 1)
+
+    async def fake_rescue(t, d, prior):
+        t.status = TaskStatus.DONE
+        return rescued
+
+    monkeypatch.setattr(engine, "_attempt_task", fake_attempt)
+    monkeypatch.setattr(engine, "_escalate_failure", no_retry)
+    monkeypatch.setattr(engine, "_rescue_task", fake_rescue)
+
+    result = run(engine._develop_task(task, design))
+    assert result is rescued
+    assert result.succeeded is True
+
+
+def test_develop_task_returns_original_result_when_rescue_fails(tmp_path, monkeypatch):
+    engine = _rescue_engine(tmp_path, candidate_rescue_count=1)
+    task, failed = _failed("T1")
+    design = Design(overview="o")
+
+    async def fake_attempt(t, d, feedback):
+        return failed
+
+    async def no_retry(t, r):
+        return None
+
+    async def fake_rescue(t, d, prior):
+        return prior  # no candidate went green; unchanged
+
+    monkeypatch.setattr(engine, "_attempt_task", fake_attempt)
+    monkeypatch.setattr(engine, "_escalate_failure", no_retry)
+    monkeypatch.setattr(engine, "_rescue_task", fake_rescue)
+
+    result = run(engine._develop_task(task, design))
+    assert result is failed
+    assert result.succeeded is False
+
+
+def test_rescue_task_stops_at_first_green_candidate(tmp_path, monkeypatch):
+    # Acceptance criterion 3.
+    engine = _rescue_engine(
+        tmp_path, candidate_rescue_count=3, reuse_engineer_session=False
+    )
+    task, prior = _failed("T1")
+    design = Design(overview="o")
+
+    engineer_attempt_calls = []
+
+    async def fake_engineer_attempt(t, d, feedback, session, *, continued, model, cwd=None):
+        engineer_attempt_calls.append(
+            {"feedback": feedback, "continued": continued, "cwd": cwd}
+        )
+        return Implementation(task_id=t.id, summary="impl"), session
+
+    merge_calls = []
+
+    async def fake_merge_task(t, arena_git, branch):
+        merge_calls.append((arena_git, branch))
+        return True, None
+
+    monkeypatch.setattr(engine, "_engineer_attempt", fake_engineer_attempt)
+    monkeypatch.setattr(engine, "_integrate", _green_integrate)
+    monkeypatch.setattr(engine, "_merge_task", fake_merge_task)
+
+    result = run(engine._rescue_task(task, design, prior))
+
+    assert result.succeeded is True
+    assert result.attempts == prior.attempts + 1
+    assert len(engineer_attempt_calls) == 1
+    assert len(merge_calls) == 1
+    assert engineer_attempt_calls[0]["feedback"] is None
+    assert engineer_attempt_calls[0]["continued"] is False
+
+
+def test_rescue_task_tries_each_candidate_until_green(tmp_path, monkeypatch):
+    # Acceptance criteria 4 and 7: candidates 1 and 2 each get a worktree
+    # created and removed before candidate 3 runs; only candidate 3 merges;
+    # every candidate opens its own fresh session.
+    cmd = _WorktreeOpSpy()
+    engine = _rescue_engine(tmp_path, cmd, candidate_rescue_count=3)
+    task, prior = _failed("T1")
+    design = Design(overview="o")
+
+    class _StubSession:
+        async def aclose(self):
+            pass
+
+    opened_sessions = []
+
+    def fake_open_session(cwd=None):
+        session = _StubSession()
+        opened_sessions.append(session)
+        return session
+
+    engineer_attempt_sessions = []
+
+    async def fake_engineer_attempt(t, d, feedback, session, *, continued, model, cwd=None):
+        engineer_attempt_sessions.append(session)
+        return Implementation(task_id=t.id, summary="impl"), session
+
+    async def fake_integrate(t, impl, span, *, workspace=None, git=None, cwd=None):
+        done = cwd is not None and cwd.endswith("-rescue-2")
+        if done:
+            return (
+                True,
+                Review(approved=True, summary="ok"),
+                TestReport(passed=True, coverage=1.0, summary="ok"),
+                None,
+            )
+        return False, Review(approved=False, summary="bad"), None, None
+
+    merge_calls = []
+
+    async def fake_merge_task(t, arena_git, branch):
+        merge_calls.append(branch)
+        return True, None
+
+    monkeypatch.setattr(engine, "_open_engineer_session", fake_open_session)
+    monkeypatch.setattr(engine, "_engineer_attempt", fake_engineer_attempt)
+    monkeypatch.setattr(engine, "_integrate", fake_integrate)
+    monkeypatch.setattr(engine, "_merge_task", fake_merge_task)
+
+    result = run(engine._rescue_task(task, design, prior))
+
+    assert result.succeeded is True
+    assert result.attempts == prior.attempts + 3
+    assert len(merge_calls) == 1
+    assert "-rescue-2" in merge_calls[0]
+    # every candidate got its own, distinct session
+    assert len(opened_sessions) == 3
+    assert len(set(map(id, opened_sessions))) == 3
+    assert engineer_attempt_sessions == opened_sessions
+
+    add_paths = [p for op, p in cmd.ops if op == "add"]
+    remove_paths = [p for op, p in cmd.ops if op == "remove"]
+    assert len(add_paths) == 3
+    assert sorted(add_paths) == sorted(set(add_paths))  # each candidate's own path
+    for path in add_paths:
+        assert remove_paths.count(path) == 2  # pre-emptive cleanup + final teardown
+
+
+def test_rescue_task_returns_original_result_when_all_candidates_fail(tmp_path, monkeypatch):
+    # Acceptance criterion 5.
+    cmd = _WorktreeOpSpy()
+    engine = _rescue_engine(
+        tmp_path, cmd, candidate_rescue_count=2, reuse_engineer_session=False
+    )
+    task, prior = _failed("T1")
+    design = Design(overview="o")
+
+    async def fake_engineer_attempt(t, d, feedback, session, *, continued, model, cwd=None):
+        return Implementation(task_id=t.id, summary="impl"), session
+
+    async def explode_merge(t, arena_git, branch):
+        raise AssertionError("must not merge when no candidate went green")
+
+    monkeypatch.setattr(engine, "_engineer_attempt", fake_engineer_attempt)
+    monkeypatch.setattr(engine, "_integrate", _red_integrate)
+    monkeypatch.setattr(engine, "_merge_task", explode_merge)
+
+    result = run(engine._rescue_task(task, design, prior))
+
+    assert result is prior
+    assert result.succeeded is False
+    assert task.status is TaskStatus.FAILED
+    add_paths = [p for op, p in cmd.ops if op == "add"]
+    remove_paths = [p for op, p in cmd.ops if op == "remove"]
+    assert len(add_paths) == 2
+    for path in add_paths:
+        assert remove_paths.count(path) == 2
+
+
+def test_rescue_task_recovers_from_a_known_failure_and_tries_the_next_candidate(
+    tmp_path, monkeypatch
+):
+    # A known failure mode (e.g. the engineer session's client wedged) must
+    # not crash the rescue loop — mirrors the same catch in
+    # _develop_task_in_worktree: count it as a losing candidate and move on.
+    engine = _rescue_engine(
+        tmp_path, candidate_rescue_count=2, reuse_engineer_session=False
+    )
+    task, prior = _failed("T1")
+    design = Design(overview="o")
+
+    attempt_calls = []
+
+    async def flaky_engineer_attempt(t, d, feedback, session, *, continued, model, cwd=None):
+        attempt_calls.append(cwd)
+        if len(attempt_calls) == 1:
+            raise AgentResponseError("engineer", "the client wedged")
+        return Implementation(task_id=t.id, summary="impl"), session
+
+    merge_calls = []
+
+    async def fake_merge_task(t, arena_git, branch):
+        merge_calls.append(branch)
+        return True, None
+
+    monkeypatch.setattr(engine, "_engineer_attempt", flaky_engineer_attempt)
+    monkeypatch.setattr(engine, "_integrate", _green_integrate)
+    monkeypatch.setattr(engine, "_merge_task", fake_merge_task)
+
+    result = run(engine._rescue_task(task, design, prior))
+
+    assert result.succeeded is True
+    assert len(attempt_calls) == 2  # candidate 1 raised; candidate 2 recovered
+    assert len(merge_calls) == 1
+
+
+def test_rescue_task_tries_the_next_candidate_when_the_merge_gate_rejects(
+    tmp_path, monkeypatch
+):
+    # A candidate can pass its own worktree gates but fail the re-gated merge
+    # onto the delivery branch (two candidates that each pass alone can still
+    # conflict) — that must not be treated as the winning candidate.
+    engine = _rescue_engine(
+        tmp_path, candidate_rescue_count=2, reuse_engineer_session=False
+    )
+    task, prior = _failed("T1")
+    design = Design(overview="o")
+
+    async def fake_engineer_attempt(t, d, feedback, session, *, continued, model, cwd=None):
+        return Implementation(task_id=t.id, summary="impl"), session
+
+    merge_calls = []
+
+    async def fake_merge_task(t, arena_git, branch):
+        merge_calls.append(branch)
+        if len(merge_calls) == 1:
+            return False, Review(approved=False, summary="merge conflict")
+        return True, None
+
+    monkeypatch.setattr(engine, "_engineer_attempt", fake_engineer_attempt)
+    monkeypatch.setattr(engine, "_integrate", _green_integrate)
+    monkeypatch.setattr(engine, "_merge_task", fake_merge_task)
+
+    result = run(engine._rescue_task(task, design, prior))
+
+    assert result.succeeded is True
+    assert len(merge_calls) == 2
+    assert result.attempts == prior.attempts + 2
+
+
+def test_rescue_task_propagates_budget_exceeded_and_cleans_up(tmp_path, monkeypatch):
+    # Acceptance criterion 6: a BudgetExceededError partway through the
+    # candidate loop propagates (never fabricates success), and every
+    # candidate that was actually started — including the one that raised —
+    # still has its worktree/branch removed.
+    cmd = _WorktreeOpSpy()
+    engine = _rescue_engine(
+        tmp_path, cmd, candidate_rescue_count=3, reuse_engineer_session=False
+    )
+    task, prior = _failed("T1")
+    design = Design(overview="o")
+
+    calls = []
+
+    async def fake_engineer_attempt(t, d, feedback, session, *, continued, model, cwd=None):
+        calls.append(cwd)
+        if len(calls) == 2:
+            raise BudgetExceededError(1.0, 1.0)
+        return Implementation(task_id=t.id, summary="impl"), session
+
+    async def explode_merge(t, arena_git, branch):
+        raise AssertionError("must not merge")
+
+    monkeypatch.setattr(engine, "_engineer_attempt", fake_engineer_attempt)
+    monkeypatch.setattr(engine, "_integrate", _red_integrate)
+    monkeypatch.setattr(engine, "_merge_task", explode_merge)
+
+    with pytest.raises(BudgetExceededError):
+        run(engine._rescue_task(task, design, prior))
+
+    add_paths = [p for op, p in cmd.ops if op == "add"]
+    remove_paths = [p for op, p in cmd.ops if op == "remove"]
+    assert len(add_paths) == 2  # the third candidate was never even created
+    for path in add_paths:
+        assert remove_paths.count(path) == 2  # both candidates fully cleaned up
+
+
+def test_develop_task_scheduler_backstop_handles_budget_exceeded_during_rescue(tmp_path):
+    # End-to-end: a BudgetExceededError raised from inside rescue is caught by
+    # the same scheduler backstop every other BudgetExceededError site uses
+    # (engine.py's worker loop), not swallowed or turned into a fabricated
+    # success.
+    cmd = _WorktreeOpSpy()
+    runner = ScriptedRunner(by_system_prompt=engine_responses(review=False))
+    engine = _rescue_engine(
+        tmp_path, cmd, runner,
+        candidate_rescue_count=1, max_task_attempts=1, reuse_engineer_session=False,
+    )
+
+    async def fake_rescue(t, d, prior):
+        raise BudgetExceededError(1.0, 1.0)
+
+    engine._rescue_task = fake_rescue
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is False
+    assert outcome.budget_exhausted is True

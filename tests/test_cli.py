@@ -184,6 +184,51 @@ def test_main_max_replan_rounds_rejected_without_deliver(capsys):
     assert "--max-replan-rounds" in err and "--deliver" in err
 
 
+def test_main_candidate_rescue_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--candidate-rescue", "1"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--candidate-rescue" in err and "--deliver" in err
+
+
+def test_main_candidate_rescue_negative_rejected():
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["T", "D", "--deliver", "--candidate-rescue", "-1"],
+            runner=ScriptedRunner([]),
+        )
+    assert excinfo.value.code == 2
+
+
+def test_main_candidate_rescue_above_cap_rejected():
+    from dev_team.engine import MAX_CANDIDATE_RESCUE
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["T", "D", "--deliver", "--candidate-rescue", str(MAX_CANDIDATE_RESCUE + 1)],
+            runner=ScriptedRunner([]),
+        )
+    assert excinfo.value.code == 2
+
+
+def test_engine_config_threads_candidate_rescue():
+    # Acceptance criterion 11: --candidate-rescue reaches EngineConfig.
+    from dev_team.cli import _engine_config, build_parser
+
+    on = build_parser().parse_args(["T", "D", "--deliver", "--candidate-rescue", "3"])
+    assert _engine_config(on).candidate_rescue_count == 3
+    off = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(off).candidate_rescue_count == 0
+
+
+def test_main_help_documents_candidate_rescue(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "--candidate-rescue" in out
+
+
 def test_main_reuse_engineer_session_rejected_without_deliver(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["Login", "Add login", "--no-reuse-engineer-session"], runner=ScriptedRunner([]))

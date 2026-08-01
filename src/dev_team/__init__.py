@@ -72,7 +72,13 @@ from .changes import AppliedChange, ApplyResult, ChangeApplier
 from .config import TeamConfig
 from .context import RepoContext, build_repo_context
 from .delivery_target import DeliveryTargetError, publish_pull_request, push_branch
-from .engine import DeliveryEngine, DeliveryOutcome, EngineConfig, RemediationOutcome
+from .engine import (
+    MAX_CANDIDATE_RESCUE,
+    DeliveryEngine,
+    DeliveryOutcome,
+    EngineConfig,
+    RemediationOutcome,
+)
 from .errors import (
     AgentResponseError,
     DependencyCycleError,
@@ -257,6 +263,7 @@ __all__ = [
     "DeliveryOutcome",
     "RemediationOutcome",
     "EngineConfig",
+    "MAX_CANDIDATE_RESCUE",
     "TeamConfig",
     "AssessmentEngine",
     "AssessmentOutcome",

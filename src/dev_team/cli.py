@@ -31,7 +31,7 @@ from .dashboard import DashboardServer
 from .checks import ChecksError, GitHubChecksReader, watch_checks
 from .delivery_target import DeliveryTargetError, publish_pull_request, push_branch
 from .dispatch import DispatchServer
-from .engine import EngineConfig
+from .engine import MAX_CANDIDATE_RESCUE, EngineConfig
 from .errors import DevTeamError
 from .eventlog import EventLog, compose
 from .events import AgentEvent, Listener
@@ -838,6 +838,18 @@ def build_parser() -> argparse.ArgumentParser:
         "(0 = off, the default; with --deliver).",
     )
     delivery.add_argument(
+        "--candidate-rescue",
+        dest="candidate_rescue_count",
+        type=int,
+        default=0,
+        metavar="N",
+        help="When a task exhausts its attempts and a retry is declined, try "
+        "up to N independent, feedback-free candidates (each a fresh cold "
+        "engineer attempt in its own worktree) before accepting the failure, "
+        "stopping at the first candidate whose gates pass (0 = off, the "
+        f"default; with --deliver; capped at {MAX_CANDIDATE_RESCUE}).",
+    )
+    delivery.add_argument(
         "--no-reuse-engineer-session",
         action="store_true",
         help="Do not reuse one SDK session across a task's engineer attempts; "
@@ -1030,6 +1042,10 @@ def _validate_args(
         parser.error("--verify-votes: must be at least 1")
     if args.verify_votes > MAX_VERIFY_VOTES:
         parser.error(f"--verify-votes: must be at most {MAX_VERIFY_VOTES}")
+    if args.candidate_rescue_count < 0:
+        parser.error("--candidate-rescue: must be non-negative")
+    if args.candidate_rescue_count > MAX_CANDIDATE_RESCUE:
+        parser.error(f"--candidate-rescue: must be at most {MAX_CANDIDATE_RESCUE}")
     if args.port is not None and not (args.dashboard or args.dispatch):
         parser.error("--port: only valid with --dashboard or --dispatch")
     if args.host is not None and not (args.dashboard or args.dispatch):
@@ -1259,6 +1275,10 @@ def _reject_deliver_only_flags(
             "--max-replan-rounds",
             args.max_replan_rounds != parser.get_default("max_replan_rounds"),
         ),
+        (
+            "--candidate-rescue",
+            args.candidate_rescue_count != parser.get_default("candidate_rescue_count"),
+        ),
         ("--no-reuse-engineer-session", args.no_reuse_engineer_session),
         ("--retrieval", args.retrieval),
         ("--retrieval-tokens", args.retrieval_tokens != parser.get_default("retrieval_tokens")),
@@ -1322,6 +1342,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         commit=not args.no_commit,
         branch=args.branch,
         max_replan_rounds=args.max_replan_rounds,
+        candidate_rescue_count=args.candidate_rescue_count,
         reuse_engineer_session=not args.no_reuse_engineer_session,
         retrieval=args.retrieval,
         retrieval_token_budget=args.retrieval_tokens,

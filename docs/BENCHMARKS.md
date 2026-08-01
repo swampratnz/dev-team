@@ -14,9 +14,12 @@ beat either alone, and false-positive suppression is a first-class metric.**
 - **Winning techniques:** reproduce-first (failing test before the patch) ✅
   (prompted); execution-guided repair loops ✅ (gate feedback per attempt);
   per-attempt escalation ✅; multi-candidate generation with execution-based
-  reranking → roadmap; retrieval-driven fault localization → roadmap;
-  session continuity across attempts ✅ (`EngineConfig.reuse_engineer_session`,
-  on by default — ROADMAP #5).
+  reranking ✅ (`EngineConfig.candidate_rescue_count` / `--candidate-rescue`,
+  off by default — fires only once a task's ordinary attempts are exhausted
+  and a retry is declined, one independent feedback-free candidate per
+  worktree, first-green-wins, capped at 5); retrieval-driven fault
+  localization → roadmap; session continuity across attempts ✅
+  (`EngineConfig.reuse_engineer_session`, on by default — ROADMAP #5).
 
 ## Code reviewer
 - **Benchmarks/metrics:** CRScore, SWR-Bench, CR-Bench; production systems
