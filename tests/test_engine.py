@@ -6790,6 +6790,16 @@ def test_engine_config_rejects_candidate_rescue_above_cap():
         EngineConfig(candidate_rescue_count=MAX_CANDIDATE_RESCUE + 1)
 
 
+def test_candidate_rescue_requires_agentic():
+    with pytest.raises(ValueError, match="candidate_rescue_count"):
+        DeliveryEngine(
+            ScriptedRunner([]),
+            workspace=InMemoryWorkspace(),
+            command_runner=FakeCommandRunner(),
+            config=EngineConfig(candidate_rescue_count=1),
+        )
+
+
 def test_develop_task_never_rescues_when_count_is_zero(tmp_path, monkeypatch):
     # Acceptance criterion 2: candidate_rescue_count == 0 is byte-identical to
     # today's behaviour — _rescue_task must never even be called.

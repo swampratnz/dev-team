@@ -1031,6 +1031,10 @@ class DeliveryEngine:
             raise ValueError("agentic mode requires a workspace with a real root directory")
         if self.config.worktrees and not self.agentic:
             raise ValueError("worktrees require agentic mode (a workspace with a real root)")
+        if self.config.candidate_rescue_count and not self.agentic:
+            raise ValueError(
+                "candidate_rescue_count requires agentic mode (a workspace with a real root)"
+            )
         self._use_worktrees = self.config.worktrees
 
         self.change_applier = ChangeApplier(self.workspace)

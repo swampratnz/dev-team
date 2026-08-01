@@ -23,6 +23,11 @@ sections below are reconstructed from the repository history.
   Engineer row ("multi-candidate generation with execution-based reranking",
   previously marked "→ roadmap"); complementary to, not a replacement for,
   `EngineConfig.reuse_engineer_session`'s sequential refinement (#291).
+  `DeliveryEngine.__init__` now rejects `candidate_rescue_count` set without
+  agentic mode (a real workspace root), mirroring the existing `worktrees`
+  guard — without it, a non-agentic/workdir-less engine would run
+  `git worktree add`/merge/commit against the process's ambient working
+  directory instead of a sandboxed workspace.
 
 ### QA
 - **Mutation-lite now flips augmented-assignment arithmetic
