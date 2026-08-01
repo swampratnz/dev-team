@@ -5,6 +5,17 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Dashboard
+- **Checks panel** (#283): the dashboard now surfaces `GET /checks`, the
+  cross-repo CI-state read the CLI's `--watch-checks` already exposes —
+  previously a raw-`curl`-only surface. A new `GET /api/checks` proxy
+  (`dashboard.py`, sixth read-only proxy in the existing
+  `_costs`/`_access_log`/`_foreman_plan` shape) forwards an operator-named
+  `repo`/`ref` to the dispatch service and relays its response verbatim; a
+  manual-only "Checks" panel (next to Foreman plan) renders `state`/`ok`/
+  `failed`/`summary`, every field escaped before `innerHTML`. See
+  `docs/DASHBOARD.md`.
+
 ### QA
 - **Mutation-lite now flips augmented-assignment arithmetic
   (`total += 1`↔`total -= 1`, `x *= 2`↔`x /= 2`), the exact follow-up #226

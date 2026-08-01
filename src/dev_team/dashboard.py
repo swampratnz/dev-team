@@ -630,9 +630,10 @@ def _make_handler(
     /api/foreman/plan`` is forwarded to the dispatch service's ``GET
     /foreman/plan`` backlog-foreman dry-run, and ``POST /api/foreman/run`` is
     forwarded to the dispatch service's ``POST /foreman/run`` enqueue route;
-    with either unset all eight stay unavailable and answer ``501``. The
-    dispatch token is only ever sent to ``dispatch_url`` — never logged or
-    reflected.
+    ``GET /api/checks`` is forwarded to the dispatch service's ``GET
+    /checks`` cross-repo CI-state read; with either unset all nine stay
+    unavailable and answer ``501``. The dispatch token is only ever sent to
+    ``dispatch_url`` — never logged or reflected.
     """
 
     guard = auth_guard if auth_guard is not None else FailedAuthTracker(
@@ -951,6 +952,8 @@ def _make_handler(
                 self._access_log(parts.query)
             elif parts.path == "/api/foreman/plan":
                 self._foreman_plan(parts.query)
+            elif parts.path == "/api/checks":
+                self._checks(parts.query)
             elif parts.path.startswith(_JOBS_PROXY_PREFIX):
                 self._question(parts.path)
             else:
@@ -1040,6 +1043,29 @@ def _make_handler(
                 if max_stories
                 else "/foreman/plan"
             )
+            self._proxy("GET", suffix, None)
+
+        # -- checks: a sixth narrow read-only proxy, same shape as the spend
+        # rollup/access log/foreman plan above. Scope is exactly this one
+        # path (see do_GET's exact-match dispatch above) — never a general
+        # dispatch passthrough. No dashboard-side validation of ``repo``/
+        # ``ref``: dispatch's own ``repo_checks`` is the sole enforcer
+        # (traversal-hardened ``valid_ref``, installation-scoped session
+        # auth), so a missing or malformed value forwards through unchanged
+        # and dispatch's own 400 is relayed verbatim.
+
+        def _checks(self, query: str) -> None:
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "checks not configured"}),
+                )
+                return
+            q = parse_qs(query)
+            repo = q.get("repo", [""])[0]
+            ref = q.get("ref", [""])[0]
+            suffix = f"/checks?repo={quote(repo, safe='')}&ref={quote(ref, safe='')}"
             self._proxy("GET", suffix, None)
 
         # -- foreman run: the write sibling of the plan dry-run above, a
@@ -1624,6 +1650,13 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
       <button id="foreman-run-btn" class="ghost" disabled>run</button>
     </div>
     <div class="panel" id="foreman-run-result"></div>
+    <h2>Checks</h2>
+    <div class="filters">
+      <input type="text" id="checks-repo" class="qtext" placeholder="owner/repo" aria-label="repo to check">
+      <input type="text" id="checks-ref" class="qtext" placeholder="ref" aria-label="ref to check">
+      <button id="checks-btn" class="ghost">check</button>
+    </div>
+    <div class="panel" id="checks"><span class="muted">enter a repo and ref, then check</span></div>
     <h2>Reports</h2>
     <div class="panel" id="reports"><span class="muted">no assessment reports</span></div>
   </div>
@@ -2357,6 +2390,43 @@ async function foremanRun() {
   loadForemanPlan();
 }
 
+// The Checks panel: an on-demand, cross-repo CI-state lookup from GET
+// /api/checks?repo=&ref= (see _checks in dashboard.py, itself a thin proxy
+// to the dispatch service's GET /checks). Manual "check" button only, no
+// auto-poll and no auto-fill from other panels (see issue #283) — same
+// on-demand-only discipline as Spend/Access log/Foreman plan above.
+// SECURITY: repo/ref/summary/failed entries are caller- or GitHub-authored
+// text (dispatch relays them verbatim) — esc() before innerHTML, same
+// discipline as every other panel.
+function checksPanel(data) {
+  const failed = (data.failed || []).map(f => `<li>${esc(f)}</li>`).join("");
+  return `<div><b>${esc(data.repo)}</b> @ <code>${esc(data.ref)}</code>: `
+    + `${esc(data.state)} ${data.ok ? "(ok)" : "(not ok)"}</div>`
+    + `<div class="muted">${esc(data.summary)}</div>`
+    + (failed ? `<ul class="list">${failed}</ul>` : "");
+}
+
+async function runChecks() {
+  const repo = $("checks-repo").value.trim();
+  const ref = $("checks-ref").value.trim();
+  const btn = $("checks-btn");
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/checks?repo=${encodeURIComponent(repo)}&ref=${encodeURIComponent(ref)}`);
+    const data = await res.json();
+    if (res.status === 501) {
+      put($("checks"), '<span class="muted">checks not configured</span>');
+    } else if (!res.ok) {
+      put($("checks"), `<span class="muted">${esc(data.error)}</span>`);
+    } else {
+      put($("checks"), checksPanel(data));
+    }
+  } catch (err) {
+    put($("checks"), '<span class="muted">failed to load checks</span>');
+  }
+  btn.disabled = false;
+}
+
 // One score-history row: a run's headline metrics plus its delta from the
 // run before it. SECURITY: feature is the delivered feature's free-text
 // name (ultimately CLI/dispatch-supplied, untrusted) — esc() before
@@ -2943,6 +3013,7 @@ $("story-overlay").addEventListener("click", e => { if (e.target === $("story-ov
 $("spend-refresh").addEventListener("click", loadSpend);
 $("access-log-refresh").addEventListener("click", loadAccessLog);
 $("foreman-plan-refresh").addEventListener("click", loadForemanPlan);
+$("checks-btn").addEventListener("click", runChecks);
 $("foreman-run-budget").addEventListener("input", () => {
   const btn = $("foreman-run-btn");
   btn.disabled = !$("foreman-run-budget").value;

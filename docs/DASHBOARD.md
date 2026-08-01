@@ -30,6 +30,7 @@ workspace on every request.
 | **Score history** — the last 8 delivery runs with headline metrics and signed deltas from the run before | `.dev_team/score-history.json` |
 | **Spend** — total spend and a per-mode breakdown, fetched on demand | the dispatch service's `GET /costs` (proxied, see *Spend* below) |
 | **Access log** — recent dispatch HTTP requests (method/path/status), fetched on demand | the dispatch service's `GET /access-log` (proxied, see *Access log* below) |
+| **Checks** — the live CI state of a `repo`/`ref` an operator names, on demand | the dispatch service's `GET /checks` (proxied, see *Checks* below) |
 | **Reports** — every `audit/*.md`, viewable in place, with blind-spot/broken-citation count chips (see *Report quality chips* below) | the workspace tree |
 
 Runs, Reports, and the Kanban board all exclude **archived** jobs by
@@ -311,6 +312,32 @@ attempted. The result (enqueued job id/story/title/position, or a skip/error
 reason) renders inline, every field escaped before `innerHTML` exactly like
 the plan table above.
 
+### Checks
+
+The **Checks** panel (next to the Foreman plan panel) is a manual, on-demand
+lookup of `GET /checks` — the same live CI state the CLI's own
+`--watch-checks` polls (see [`docs/DISPATCH.md`](DISPATCH.md)): an operator
+types a `repo` (`owner/name`) and a `ref` (branch or SHA), clicks "check",
+and the panel renders the response's `state`, whether it's `ok`, any
+`failed` check names, and a `summary`. Unlike the other panels above, this
+one is not tied to a repo already surfaced elsewhere on the dashboard — any
+repository the dispatch service's per-repo credential can reach may be
+queried, matching what `repo_checks` already grants any caller who holds
+the dispatch bearer token or an installation-scoped OAuth session; the panel
+changes ergonomics, not authorization.
+
+No dashboard-side validation of `repo`/`ref`: `GET /api/checks` forwards
+them unchanged to the dispatch service's `GET /checks`, which is the sole
+enforcer (traversal-hardened `valid_ref`, installation-scoped session
+auth) — a missing or malformed value relays dispatch's own `400` verbatim.
+Without a dispatch URL/token configured, `GET /api/checks` answers `501`
+and the panel renders a muted "not configured" state. Same manual-only
+discipline as every other dispatch-proxied panel: **no auto-poll and no
+auto-fill from another panel** — a click is the only trigger. Every
+rendered field (`repo`, `ref`, `state`, `summary`, each `failed` entry)
+goes through `esc()` before `innerHTML`, since they are caller- or
+GitHub-authored text relayed verbatim by dispatch.
+
 ### Pending questions
 
 An `interactive: true` deliver job (see [`docs/DISPATCH.md`](DISPATCH.md))
@@ -485,6 +512,13 @@ proxy — the write half of the same panel:
 browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(dispatch token)──▶ dispatch POST /foreman/run
 ```
 
+The Checks panel's `GET /api/checks` (above) is an eighth, read-only proxy
+of the same shape:
+
+```
+browser ──(dashboard token)──▶ dashboard GET /api/checks ──(dispatch token)──▶ dispatch GET /checks
+```
+
 - **The proxy** (`--dashboard` with `--dispatch-url`, default
   `http://127.0.0.1:8738`): authorised `POST`/`PATCH`/`DELETE` requests
   under `/api/backlog/` are forwarded — same method, same JSON body — to
@@ -530,7 +564,7 @@ browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(
   dispatch service itself clamps it to `[1, 10]`), and without a token it
   answers `501 {"error": "foreman plan not configured"}`. Scope is
   **exactly `/api/foreman/plan`** — no path parameter.
-- Last, `POST /api/foreman/run`: forwarded verbatim to `<dispatch-url>
+- `POST /api/foreman/run`: forwarded verbatim to `<dispatch-url>
   /foreman/run` (`202`/`200` success, `400` validation rejection, `500`
   compensated-cancel, `502` unreachable — all relayed unchanged), and
   without a token it answers `501 {"error": "foreman run not
@@ -540,6 +574,13 @@ browser ──(dashboard token)──▶ dashboard POST /api/foreman/run ──(
   never forwarded. The dashboard adds no validation of its own; the
   dispatch service remains the sole enforcer of `budget_usd`/`max_stories`
   bounds.
+- Last, `GET /api/checks`: forwarded to `<dispatch-url>/checks?repo=&ref=`
+  (both passed through unchanged — no dashboard-side duplicate validation,
+  matching dispatch's own `repo_checks` as sole enforcer), relaying
+  dispatch's `200`/`400`/`403`/`502` verbatim, and without a token it
+  answers `501 {"error": "checks not configured"}`, no outbound call
+  attempted. Scope is **exactly `/api/checks`** — no path parameter, no
+  other dispatch route reachable through it.
 - **Auth is layered**: the browser authenticates to the dashboard
   (dashboard token / cookie, checked first); the dashboard process — not
   the browser — holds the dispatch bearer token. Both comparisons are

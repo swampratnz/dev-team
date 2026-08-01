@@ -2918,6 +2918,185 @@ def test_dashboard_html_foreman_run_form():
     assert 'btn.disabled = !$("foreman-run-budget").value;' in foreman_run_fn_body
 
 
+# --- the checks proxy (GET /api/checks → dispatch GET /checks) ---------------
+
+
+def test_checks_proxy_forwards_and_relays_verbatim(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch,
+        status=200,
+        body=b'{"repo": "acme/rota", "ref": "main", "state": "success",'
+        b' "ok": true, "concluded": true, "failed": [], "summary": "3/3 passed"}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/checks?repo=acme/rota&ref=main", headers=AUTH
+    )
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {
+        "repo": "acme/rota",
+        "ref": "main",
+        "state": "success",
+        "ok": True,
+        "concluded": True,
+        "failed": [],
+        "summary": "3/3 passed",
+    }
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/checks?repo=acme%2Frota&ref=main"
+    assert request.get_method() == "GET"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.data is None
+
+
+@pytest.mark.parametrize("status", [400, 403, 502])
+def test_checks_proxy_relays_a_dispatch_rejection_verbatim(
+    proxy_server, monkeypatch, status
+):
+    # e.g. an invalid ref (400), a repo outside the session's installations
+    # (403), or an upstream GitHub outage (502) — the dispatch service's own
+    # status/body, never swallowed or translated by the dashboard.
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/checks", status, "error", None,
+        io.BytesIO(b'{"error": "rejected"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    got_status, _, body = _request(
+        proxy_server, "GET", "/api/checks?repo=acme/rota&ref=main", headers=AUTH
+    )
+    assert got_status == status
+    assert json.loads(body) == {"error": "rejected"}
+
+
+def test_checks_proxy_unconfigured_is_501(token_server, monkeypatch):
+    # token_server has dashboard auth but no dispatch_url/dispatch_token wired
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "GET", "/api/checks?repo=acme/rota&ref=main", headers=AUTH
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "checks not configured"}
+    assert seen == []
+
+
+def test_checks_proxy_url_without_token_stays_unconfigured(monkeypatch):
+    # A dispatch URL alone (no dispatch token) must not forward: still 501,
+    # matching every other proxy's own behaviour.
+    seen = _capture_urlopen(monkeypatch)
+    srv = DashboardServer(
+        InMemoryWorkspace(), port=0, token=TOKEN, dispatch_url=DISPATCH_URL
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, body = _request(
+            srv, "GET", "/api/checks?repo=acme/rota&ref=main", headers=AUTH
+        )
+        assert status == 501
+        assert json.loads(body) == {"error": "checks not configured"}
+        assert seen == []
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
+
+
+def test_checks_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    # SECURITY: unauthenticated GET /api/checks answers 401, and nothing is
+    # ever forwarded to the dispatch service.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/checks?repo=acme/rota&ref=main"
+    )
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []  # nothing was ever forwarded
+
+
+def test_checks_proxy_missing_repo_or_ref_forwards_through_unchanged(
+    proxy_server, monkeypatch
+):
+    # No dashboard-side duplicate validation: a missing repo/ref forwards
+    # through as an empty query value, and dispatch's own 400 is relayed
+    # verbatim (see repo_checks in dispatch.py).
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/checks", 400, "Bad Request", None,
+        io.BytesIO(b'{"error": "checks needs repo and ref"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(proxy_server, "GET", "/api/checks", headers=AUTH)
+    assert status == 400
+    assert json.loads(body) == {"error": "checks needs repo and ref"}
+
+
+def test_checks_proxy_unreachable_dispatch_is_502(proxy_server, monkeypatch):
+    _capture_urlopen(monkeypatch, error=urllib.error.URLError("refused"))
+    status, _, body = _request(
+        proxy_server, "GET", "/api/checks?repo=acme/rota&ref=main", headers=AUTH
+    )
+    assert status == 502
+    assert json.loads(body) == {"error": "dispatch service unreachable"}
+    assert "refused" not in body  # no internals leak
+
+
+def test_checks_proxy_never_echoes_the_dispatch_token(proxy_server, monkeypatch):
+    # SECURITY: the dispatch bearer token must never reach the browser, in
+    # the response body or in any header.
+    _capture_urlopen(
+        monkeypatch,
+        body=b'{"repo": "acme/rota", "ref": "main", "state": "success",'
+        b' "ok": true, "concluded": true, "failed": [], "summary": "ok"}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/checks?repo=acme/rota&ref=main", headers=AUTH
+    )
+    assert status == 200
+    assert DISPATCH_TOKEN not in body
+    assert DISPATCH_TOKEN not in str(headers)
+
+
+def test_checks_route_scope_is_exact_match_only(proxy_server, monkeypatch):
+    # SECURITY/scope: only exactly /api/checks is the route — a path that
+    # merely starts with it falls through to the ordinary 404, never
+    # forwarded to the dispatch service (no general dispatch passthrough).
+    seen = _capture_urlopen(monkeypatch)
+    for path in ("/api/checks/", "/api/checks/extra", "/api/checks2"):
+        status, _, _ = _request(proxy_server, "GET", path, headers=AUTH)
+        assert status == 404
+    assert seen == []
+
+
+def test_dashboard_html_checks_panel():
+    # AC5/AC8: no auto-poll — a manual "check" button only, and every
+    # rendered field flows through esc() before innerHTML: repo/ref/summary/
+    # failed-entry values are caller- or GitHub-authored text relayed
+    # verbatim by dispatch, so they must always render as inert text.
+    assert '<input type="text" id="checks-repo"' in DASHBOARD_HTML
+    assert '<input type="text" id="checks-ref"' in DASHBOARD_HTML
+    assert '<button id="checks-btn" class="ghost">check</button>' in DASHBOARD_HTML
+    assert '<div class="panel" id="checks">' in DASHBOARD_HTML
+    assert '$("checks-btn").addEventListener("click", runChecks)' in DASHBOARD_HTML
+    assert "checks not configured" in DASHBOARD_HTML
+    assert "failed to load checks" in DASHBOARD_HTML
+
+    assert "${esc(data.repo)}" in DASHBOARD_HTML
+    assert "${esc(data.ref)}" in DASHBOARD_HTML
+    assert "${esc(data.state)}" in DASHBOARD_HTML
+    assert "${esc(data.summary)}" in DASHBOARD_HTML
+    assert "f => `<li>${esc(f)}</li>`" in DASHBOARD_HTML
+
+    # No auto-poll: no setInterval anywhere references checks, and the page
+    # doesn't call runChecks()/fetch("/api/checks…") on load — only the
+    # click handler above does.
+    assert "setInterval(runChecks" not in DASHBOARD_HTML
+    assert "setInterval(loadChecks" not in DASHBOARD_HTML
+    assert "\nrunChecks();" not in DASHBOARD_HTML
+    refresh_start = DASHBOARD_HTML.index("async function refresh()")
+    refresh_end = DASHBOARD_HTML.index("refresh();", refresh_start)
+    assert "/api/checks" not in DASHBOARD_HTML[refresh_start:refresh_end]
+
+
 # --- the pending-question proxy (GET /api/jobs/{id}/question → dispatch) -----
 
 
@@ -3238,7 +3417,7 @@ def test_dashboard_html_run_card_waiting_chip():
     #    the one GET /api/jobs/{id}/question request per running job per
     #    5s tick that they did before this change, and the page still has
     #    exactly the same total number of fetch(/setInterval( call sites.
-    assert DASHBOARD_HTML.count("fetch(") == 14
+    assert DASHBOARD_HTML.count("fetch(") == 15
     assert DASHBOARD_HTML.count("setInterval(") == 3
     assert body.count("fetch(") == 1  # loadQuestion's one existing request
     assert "setInterval(pollQuestions, 5000)" in DASHBOARD_HTML
