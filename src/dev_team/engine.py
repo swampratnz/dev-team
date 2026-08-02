@@ -3142,18 +3142,21 @@ class DeliveryEngine:
     ) -> None:
         """Advisory mutation-lite signal: does one flipped mutant survive?
 
-        For each of the task's non-test Python product files (up to
-        :data:`_MUTATION_CHECK_MAX_FILES`, in sorted path order), flips the
-        first comparison, boolean, identity/membership, or arithmetic
-        operator (see :mod:`dev_team.mutation`), re-runs the gates, and
-        accumulates a ``mutation_survived``/``mutation_killed`` scorecard
-        counter — **never** a rejection, retry, or rollback (unlike
-        :meth:`_tests_are_vacuous`). A file with no mutable operator, or a
-        non-Python file, is skipped and the remaining files still run. Files
-        beyond the cap are never read, mutated, or counted. The whole check
-        is skipped, with no scorecard change, no gate re-run, and no file
-        written to disk, when: disabled; a dry run; verification is remote or
-        degraded; or there are no qualifying non-test product files.
+        Non-test product files are filtered down to Python files first, then
+        sorted by path and capped at :data:`_MUTATION_CHECK_MAX_FILES` — a
+        non-Python file never occupies a cap slot ahead of a qualifying `.py`
+        file. For each of the (at most :data:`_MUTATION_CHECK_MAX_FILES`)
+        remaining files, flips the first comparison, boolean,
+        identity/membership, or arithmetic operator (see
+        :mod:`dev_team.mutation`), re-runs the gates, and accumulates a
+        ``mutation_survived``/``mutation_killed`` scorecard counter —
+        **never** a rejection, retry, or rollback (unlike
+        :meth:`_tests_are_vacuous`). A file with no mutable operator is
+        skipped and the remaining files still run. Files beyond the cap are
+        never read, mutated, or counted. The whole check is skipped, with no
+        scorecard change, no gate re-run, and no file written to disk, when:
+        disabled; a dry run; verification is remote or degraded; or there
+        are no qualifying Python product files.
 
         Each file's mutated write is always restored, success or failure —
         mirroring :meth:`_tests_are_vacuous`'s fail-secure guarantee — via a
@@ -3173,7 +3176,10 @@ class DeliveryEngine:
         impl_paths = sorted(
             c.path
             for c in implementation.files
-            if c.path and ws.exists(c.path) and not _is_test_path(c.path)
+            if c.path
+            and c.path.endswith(".py")
+            and ws.exists(c.path)
+            and not _is_test_path(c.path)
         )
         if not impl_paths:
             return
@@ -3192,8 +3198,6 @@ class DeliveryEngine:
 
         async def _check_paths() -> None:
             for path in impl_paths[:_MUTATION_CHECK_MAX_FILES]:
-                if not path.endswith(".py"):
-                    continue
                 original = ws.read_text(path)
                 mutated = mutate_first_mutant(original)
                 if mutated is None:

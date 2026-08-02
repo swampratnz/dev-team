@@ -3848,6 +3848,47 @@ def test_mutation_check_non_python_file_skipped_individually_not_disqualifying()
     assert ws.read_text("src/b.ts") == "function f(a, b) { return a === b; }\n"
 
 
+def test_mutation_check_cap_applies_after_python_filter_not_before():
+    # Regression for the PR #296 review finding: the cap must be computed
+    # over the already-`.py`-filtered, sorted list, not over all non-test
+    # paths. Five non-Python files sort ahead of the one qualifying `.py`
+    # file by path — if the cap were (wrongly) taken before filtering, it
+    # would consume all 5 slots on files that get skipped anyway, and the
+    # one real Python file would never be checked at all.
+    from dev_team.models import ChangeType, FileChange
+
+    non_python = {f"src/{c}.md": f"# {c}\n" for c in "abcde"}
+    ws = InMemoryWorkspace(
+        {
+            **non_python,
+            "src/z.py": "def f(a, b):\n    return a == b\n",
+        }
+    )
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[
+            *(
+                FileChange(path=f"src/{c}.md", change_type=ChangeType.CREATE, summary="s")
+                for c in "abcde"
+            ),
+            FileChange(path="src/z.py", change_type=ChangeType.CREATE, summary="s"),
+        ],
+    )
+    run(engine._mutation_check(impl, ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert "mutation_killed" not in engine._scorecard
+    assert len(cmd.calls) == 1
+    assert ws.read_text("src/z.py") == "def f(a, b):\n    return a == b\n"
+
+
 def test_mutation_check_excludes_engineer_authored_test_files():
     # Mirrors test_fail_to_pass_keeps_engineer_authored_tests: the agentic
     # engineer reports its own test file in implementation.files alongside
