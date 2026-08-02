@@ -26,6 +26,19 @@ sections below are reconstructed from the repository history.
   external service credential, out of scope per the standing guardrail).
 
 ### Dispatch
+- **`GET /calibration` gains `by_repo`** (`docs/DISPATCH.md`, #293): mirrors
+  `GET /costs`'s existing `by_repo` (#232) so a direct API caller — Dave, a
+  script, `curl` — gets the same per-repo confirm-rate breakdown the
+  dashboard's Calibration panel has computed client-side since #223. Groups
+  the same `verifications.jsonl` entries already walked for `phases`/
+  `overall` by the owning job's `repo` (read off the `meta.json` fetch
+  `_is_archived` already makes for that job — no new file read), defaulting
+  to `"(unknown)"` for a missing/corrupt `meta.json` or empty `repo` field.
+  Each bucket is a full `calibration_summary()` `"overall"` result, not a
+  hand-picked subset, so `by_repo` can never drift from what `phases`/
+  `overall` already promise, and bucket totals always sum to
+  `overall["total"]`. Archived jobs are excluded from `by_repo` exactly as
+  they already are from `overall`/`phases`.
 - **On-demand bulk purge** (`docs/DISPATCH.md`): `GET`/`POST
   /jobs/purge?archived_before=<epoch-seconds>` — the still-deferred second
   half of the purge "Natural growth" note, now that the single-job

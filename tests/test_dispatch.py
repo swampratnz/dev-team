@@ -847,6 +847,7 @@ def test_calibration_with_no_verification_files_is_zeroed():
             "total": 0, "confirm_rate": None,
             "multi_vote_total": 0, "unanimous_total": 0,
         },
+        "by_repo": {},
         "jobs_counted": 0,
         "blind_spot_total": 0,
         "broken_citation_total": 0,
@@ -1012,6 +1013,137 @@ def test_calibration_report_quality_excludes_archived_job_and_reappears_after_un
     assert payload["blind_spot_total"] == 2
     assert payload["broken_citation_total"] == 1
     assert payload["report_quality_jobs_counted"] == 2
+
+
+# --- calibration by_repo (#293) -------------------------------------------
+
+
+def test_calibration_by_repo_single_repo_matches_overall():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-a"}),
+    )
+    dash.write_text(
+        "audit/assess-a/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[0]", "verdict": "confirmed"}) + "\n"
+        + json.dumps({"finding_id": "risk.secrets[1]", "verdict": "refuted"}) + "\n",
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.calibration()
+    assert status == 200
+    assert set(payload["by_repo"]) == {"acme/mono"}
+    assert payload["by_repo"]["acme/mono"] == payload["overall"]
+
+
+def test_calibration_by_repo_two_repos_split_and_overall_unchanged():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-a"}),
+    )
+    dash.write_text(
+        "audit/assess-a/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[0]", "verdict": "confirmed"}) + "\n",
+    )
+    dash.write_text(
+        "audit/assess-b/meta.json",
+        json.dumps({"repo": "other/repo", "mode": "assess", "id": "assess-b"}),
+    )
+    dash.write_text(
+        "audit/assess-b/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[1]", "verdict": "refuted"}) + "\n"
+        + json.dumps({"finding_id": "risk.secrets[2]", "verdict": "refuted"}) + "\n",
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.calibration()
+    assert status == 200
+    assert set(payload["by_repo"]) == {"acme/mono", "other/repo"}
+    assert payload["by_repo"]["acme/mono"]["total"] == 1
+    assert payload["by_repo"]["acme/mono"]["confirmed"] == 1
+    assert payload["by_repo"]["other/repo"]["total"] == 2
+    assert payload["by_repo"]["other/repo"]["refuted"] == 2
+    # overall stays the byte-identical union across both repos, unaffected
+    # by the new by_repo grouping (pre-change behaviour, regression-tested)
+    assert payload["overall"] == {
+        "confirmed": 1, "refuted": 2, "needs_context": 0,
+        "total": 3, "confirm_rate": 1 / 3,
+        "multi_vote_total": 0, "unanimous_total": 0,
+    }
+
+
+def test_calibration_by_repo_groups_missing_or_corrupt_meta_under_unknown():
+    dash = InMemoryWorkspace()
+    # no meta.json at all
+    dash.write_text(
+        "audit/assess-a/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[0]", "verdict": "confirmed"}) + "\n",
+    )
+    # corrupt meta.json
+    dash.write_text("audit/assess-b/meta.json", "{not json")
+    dash.write_text(
+        "audit/assess-b/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[1]", "verdict": "refuted"}) + "\n",
+    )
+    # meta.json with an empty repo field
+    dash.write_text(
+        "audit/assess-c/meta.json",
+        json.dumps({"repo": "", "mode": "assess", "id": "assess-c"}),
+    )
+    dash.write_text(
+        "audit/assess-c/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[2]", "verdict": "needs-context"}) + "\n",
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.calibration()
+    assert status == 200
+    assert set(payload["by_repo"]) == {"(unknown)"}
+    assert payload["by_repo"]["(unknown)"]["total"] == 3
+    # by_repo bucket totals always sum to overall's total
+    assert (
+        sum(bucket["total"] for bucket in payload["by_repo"].values())
+        == payload["overall"]["total"]
+    )
+
+
+def test_calibration_by_repo_carries_multi_vote_and_unanimous_totals():
+    dash = InMemoryWorkspace()
+    dash.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"repo": "acme/mono", "mode": "assess", "id": "assess-a"}),
+    )
+    dash.write_text(
+        "audit/assess-a/verifications.jsonl",
+        json.dumps({
+            "finding_id": "risk.secrets[0]", "verdict": "confirmed",
+            "vote_count": 3, "max_agreement": 3,
+        }) + "\n",
+    )
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    status, payload = disp.calibration()
+    assert status == 200
+    assert payload["by_repo"]["acme/mono"]["multi_vote_total"] == 1
+    assert payload["by_repo"]["acme/mono"]["unanimous_total"] == 1
+    # same calibration_summary() call underlies both — no re-implementation
+    assert payload["by_repo"]["acme/mono"] == payload["overall"]
+
+
+def test_calibration_by_repo_key_with_json_special_chars_round_trips_safely():
+    dash = InMemoryWorkspace()
+    tricky_repo = 'acme/repo"; DROP'
+    dash.write_text(
+        "audit/assess-a/meta.json",
+        json.dumps({"repo": tricky_repo, "mode": "assess", "id": "assess-a"}),
+    )
+    dash.write_text(
+        "audit/assess-a/verifications.jsonl",
+        json.dumps({"finding_id": "risk.secrets[0]", "verdict": "confirmed"}) + "\n",
+    )
+    with running(materialise=_mem_materialise, dashboard_workspace=dash) as server:
+        status, payload = _call(server, "/calibration")
+        assert status == 200
+        assert set(payload["by_repo"]) == {tricky_repo}
+        assert payload["by_repo"][tricky_repo]["total"] == 1
 
 
 # --- costs rollup ---------------------------------------------------------
@@ -2966,6 +3098,9 @@ def test_calibration_excludes_archived_job_and_reappears_after_unarchive():
     assert status == 200
     assert payload["jobs_counted"] == 2
     assert payload["overall"]["total"] == 2
+    assert set(payload["by_repo"]) == {"acme/mono", "(unknown)"}
+    assert payload["by_repo"]["acme/mono"]["total"] == 1
+    assert payload["by_repo"]["(unknown)"]["total"] == 1
 
     disp.archive_job("assess-a")
     status, payload = disp.calibration()
@@ -2973,11 +3108,15 @@ def test_calibration_excludes_archived_job_and_reappears_after_unarchive():
     assert payload["jobs_counted"] == 1
     assert payload["overall"]["total"] == 1
     assert payload["overall"]["refuted"] == 1  # only assess-b's verdict survives
+    # the archived job's repo bucket is excluded entirely, same as overall
+    assert set(payload["by_repo"]) == {"(unknown)"}
+    assert payload["by_repo"]["(unknown)"]["total"] == 1
 
     disp.unarchive_job("assess-a")
     status, payload = disp.calibration()
     assert payload["jobs_counted"] == 2
     assert payload["overall"]["total"] == 2
+    assert set(payload["by_repo"]) == {"acme/mono", "(unknown)"}
 
 
 def test_calibration_http_route_end_to_end():
@@ -2992,7 +3131,7 @@ def test_calibration_http_route_end_to_end():
         status, payload = _call(server, "/calibration")
         assert status == 200
         assert set(payload) == {
-            "phases", "overall", "jobs_counted",
+            "phases", "overall", "by_repo", "jobs_counted",
             "blind_spot_total", "broken_citation_total",
             "report_quality_jobs_counted",
         }
