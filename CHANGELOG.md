@@ -6,6 +6,22 @@ sections below are reconstructed from the repository history.
 ## [Unreleased]
 
 ### QA
+- **Mutation-lite now runs on every qualifying product file in a task, not
+  just tasks that touch exactly one** (#295). Previously `_mutation_check`'s
+  file-selection guard was `if len(impl_paths) != 1: return` — any task whose
+  implementation touched two or more non-test product files got zero
+  mutation-lite signal, silently. `_mutation_check` now loops over the
+  task's non-test `.py` files in sorted path order, capped at a fixed 5 files
+  per task (mirroring the `[1, 5]` cap already shipped for `--verify-votes`),
+  running the existing single-mutant flip → gate-rerun → restore sequence
+  per file and accumulating into the same `mutation_survived`/
+  `mutation_killed` scorecard counters. A file with no mutable operator, or a
+  non-Python file, is skipped individually — it no longer disqualifies the
+  whole task, and the remaining files still run. The `_stash_lock` (agentic,
+  non-worktree mode) now scopes the whole per-task loop rather than a single
+  file, so concurrent tasks still can't interleave mutate/restore across
+  files. Purely additive: zero and one-qualifying-file behaviour is
+  byte-identical to before.
 - **Mutation-lite now flips augmented-assignment arithmetic
   (`total += 1`↔`total -= 1`, `x *= 2`↔`x /= 2`), the exact follow-up #226
   named as out of scope for itself** (#257). Previously

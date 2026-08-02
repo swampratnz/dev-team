@@ -3638,7 +3638,27 @@ def test_mutation_check_skipped_with_no_product_files():
     assert cmd.calls == []
 
 
-def test_mutation_check_skipped_with_multiple_product_files():
+class _NthCallFails:
+    """A scripted command runner whose Nth invocation reports gate failure
+    (a "killed" mutant); every other call passes (a "survived" mutant)."""
+
+    def __init__(self, fail_call: int):
+        self.calls: list = []
+        self.fail_call = fail_call
+
+    def run(self, command, *, cwd=None, timeout=None):
+        args = list(command)
+        self.calls.append(args)
+        if len(self.calls) == self.fail_call:
+            return CommandResult(args, 1, "FAILED: mutant caught", "")
+        return CommandResult(args, 0, "ok", "")
+
+
+def test_mutation_check_runs_all_qualifying_files_in_a_multi_file_task():
+    # #295 acceptance criterion 1: the old `len(impl_paths) != 1: return`
+    # guard skipped any task touching 2+ product files entirely. Each
+    # qualifying file now gets its own flip/gate-rerun/restore, accumulating
+    # into the same scorecard counters (sorted path order: a.py, then b.py).
     from dev_team.models import ChangeType, FileChange
 
     ws = InMemoryWorkspace(
@@ -3647,7 +3667,7 @@ def test_mutation_check_skipped_with_multiple_product_files():
             "src/b.py": "def g(a, b):\n    return a == b\n",
         }
     )
-    cmd = FakeCommandRunner()
+    cmd = _NthCallFails(fail_call=2)
     engine = _engine(
         ScriptedRunner([]),
         workspace=ws,
@@ -3663,8 +3683,169 @@ def test_mutation_check_skipped_with_multiple_product_files():
         ],
     )
     run(engine._mutation_check(impl, ws, engine.git, None))
-    assert engine._scorecard == {}
-    assert cmd.calls == []
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert engine._scorecard.get("mutation_killed") == 1
+    assert len(cmd.calls) == 2
+    assert ws.read_text("src/a.py") == "def f(a, b):\n    return a == b\n"
+    assert ws.read_text("src/b.py") == "def g(a, b):\n    return a == b\n"
+
+
+class _ReadTrackingWorkspace:
+    """Wraps a workspace and records every ``read_text`` call, so a test can
+    prove a file was never touched rather than merely never scored."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.reads: list = []
+
+    def read_text(self, path):
+        self.reads.append(path)
+        return self._inner.read_text(path)
+
+    def write_text(self, path, content):
+        self._inner.write_text(path, content)
+
+    def exists(self, path):
+        return self._inner.exists(path)
+
+
+def test_mutation_check_cap_boundary_only_first_five_files_by_sorted_path():
+    # #295 acceptance criterion 4: a task with 6 qualifying files only
+    # mutates the first 5 by sorted path; the 6th is never read, mutated, or
+    # restored.
+    from dev_team.models import ChangeType, FileChange
+
+    letters = "abcdef"
+    inner = InMemoryWorkspace(
+        {f"src/{c}.py": f"def f_{c}(a, b):\n    return a == b\n" for c in letters}
+    )
+    ws = _ReadTrackingWorkspace(inner)
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[
+            FileChange(path=f"src/{c}.py", change_type=ChangeType.CREATE, summary="s")
+            for c in letters
+        ],
+    )
+    run(engine._mutation_check(impl, ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 5
+    assert len(cmd.calls) == 5
+    assert "src/f.py" not in ws.reads
+    assert sorted(ws.reads) == ws.reads
+
+
+def test_mutation_check_file_with_no_mutable_operator_does_not_halt_loop():
+    # #295 acceptance criterion 5: a file with no mutable operator among
+    # several qualifying files doesn't halt the loop — the remaining
+    # qualifying files still get evaluated and their outcomes still recorded.
+    from dev_team.models import ChangeType, FileChange
+
+    ws = InMemoryWorkspace(
+        {
+            "src/a.py": "def f(a, b):\n    return a == b\n",
+            "src/b.py": "def g(a):\n    return a\n",
+            "src/c.py": "def h(a, b):\n    return a != b\n",
+        }
+    )
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[
+            FileChange(path="src/a.py", change_type=ChangeType.CREATE, summary="s"),
+            FileChange(path="src/b.py", change_type=ChangeType.CREATE, summary="s"),
+            FileChange(path="src/c.py", change_type=ChangeType.CREATE, summary="s"),
+        ],
+    )
+    run(engine._mutation_check(impl, ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 2
+    assert len(cmd.calls) == 2
+
+
+def test_mutation_check_multi_file_fail_secure_ordering():
+    # #295 acceptance criterion 6 [security]: a stash/write-restore failure
+    # on the SECOND file's restore must still raise `_StashRestoreFailed`
+    # even though the first file's restore succeeded cleanly — a clean
+    # restore on one file must never mask a failed restore on another.
+    from dev_team.models import ChangeType, FileChange
+
+    inner = InMemoryWorkspace(
+        {
+            "src/a.py": "def f(a, b):\n    return a == b\n",
+            "src/b.py": "def g(a, b):\n    return a == b\n",
+        }
+    )
+    # Writes: 1=a.py mutate, 2=a.py restore (ok), 3=b.py mutate, 4=b.py
+    # restore (fails).
+    flaky = _FlakyRestoreWorkspace(inner, fail_on_write=4)
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=InMemoryWorkspace(),
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[
+            FileChange(path="src/a.py", change_type=ChangeType.CREATE, summary="s"),
+            FileChange(path="src/b.py", change_type=ChangeType.CREATE, summary="s"),
+        ],
+    )
+    with pytest.raises(_StashRestoreFailed):
+        run(engine._mutation_check(impl, flaky, engine.git, None))
+    # the first file completed (mutate → evaluate → clean restore) before
+    # the second file's restore failure aborted the loop
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert "mutation_killed" not in engine._scorecard
+
+
+def test_mutation_check_non_python_file_skipped_individually_not_disqualifying():
+    # #295 acceptance criterion 7: a non-`.py` file mixed in among qualifying
+    # files is skipped individually, not treated as disqualifying the whole
+    # task.
+    from dev_team.models import ChangeType, FileChange
+
+    ws = InMemoryWorkspace(
+        {
+            "src/a.py": "def f(a, b):\n    return a == b\n",
+            "src/b.ts": "function f(a, b) { return a === b; }\n",
+        }
+    )
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    impl = Implementation(
+        task_id="T1",
+        summary="s",
+        files=[
+            FileChange(path="src/a.py", change_type=ChangeType.CREATE, summary="s"),
+            FileChange(path="src/b.ts", change_type=ChangeType.CREATE, summary="s"),
+        ],
+    )
+    run(engine._mutation_check(impl, ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert "mutation_killed" not in engine._scorecard
+    assert len(cmd.calls) == 1
+    assert ws.read_text("src/b.ts") == "function f(a, b) { return a === b; }\n"
 
 
 def test_mutation_check_excludes_engineer_authored_test_files():
@@ -4199,6 +4380,61 @@ def test_mutation_check_killed_leaves_task_outcome_unchanged():
     assert "mutation_killed" not in base_engine._scorecard
     assert mut_engine._scorecard.get("mutation_killed") == 1
     assert mutated.scorecard.get("mutation_killed") == 1
+
+
+def _impl_response_with_two_comparisons():
+    return json_response(
+        {
+            "summary": "impl",
+            "files": [
+                {
+                    "path": "src/a.py",
+                    "change_type": "create",
+                    "summary": "s",
+                    "content": "def f(a, b):\n    return a == b\n",
+                },
+                {
+                    "path": "src/b.py",
+                    "change_type": "create",
+                    "summary": "s",
+                    "content": "def g(a, b):\n    return a == b\n",
+                },
+            ],
+            "notes": "",
+        }
+    )
+
+
+def test_mutation_check_multi_file_leaves_task_outcome_unchanged():
+    # #295 acceptance criterion 8: task outcome (final status, attempt count)
+    # is unaffected by mutation_survived/killed counts, including when a
+    # task touches multiple qualifying files.
+    mapping = engine_responses()
+    mapping["senior software engineer"] = _impl_response_with_two_comparisons()
+
+    def _deliver(mutation_check):
+        eng = _engine(
+            ScriptedRunner(by_system_prompt=mapping),
+            command_runner=FakeCommandRunner(),
+            config=EngineConfig(
+                mutation_check=mutation_check,
+                fail_to_pass_check=False,
+                max_task_attempts=1,
+            ),
+        )
+        return run(eng.deliver(_request())), eng
+
+    baseline, base_engine = _deliver(False)
+    mutated, mut_engine = _deliver(True)
+
+    assert baseline.success is True
+    assert mutated.success is True
+    assert mutated.task_results[0].attempts == baseline.task_results[0].attempts
+    assert mutated.task_results[0].task.status is TaskStatus.DONE
+    assert baseline.task_results[0].task.status is TaskStatus.DONE
+    assert "mutation_survived" not in base_engine._scorecard
+    assert mut_engine._scorecard.get("mutation_survived") == 2
+    assert mutated.scorecard.get("mutation_survived") == 2
 
 
 def test_run_evidence_surfaces_mutation_scorecard_keys():

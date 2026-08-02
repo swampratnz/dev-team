@@ -42,7 +42,8 @@ beat either alone, and false-positive suppression is a first-class metric.**
   `==`/`!=`/`<`/`>=`/`>`/`<=`/`is`/`is not`/`in`/`not in`), boolean-operator
   (`and`/`or`), or arithmetic-operator (`+`/`-`/`*`/`/`, on both plain
   expressions and augmented assignment — `x + y` and `x += y` alike) flip in
-  the task's one product file and reruns the gates; a surviving mutant is an advisory
+  each of the task's product files (up to a fixed cap of 5, sorted by path)
+  and reruns the gates; a surviving mutant is an advisory
   `mutation_survived` scorecard signal only (never a rejection, unlike
   fail-to-pass) (`EngineConfig.mutation_check`,
   off by default). Per-profile mutators for other languages remain future
