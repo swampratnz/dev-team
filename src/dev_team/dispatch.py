@@ -592,6 +592,17 @@ class Dispatcher:
         # eligibility and both run the deletion path. Membership here is the
         # claim; discarded once the claiming call's deletion has completed.
         self._purging: set = set()
+        # The in-flight asyncio task (and the event loop it runs on) for
+        # every job currently "running", keyed by job id and guarded by
+        # self._lock. _execute populates its own entry the instant it flips
+        # queued->running (same locked block, so cancel_job never observes
+        # state == "running" without a matching entry here) and removes it
+        # in every terminal branch. cancel_job reads it to cross-thread-
+        # cancel an in-flight job: the HTTP handler thread and the worker's
+        # own event loop are different threads, and asyncio.Task.cancel()
+        # is not thread-safe, so the actual cancel() call is always made via
+        # loop.call_soon_threadsafe.
+        self._tasks: Dict[str, Tuple["asyncio.Task[Any]", asyncio.AbstractEventLoop]] = {}
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -1080,7 +1091,7 @@ class Dispatcher:
     # -- execution -----------------------------------------------------------
 
     async def _execute(self, job_id: str) -> None:
-        """Move a job through ``running`` → ``succeeded`` / ``failed``."""
+        """Move a job through ``running`` → ``succeeded`` / ``failed`` / ``cancelled``."""
 
         record = self._registry[job_id]
         with self._lock:
@@ -1092,10 +1103,37 @@ class Dispatcher:
                 return
             record.state = "running"
             record.started = self._clock()
+            # Published under the same locked block that flips the state to
+            # "running", so cancel_job (which only reaches its running-job
+            # branch after observing state == "running" under this same
+            # lock) can never find this job "running" without a matching
+            # entry here.
+            self._tasks[job_id] = (asyncio.current_task(), asyncio.get_running_loop())
         try:
             outcome, cost = await self.run_job(record)
+        except asyncio.CancelledError:
+            with self._lock:
+                manually_cancelled = record.state == "cancelled"
+                self._tasks.pop(job_id, None)
+            if not manually_cancelled:
+                # This CancelledError came from wait_for's own wall-clock
+                # timeout, not from cancel_job (which would have already
+                # written "cancelled" under the same lock before requesting
+                # this cancellation) — let it keep propagating so
+                # _worker_loop's TimeoutError handler (_fail_timed_out)
+                # records the timeout, exactly as it did before this feature.
+                raise
+            # cancel_job already wrote every terminal field, ran the story
+            # write-back, and set the completion event before requesting
+            # this cancellation — nothing left to do.
+            return
         except Exception as exc:  # noqa: BLE001 — a failed job must not kill the worker
             with self._lock:
+                self._tasks.pop(job_id, None)
+                if record.state == "cancelled":
+                    # cancel_job won the race after run_job had already
+                    # started failing on its own; its outcome stands.
+                    return
                 record.state = "failed"
                 record.error = str(exc)
                 record.cost_usd = _failed_cost(record)
@@ -1105,6 +1143,11 @@ class Dispatcher:
             self._write_back_story(record.spec.story_id, ItemStatus.BLOCKED)
         else:
             with self._lock:
+                self._tasks.pop(job_id, None)
+                if record.state == "cancelled":
+                    # cancel_job won the race after run_job had already
+                    # succeeded on its own; its outcome stands.
+                    return
                 record.outcome = outcome
                 record.cost_usd = cost
                 record.state = "succeeded"
@@ -1386,32 +1429,68 @@ class Dispatcher:
     # -- cancel (job lifecycle) -----------------------------------------------
 
     def cancel_job(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
-        """The ``POST /jobs/{id}/cancel`` core: pull a still-queued job out.
+        """The ``POST /jobs/{id}/cancel`` core: pull a queued or running job out.
 
-        Reachable only from ``queued`` — the one rung the documented state
-        machine (``queued -> running -> succeeded | failed``) is otherwise
-        missing: once a job is ``running`` it is out of scope (an in-flight
-        clone/agent session, same boundary ``archive_job`` already draws).
+        Reachable from ``queued`` **and** ``running`` — the only refusal left
+        is an already-terminal job (``succeeded``/``failed``/``cancelled``),
+        the same boundary :meth:`archive_job` already draws via
+        :meth:`_job_running`. Issue #39 originally scoped this to ``queued``
+        only, deferring ``running`` as "a materially different and harder
+        problem"; it turns out not to be one — the wall-clock timeout path
+        (:meth:`_worker_loop`) already proves that a ``CancelledError``
+        unwinds cleanly through the whole ``run_job`` -> engine -> SDK stack,
+        this just triggers that same unwind manually instead of by a clock.
+
+        For a ``running`` job the actual stop is cross-thread: the HTTP
+        handler thread and the worker's own event loop are different
+        threads, and ``asyncio.Task.cancel()`` is not thread-safe, so the
+        request goes through ``loop.call_soon_threadsafe(task.cancel)``
+        (:attr:`_tasks`, populated by :meth:`_execute` in the same locked
+        block that flips the state to ``running``). The registry write
+        (state, ``ended``, the partial spend already banked) happens here,
+        synchronously, rather than waiting for the task to actually finish
+        unwinding — cancellation of an in-flight OS subprocess (a clone, a
+        sandboxed container run) is best-effort, same acknowledged
+        characteristic the existing timeout path already has, just now also
+        reachable manually. :meth:`_execute` recognises its own
+        already-``cancelled`` record when the requested cancellation
+        eventually lands and skips re-writing it.
+
         Non-idempotent by design (409 on every other state, including an
         already-cancelled job) — every other transition here is one-way, so
         mixing an idempotent cancel into this route table would be less
         consistent than a 409 on a redundant call. Shares ``self._lock``
-        with :meth:`_execute`'s queued->running flip, so the two transitions
-        are mutually exclusive: whichever call wins the race decides the
-        outcome deterministically, and a job can never end up both running
-        and marked cancelled.
+        with :meth:`_execute`'s ``queued -> running`` flip and its terminal
+        writes, so every one of these transitions is mutually exclusive:
+        whichever call wins the race decides the outcome deterministically
+        — a job already written ``succeeded``/``failed`` under the lock is
+        never overwritten by a cancel that arrives just after, and a cancel
+        already written ``cancelled`` under the lock is never overwritten by
+        a completion that lands just after.
         """
 
+        task: Optional["asyncio.Task[Any]"] = None
+        loop: Optional[asyncio.AbstractEventLoop] = None
         with self._lock:
             record = self._registry.get(job_id)
             if record is None:
                 return 404, {"error": "unknown job"}
-            if record.state != "queued":
-                return 409, {"error": "job is not queued", "state": record.state}
+            state = record.state
+            if state not in ("queued", "running"):
+                return 409, {"error": "job is not cancellable", "state": state}
             record.state = "cancelled"
             record.ended = self._clock()
-        # A cancelled foreman job never ran: the story goes back to TODO (and
-        # sheds its delivery_job edge) so a later run can pick it up again.
+            if state == "running":
+                # The real (possibly partial) spend already banked, not a
+                # hard 0.0 — mirrors _fail_timed_out's equivalent handling
+                # for the other cancellation path (a wall-clock timeout).
+                record.cost_usd = _failed_cost(record)
+                task, loop = self._tasks[job_id]
+        if task is not None:
+            loop.call_soon_threadsafe(task.cancel)
+        # A cancelled foreman job never ran to completion: the story goes
+        # back to TODO (and sheds its delivery_job edge) so a later run can
+        # pick it up again — true whether it was cancelled queued or running.
         self._write_back_story(record.spec.story_id, ItemStatus.TODO)
         self._events[job_id].set()
         return 200, {"id": job_id, "state": "cancelled"}
@@ -1917,10 +1996,13 @@ class Dispatcher:
         sums outside it — archived-exclusion does a disk read via
         :meth:`_is_archived`, which must never run while the lock is held.
 
-        Only ``succeeded``/``failed`` jobs have a non-``None`` ``cost_usd``
-        (``queued``/``running`` never set it; ``cancel_job`` never touches
-        it), matching :meth:`result`'s "finished" framing — those are the
-        only ones counted. No dashboard-workspace guard is needed:
+        ``succeeded``/``failed`` jobs always have a non-``None`` ``cost_usd``
+        (``queued``/``running`` never set it); a ``cancelled`` job has one
+        only if ``cancel_job`` interrupted it while running (the real,
+        possibly partial, spend already banked) — cancelling a still-queued
+        job never touches it, since it never spent anything. Either way,
+        every non-``None`` ``cost_usd`` is real spend and belongs in the
+        rollup. No dashboard-workspace guard is needed:
         :meth:`_is_archived` returns ``False`` (never raises) when
         ``self._dashboard_workspace is None``, so archived-exclusion is
         simply a no-op until one is configured.
@@ -2212,9 +2294,12 @@ class Dispatcher:
                 target = cancelled if status == 200 else uncancellable
                 target.append({"job_id": entry["job_id"], "story_id": entry["story_id"]})
             # 500, not 202: the run did not do what it promised. The payload
-            # is the honest ledger — cancelled jobs never spend; a job the
-            # single-flight worker had already started cannot be pulled back
-            # and is named so the operator knows a re-run would duplicate it.
+            # is the honest ledger — cancel_job now pulls back a job the
+            # single-flight worker had already started running, not just a
+            # still-queued one, so "uncancellable" is now the narrower case
+            # of a job that had already reached succeeded/failed before this
+            # compensating cancel could reach it; it is named so the
+            # operator knows a re-run would duplicate it.
             return 500, {
                 "error": "backlog write failed; enqueued jobs were cancelled",
                 "cancelled": cancelled,
@@ -2565,14 +2650,18 @@ class Dispatcher:
                 "cost_usd": record.cost_usd,
             }
         if record.state == "cancelled":
-            # A cancelled job never ran, so record.outcome stays None —
-            # must not fall through to the outcome-dereferencing branches
-            # below.
+            # A cancelled job's outcome stays None (whether it never ran at
+            # all or was interrupted mid-run) — must not fall through to the
+            # outcome-dereferencing branches below. cost_usd is None for a
+            # job cancelled while still queued (never spent anything) and
+            # the real, possibly partial, spend banked before a running job
+            # was interrupted otherwise (see cancel_job / _failed_cost) —
+            # never a hardcoded 0 that would hide genuine spend.
             return 200, {
                 "kind": record.spec.mode,
                 "success": False,
                 "error": "cancelled",
-                "cost_usd": 0,
+                "cost_usd": record.cost_usd if record.cost_usd is not None else 0,
             }
         outcome = record.outcome
         if record.spec.mode == "verify":
