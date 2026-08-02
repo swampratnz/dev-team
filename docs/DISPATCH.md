@@ -827,6 +827,9 @@ always present, defaulting to `0` — never omitted, matching every other
  "overall":{"confirmed":6,"refuted":1,"needs_context":1,
             "total":8,"confirm_rate":0.75,
             "multi_vote_total":2,"unanimous_total":1},
+ "by_repo":{"acme/mono":{"confirmed":6,"refuted":1,"needs_context":1,
+                          "total":8,"confirm_rate":0.75,
+                          "multi_vote_total":2,"unanimous_total":1}},
  "jobs_counted":3,
  "blind_spot_total":5,"broken_citation_total":2,
  "report_quality_jobs_counted":2}
@@ -841,6 +844,19 @@ tolerant parse as `GET /jobs/{id}/verifications`. `jobs_counted` is the
 number of `verifications.jsonl` files that contributed at least one
 parseable line. `409 {"error":"calibration needs a dashboard workspace"}`
 when the service was started without `--dashboard-workspace`.
+
+`by_repo` mirrors `/costs`'s own `by_repo` (below): the same entries are
+additionally grouped by the owning job's `repo` (read off its mirrored
+`meta.json`), and each group is rolled up with the identical
+`calibration_summary()` call that produces `phases`/`overall` — so a
+per-repo bucket is never a hand-picked subset, and its fields (including
+`multi_vote_total`/`unanimous_total`) mean exactly what they mean in
+`overall`. A job with no `meta.json`, a corrupt one, or an empty/missing
+`repo` field groups under `"(unknown)"` rather than being dropped, so
+`by_repo` bucket totals always sum to `overall["total"]`. Archived jobs are
+excluded from `by_repo` exactly as they already are from `overall`/`phases`.
+An empty workspace gives `"by_repo":{}`, matching `phases`' existing
+empty-dict behaviour — never omitted, never `null`.
 
 `blind_spot_total` and `broken_citation_total` fold in the same $0,
 deterministic report-quality signals the dashboard's Reports panel already

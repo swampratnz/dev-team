@@ -1833,6 +1833,18 @@ class Dispatcher:
         number of files that contributed at least one parseable line — a
         pure, $0, disk-only aggregate, like :meth:`make_backlog`.
 
+        ``by_repo`` groups the same entries by the owning job's ``repo``
+        (read off the one ``meta.json`` already fetched for the
+        archived-check above — no extra disk read), defaulting to
+        ``"(unknown)"`` for a missing/corrupt ``meta.json`` or an
+        empty/non-string ``repo``, exactly the sentinel
+        :func:`dev_team.dashboard._calibration_state` already uses. Each
+        bucket is a full :func:`calibration_summary` ``"overall"`` result
+        (not a hand-picked subset), so ``by_repo`` entries can never drift
+        from what ``phases``/``overall`` promise, and — since every entry is
+        assigned to exactly one repo key — ``by_repo`` bucket totals always
+        sum to ``overall["total"]``.
+
         Additionally walks every ``audit/*/assessment.json`` — a separate
         population from the ``verifications.jsonl`` walk above (a freshly
         assessed job may have an ``assessment.json`` with zero verifications
@@ -1849,6 +1861,7 @@ class Dispatcher:
         if self._dashboard_workspace is None:
             return 409, {"error": "calibration needs a dashboard workspace"}
         entries: List[Dict[str, Any]] = []
+        entries_by_repo: Dict[str, List[Dict[str, Any]]] = {}
         jobs_counted = 0
         for path in self._dashboard_workspace.list_files():
             if not path.startswith("audit/") or not path.endswith(
@@ -1856,19 +1869,29 @@ class Dispatcher:
             ):
                 continue
             parts = path.split("/")
-            if len(parts) == 3 and self._is_archived(parts[1]):
+            meta = self._read_meta(parts[1]) if len(parts) == 3 else None
+            if meta and meta.get("archived", False):
                 continue
+            repo = meta.get("repo") if meta else None
+            repo_key = repo if isinstance(repo, str) and repo else "(unknown)"
             contributed = False
             for line in self._dashboard_workspace.read_text(path).splitlines():
                 if not line.strip():
                     continue
                 try:
-                    entries.append(json.loads(line))
+                    entry = json.loads(line)
                 except ValueError:
                     continue
+                entries.append(entry)
+                entries_by_repo.setdefault(repo_key, []).append(entry)
                 contributed = True
             if contributed:
                 jobs_counted += 1
+
+        by_repo = {
+            repo_key: calibration_summary(repo_entries)["overall"]
+            for repo_key, repo_entries in entries_by_repo.items()
+        }
 
         blind_spot_total = 0
         broken_citation_total = 0
@@ -1901,6 +1924,7 @@ class Dispatcher:
 
         return 200, {
             **calibration_summary(entries),
+            "by_repo": by_repo,
             "jobs_counted": jobs_counted,
             "blind_spot_total": blind_spot_total,
             "broken_citation_total": broken_citation_total,
