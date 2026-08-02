@@ -24,9 +24,10 @@ auto-purge).
 from __future__ import annotations
 
 import collections
+import ipaddress
 import threading
 import time
-from typing import Callable, Deque, Dict, Optional
+from typing import Callable, Deque, Dict, Mapping, Optional
 
 #: Failures within this many seconds of each other count toward the same
 #: threshold window.
@@ -39,6 +40,12 @@ DEFAULT_THRESHOLD = 10
 #: How long a tripped source stays locked out once the threshold is reached.
 DEFAULT_LOCKOUT_SECONDS = 60.0
 
+#: Trusted reverse-proxy hop count for :func:`resolve_source_key`. ``0``
+#: disables proxy-aware resolution entirely -- the header is never even
+#: read, and the source key stays the raw TCP peer address, byte-identical
+#: to the behaviour before this feature existed.
+DEFAULT_TRUST_PROXY_DEPTH = 0
+
 #: Distinct source keys tracked at once; mirrors :mod:`dev_team.accesslog`'s
 #: own ``MAX_ACCESS_RECORDS`` bound — "bound the pathological case, don't
 #: try to be perfect" (see issue #214's "Alternatives considered" #210/#212
@@ -46,6 +53,49 @@ DEFAULT_LOCKOUT_SECONDS = 60.0
 #: oldest-inserted key first (a plain ``dict`` preserves insertion order —
 #: no extra structure needed).
 DEFAULT_MAX_TRACKED_SOURCES = 4096
+
+
+def resolve_source_key(
+    client_address_ip: str,
+    headers: Mapping[str, str],
+    trust_proxy_depth: int,
+) -> str:
+    """Resolve the :class:`FailedAuthTracker` key for one request.
+
+    ``trust_proxy_depth`` (``N``) is the standard trusted-hop-count
+    convention also used by Werkzeug's ``ProxyFix(x_for=N)`` and Express's
+    numeric ``trust proxy``: with ``N`` trusted reverse-proxy hops in front
+    of the origin, each hop appends the peer address it saw to the right of
+    ``X-Forwarded-For`` as the request passes through, so the entry ``N``
+    places from the right is the address the outermost trusted hop
+    observed. Safe to enable only when the origin port is unreachable
+    except through those ``N`` trusted hops -- see ``docs/SECURITY.md``.
+
+    ``N <= 0`` (the default) never reads the header at all: the result is
+    always ``client_address_ip``, byte-identical to the pre-existing
+    ``self.client_address[0]`` behaviour. Any other reason resolution can't
+    proceed -- header missing, fewer entries than ``N``, or the selected
+    entry isn't a syntactically valid IP address -- also falls back to
+    ``client_address_ip`` rather than raising. That fallback is safe
+    specifically because it lands on the value that was already the
+    trusted, non-attacker-controlled default before this feature existed,
+    never on attacker-controlled input.
+    """
+
+    if trust_proxy_depth <= 0:
+        return client_address_ip
+    raw = headers.get("X-Forwarded-For", "")
+    if not raw:
+        return client_address_ip
+    entries = [entry.strip() for entry in raw.split(",")]
+    if len(entries) < trust_proxy_depth:
+        return client_address_ip
+    candidate = entries[-trust_proxy_depth]
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return client_address_ip
+    return candidate
 
 
 class FailedAuthTracker:

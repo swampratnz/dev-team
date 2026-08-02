@@ -4077,9 +4077,9 @@ def running(**kwargs):
         thread.join(timeout=5)
 
 
-def _call(server, path, *, method="GET", token=TOKEN, body=None):
+def _call(server, path, *, method="GET", token=TOKEN, body=None, extra_headers=None):
     url = server.url.rstrip("/") + path
-    headers = {}
+    headers = dict(extra_headers or {})
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
     data = None
@@ -6118,6 +6118,94 @@ def test_dispatch_server_threads_auth_guard_kwargs_into_its_dispatcher():
         assert server.dispatcher.auth_guard.threshold == 4
         assert server.dispatcher.auth_guard.window_seconds == 9
         assert server.dispatcher.auth_guard.lockout_seconds == 11
+
+
+# --- opt-in reverse-proxy-aware source keying (issue #306) ------------------
+
+
+def test_dispatcher_defaults_trust_proxy_depth_to_zero():
+    disp = Dispatcher(token="x")
+    assert disp.auth_rate_limit_trust_proxy_depth == 0
+
+
+def test_dispatcher_stores_the_trust_proxy_depth_kwarg():
+    disp = Dispatcher(token="x", auth_rate_limit_trust_proxy_depth=2)
+    assert disp.auth_rate_limit_trust_proxy_depth == 2
+
+
+def test_dispatch_server_threads_trust_proxy_depth_into_its_dispatcher():
+    with running(
+        materialise=_mem_materialise, auth_rate_limit_trust_proxy_depth=3
+    ) as server:
+        assert server.dispatcher.auth_rate_limit_trust_proxy_depth == 3
+
+
+def test_dispatch_server_defaults_trust_proxy_depth_to_zero():
+    with running(materialise=_mem_materialise) as server:
+        assert server.dispatcher.auth_rate_limit_trust_proxy_depth == 0
+
+
+def test_depth_zero_default_ignores_a_spoofed_x_forwarded_for_header():
+    # Criterion 1/7 (security): with the default depth 0, two wrong-token
+    # requests carrying DIFFERENT spoofed X-Forwarded-For values still trip
+    # the SAME lockout bucket — proving the header has zero effect on the
+    # key, exactly as before this feature existed.
+    with running(materialise=_mem_materialise, auth_rate_limit_threshold=1) as server:
+        status1, _ = _call(
+            server, "/jobs", token="wrong",
+            extra_headers={"X-Forwarded-For": "1.1.1.1"},
+        )
+        assert status1 == 401
+        status2, _ = _call(
+            server, "/jobs", token="wrong",
+            extra_headers={"X-Forwarded-For": "2.2.2.2"},
+        )
+        assert status2 == 429  # same bucket as the first request
+
+
+def test_depth_one_call_site_keys_the_lockout_on_the_forwarded_for_entry():
+    # Criterion 6: dispatch.py's call site actually invokes
+    # resolve_source_key rather than a divergent duplicate implementation —
+    # the tracked key is the forwarded IP, not the real socket peer.
+    with running(
+        materialise=_mem_materialise,
+        auth_rate_limit_threshold=1,
+        auth_rate_limit_trust_proxy_depth=1,
+    ) as server:
+        status, _ = _call(
+            server, "/jobs", token="wrong",
+            extra_headers={"X-Forwarded-For": "203.0.113.5"},
+        )
+        assert status == 401
+        guard = server.dispatcher.auth_guard
+        assert guard.is_locked_out("203.0.113.5") is not None
+        assert guard.is_locked_out("127.0.0.1") is None  # never the real peer
+
+
+def test_depth_one_tracks_distinct_forwarded_for_values_as_separate_buckets():
+    # Criterion 2: same socket peer, different single-entry X-Forwarded-For
+    # values are separate throttle buckets — the shared-fate collapse is
+    # fixed for a caller behind one trusted reverse-proxy hop.
+    with running(
+        materialise=_mem_materialise,
+        auth_rate_limit_threshold=1,
+        auth_rate_limit_trust_proxy_depth=1,
+    ) as server:
+        status1, _ = _call(
+            server, "/jobs", token="wrong",
+            extra_headers={"X-Forwarded-For": "1.1.1.1"},
+        )
+        assert status1 == 401
+        status2, _ = _call(
+            server, "/jobs", token="wrong",
+            extra_headers={"X-Forwarded-For": "1.1.1.1"},
+        )
+        assert status2 == 429  # same forwarded IP, now locked out
+        status3, _ = _call(
+            server, "/jobs", token=TOKEN,
+            extra_headers={"X-Forwarded-For": "2.2.2.2"},
+        )
+        assert status3 == 200  # different forwarded IP, unaffected
 
 
 # --- access log job-id correlation (#167) ----------------------------------

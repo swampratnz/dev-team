@@ -1068,7 +1068,9 @@ every caller on its network. This throttle is keyed on source IP
 (`self.client_address[0]`, never the attempted token), which assumes the
 tailnet-only deployment model this service is designed for (see *Deployment*
 below): behind a reverse proxy or shared NAT, every caller collapses to one
-source IP and shares one lockout budget. See
+source IP and shares one lockout budget. `--auth-rate-limit-trust-proxy-
+depth` opts into resolving the key from `X-Forwarded-For` instead — safe
+only when this port isn't directly reachable by untrusted clients. See
 `dev_team.authguard.FailedAuthTracker` and
 [`docs/SECURITY.md`](SECURITY.md)'s *HTTP surface auth* section.
 

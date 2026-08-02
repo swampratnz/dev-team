@@ -1,15 +1,19 @@
-"""Tests for the dispatch/dashboard failed-auth rate limiter (issue #214)."""
+"""Tests for the dispatch/dashboard failed-auth rate limiter (issue #214)
+and its opt-in reverse-proxy-aware source-key resolution (issue #306)."""
 
 from __future__ import annotations
 
 import threading
+from email.message import Message
 
 from dev_team.authguard import (
     DEFAULT_LOCKOUT_SECONDS,
     DEFAULT_MAX_TRACKED_SOURCES,
     DEFAULT_THRESHOLD,
+    DEFAULT_TRUST_PROXY_DEPTH,
     DEFAULT_WINDOW_SECONDS,
     FailedAuthTracker,
+    resolve_source_key,
 )
 
 
@@ -20,11 +24,148 @@ def _fake_clock(start: float = 0.0):
     return box, (lambda: box[0])
 
 
+def _headers(**kwargs):
+    """A case-insensitive header mapping, mirroring ``self.headers`` (an
+    ``http.client.HTTPMessage``, itself an ``email.message.Message``)."""
+
+    msg = Message()
+    for name, value in kwargs.items():
+        msg[name.replace("_", "-")] = value
+    return msg
+
+
 def test_defaults_match_the_documented_values():
     assert DEFAULT_THRESHOLD == 10
     assert DEFAULT_WINDOW_SECONDS == 60.0
     assert DEFAULT_LOCKOUT_SECONDS == 60.0
     assert DEFAULT_MAX_TRACKED_SOURCES == 4096
+    assert DEFAULT_TRUST_PROXY_DEPTH == 0
+
+
+# --- resolve_source_key (issue #306) ----------------------------------------
+# Criteria numbers below reference the tightened acceptance criteria in the
+# adversarial-review verdict comment on issue #306.
+
+
+# --- criterion 1 / 7: depth 0 (default) never reads the header, SECURITY ---
+
+
+def test_depth_zero_ignores_any_x_forwarded_for_header():
+    headers = _headers(x_forwarded_for="203.0.113.5")
+    assert resolve_source_key("9.9.9.9", headers, 0) == "9.9.9.9"
+
+
+def test_depth_zero_is_unaffected_by_a_spoofed_multi_hop_header():
+    # No attacker-controlled header of any shape may influence the key when
+    # depth is 0 — try a handful of adversarial shapes.
+    for spoofed in (
+        "1.2.3.4",
+        "1.2.3.4, 5.6.7.8, 9.10.11.12",
+        "not-an-ip-at-all",
+        "",
+        ", , ,",
+    ):
+        headers = _headers(x_forwarded_for=spoofed)
+        assert resolve_source_key("9.9.9.9", headers, 0) == "9.9.9.9"
+
+
+def test_negative_depth_also_never_reads_the_header():
+    headers = _headers(x_forwarded_for="203.0.113.5")
+    assert resolve_source_key("9.9.9.9", headers, -1) == "9.9.9.9"
+
+
+def test_missing_header_at_depth_zero_falls_back_too():
+    assert resolve_source_key("9.9.9.9", _headers(), 0) == "9.9.9.9"
+
+
+# --- criterion 2: depth=1, single-entry header ------------------------------
+
+
+def test_depth_one_resolves_to_the_single_entry():
+    headers = _headers(x_forwarded_for="203.0.113.5")
+    assert resolve_source_key("9.9.9.9", headers, 1) == "203.0.113.5"
+
+
+def test_depth_one_tracks_distinct_forwarded_for_values_as_separate_buckets():
+    # Proves the shared-fate collapse is fixed: same socket peer, different
+    # single-entry X-Forwarded-For values resolve to different keys.
+    same_peer = "10.0.0.1"
+    key_a = resolve_source_key(
+        same_peer, _headers(x_forwarded_for="203.0.113.5"), 1
+    )
+    key_b = resolve_source_key(
+        same_peer, _headers(x_forwarded_for="198.51.100.9"), 1
+    )
+    assert key_a == "203.0.113.5"
+    assert key_b == "198.51.100.9"
+    assert key_a != key_b
+
+
+# --- criterion 3: depth=2, two-entry header ---------------------------------
+
+
+def test_depth_two_resolves_to_the_entry_left_of_the_two_discarded_hops():
+    headers = _headers(x_forwarded_for="203.0.113.5, 198.51.100.7")
+    assert resolve_source_key("9.9.9.9", headers, 2) == "203.0.113.5"
+
+
+def test_depth_two_with_a_longer_chain_keeps_the_untrusted_prefix_intact():
+    # 3 entries, depth 2: the rightmost 2 are the trusted hops; the entry
+    # immediately to their left is the resolved key (still just one hop
+    # in from the presumed-untrusted edge, same as the depth=2 example).
+    headers = _headers(x_forwarded_for="192.0.2.1, 203.0.113.5, 198.51.100.7")
+    assert resolve_source_key("9.9.9.9", headers, 2) == "203.0.113.5"
+
+
+# --- criterion 4: missing / malformed / short header falls back ------------
+
+
+def test_missing_header_falls_back_to_client_address():
+    assert resolve_source_key("9.9.9.9", _headers(), 1) == "9.9.9.9"
+
+
+def test_empty_header_falls_back_to_client_address():
+    assert resolve_source_key("9.9.9.9", _headers(x_forwarded_for=""), 1) == "9.9.9.9"
+
+
+def test_fewer_entries_than_depth_falls_back():
+    headers = _headers(x_forwarded_for="203.0.113.5")
+    assert resolve_source_key("9.9.9.9", headers, 2) == "9.9.9.9"
+
+
+def test_non_ip_token_falls_back_to_client_address():
+    headers = _headers(x_forwarded_for="not-an-ip")
+    assert resolve_source_key("9.9.9.9", headers, 1) == "9.9.9.9"
+
+
+def test_empty_entry_between_commas_falls_back_to_client_address():
+    headers = _headers(x_forwarded_for="203.0.113.5, ")
+    # depth=1 selects the trailing (empty) entry, not the valid one.
+    assert resolve_source_key("9.9.9.9", headers, 1) == "9.9.9.9"
+
+
+def test_malformed_header_never_raises():
+    for raw in ("not, an, ip, list", "::::", "1.2.3.4.5.6"):
+        headers = _headers(x_forwarded_for=raw)
+        # Must not raise for any depth — always resolves to something.
+        assert resolve_source_key("9.9.9.9", headers, 1) is not None
+
+
+# --- header lookup is case-insensitive, like the real self.headers ---------
+
+
+def test_header_lookup_is_case_insensitive():
+    msg = Message()
+    msg["x-forwarded-for"] = "203.0.113.5"
+    assert resolve_source_key("9.9.9.9", msg, 1) == "203.0.113.5"
+
+
+# --- IPv6 entries are valid too ---------------------------------------------
+
+
+def test_ipv6_entry_is_accepted():
+    headers = _headers(x_forwarded_for="2001:db8::1")
+    assert resolve_source_key("9.9.9.9", headers, 1) == "2001:db8::1"
 
 
 # --- criterion 1: below threshold, no lockout (regression) -----------------

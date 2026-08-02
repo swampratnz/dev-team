@@ -2914,7 +2914,8 @@ class _FakeDashboardServer:
     def __init__(self, workspace, *, host, port, token=None,
                  dispatch_url=None, dispatch_token=None, secure=False,
                  auth_rate_limit_threshold=None, auth_rate_limit_window_seconds=None,
-                 auth_rate_limit_lockout_seconds=None, auth_guard=None):
+                 auth_rate_limit_lockout_seconds=None, auth_guard=None,
+                 auth_rate_limit_trust_proxy_depth=None):
         self.workspace, self.host, self.port = workspace, host, port
         self.token = token
         self.dispatch_url = dispatch_url
@@ -2924,6 +2925,7 @@ class _FakeDashboardServer:
         self.auth_rate_limit_window_seconds = auth_rate_limit_window_seconds
         self.auth_rate_limit_lockout_seconds = auth_rate_limit_lockout_seconds
         self.auth_guard = auth_guard
+        self.auth_rate_limit_trust_proxy_depth = auth_rate_limit_trust_proxy_depth
         self.interrupted = False
         self.shut_down = False
         _FakeDashboardServer.instances.append(self)
@@ -2967,13 +2969,15 @@ def test_main_dashboard_defaults_and_ctrl_c(tmp_path, monkeypatch):
                           dispatch_url=None, dispatch_token=None, secure=False,
                           auth_rate_limit_threshold=None,
                           auth_rate_limit_window_seconds=None,
-                          auth_rate_limit_lockout_seconds=None):
+                          auth_rate_limit_lockout_seconds=None,
+                          auth_rate_limit_trust_proxy_depth=None):
         original_init(self, workspace, host=host, port=port, token=token,
                       dispatch_url=dispatch_url, dispatch_token=dispatch_token,
                       secure=secure,
                       auth_rate_limit_threshold=auth_rate_limit_threshold,
                       auth_rate_limit_window_seconds=auth_rate_limit_window_seconds,
-                      auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds)
+                      auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds,
+                      auth_rate_limit_trust_proxy_depth=auth_rate_limit_trust_proxy_depth)
         self.interrupted = True
 
     monkeypatch.setattr(_FakeDashboardServer, "__init__", interrupting_init)
@@ -3212,7 +3216,8 @@ class _FakeDispatchServer:
     def __init__(self, token, *, host, port, runner=None, dashboard_workspace=None,
                  record_transcripts=False, oauth=None, max_workers=1, sandbox=None,
                  purge_ttl_days=None, auth_rate_limit_threshold=None,
-                 auth_rate_limit_window_seconds=None, auth_rate_limit_lockout_seconds=None):
+                 auth_rate_limit_window_seconds=None, auth_rate_limit_lockout_seconds=None,
+                 auth_rate_limit_trust_proxy_depth=None):
         self.token, self.host, self.port, self.runner = token, host, port, runner
         self.dashboard_workspace = dashboard_workspace
         self.record_transcripts = record_transcripts
@@ -3223,6 +3228,7 @@ class _FakeDispatchServer:
         self.auth_rate_limit_threshold = auth_rate_limit_threshold
         self.auth_rate_limit_window_seconds = auth_rate_limit_window_seconds
         self.auth_rate_limit_lockout_seconds = auth_rate_limit_lockout_seconds
+        self.auth_rate_limit_trust_proxy_depth = auth_rate_limit_trust_proxy_depth
         self.interrupted = False
         self.shut_down = False
         _FakeDispatchServer.instances.append(self)
@@ -3268,7 +3274,8 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
                           oauth=None, max_workers=1, sandbox=None,
                           purge_ttl_days=None, auth_rate_limit_threshold=None,
                           auth_rate_limit_window_seconds=None,
-                          auth_rate_limit_lockout_seconds=None):
+                          auth_rate_limit_lockout_seconds=None,
+                          auth_rate_limit_trust_proxy_depth=None):
         original_init(self, token, host=host, port=port, runner=runner,
                       dashboard_workspace=dashboard_workspace,
                       record_transcripts=record_transcripts, oauth=oauth,
@@ -3276,7 +3283,8 @@ def test_main_dispatch_defaults_and_ctrl_c(monkeypatch):
                       purge_ttl_days=purge_ttl_days,
                       auth_rate_limit_threshold=auth_rate_limit_threshold,
                       auth_rate_limit_window_seconds=auth_rate_limit_window_seconds,
-                      auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds)
+                      auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds,
+                      auth_rate_limit_trust_proxy_depth=auth_rate_limit_trust_proxy_depth)
         self.interrupted = True
 
     monkeypatch.setattr(_FakeDispatchServer, "__init__", interrupting_init)
@@ -3434,6 +3442,7 @@ def test_main_dispatch_rejects_negative_auth_rate_limit_flags(monkeypatch, capsy
         "--auth-rate-limit-threshold",
         "--auth-rate-limit-window-seconds",
         "--auth-rate-limit-lockout-seconds",
+        "--auth-rate-limit-trust-proxy-depth",
     ):
         code = main(["--dispatch", flag, "-1"], runner=ScriptedRunner([]))
         assert code == 2
@@ -3445,6 +3454,7 @@ def test_main_dashboard_rejects_negative_auth_rate_limit_flags(tmp_path, capsys)
         "--auth-rate-limit-threshold",
         "--auth-rate-limit-window-seconds",
         "--auth-rate-limit-lockout-seconds",
+        "--auth-rate-limit-trust-proxy-depth",
     ):
         code = main(
             ["--dashboard", "--workspace", str(tmp_path), flag, "-1"],
@@ -3464,6 +3474,7 @@ def test_main_dispatch_auth_rate_limit_flags_default(monkeypatch):
     assert server.auth_rate_limit_threshold == 10
     assert server.auth_rate_limit_window_seconds == 60
     assert server.auth_rate_limit_lockout_seconds == 60
+    assert server.auth_rate_limit_trust_proxy_depth == 0
 
 
 def test_main_dispatch_auth_rate_limit_flags_are_wired(monkeypatch):
@@ -3476,6 +3487,7 @@ def test_main_dispatch_auth_rate_limit_flags_are_wired(monkeypatch):
             "--auth-rate-limit-threshold", "0",
             "--auth-rate-limit-window-seconds", "30",
             "--auth-rate-limit-lockout-seconds", "45",
+            "--auth-rate-limit-trust-proxy-depth", "2",
         ],
         runner=ScriptedRunner([]),
     )
@@ -3484,6 +3496,20 @@ def test_main_dispatch_auth_rate_limit_flags_are_wired(monkeypatch):
     assert server.auth_rate_limit_threshold == 0  # the documented opt-out
     assert server.auth_rate_limit_window_seconds == 30
     assert server.auth_rate_limit_lockout_seconds == 45
+    assert server.auth_rate_limit_trust_proxy_depth == 2
+
+
+def test_main_dispatch_auth_rate_limit_trust_proxy_depth_help_states_precondition():
+    # Acceptance criterion 8 (#306): the flag's --help text must state,
+    # explicitly, that it is safe only when the origin port is not directly
+    # reachable by untrusted clients.
+    parser = build_parser()
+    action = next(
+        a for a in parser._actions
+        if a.dest == "auth_rate_limit_trust_proxy_depth"
+    )
+    assert "directly reachable" in action.help
+    assert "SAFE TO ENABLE ONLY" in action.help
 
 
 def test_main_dashboard_auth_rate_limit_flags_default(tmp_path, monkeypatch):
@@ -3495,6 +3521,7 @@ def test_main_dashboard_auth_rate_limit_flags_default(tmp_path, monkeypatch):
     assert server.auth_rate_limit_threshold == 10
     assert server.auth_rate_limit_window_seconds == 60
     assert server.auth_rate_limit_lockout_seconds == 60
+    assert server.auth_rate_limit_trust_proxy_depth == 0
 
 
 def test_main_dashboard_auth_rate_limit_flags_are_wired(tmp_path, monkeypatch):
@@ -3506,6 +3533,7 @@ def test_main_dashboard_auth_rate_limit_flags_are_wired(tmp_path, monkeypatch):
             "--auth-rate-limit-threshold", "0",
             "--auth-rate-limit-window-seconds", "30",
             "--auth-rate-limit-lockout-seconds", "45",
+            "--auth-rate-limit-trust-proxy-depth", "1",
         ],
         runner=None,
     )
@@ -3514,6 +3542,7 @@ def test_main_dashboard_auth_rate_limit_flags_are_wired(tmp_path, monkeypatch):
     assert server.auth_rate_limit_threshold == 0
     assert server.auth_rate_limit_window_seconds == 30
     assert server.auth_rate_limit_lockout_seconds == 45
+    assert server.auth_rate_limit_trust_proxy_depth == 1
 
 
 def test_main_dispatch_sandbox_is_wired(monkeypatch):

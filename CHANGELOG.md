@@ -54,6 +54,24 @@ sections below are reconstructed from the repository history.
   other filter on this route.
 
 ### Security
+- **Opt-in `--auth-rate-limit-trust-proxy-depth` fixes the auth-throttle
+  shared-fate risk `docs/SECURITY.md` named for reverse-proxy/shared-NAT
+  deployments** (#306): `dispatch.py` and `dashboard.py` both keyed the
+  `FailedAuthTracker` lockout on the bare `self.client_address[0]` TCP peer
+  address — behind a reverse proxy every caller collapses to one source IP
+  and shares one lockout budget. A new shared
+  `dev_team.authguard.resolve_source_key(client_address_ip, headers,
+  trust_proxy_depth)` resolves the lockout key from `X-Forwarded-For` when
+  `trust_proxy_depth > 0` (the standard trusted-hop-count convention also
+  used by Werkzeug's `ProxyFix(x_for=N)` and Express's numeric `trust
+  proxy`), falling back to the raw TCP peer address — never raising — on a
+  missing, too-short, or malformed header. Default (`0`) never reads the
+  header: byte-identical to the prior behaviour. Safe to enable only when
+  the origin port is not directly reachable by untrusted clients — stated
+  in both `docs/SECURITY.md` and the flag's `--help` text, since a
+  mismatched depth on a directly-reachable origin lets an attacker forge
+  extra hops to defeat the throttle entirely. A negative value is a startup
+  `DevTeamError`, consistent with the existing `--auth-rate-limit-*` flags.
 - **Opt-in `--sandbox-userns` for per-job UID/GID separation** (#246):
   `SandboxConfig` gains `user_namespace`, wired to a new `--sandbox-userns`
   CLI flag (only valid with `--sandbox`, mirroring `--sandbox-network`).
