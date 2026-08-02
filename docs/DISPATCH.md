@@ -264,13 +264,15 @@ follow-up, not yet done.
 - **failed**: `{"kind":<mode>,"success":false,"error":str,"cost_usd":num}` —
   the real (possibly partial) spend banked before the failure; `0` only when
   the job failed before any budget existed (e.g. a clone failure).
-- **cancelled**: `{"kind":<mode>,"success":false,"error":"cancelled","cost_usd":0}`.
+- **cancelled**: `{"kind":<mode>,"success":false,"error":"cancelled","cost_usd":num}`
+  — `0` for a job cancelled while still `queued` (it never spent anything);
+  the real, possibly partial, spend already banked for a job cancelled while
+  `running` (see *Cancel* below).
 - still **queued/running**: `409 {"error":"not finished","state":<state>}`.
 - unknown id → `404`.
 
 State machine: `queued → running → succeeded | failed`, plus `queued →
-cancelled` (see *Cancel* below) — `cancelled` is reachable only from
-`queued`, never from `running`.
+cancelled` and `running → cancelled` (see *Cancel* below).
 
 **Restart survival:** same registry-miss fallback as `GET /jobs/{id}` above
 — a succeeded assess job's result is rendered from `assessment.json` (plus
@@ -310,48 +312,76 @@ assess once, generate the backlog any time.
 
 ## Cancel
 
-The box has exactly one worker, so a mis-submitted or no-longer-wanted job
-sitting in `queued` has no way out except waiting for it to run anyway or
-restarting the whole service (which drops the entire in-memory queue,
-including every other legitimately queued job). Cancel is the missing rung
-on the job lifecycle: a one-way `queued → cancelled` transition, mirroring
-the archive/unarchive precedent's shape (in-memory mutation guarded by the
-existing lock, not a new store).
+The box has exactly one worker, so a mis-submitted or no-longer-wanted job —
+`queued` **or already `running`** (a wrong repo, a runaway budget flag, an
+agent session hung on a network call) — otherwise has no way out except
+waiting it out or restarting the whole service (which drops the entire
+in-memory queue, including every other legitimately queued job). Cancel is
+the missing rung on the job lifecycle: `queued → cancelled` and
+`running → cancelled` are both one-way transitions, in-memory and guarded by
+the existing lock, no new store.
+
+Cancelling a `running` job was originally scoped out (issue #39) as "a
+materially different and harder problem" than cancelling a `queued` one. It
+turned out not to be: the wall-clock job-timeout path already proves that an
+`asyncio.CancelledError` unwinds cleanly through the whole `run_job` → engine
+→ SDK stack (the timeout cancels the in-flight task and the worker survives
+to serve the next job) — cancel just triggers that same unwind manually,
+cross-thread, instead of by a clock.
 
 ### `POST /jobs/{id}/cancel` (auth, no body)
 
 → `200 {"id":"assess-…","state":"cancelled"}`. Errors:
 
 - `404 {"error":"unknown job"}` — no such job id.
-- `409 {"error":"job is not queued","state":<state>}` — the job is
-  `running` (an in-flight clone/agent session is out of scope for this
-  lighter-weight lifecycle op, same boundary `archive_job` draws) or
-  already terminal (`succeeded`/`failed`/`cancelled`). **Not idempotent**:
-  cancelling an already-cancelled job is a `409`, matching every other
-  one-way state-machine transition in this file — only archive/unarchive
-  is idempotent, because it flips a boolean flag rather than progressing a
+- `409 {"error":"job is not cancellable","state":<state>}` — the job is
+  already terminal (`succeeded`/`failed`/`cancelled`), the same boundary
+  `archive_job` draws via `_job_running`. **Not idempotent**: cancelling an
+  already-cancelled job is a `409`, matching every other one-way
+  state-machine transition in this file — only archive/unarchive is
+  idempotent, because it flips a boolean flag rather than progressing a
   state machine.
 - `401` — as everywhere.
 
-A cancelled job never reaches `run_job`: no clone, no workspace, no disk
-I/O, no agent/LLM call, $0 cost. `GET /jobs/{id}/result` on a cancelled job
-returns `200 {"kind":<mode>,"success":false,"error":"cancelled","cost_usd":0}`
-rather than the `409 not finished` a genuinely pending job gets. Cancelling
-also frees the queue-cap slot the job was holding (`GET /jobs` and the
+A job cancelled while still `queued` never reaches `run_job`: no clone, no
+workspace, no disk I/O, no agent/LLM call, $0 cost. A job cancelled while
+`running` is asked to stop via `loop.call_soon_threadsafe(task.cancel)` — the
+HTTP handler thread and the worker's own event loop are different threads,
+and `asyncio.Task.cancel()` is not thread-safe, so the request always crosses
+threads this way. The registry write (state, `ended`, and the real, possibly
+partial, spend already banked) happens synchronously in the same call, not
+after the task actually finishes unwinding: like the existing timeout path,
+stopping the awaiting coroutine does not, by itself, guarantee an
+already-spawned OS subprocess (a `git clone`, a sandboxed container run) is
+killed — best-effort subprocess/container termination is a possible growth
+step, not part of this slice. `GET /jobs/{id}/result` on a cancelled job
+returns `200 {"kind":<mode>,"success":false,"error":"cancelled","cost_usd":num}`
+(`0` if it never ran; the banked spend otherwise) rather than the
+`409 not finished` a genuinely pending job gets. Cancelling also frees the
+queue-cap slot a still-`queued` job was holding (`GET /jobs` and the
 `POST /jobs` cap only count jobs still `state: "queued"`).
 
 `GET /jobs` lists a cancelled job like any other — it is not auto-archived,
-so the record of *why* the queue was shorter stays visible. However, a
-cancelled job is cancelled before `run_job` (and therefore the meta.json
-mirror) ever runs, so `POST /jobs/{id}/archive` on a cancelled job still
-`404`s with `{"error":"no assessment for that job"}` — the same pre-existing
-limitation `archive_job` already has for every `deliver` job today, not
-something cancel changes.
+so the record of *why* the queue was shorter stays visible. However, a job
+cancelled while `queued` never reaches `run_job` (and therefore the
+meta.json mirror) at all, and a job cancelled while `running` may have been
+stopped before `run_job` got that far either, so `POST /jobs/{id}/archive`
+on a cancelled job still commonly `404`s with
+`{"error":"no assessment for that job"}` — the same pre-existing limitation
+`archive_job` already has for every `deliver` job today, not something
+cancel changes.
 
-**Concurrency**: `cancel_job` shares the same lock as the worker's
-`queued → running` transition, so the two are mutually exclusive —
-whichever call wins a race decides the outcome deterministically. A job can
-never end up both running and marked cancelled.
+**Concurrency**: `cancel_job` shares `self._lock` with every one of
+`_execute`'s state transitions — the `queued → running` flip, the
+`running → succeeded` write, and the `running → failed` write — so all of
+these are mutually exclusive: whichever call wins a race decides the outcome
+deterministically. A job already written `succeeded`/`failed` under the lock
+is never overwritten by a cancel that arrives just after (it 409s instead,
+seeing the terminal state); a job already written `cancelled` under the lock
+is never overwritten by a completion or failure that lands just after
+(`_execute` recognises its own already-`cancelled` record and leaves it
+alone). A job can never end up both genuinely completed and marked
+cancelled.
 
 ## Interactive deliver
 
@@ -863,9 +893,12 @@ totals exactly as they already are from the verdict rollup.
 A pure, $0, in-memory aggregate over every job's `cost_usd` — the registry,
 not disk, is the source of truth here: unlike verdicts, `deliver` job cost is
 never mirrored to disk, so a disk walk (as `/calibration` does) would
-silently under-report. Only `succeeded` and `failed` jobs have a non-`null`
-`cost_usd` (`queued`/`running` never set it; a cancelled job never touches
-it) — those are the only ones counted:
+silently under-report. `succeeded` and `failed` jobs always have a
+non-`null` `cost_usd` (`queued`/`running` never set it); a `cancelled` job
+has one only if it was cancelled while `running` (the real, possibly
+partial, spend already banked — see *Cancel* above) — cancelling a
+still-`queued` job never touches it, since it never spent anything. Every
+non-`null` `cost_usd` is real spend and is counted:
 
 ```json
 {"total_usd":12.34,"by_mode":{"assess":8.0,"deliver":3.34,"verify":1.0},
@@ -905,7 +938,7 @@ the same backlog write lock every other backlog mutation uses:
 | job succeeded **and** the delivery reports `success` | `done` |
 | job succeeded but delivered nothing (tasks failed / commit blocked) | `blocked` |
 | job failed or timed out | `blocked` |
-| job cancelled while still queued | back to `todo`, `delivery_job` cleared |
+| job cancelled (queued or running) | back to `todo`, `delivery_job` cleared |
 
 One story gets exactly **one** autonomous attempt: `blocked` stories are
 never re-selected — they wait for a human, the `needs-human` posture. The
@@ -955,10 +988,13 @@ backlog lock, so two concurrent runs can never enqueue the same story twice;
 a full queue stops the batch and every story of the batch that never got its
 submit is reported in `skipped` as `queue full`, never silently omitted.
 If the post-submit backlog save fails, the run **compensates instead of
-double-spending**: the just-enqueued jobs are cancelled (a cancelled job
-never runs or spends) and the answer is a `500` naming what was cancelled —
-plus, in the `uncancellable` list, any job the single-flight worker had
-already started, so the operator knows a blind re-run would duplicate it.
+double-spending**: the just-enqueued jobs are cancelled — whether still
+`queued` or already picked up and `running` by the single-flight worker,
+cancel now reaches both — and the answer is a `500` naming what was
+cancelled, plus, in the `uncancellable` list, any job that had already
+reached a terminal state (`succeeded`/`failed`) before the compensating
+cancel could reach it, so the operator knows a blind re-run would duplicate
+it.
 Answers `202` with the enqueued jobs (or `200` when nothing was ready):
 
 ```json

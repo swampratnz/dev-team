@@ -26,6 +26,28 @@ sections below are reconstructed from the repository history.
   external service credential, out of scope per the standing guardrail).
 
 ### Dispatch
+- **`POST /jobs/{id}/cancel` now reaches a `running` job, not just `queued`**
+  (`docs/DISPATCH.md`): issue #39 originally scoped cancel to `queued` only,
+  explicitly deferring `running` as "a materially different and harder
+  problem." It wasn't one — the wall-clock job-timeout path already proves an
+  `asyncio.CancelledError` unwinds cleanly through the whole `run_job` →
+  engine → SDK stack, so this triggers that same unwind manually,
+  cross-thread (`loop.call_soon_threadsafe(task.cancel)`, since the HTTP
+  handler thread and the worker's own event loop differ and
+  `asyncio.Task.cancel()` is not thread-safe), instead of by a clock. The
+  409 boundary narrows to genuinely terminal states
+  (`succeeded`/`failed`/`cancelled`) — the error becomes `"job is not
+  cancellable"`. `cancel_job` and `_execute`'s terminal writes share
+  `self._lock`, so a cancel racing a legitimate completion never overwrites
+  either side: whichever lands under the lock first wins. `GET
+  /jobs/{id}/result` on a cancelled job now reports the real, possibly
+  partial, spend banked before an in-flight job was interrupted (previously
+  a hardcoded `0`, still correct for the `queued` case) — `GET /costs` picks
+  that up too. Cancelling a `running` foreman-enqueued job writes its story
+  back to `todo` exactly like the existing `queued`-cancel path. Known,
+  accepted limitation carried over unchanged from the timeout path: stopping
+  the awaiting coroutine does not by itself guarantee an already-spawned OS
+  subprocess (a clone, a sandboxed container run) is killed.
 - **On-demand bulk purge** (`docs/DISPATCH.md`): `GET`/`POST
   /jobs/purge?archived_before=<epoch-seconds>` — the still-deferred second
   half of the purge "Natural growth" note, now that the single-job

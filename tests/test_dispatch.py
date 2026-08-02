@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -2636,7 +2637,11 @@ def test_cancel_unknown_job_is_404():
     assert disp.cancel_job("ghost") == (404, {"error": "unknown job"})
 
 
-def test_cancel_a_running_job_is_409():
+def test_cancel_a_running_job_transitions_it_to_cancelled_immediately():
+    # AC1: POST /jobs/{id}/cancel on a state == "running" job now transitions
+    # it to state == "cancelled" and returns 200 (not 409) — the registry
+    # write happens synchronously in cancel_job itself, before the task
+    # actually finishes unwinding (materialise is still blocked below).
     first_in = threading.Event()
     release = threading.Event()
 
@@ -2652,11 +2657,114 @@ def test_cancel_a_running_job_is_409():
             disp.build_spec({"mode": "assess", "repo": "a/one"}))
         assert first_in.wait(5)
         assert disp.cancel_job(running_id) == (
-            409, {"error": "job is not queued", "state": "running"})
+            200, {"id": running_id, "state": "cancelled"})
+        assert disp.get(running_id).state == "cancelled"
     finally:
         release.set()
         disp.wait(running_id, 5)
         disp.stop()
+    # The requested cross-thread cancellation actually landed once
+    # materialise unblocked and the task reached its next await point: the
+    # job's final state is still "cancelled", never overwritten back to
+    # "succeeded" by the run that was already in flight.
+    assert disp.get(running_id).state == "cancelled"
+
+
+def test_cancel_a_running_job_is_cancelled_via_cross_thread_task_cancellation():
+    # AC2: a stub job blocked on an asyncio.Event that never resolves on its
+    # own is cancelled mid-run; the job reaches "cancelled" in bounded time
+    # instead of running to the worker's _job_timeout ceiling (set generously
+    # high here so only a real cancel — never a timeout — could explain a
+    # quick, successful disp.wait()).
+    started = threading.Event()
+    block = asyncio.Event()
+
+    async def hang_on_await(record):
+        started.set()
+        await block.wait()  # never set — only task.cancel() ends this
+
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=_mem_materialise,
+        job_timeout=30.0,
+    )
+    disp.run_job = hang_on_await
+    disp.start()
+    try:
+        running_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert started.wait(5)
+        assert disp.cancel_job(running_id) == (
+            200, {"id": running_id, "state": "cancelled"})
+        assert disp.wait(running_id, 5) is True
+        record = disp.get(running_id)
+        assert record.state == "cancelled"
+        assert record.cost_usd == 0.0  # no budget was ever created for it
+
+        # The worker survived the cancellation (AC8): restore the real
+        # run_job and prove the next job still runs to completion. By the
+        # time this next job succeeds, the single-flight worker must have
+        # already fully unwound (and cleaned up self._tasks for) the
+        # cancelled one — _worker_loop only pops the next job after
+        # run_until_complete returns for the current one.
+        del disp.run_job
+        next_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "acme/mono"}))
+        assert disp.wait(next_id, 5) is True
+        assert disp.get(next_id).state == "succeeded"
+        assert running_id not in disp._tasks
+        assert next_id not in disp._tasks
+    finally:
+        disp.stop()
+
+
+def test_cancel_job_race_does_not_get_overwritten_by_a_late_success():
+    # AC5: if cancel_job wins the lock while a job is genuinely mid-flight,
+    # a result that lands afterward must not resurrect the job back to
+    # "succeeded" — the terminal "cancelled" state, once written under the
+    # lock, is final. Deterministic (no real thread timing to race): run_job
+    # itself calls cancel_job partway through, simulating cancel_job winning
+    # the lock before run_job's own success lands.
+    disp = Dispatcher(token="x", clock=lambda: 9.0)
+    spec = disp.build_spec({"mode": "assess", "repo": "a/one"})
+    spec.id = "assess-race-success"
+    record = JobRecord(spec=spec)
+    disp._registry[spec.id] = record
+    disp._events[spec.id] = threading.Event()
+
+    async def fake_run_job(rec):
+        status, payload = disp.cancel_job(spec.id)
+        assert (status, payload) == (200, {"id": spec.id, "state": "cancelled"})
+        return SimpleNamespace(success=True), 1.25
+
+    disp.run_job = fake_run_job
+    asyncio.run(disp._execute(spec.id))
+
+    assert record.state == "cancelled"
+    assert record.outcome is None  # the late "succeeded" write never landed
+    assert spec.id not in disp._tasks
+
+
+def test_cancel_job_race_does_not_get_overwritten_by_a_late_failure():
+    # Same guard as above, but for the except-Exception branch: a job that
+    # fails on its own after cancel_job already won the race must stay
+    # "cancelled", not get overwritten to "failed".
+    disp = Dispatcher(token="x", clock=lambda: 9.0)
+    spec = disp.build_spec({"mode": "assess", "repo": "a/one"})
+    spec.id = "assess-race-failure"
+    record = JobRecord(spec=spec)
+    disp._registry[spec.id] = record
+    disp._events[spec.id] = threading.Event()
+
+    async def fake_run_job(rec):
+        status, payload = disp.cancel_job(spec.id)
+        assert (status, payload) == (200, {"id": spec.id, "state": "cancelled"})
+        raise RuntimeError("boom after cancel")
+
+    disp.run_job = fake_run_job
+    asyncio.run(disp._execute(spec.id))
+
+    assert record.state == "cancelled"
+    assert record.error is None  # the late "failed" write never landed
+    assert spec.id not in disp._tasks
 
 
 def test_cancel_an_already_terminal_job_is_409_per_state():
@@ -2671,7 +2779,7 @@ def test_cancel_an_already_terminal_job_is_409_per_state():
         disp.wait(succeeded_id, 5)
         assert disp.get(succeeded_id).state == "succeeded"
         assert disp.cancel_job(succeeded_id) == (
-            409, {"error": "job is not queued", "state": "succeeded"})
+            409, {"error": "job is not cancellable", "state": "succeeded"})
     finally:
         disp.stop()
 
@@ -2683,7 +2791,7 @@ def test_cancel_an_already_terminal_job_is_409_per_state():
         disp.wait(failed_id, 5)
         assert disp.get(failed_id).state == "failed"
         assert disp.cancel_job(failed_id) == (
-            409, {"error": "job is not queued", "state": "failed"})
+            409, {"error": "job is not cancellable", "state": "failed"})
     finally:
         disp.stop()
 
@@ -2691,7 +2799,7 @@ def test_cancel_an_already_terminal_job_is_409_per_state():
     cancelled_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/three"}))
     disp.cancel_job(cancelled_id)
     assert disp.cancel_job(cancelled_id) == (
-        409, {"error": "job is not queued", "state": "cancelled"})
+        409, {"error": "job is not cancellable", "state": "cancelled"})
 
 
 def test_cancelled_job_is_never_executed():
@@ -2728,11 +2836,15 @@ def test_cancelled_job_is_never_executed():
 
 
 def test_cancel_running_race_is_deterministic_and_consistent():
-    """AC11: cancel_job() and _execute()'s queued->running flip share
-    self._lock, so whichever wins a race resolves to exactly one outcome —
-    either the job never ran (materialise never called, state stays
-    "cancelled"), or cancel is refused with 409 because the job is already
-    past "queued" — never both, never neither.
+    """cancel_job() and _execute()'s queued->running flip share self._lock,
+    so whichever wins a race resolves to exactly one outcome. Now that a
+    "running" job is cancellable too (not just "queued"), losing the
+    queued->running race no longer means a 409 for cancel_job — it still
+    succeeds and interrupts the job either way. The only way to see a 409
+    here is job 2 racing all the way through to a genuine success before
+    cancel_job's lock lands — vanishingly unlikely given job 2's assess run
+    still has to clear multiple further awaits, but asserted as a fallback
+    for CI determinism rather than assumed away.
     """
 
     calls = []
@@ -2761,11 +2873,10 @@ def test_cancel_running_race_is_deterministic_and_consistent():
         if status == 200:
             assert payload == {"id": queued_id, "state": "cancelled"}
             assert record.state == "cancelled"
-            assert queued_id not in calls
         else:
             assert status == 409
-            assert payload["error"] == "job is not queued"
-            assert record.state in ("running", "succeeded")
+            assert payload["error"] == "job is not cancellable"
+            assert record.state == "succeeded"
     finally:
         disp.wait(running_id, 5)
         disp.stop()
@@ -2785,6 +2896,51 @@ def test_cancel_result_and_status_shape():
         200,
         {"kind": "assess", "success": False, "error": "cancelled", "cost_usd": 0},
     )
+
+
+def test_cancel_a_running_job_reports_partial_spend_not_a_hardcoded_zero():
+    # A job cancelled while queued never spent anything (cost_usd stays the
+    # hardcoded 0 in /result, None in /status, unchanged from before this
+    # feature). A job cancelled while running may have already banked real
+    # spend on its budget — /result and /costs must report that, not a
+    # hardcoded 0 that would hide genuine spend.
+    disp = Dispatcher(token="x", clock=lambda: 9.0)
+    spec = disp.build_spec({"mode": "assess", "repo": "a/one"})
+    spec.id = "assess-partial-spend"
+    record = JobRecord(spec=spec)
+    disp._registry[spec.id] = record
+    disp._events[spec.id] = threading.Event()
+
+    async def spend_then_hang(rec):
+        budget = Budget()
+        rec.budget = budget
+        budget.record("architect", AgentResult(text="", cost_usd=0.42, num_turns=1))
+        await asyncio.Event().wait()  # never resolves on its own
+
+    disp.run_job = spend_then_hang
+    task_holder = {}
+
+    async def drive():
+        task = asyncio.ensure_future(disp._execute(spec.id))
+        task_holder["task"] = task
+        await asyncio.sleep(0)  # let _execute register in disp._tasks
+        status, payload = disp.cancel_job(spec.id)
+        assert (status, payload) == (200, {"id": spec.id, "state": "cancelled"})
+        await task
+
+    asyncio.run(drive())
+
+    assert record.state == "cancelled"
+    assert record.cost_usd == 0.42
+    status_payload = disp.status(record)
+    assert status_payload["cost_usd"] == 0.42
+    assert disp.result(record) == (
+        200,
+        {"kind": "assess", "success": False, "error": "cancelled", "cost_usd": 0.42},
+    )
+    assert disp.costs() == (
+        200, {"total_usd": 0.42, "by_mode": {"assess": 0.42},
+              "by_repo": {"a/one": 0.42}, "jobs_counted": 1})
 
 
 def test_cancelled_job_is_listed_but_not_archivable():
@@ -3165,13 +3321,15 @@ def test_cancel_http_route_unknown_and_running_and_double_cancel():
         _, job = _call(server, "/jobs", method="POST",
                        body={"mode": "assess", "repo": "a/one"})
         assert first_in.wait(5)
+        # a running job is now cancellable too (not just queued)
         assert _call(server, f"/jobs/{job['id']}/cancel", method="POST") == (
-            409, {"error": "job is not queued", "state": "running"})
+            200, {"id": job["id"], "state": "cancelled"})
         release.set()
         server.dispatcher.wait(job["id"], 5)
-        # already succeeded -> still refused, not idempotent
+        assert server.dispatcher.get(job["id"]).state == "cancelled"
+        # already cancelled -> still refused, not idempotent
         assert _call(server, f"/jobs/{job['id']}/cancel", method="POST") == (
-            409, {"error": "job is not queued", "state": "succeeded"})
+            409, {"error": "job is not cancellable", "state": "cancelled"})
 
 
 def test_cancel_http_route_requires_auth():
@@ -3180,6 +3338,31 @@ def test_cancel_http_route_requires_auth():
     with running(materialise=_mem_materialise) as server:
         assert _call(server, "/jobs/x/cancel", method="POST", token=None) == (
             401, {"error": "unauthorized"})
+
+
+def test_cancel_http_route_requires_auth_for_a_running_job_too():
+    # AC6 (SECURITY): the new running-job cancel path reuses the exact same
+    # operator/session auth gate as the pre-existing queued-cancel path — an
+    # unauthenticated/unauthorized caller gets the identical 401 rejection
+    # even when the target job genuinely exists and is running, not just
+    # when the id is unknown.
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return _clone_ws()
+
+    with running(runner=_assess_runner(), materialise=materialise) as server:
+        _, job = _call(server, "/jobs", method="POST",
+                       body={"mode": "assess", "repo": "a/one"})
+        assert first_in.wait(5)
+        assert _call(server, f"/jobs/{job['id']}/cancel", method="POST", token=None) == (
+            401, {"error": "unauthorized"})
+        assert server.dispatcher.get(job["id"]).state == "running"
+        release.set()
+        server.dispatcher.wait(job["id"], 5)
 
 
 # --- interactive dispatch: question/answer (issue #87) -----------------------
@@ -6758,6 +6941,32 @@ def test_foreman_cancel_returns_the_story_to_todo():
     assert story.delivery_job is None  # the edge to a job that never ran is shed
 
 
+def test_foreman_cancel_of_a_running_job_also_returns_the_story_to_todo():
+    # AC3: the story write-back on cancel is not special-cased to "still
+    # queued" — a deliberate cancel of an in-flight foreman job also writes
+    # todo (not blocked), the same way a queued-cancel does, distinguishing
+    # an operator's deliberate stop from a failure.
+    dash = _foreman_dash(stories=1)
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    record = _foreman_record(disp)
+    store = BacklogStore(dash)
+    backlog = store.load()
+    story = next(s for s in backlog.stories if s.id == "S1")
+    story.status = ItemStatus.IN_PROGRESS
+    story.delivery_job = record.spec.id
+    store.save(backlog)
+    with disp._lock:
+        record.state = "running"
+        record.started = 1.0
+        disp._tasks[record.spec.id] = (None, None)
+    status, payload = disp.cancel_job(record.spec.id)
+    assert (status, payload) == (200, {"id": record.spec.id, "state": "cancelled"})
+    assert record.state == "cancelled"
+    story = _story(dash, "S1")
+    assert story.status is ItemStatus.TODO
+    assert story.delivery_job is None
+
+
 def test_foreman_write_back_noops_without_a_story_or_workspace():
     import types
 
@@ -6857,9 +7066,12 @@ def test_foreman_run_save_failure_cancels_the_enqueued_jobs(monkeypatch):
 
 
 def test_foreman_run_save_failure_names_a_job_it_cannot_pull_back(monkeypatch):
-    # If the single-flight worker already started a job before the save
-    # failure, cancel_job answers 409 — the run must name that job as
-    # uncancellable so the operator knows a re-run would duplicate it.
+    # cancel_job now reaches a "running" job too, not just "queued" — so the
+    # only job the compensation loop still cannot pull back is one that had
+    # already reached a genuinely terminal state (succeeded/failed) before
+    # the compensating cancel could run. Simulate that: cancel_job answers
+    # 409, and the run must name that job as uncancellable so the operator
+    # knows a re-run would duplicate it.
     dash = _foreman_dash(stories=1)
     disp = Dispatcher(token="x", dashboard_workspace=dash)
 
@@ -6871,9 +7083,10 @@ def test_foreman_run_save_failure_names_a_job_it_cannot_pull_back(monkeypatch):
             return self._real.load()
 
         def save(self, backlog):
-            # simulate the worker winning the race before the save fails
+            # simulate the job racing all the way to completion before the
+            # save (and the compensating cancel) can catch up to it
             for record in disp._registry.values():
-                record.state = "running"
+                record.state = "succeeded"
             raise OSError("disk full")
 
     monkeypatch.setattr(dispatch_mod, "BacklogStore", _SaveBoomRunningStore)
