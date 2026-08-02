@@ -3810,8 +3810,22 @@ def test_mutation_check_now_checks_boolop_only_product_file():
     )
 
 
-def test_mutation_check_skipped_for_non_python_file():
-    ws = InMemoryWorkspace({"src/x.ts": "function f(a, b) { return a === b; }\n"})
+def test_mutation_check_skipped_for_non_python_non_js_file():
+    ws = InMemoryWorkspace({"src/x.rs": "fn f(a: i32, b: i32) -> bool { a == b }\n"})
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl("src/x.rs"), ws, engine.git, None))
+    assert engine._scorecard == {}
+    assert cmd.calls == []
+
+
+def test_mutation_check_skipped_when_no_mutable_js_operator():
+    ws = InMemoryWorkspace({"src/x.ts": "function f(a: number) { return a; }\n"})
     cmd = FakeCommandRunner()
     engine = _engine(
         ScriptedRunner([]),
@@ -3822,6 +3836,42 @@ def test_mutation_check_skipped_for_non_python_file():
     run(engine._mutation_check(_mutation_impl("src/x.ts"), ws, engine.git, None))
     assert engine._scorecard == {}
     assert cmd.calls == []
+
+
+def test_mutation_check_routes_ts_file_to_js_mutator_and_records_survived():
+    ws = InMemoryWorkspace(
+        {"src/x.ts": "function f(a: number, b: number) { return a === b; }\n"}
+    )
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl("src/x.ts"), ws, engine.git, None))
+    assert engine._scorecard.get("mutation_survived") == 1
+    assert "mutation_killed" not in engine._scorecard
+    assert ws.read_text("src/x.ts") == (
+        "function f(a: number, b: number) { return a === b; }\n"
+    )
+
+
+def test_mutation_check_routes_ts_file_to_js_mutator_and_records_killed():
+    ws = InMemoryWorkspace(
+        {"src/x.ts": "function f(a: number, b: number) { return a === b; }\n"}
+    )
+    engine = _engine(
+        ScriptedRunner([]),
+        workspace=ws,
+        command_runner=FakeCommandRunner(default_exit_code=1),
+        config=EngineConfig(mutation_check=True, verify_command=("pytest",)),
+    )
+    run(engine._mutation_check(_mutation_impl("src/x.ts"), ws, engine.git, None))
+    assert engine._scorecard.get("mutation_killed") == 1
+    assert "mutation_survived" not in engine._scorecard
+    assert ws.read_text("src/x.ts") == (
+        "function f(a: number, b: number) { return a === b; }\n"
+    )
 
 
 def test_mutation_check_skipped_when_no_mutable_comparison():
