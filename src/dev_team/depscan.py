@@ -245,7 +245,42 @@ def parse_pom_xml_deps(text: str, manifest: str) -> List[Dependency]:
     return deps
 
 
-def parse_csproj_package_references(text: str, manifest: str) -> List[Dependency]:
+def parse_directory_packages_props(text: str) -> Dict[str, str]:
+    """.NET Central Package Management's ``Directory.Packages.props``:
+    ``<PackageVersion Include=... Version=... />`` entries, forming the
+    repo-wide ``{name: version_spec}`` map a versionless ``PackageReference``
+    resolves against (see :func:`parse_csproj_package_references`'s
+    ``central_versions`` parameter).
+
+    Returns a raw ``{name: version_spec}`` map, not :class:`Dependency`
+    objects: the eventual dependency's ``manifest`` should cite the
+    *referencing* ``.csproj``, not this file — a ``PackageVersion`` isn't
+    itself a dependency of the props file. A ``PackageVersion`` missing
+    ``Include`` or ``Version`` is skipped. A duplicate ``Include`` within one
+    file: the later element wins (plain ``dict`` assignment) —
+    :func:`collect_dependencies` applies the same last-one-wins rule across
+    multiple ``Directory.Packages.props`` files, for the same reason (no
+    build-graph context to prefer one over another).
+    """
+
+    try:
+        root = ET.fromstring(text)
+    except (ET.ParseError, ValueError):
+        return {}
+    versions: Dict[str, str] = {}
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "PackageVersion":
+            continue
+        name = element.get("Include")
+        version = element.get("Version")
+        if name and version:
+            versions[name] = version.strip()
+    return versions
+
+
+def parse_csproj_package_references(
+    text: str, manifest: str, central_versions: Optional[Dict[str, str]] = None
+) -> List[Dependency]:
     """.NET SDK-style ``.csproj``: ``<PackageReference Include=... Version=...>``
     entries — the modern replacement for ``packages.config`` every
     ``dotnet new``-scaffolded project (.NET Core/5+ onward) uses.
@@ -262,9 +297,14 @@ def parse_csproj_package_references(text: str, manifest: str) -> List[Dependency
     other bracket/paren range form (``[1.0,2.0)``, ``(,2.0]``, comma lists)
     needs real resolver semantics this module has no context for and is
     skipped, never guessed at — as is an ``Update=`` reference (nothing to
-    resolve against here) and a reference with no ``Version`` attribute or
-    child element at all (the Central Package Management form, out of scope
-    — see the module docstring's honest-limitations note).
+    resolve against here).
+
+    A reference with no ``Version`` attribute or child element is the
+    Central Package Management form: when ``central_versions`` (typically
+    :func:`parse_directory_packages_props`'s repo-wide map) is supplied and
+    contains the reference's ``Include`` name, that spec is resolved through
+    the identical bracket-exact/bare-floor logic below; otherwise — no map,
+    or the name isn't in it — it is skipped, unresolved, exactly as before.
     """
 
     try:
@@ -284,6 +324,8 @@ def parse_csproj_package_references(text: str, manifest: str) -> List[Dependency
                 if child.tag.rsplit("}", 1)[-1] == "Version":
                     raw_version = (child.text or "").strip()
                     break
+        if not raw_version and central_versions:
+            raw_version = central_versions.get(name)
         if not raw_version:
             continue
         spec = raw_version.strip()
@@ -751,11 +793,38 @@ def collect_dependencies(workspace: Workspace) -> List[Dependency]:
     entry is dropped. Otherwise dedup on ``(ecosystem, name, version)`` would
     keep both the floor and the resolved version, and OSV would be queried
     about — and a CVE attributed to — a version that is not installed.
+
+    A pre-pass collects every ``Directory.Packages.props`` file (NuGet
+    Central Package Management) into one repo-wide ``{name: version_spec}``
+    map before the main per-file loop, mirroring the same
+    "pre-pass builds a map, main loop consumes it" shape
+    :func:`_resolve_dependency_groups` uses for PEP 735 composition. A
+    ``Directory.Packages.props`` found in more than one directory: the
+    later one in sorted-path order wins on a conflicting name — this module
+    has no build-graph context to prefer one solution's props file over
+    another, so the same honest last-one-wins contract
+    :func:`parse_directory_packages_props` applies within a single file
+    applies across files too. The map is only ever consulted for a
+    ``.csproj`` reference with no inline ``Version`` (see
+    :func:`parse_csproj_package_references`); the props file itself is never
+    treated as a manifest of its own (no ``_PARSERS`` entry).
     """
+
+    file_list = sorted(workspace.list_files())
+
+    central_versions: Dict[str, str] = {}
+    for path in file_list:
+        if path.rsplit("/", 1)[-1] != "Directory.Packages.props":
+            continue
+        try:
+            text = workspace.read_text(path)
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        central_versions.update(parse_directory_packages_props(text))
 
     seen = set()
     deps: List[Dependency] = []
-    for path in sorted(workspace.list_files()):
+    for path in file_list:
         parser = _PARSERS.get(path.rsplit("/", 1)[-1])
         if parser is None and path.endswith(".csproj"):
             # .csproj filenames vary per project (MyApp.csproj), so the
@@ -769,7 +838,11 @@ def collect_dependencies(workspace: Workspace) -> List[Dependency]:
             text = workspace.read_text(path)
         except (OSError, UnicodeDecodeError, ValueError):
             continue
-        for dep in parser(text, path):
+        if parser is parse_csproj_package_references:
+            parsed = parser(text, path, central_versions=central_versions)
+        else:
+            parsed = parser(text, path)
+        for dep in parsed:
             key = (dep.ecosystem, dep.name, dep.version)
             if key in seen:
                 continue

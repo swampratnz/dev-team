@@ -137,11 +137,17 @@ machinery understands them now:
   child-element forms only): a bracket-exact version (`[1.2.3]`) is an exact
   pin, a bare version (`1.2.3`) is a lower-bound floor superseded by an
   exact pin the same way `package.json`'s `^`/`~` ranges are. Central
-  Package Management (`Directory.Packages.props`, where a versionless
-  `PackageReference` resolves from a separate file) and full NuGet
-  version-range grammar (`[1.0,2.0)`, open bounds, comma lists) still fall
-  back to model knowledge — resolving either needs build-graph or resolver
-  semantics this static parser doesn't have.
+  Package Management is also live-scanned: a versionless `PackageReference`
+  resolves against a repo-wide `{name: version}` map built from every
+  `Directory.Packages.props` found in the workspace (same bracket-exact/
+  bare-floor resolution as an inline `Version`); when more than one such
+  file exists with a conflicting entry for the same package, the
+  later-processed one wins deterministically — there is no build-graph
+  context to prefer one solution's props file over another. Full NuGet
+  version-range grammar (`[1.0,2.0)`, open bounds, comma lists) and
+  per-solution CPM scoping still fall back to model knowledge — resolving
+  either needs resolver semantics or build-graph context this static parser
+  doesn't have.
 - **Detected Node.js/Python/.NET/Ruby/Go/PHP/Java/Rust runtime versions get
   a live endoflife.date EOL/support-status check; every other EOL/support-
   status judgment (other runtimes, frameworks, libraries) is model

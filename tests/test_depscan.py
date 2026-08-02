@@ -19,6 +19,7 @@ from dev_team.depscan import (
     parse_composer_json,
     parse_composer_lock,
     parse_csproj_package_references,
+    parse_directory_packages_props,
     parse_gemfile_lock,
     parse_go_mod,
     parse_package_json,
@@ -1550,3 +1551,233 @@ def test_collect_dependencies_csproj_bare_floor_superseded_by_lockfile_exact_pin
     assert [(d.name, d.version, d.approximate) for d in deps] == [
         ("Newtonsoft.Json", "13.0.3", False)
     ]
+
+
+# -- Central Package Management (Directory.Packages.props) -- issue #300 --
+
+
+def test_parse_directory_packages_props_multiple_entries():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageVersion Include="Newtonsoft.Json" Version="13.0.1" />'
+        '<PackageVersion Include="Serilog" Version="2.10.0" />'
+        "</ItemGroup></Project>"
+    )
+    assert parse_directory_packages_props(text) == {
+        "Newtonsoft.Json": "13.0.1",
+        "Serilog": "2.10.0",
+    }
+
+
+def test_parse_directory_packages_props_malformed_never_raises():
+    assert parse_directory_packages_props("not xml at all") == {}
+    assert parse_directory_packages_props("<Project><ItemGroup>") == {}
+
+
+def test_parse_directory_packages_props_skips_missing_include_or_version():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageVersion Include="Serilog" />'
+        '<PackageVersion Version="1.0.0" />'
+        '<PackageVersion Include="Newtonsoft.Json" Version="13.0.1" />'
+        "</ItemGroup></Project>"
+    )
+    assert parse_directory_packages_props(text) == {"Newtonsoft.Json": "13.0.1"}
+
+
+def test_parse_directory_packages_props_duplicate_include_last_one_wins():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageVersion Include="Serilog" Version="2.9.0" />'
+        '<PackageVersion Include="Serilog" Version="2.10.0" />'
+        "</ItemGroup></Project>"
+    )
+    assert parse_directory_packages_props(text) == {"Serilog": "2.10.0"}
+
+
+def test_parse_directory_packages_props_adversarial_xml_never_hangs_or_raises():
+    # Billion-laughs-style entity expansion and a raw entity reference in an
+    # attribute value: both must degrade to an empty (or well-formed-only)
+    # map, never hang or raise -- the same fail-closed contract every parser
+    # in this module already holds (#225 settled etree-vs-defusedxml for
+    # this file; this is not a new claim, just a dedicated regression test).
+    billion_laughs = (
+        '<?xml version="1.0"?>'
+        "<!DOCTYPE lolz ["
+        '<!ENTITY lol "lol">'
+        '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">'
+        '<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">'
+        "]>"
+        "<Project><ItemGroup>"
+        '<PackageVersion Include="Foo" Version="&lol3;" />'
+        "</ItemGroup></Project>"
+    )
+    result = parse_directory_packages_props(billion_laughs)
+    assert isinstance(result, dict)
+
+    entity_ref = (
+        '<?xml version="1.0"?>'
+        "<Project><ItemGroup>"
+        '<PackageVersion Include="Foo" Version="&undefined_entity;" />'
+        "</ItemGroup></Project>"
+    )
+    assert parse_directory_packages_props(entity_ref) == {}
+
+
+def test_parse_csproj_package_references_resolves_central_version_bare_floor():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageReference Include="Serilog" />'
+        "</ItemGroup></Project>"
+    )
+    deps = parse_csproj_package_references(
+        text, "App.csproj", central_versions={"Serilog": "2.10.0"}
+    )
+    assert deps == [
+        Dependency("Serilog", "2.10.0", "NuGet", "App.csproj", approximate=True)
+    ]
+
+
+def test_parse_csproj_package_references_resolves_central_version_bracket_exact():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageReference Include="Serilog" />'
+        "</ItemGroup></Project>"
+    )
+    deps = parse_csproj_package_references(
+        text, "App.csproj", central_versions={"Serilog": "[2.10.0]"}
+    )
+    assert deps == [Dependency("Serilog", "2.10.0", "NuGet", "App.csproj")]
+    assert deps[0].approximate is False
+
+
+def test_parse_csproj_package_references_central_version_name_not_found_still_skips():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageReference Include="Serilog" />'
+        "</ItemGroup></Project>"
+    )
+    assert (
+        parse_csproj_package_references(
+            text, "App.csproj", central_versions={"Other.Package": "1.0.0"}
+        )
+        == []
+    )
+    # Omitted/None default -- unchanged behaviour, existing callers unaffected.
+    assert parse_csproj_package_references(text, "App.csproj") == []
+    assert parse_csproj_package_references(text, "App.csproj", central_versions=None) == []
+
+
+def test_parse_csproj_package_references_inline_version_takes_precedence_over_central():
+    text = (
+        "<Project><ItemGroup>"
+        '<PackageReference Include="Serilog" Version="1.0.0" />'
+        "</ItemGroup></Project>"
+    )
+    deps = parse_csproj_package_references(
+        text, "App.csproj", central_versions={"Serilog": "9.9.9"}
+    )
+    assert [(d.name, d.version) for d in deps] == [("Serilog", "1.0.0")]
+
+
+def test_collect_dependencies_resolves_cpm_end_to_end():
+    ws = InMemoryWorkspace(
+        {
+            "Directory.Packages.props": (
+                "<Project><ItemGroup>"
+                '<PackageVersion Include="Newtonsoft.Json" Version="13.0.1" />'
+                '<PackageVersion Include="Serilog" Version="2.10.0" />'
+                "</ItemGroup></Project>"
+            ),
+            "src/App/App.csproj": (
+                "<Project><ItemGroup>"
+                '<PackageReference Include="Newtonsoft.Json" />'
+                '<PackageReference Include="Serilog" />'
+                "</ItemGroup></Project>"
+            ),
+        }
+    )
+    deps = collect_dependencies(ws)
+    assert [(d.name, d.version, d.ecosystem, d.manifest) for d in deps] == [
+        ("Newtonsoft.Json", "13.0.1", "NuGet", "src/App/App.csproj"),
+        ("Serilog", "2.10.0", "NuGet", "src/App/App.csproj"),
+    ]
+
+
+def test_collect_dependencies_no_props_file_matches_today_exactly():
+    # Regression guard (AC9): every existing ecosystem's fixtures, including
+    # an inline-versioned .csproj, packages.config, and packages.lock.json,
+    # produce byte-identical output when no Directory.Packages.props exists.
+    ws = InMemoryWorkspace(
+        {
+            "App.csproj": (
+                "<Project><ItemGroup>"
+                '<PackageReference Include="Newtonsoft.Json" Version="13.0.1" />'
+                "</ItemGroup></Project>"
+            ),
+            "legacy/packages.config": _PACKAGES_CONFIG,
+            "packages.lock.json": json.dumps(
+                {"dependencies": {"net6.0": {"Newtonsoft.Json": {"resolved": "13.0.3"}}}}
+            ),
+        }
+    )
+    baseline = collect_dependencies(ws)
+    again = collect_dependencies(ws)
+    assert baseline == again
+    assert [(d.name, d.version, d.approximate) for d in baseline] == [
+        ("Moq", "4.2.1409.1722", False),
+        ("FluentAssertions", "5.10.3", False),
+        ("Newtonsoft.Json", "13.0.3", False),
+    ]
+
+
+def test_collect_dependencies_multiple_props_files_later_path_wins():
+    ws = InMemoryWorkspace(
+        {
+            "a/Directory.Packages.props": (
+                "<Project><ItemGroup>"
+                '<PackageVersion Include="Serilog" Version="2.9.0" />'
+                "</ItemGroup></Project>"
+            ),
+            "b/Directory.Packages.props": (
+                "<Project><ItemGroup>"
+                '<PackageVersion Include="Serilog" Version="2.10.0" />'
+                "</ItemGroup></Project>"
+            ),
+            "App.csproj": (
+                "<Project><ItemGroup>"
+                '<PackageReference Include="Serilog" />'
+                "</ItemGroup></Project>"
+            ),
+        }
+    )
+    # sorted(workspace.list_files()) orders "a/..." before "b/...", so the
+    # later-processed ("b/...") entry wins deterministically.
+    deps = collect_dependencies(ws)
+    assert [(d.name, d.version) for d in deps] == [("Serilog", "2.10.0")]
+
+
+def test_collect_dependencies_tolerates_unreadable_directory_packages_props():
+    class _Flaky(InMemoryWorkspace):
+        def read_text(self, path):
+            if path == "Directory.Packages.props":
+                raise OSError("nope")
+            return super().read_text(path)
+
+    ws = _Flaky(
+        {
+            "Directory.Packages.props": (
+                "<Project><ItemGroup>"
+                '<PackageVersion Include="Serilog" Version="2.10.0" />'
+                "</ItemGroup></Project>"
+            ),
+            "App.csproj": (
+                "<Project><ItemGroup>"
+                '<PackageReference Include="Serilog" />'
+                "</ItemGroup></Project>"
+            ),
+        }
+    )
+    # The unreadable props file degrades to no central versions -- the
+    # versionless PackageReference stays unresolved, never raises.
+    assert collect_dependencies(ws) == []
