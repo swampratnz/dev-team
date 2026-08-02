@@ -128,9 +128,13 @@ machinery understands them now:
   branch aliases — still fall back to model knowledge, since resolving them
   correctly needs Composer's own dependency resolver. Maven `pom.xml`
   top-level `<dependencies>` entries with a literal, non-property `<version>`
-  are live-scanned (ecosystem `Maven`, package name `groupId:artifactId`);
-  `<dependencyManagement>` and `<profile>`-scoped dependency blocks are not
-  read, and a `${property}`-interpolated or inherited (parent-POM/BOM)
+  are live-scanned (ecosystem `Maven`, package name `groupId:artifactId`); a
+  `<version>` that is exactly one `${x}` property reference is also
+  live-scanned if `x` resolves against that same file's own top-level
+  `<properties>` block to a non-empty, non-`${`-containing value.
+  `<dependencyManagement>` and `<profile>`-scoped `<properties>`/dependency
+  blocks are not read, and a parent-POM/BOM-inherited, chained/self-
+  referential, or compound-interpolated (`${a}-SNAPSHOT`, `${a}${b}`)
   version is skipped rather than guessed at, so it falls back to model
   knowledge. NuGet SDK-style `.csproj` `<PackageReference Include=...
   Version=...>` entries are live-scanned too (inline `Version` attribute or

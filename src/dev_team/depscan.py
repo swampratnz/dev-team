@@ -20,6 +20,7 @@ that the live scan was unavailable.
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -43,6 +44,11 @@ _MAX_GROUP_EXPANSIONS = 500
 
 #: A ``fetch`` callable posts the querybatch payload and returns the response.
 Fetch = Callable[[Dict], Dict]
+
+# Matches a `<version>` that is *exactly* one `${token}` property reference —
+# not a partial/compound form (`${a}-SNAPSHOT`, `${a}${b}`), which is left
+# unresolved by design (see parse_pom_xml_deps).
+_POM_PROPERTY_REF_RE = re.compile(r"^\$\{([^${}]+)\}$")
 
 
 @dataclass(frozen=True)
@@ -206,12 +212,20 @@ def parse_pom_xml_deps(text: str, manifest: str) -> List[Dependency]:
     uses for this identical file format, since Maven POMs declare a default
     XML namespace plain tag comparison would otherwise miss.
 
-    Only a literal, non-empty ``<version>`` counts as a pin: a
-    ``${property}``-interpolated version (requiring a ``<properties>``
-    lookup or parent-POM inheritance this module has no context for) or a
-    missing ``<version>`` (inherited from ``dependencyManagement``, possibly
-    in a parent POM never fetched) is skipped, never guessed at. A
-    ``<dependency>`` missing ``<groupId>`` or ``<artifactId>`` is skipped too.
+    A literal, non-empty ``<version>`` counts as a pin directly. A version
+    that is *exactly* one ``${token}`` property reference (not a partial or
+    compound form like ``${a}-SNAPSHOT`` or ``${a}${b}``) is resolved against
+    the root's own top-level ``<properties>`` element — the same same-file,
+    top-level-only read :func:`eolscan.parse_pom_xml_java` already does for a
+    different property set — and only if the matching property is present,
+    non-empty, and its own text contains no ``${`` (so a chained/self-
+    referential property, or a Maven built-in like ``project.version`` with
+    no local ``<properties>`` entry, is left unresolved: skipped, never
+    guessed at, no recursive resolution). Anything else — a missing
+    ``<version>`` (inherited from ``dependencyManagement``, possibly in a
+    parent POM never fetched), an unresolved property reference, or a
+    compound interpolation — is skipped, never guessed at. A ``<dependency>``
+    missing ``<groupId>`` or ``<artifactId>`` is skipped too.
 
     ``ValueError`` is caught alongside ``ET.ParseError`` for the same
     multi-byte-encoding expat quirk :func:`eolscan.parse_pom_xml_java`
@@ -222,6 +236,12 @@ def parse_pom_xml_deps(text: str, manifest: str) -> List[Dependency]:
         root = ET.fromstring(text)
     except (ET.ParseError, ValueError):
         return []
+    properties: Dict[str, str] = {}
+    for child in root:
+        if child.tag.rsplit("}", 1)[-1] == "properties":
+            for prop in child:
+                properties[prop.tag.rsplit("}", 1)[-1]] = prop.text or ""
+            break
     deps = []
     for child in root:
         if child.tag.rsplit("}", 1)[-1] != "dependencies":
@@ -240,7 +260,13 @@ def parse_pom_xml_deps(text: str, manifest: str) -> List[Dependency]:
             if not group_id or not artifact_id or not version:
                 continue
             if "${" in version:
-                continue
+                match = _POM_PROPERTY_REF_RE.match(version)
+                if not match:
+                    continue
+                resolved = properties.get(match.group(1))
+                if not resolved or "${" in resolved:
+                    continue
+                version = resolved
             deps.append(Dependency(f"{group_id}:{artifact_id}", version, "Maven", manifest))
     return deps
 

@@ -1059,6 +1059,89 @@ def test_parse_pom_xml_deps_skips_property_interpolated_version():
     assert parse_pom_xml_deps(text, "pom.xml") == []
 
 
+def test_parse_pom_xml_deps_resolves_same_file_property_reference():
+    text = (
+        "<project>"
+        "<properties><spring.version>5.3.20</spring.version></properties>"
+        "<dependencies>"
+        "<dependency><groupId>org.springframework</groupId>"
+        "<artifactId>spring-core</artifactId>"
+        "<version>${spring.version}</version></dependency>"
+        "</dependencies></project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert deps == [
+        Dependency("org.springframework:spring-core", "5.3.20", "Maven", "pom.xml")
+    ]
+    assert deps[0].approximate is False
+
+
+def test_parse_pom_xml_deps_skips_self_referential_property():
+    text = (
+        "<project>"
+        "<properties><spring.version>${other.version}</spring.version></properties>"
+        "<dependencies>"
+        "<dependency><groupId>org.springframework</groupId>"
+        "<artifactId>spring-core</artifactId>"
+        "<version>${spring.version}</version></dependency>"
+        "</dependencies></project>"
+    )
+    assert parse_pom_xml_deps(text, "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_skips_empty_property_value():
+    text = (
+        "<project>"
+        "<properties><spring.version></spring.version></properties>"
+        "<dependencies>"
+        "<dependency><groupId>org.springframework</groupId>"
+        "<artifactId>spring-core</artifactId>"
+        "<version>${spring.version}</version></dependency>"
+        "</dependencies></project>"
+    )
+    assert parse_pom_xml_deps(text, "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_skips_compound_interpolation():
+    text = (
+        "<project>"
+        "<properties><a>1.2</a><b>3</b></properties>"
+        "<dependencies>"
+        "<dependency><groupId>com.example</groupId><artifactId>suffix</artifactId>"
+        "<version>${a}-SNAPSHOT</version></dependency>"
+        "<dependency><groupId>com.example</groupId><artifactId>concat</artifactId>"
+        "<version>${a}${b}</version></dependency>"
+        "</dependencies></project>"
+    )
+    assert parse_pom_xml_deps(text, "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_ignores_profile_and_management_scoped_properties():
+    text = (
+        "<project>"
+        "<properties><spring.version>5.3.20</spring.version></properties>"
+        "<dependencyManagement><properties>"
+        "<managed.version>9.9.9</managed.version>"
+        "</properties></dependencyManagement>"
+        "<profiles><profile><properties>"
+        "<profile.version>8.8.8</profile.version>"
+        "</properties></profile></profiles>"
+        "<dependencies>"
+        "<dependency><groupId>org.springframework</groupId>"
+        "<artifactId>spring-core</artifactId>"
+        "<version>${spring.version}</version></dependency>"
+        "<dependency><groupId>com.example</groupId><artifactId>managed</artifactId>"
+        "<version>${managed.version}</version></dependency>"
+        "<dependency><groupId>com.example</groupId><artifactId>profiled</artifactId>"
+        "<version>${profile.version}</version></dependency>"
+        "</dependencies></project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert deps == [
+        Dependency("org.springframework:spring-core", "5.3.20", "Maven", "pom.xml")
+    ]
+
+
 def test_parse_pom_xml_deps_skips_missing_version():
     text = (
         "<project><dependencies>"
