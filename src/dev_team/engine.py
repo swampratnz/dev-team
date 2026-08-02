@@ -197,15 +197,16 @@ class EngineConfig:
     - ``mutation_check``: after gates pass, flip the first comparison
       operator (``==``/``!=``/``<``/``>=``/``>``/``<=``/``is``/``is not``/
       ``in``/``not in``), boolean operator (``and``/``or``), or arithmetic
-      operator (``+``/``-``/``*``/``/``) in the task's one Python product
-      file and re-run the gates; a mutant that still passes is an advisory
-      ``mutation_survived`` scorecard signal, never a rejection (unlike
-      ``fail_to_pass_check``, this never gates, retries, or rolls back the
-      task). Off by default — a new, less-proven signal, matching
-      ``visual_review``'s "off by default, advisory-only" opt-in. Skipped
-      for dry runs, non-local verification, non-Python or multi-file
-      changes, and when the file has no mutable comparison, boolean, or
-      arithmetic operator.
+      operator (``+``/``-``/``*``/``/``) in each of the task's Python
+      product files (up to a fixed cap of 5, sorted by path) and re-run the
+      gates; a mutant that still passes is an advisory ``mutation_survived``
+      scorecard signal, never a rejection (unlike ``fail_to_pass_check``,
+      this never gates, retries, or rolls back the task). Off by default —
+      a new, less-proven signal, matching ``visual_review``'s "off by
+      default, advisory-only" opt-in. Skipped for dry runs, non-local
+      verification, and when there are no qualifying Python product files;
+      a non-Python file or one with no mutable comparison, boolean, or
+      arithmetic operator is skipped individually, not disqualifying.
     - ``remote_verify_status`` / ``remote_verify_trigger``: delegate
       verification to an external CI system (see
       :class:`~dev_team.verification.RemoteCIGate`) — the escape hatch for
@@ -355,13 +356,13 @@ class EngineConfig:
     security_scan_command: Optional[Sequence[str]] = None
     fail_to_pass_check: bool = True
     #: Advisory-only mutation-lite signal: flip the first comparison,
-    #: boolean, or arithmetic operator in the task's one Python product file
-    #: and re-run the gates. A surviving mutant only increments a scorecard
-    #: counter — it never rejects, retries, or rolls back the task. Off by
-    #: default: a new, less-proven signal that should earn a default
-    #: separately (mirrors ``visual_review``'s off-by-default,
-    #: never-blocks-the-commit stance). See ``docs/BENCHMARKS.md``
-    #: ("Mutation-lite scoring") and ROADMAP.
+    #: boolean, or arithmetic operator in each of the task's Python product
+    #: files (up to a fixed cap of 5) and re-run the gates. A surviving
+    #: mutant only increments a scorecard counter — it never rejects,
+    #: retries, or rolls back the task. Off by default: a new, less-proven
+    #: signal that should earn a default separately (mirrors
+    #: ``visual_review``'s off-by-default, never-blocks-the-commit stance).
+    #: See ``docs/BENCHMARKS.md`` ("Mutation-lite scoring") and ROADMAP.
     mutation_check: bool = False
     remote_verify_status: Optional[Sequence[str]] = None
     remote_verify_trigger: Optional[Sequence[str]] = None
@@ -791,6 +792,12 @@ def _gitignore_ignores(existing: str, entry: str) -> bool:
 # first looks vacuous (the earlier tasks' tests still pass unchanged).
 _TEST_DIR_SEGMENTS = frozenset({"tests", "test", "__tests__"})
 _TEST_CONFIG_BASENAMES = frozenset({"conftest.py", "pytest.ini", "tox.ini"})
+
+# Bounds the per-task cost of the mutation-lite check (issue #295): an
+# uncapped gate-rerun count per qualifying product file has no cost ceiling on
+# a large multi-file task. Mirrors the ``[1, 5]`` cap already shipped for
+# ``--verify-votes`` (MAX_VERIFY_VOTES).
+_MUTATION_CHECK_MAX_FILES = 5
 
 
 def _is_test_path(path: str) -> bool:
@@ -3135,22 +3142,29 @@ class DeliveryEngine:
     ) -> None:
         """Advisory mutation-lite signal: does one flipped mutant survive?
 
-        Flips the first comparison or boolean operator (see
-        :mod:`dev_team.mutation`) in the task's one Python product file,
-        re-runs the gates, and records a
+        Non-test product files are filtered down to Python files first, then
+        sorted by path and capped at :data:`_MUTATION_CHECK_MAX_FILES` — a
+        non-Python file never occupies a cap slot ahead of a qualifying `.py`
+        file. For each of the (at most :data:`_MUTATION_CHECK_MAX_FILES`)
+        remaining files, flips the first comparison, boolean,
+        identity/membership, or arithmetic operator (see
+        :mod:`dev_team.mutation`), re-runs the gates, and accumulates a
         ``mutation_survived``/``mutation_killed`` scorecard counter —
         **never** a rejection, retry, or rollback (unlike
-        :meth:`_tests_are_vacuous`). Skipped, with no scorecard change, no
-        gate re-run, and no file written to disk, when: disabled; a dry run;
-        verification is remote or degraded; ``impl_paths`` holds zero or more
-        than one non-test product file; that one file is not Python; or it
-        has no mutable comparison or boolean operator.
+        :meth:`_tests_are_vacuous`). A file with no mutable operator is
+        skipped and the remaining files still run. Files beyond the cap are
+        never read, mutated, or counted. The whole check is skipped, with no
+        scorecard change, no gate re-run, and no file written to disk, when:
+        disabled; a dry run; verification is remote or degraded; or there
+        are no qualifying Python product files.
 
-        The mutated write is always restored, success or failure — mirroring
-        :meth:`_tests_are_vacuous`'s fail-secure guarantee — via a ``finally``
-        block; a restore that itself fails raises :class:`_StashRestoreFailed`
-        (the same hard-stop class, handled by the caller) rather than risking
-        mutated code left on disk or, worse, committed.
+        Each file's mutated write is always restored, success or failure —
+        mirroring :meth:`_tests_are_vacuous`'s fail-secure guarantee — via a
+        ``finally`` block before the loop proceeds to the next file; a
+        restore that itself fails raises :class:`_StashRestoreFailed` (the
+        same hard-stop class, handled by the caller) rather than risking
+        mutated code left on disk or, worse, committed — a clean restore on
+        one file never masks a failed restore on another.
         """
 
         if not self.config.mutation_check:
@@ -3159,22 +3173,18 @@ class DeliveryEngine:
             return
         if isinstance(self.command_runner.inner, DryRunCommandRunner):
             return
-        impl_paths = [
+        impl_paths = sorted(
             c.path
             for c in implementation.files
-            if c.path and ws.exists(c.path) and not _is_test_path(c.path)
-        ]
-        if len(impl_paths) != 1:
-            return
-        path = impl_paths[0]
-        if not path.endswith(".py"):
-            return
-        original = ws.read_text(path)
-        mutated = mutate_first_mutant(original)
-        if mutated is None:
+            if c.path
+            and c.path.endswith(".py")
+            and ws.exists(c.path)
+            and not _is_test_path(c.path)
+        )
+        if not impl_paths:
             return
 
-        async def _evaluate_mutant() -> DoDReport:
+        async def _evaluate_mutant(path: str, original: str, mutated: str) -> DoDReport:
             ws.write_text(path, mutated)
             try:
                 return await asyncio.to_thread(
@@ -3186,26 +3196,36 @@ class DeliveryEngine:
                 except Exception as exc:
                     raise _StashRestoreFailed from exc
 
+        async def _check_paths() -> None:
+            for path in impl_paths[:_MUTATION_CHECK_MAX_FILES]:
+                original = ws.read_text(path)
+                mutated = mutate_first_mutant(original)
+                if mutated is None:
+                    continue
+                dod = await _evaluate_mutant(path, original, mutated)
+                if dod.passed or self._inherited_failures_only(dod):
+                    self._scorecard["mutation_survived"] = (
+                        self._scorecard.get("mutation_survived", 0) + 1
+                    )
+                else:
+                    self._scorecard["mutation_killed"] = (
+                        self._scorecard.get("mutation_killed", 0) + 1
+                    )
+
         if self.agentic and not self._use_worktrees:
             # Shares the vacuous check's lock: the workspace is not
             # task-private in agentic non-worktree mode, so concurrent tasks
-            # mutating/restoring the same files must be serialised. Worktree
-            # mode gives each task its own private Workspace directory (no
-            # shared mutable resource like the stash ref), so locking there
-            # would only serialise gate re-runs across tasks for no reason.
+            # mutating/restoring the same files must be serialised. Scoped
+            # around the whole per-task loop, not per-file, so two tasks'
+            # mutate/restore cycles can't interleave across files either.
+            # Worktree mode gives each task its own private Workspace
+            # directory (no shared mutable resource like the stash ref), so
+            # locking there would only serialise gate re-runs across tasks
+            # for no reason.
             async with self._stash_lock:
-                dod = await _evaluate_mutant()
+                await _check_paths()
         else:
-            dod = await _evaluate_mutant()
-
-        if dod.passed or self._inherited_failures_only(dod):
-            self._scorecard["mutation_survived"] = (
-                self._scorecard.get("mutation_survived", 0) + 1
-            )
-        else:
-            self._scorecard["mutation_killed"] = (
-                self._scorecard.get("mutation_killed", 0) + 1
-            )
+            await _check_paths()
 
     def _inherited_failures_only(self, dod: DoDReport) -> bool:
         """Whether every failing test in ``dod`` was already failing at baseline.
