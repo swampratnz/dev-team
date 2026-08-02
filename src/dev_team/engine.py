@@ -97,6 +97,7 @@ from .memory import (
     task_fingerprint,
 )
 from .mutation import mutate_first_mutant
+from .mutation_js import mutate_first_mutant_js
 from .scores import RunScore, ScoreHistory
 from .models import (
     ChangeType,
@@ -198,14 +199,14 @@ class EngineConfig:
       operator (``==``/``!=``/``<``/``>=``/``>``/``<=``/``is``/``is not``/
       ``in``/``not in``), boolean operator (``and``/``or``), or arithmetic
       operator (``+``/``-``/``*``/``/``) in the task's one Python product
-      file and re-run the gates; a mutant that still passes is an advisory
-      ``mutation_survived`` scorecard signal, never a rejection (unlike
-      ``fail_to_pass_check``, this never gates, retries, or rolls back the
-      task). Off by default — a new, less-proven signal, matching
-      ``visual_review``'s "off by default, advisory-only" opt-in. Skipped
-      for dry runs, non-local verification, non-Python or multi-file
-      changes, and when the file has no mutable comparison, boolean, or
-      arithmetic operator.
+      file — or the first strict-equality operator (``===``/``!==``) in its
+      one JS/TS product file — and re-run the gates; a mutant that still
+      passes is an advisory ``mutation_survived`` scorecard signal, never a
+      rejection (unlike ``fail_to_pass_check``, this never gates, retries,
+      or rolls back the task). Off by default — a new, less-proven signal,
+      matching ``visual_review``'s "off by default, advisory-only" opt-in.
+      Skipped for dry runs, non-local verification, non-Python/JS/TS or
+      multi-file changes, and when the file has no mutable operator.
     - ``remote_verify_status`` / ``remote_verify_trigger``: delegate
       verification to an external CI system (see
       :class:`~dev_team.verification.RemoteCIGate`) — the escape hatch for
@@ -3136,15 +3137,17 @@ class DeliveryEngine:
         """Advisory mutation-lite signal: does one flipped mutant survive?
 
         Flips the first comparison or boolean operator (see
-        :mod:`dev_team.mutation`) in the task's one Python product file,
-        re-runs the gates, and records a
+        :mod:`dev_team.mutation`) in the task's one Python product file, or
+        the first strict-equality operator (see :mod:`dev_team.mutation_js`)
+        in its one JS/TS product file, re-runs the gates, and records a
         ``mutation_survived``/``mutation_killed`` scorecard counter —
         **never** a rejection, retry, or rollback (unlike
         :meth:`_tests_are_vacuous`). Skipped, with no scorecard change, no
         gate re-run, and no file written to disk, when: disabled; a dry run;
         verification is remote or degraded; ``impl_paths`` holds zero or more
-        than one non-test product file; that one file is not Python; or it
-        has no mutable comparison or boolean operator.
+        than one non-test product file; that one file is not Python or
+        JS/TS (``.js``/``.jsx``/``.ts``/``.tsx``); or it has no mutable
+        operator for its language.
 
         The mutated write is always restored, success or failure — mirroring
         :meth:`_tests_are_vacuous`'s fail-secure guarantee — via a ``finally``
@@ -3167,10 +3170,14 @@ class DeliveryEngine:
         if len(impl_paths) != 1:
             return
         path = impl_paths[0]
-        if not path.endswith(".py"):
+        if path.endswith(".py"):
+            mutator = mutate_first_mutant
+        elif path.endswith((".js", ".jsx", ".ts", ".tsx")):
+            mutator = mutate_first_mutant_js
+        else:
             return
         original = ws.read_text(path)
-        mutated = mutate_first_mutant(original)
+        mutated = mutator(original)
         if mutated is None:
             return
 

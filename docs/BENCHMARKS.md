@@ -37,15 +37,19 @@ beat either alone, and false-positive suppression is a first-class metric.**
 - **Adopted:** fail-to-pass validation ✅ — after gates pass, the engine
   reruns them with the implementation reverted (snapshot restore or
   `git stash -u`); a suite that still passes is rejected as vacuous
-  (`EngineConfig.fail_to_pass_check`). Mutation-lite scoring ✅ — opt-in,
-  Python-only v1: flips the first comparison (including identity/membership:
+  (`EngineConfig.fail_to_pass_check`). Mutation-lite scoring ✅ — opt-in.
+  Python v1: flips the first comparison (including identity/membership:
   `==`/`!=`/`<`/`>=`/`>`/`<=`/`is`/`is not`/`in`/`not in`), boolean-operator
   (`and`/`or`), or arithmetic-operator (`+`/`-`/`*`/`/`, on both plain
   expressions and augmented assignment — `x + y` and `x += y` alike) flip in
-  the task's one product file and reruns the gates; a surviving mutant is an advisory
-  `mutation_survived` scorecard signal only (never a rejection, unlike
-  fail-to-pass) (`EngineConfig.mutation_check`,
-  off by default). Per-profile mutators for other languages remain future
+  the task's one product file and reruns the gates. JS/TS v1
+  (`dev_team.mutation_js`): flips the first strict-equality operator
+  (`===`/`!==`) in the task's one `.js`/`.jsx`/`.ts`/`.tsx` product file via
+  a dependency-free character scanner (string/comment-aware, bails out
+  unconditionally on any template literal). Either way a surviving mutant is
+  an advisory `mutation_survived` scorecard signal only (never a rejection,
+  unlike fail-to-pass) (`EngineConfig.mutation_check`, off by default).
+  Per-profile mutators for other languages (Go, Rust, ...) remain future
   work.
 
 ## Security
