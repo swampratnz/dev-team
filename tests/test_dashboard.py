@@ -1741,6 +1741,99 @@ def test_login_lockout_is_never_reached_when_no_token_is_configured(server):
         assert status == 303  # _login short-circuits before the guard entirely
 
 
+# --- opt-in reverse-proxy-aware source keying (issue #306) ------------------
+
+
+def test_depth_zero_default_ignores_a_spoofed_x_forwarded_for_on_bearer_path():
+    # Criterion 1/7 (security): with the default depth 0, two wrong-bearer
+    # requests carrying DIFFERENT spoofed X-Forwarded-For values still trip
+    # the SAME lockout bucket — the header has zero effect on the key.
+    with _running(auth_rate_limit_threshold=1) as srv:
+        status, _, _ = _request(
+            srv, "GET", "/api/state",
+            headers={"Authorization": "Bearer wrong", "X-Forwarded-For": "1.1.1.1"},
+        )
+        assert status == 401
+        status, _, _ = _request(
+            srv, "GET", "/api/state",
+            headers={"Authorization": "Bearer wrong", "X-Forwarded-For": "2.2.2.2"},
+        )
+        assert status == 429  # same bucket as the first request
+
+
+def test_depth_zero_default_ignores_a_spoofed_x_forwarded_for_on_login_path():
+    with _running(auth_rate_limit_threshold=1) as srv:
+        status, _, _ = _request(
+            srv, "POST", "/login", body="token=wrong",
+            headers={**FORM, "X-Forwarded-For": "1.1.1.1"},
+        )
+        assert status == 401
+        status, _, _ = _request(
+            srv, "POST", "/login", body="token=wrong",
+            headers={**FORM, "X-Forwarded-For": "2.2.2.2"},
+        )
+        assert status == 429  # same bucket as the first request
+
+
+def test_depth_one_call_sites_key_the_lockout_on_the_forwarded_for_entry():
+    # Criterion 6: both dashboard.py call sites (_guard_and_authorise and
+    # _login) invoke resolve_source_key, not a divergent duplicate — the
+    # tracked key is the forwarded IP, never the real socket peer. Inject
+    # the guard (same pattern as test_lockout_recovers_after_the_configured_
+    # seconds_elapse above) so the test can inspect it directly afterward.
+    guard = FailedAuthTracker(threshold=1)
+    with _running(auth_guard=guard, auth_rate_limit_trust_proxy_depth=1) as srv:
+        status, _, _ = _request(
+            srv, "GET", "/api/state",
+            headers={"Authorization": "Bearer wrong", "X-Forwarded-For": "203.0.113.5"},
+        )
+        assert status == 401
+        assert guard.is_locked_out("203.0.113.5") is not None
+        assert guard.is_locked_out("127.0.0.1") is None  # never the real peer
+
+
+def test_depth_one_tracks_distinct_forwarded_for_values_as_separate_buckets():
+    # Criterion 2: same socket peer, different single-entry X-Forwarded-For
+    # values are separate throttle buckets.
+    with _running(
+        auth_rate_limit_threshold=1, auth_rate_limit_trust_proxy_depth=1
+    ) as srv:
+        status, _, _ = _request(
+            srv, "GET", "/api/state",
+            headers={"Authorization": "Bearer wrong", "X-Forwarded-For": "1.1.1.1"},
+        )
+        assert status == 401
+        status, _, _ = _request(
+            srv, "GET", "/api/state",
+            headers={"Authorization": "Bearer wrong", "X-Forwarded-For": "1.1.1.1"},
+        )
+        assert status == 429  # same forwarded IP, now locked out
+        status, _, _ = _request(
+            srv, "GET", "/api/state",
+            headers={"Authorization": f"Bearer {TOKEN}", "X-Forwarded-For": "2.2.2.2"},
+        )
+        assert status == 200  # different forwarded IP, unaffected
+
+
+def test_login_path_keys_on_the_forwarded_for_entry_too():
+    with _running(
+        auth_rate_limit_threshold=1, auth_rate_limit_trust_proxy_depth=1
+    ) as srv:
+        status, _, _ = _request(
+            srv, "POST", "/login", body="token=wrong",
+            headers={**FORM, "X-Forwarded-For": "198.51.100.9"},
+        )
+        assert status == 401
+        # A different forwarded-for value from the same socket peer is a
+        # fresh bucket, so the correct token is accepted (not locked out).
+        status, headers, _ = _request(
+            srv, "POST", "/login", body=f"token={TOKEN}",
+            headers={**FORM, "X-Forwarded-For": "6.6.6.6"},
+        )
+        assert status == 303
+        assert "Set-Cookie" in headers
+
+
 # --- the board write proxy (/api/backlog/* → the dispatch service) ------------
 
 DISPATCH_URL = "http://dispatch.test:8738"

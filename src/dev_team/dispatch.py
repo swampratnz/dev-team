@@ -60,8 +60,13 @@ from urllib.parse import parse_qs, urlsplit
 
 from .accesslog import AccessLog, read_access_log
 from .approval import PolicyApprovalGate
-from .authguard import DEFAULT_LOCKOUT_SECONDS, DEFAULT_THRESHOLD, DEFAULT_WINDOW_SECONDS
-from .authguard import FailedAuthTracker
+from .authguard import (
+    DEFAULT_LOCKOUT_SECONDS,
+    DEFAULT_THRESHOLD,
+    DEFAULT_TRUST_PROXY_DEPTH,
+    DEFAULT_WINDOW_SECONDS,
+)
+from .authguard import FailedAuthTracker, resolve_source_key
 from .assessment import (
     MAX_VERIFY_VOTES,
     AssessConfig,
@@ -494,6 +499,7 @@ class Dispatcher:
         auth_rate_limit_window_seconds: float = DEFAULT_WINDOW_SECONDS,
         auth_rate_limit_lockout_seconds: float = DEFAULT_LOCKOUT_SECONDS,
         auth_guard: Optional[FailedAuthTracker] = None,
+        auth_rate_limit_trust_proxy_depth: int = DEFAULT_TRUST_PROXY_DEPTH,
     ) -> None:
         self.token = token
         # Injectable factory for GET /checks (tests never touch the network);
@@ -530,6 +536,10 @@ class Dispatcher:
             window_seconds=auth_rate_limit_window_seconds,
             lockout_seconds=auth_rate_limit_lockout_seconds,
         )
+        # Opt-in reverse-proxy-aware source keying (see
+        # dev_team.authguard.resolve_source_key's docstring and
+        # docs/SECURITY.md). 0 (the default) never reads X-Forwarded-For.
+        self.auth_rate_limit_trust_proxy_depth = auth_rate_limit_trust_proxy_depth
         # Off by default: capturing raw agent I/O is opt-in (the operator
         # enables it via --record-transcripts or DEV_TEAM_RECORD_TRANSCRIPTS).
         self._record_transcripts = record_transcripts
@@ -2953,7 +2963,11 @@ def _make_handler(dispatcher: Dispatcher) -> type:
             clears its history.
             """
 
-            source = self.client_address[0]
+            source = resolve_source_key(
+                self.client_address[0],
+                self.headers,
+                dispatcher.auth_rate_limit_trust_proxy_depth,
+            )
             retry_after = dispatcher.auth_guard.is_locked_out(source)
             if retry_after is not None:
                 seconds = max(1, math.ceil(retry_after))
@@ -3535,6 +3549,7 @@ class DispatchServer:
         auth_rate_limit_window_seconds: float = DEFAULT_WINDOW_SECONDS,
         auth_rate_limit_lockout_seconds: float = DEFAULT_LOCKOUT_SECONDS,
         auth_guard: Optional[FailedAuthTracker] = None,
+        auth_rate_limit_trust_proxy_depth: int = DEFAULT_TRUST_PROXY_DEPTH,
     ) -> None:
         self.dispatcher = Dispatcher(
             token=token,
@@ -3555,6 +3570,7 @@ class DispatchServer:
             auth_rate_limit_window_seconds=auth_rate_limit_window_seconds,
             auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds,
             auth_guard=auth_guard,
+            auth_rate_limit_trust_proxy_depth=auth_rate_limit_trust_proxy_depth,
         )
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self.dispatcher))
         self.dispatcher.start()

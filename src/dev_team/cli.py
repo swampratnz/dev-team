@@ -22,7 +22,12 @@ from .assessment import (
     outcome_to_dict,
     verify_finding,
 )
-from .authguard import DEFAULT_LOCKOUT_SECONDS, DEFAULT_THRESHOLD, DEFAULT_WINDOW_SECONDS
+from .authguard import (
+    DEFAULT_LOCKOUT_SECONDS,
+    DEFAULT_THRESHOLD,
+    DEFAULT_TRUST_PROXY_DEPTH,
+    DEFAULT_WINDOW_SECONDS,
+)
 from .backlog import BacklogStore
 from .budget import Budget, BudgetExceededError
 from .chat import ChatSession, chat_system_prompt
@@ -455,6 +460,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --dashboard or --dispatch: how many seconds a source "
         f"stays locked out once it trips the threshold (default "
         f"{int(DEFAULT_LOCKOUT_SECONDS)}). A negative value is rejected.",
+    )
+    serving.add_argument(
+        "--auth-rate-limit-trust-proxy-depth",
+        type=int,
+        default=DEFAULT_TRUST_PROXY_DEPTH,
+        metavar="N",
+        help="With --dashboard or --dispatch: number of trusted reverse-"
+        f"proxy hops in front of this service (default {DEFAULT_TRUST_PROXY_DEPTH}, "
+        "meaning the auth-rate-limit lockout keys on the raw TCP peer "
+        "address exactly as before this flag existed). When N > 0, the "
+        "lockout key is instead the X-Forwarded-For entry N places from "
+        "the right (the standard trusted-hop-count convention also used "
+        "by Werkzeug's ProxyFix and Express's 'trust proxy'); a missing, "
+        "too-short, or malformed header falls back to the raw TCP peer "
+        "address. SAFE TO ENABLE ONLY when this service's port is not "
+        "directly reachable by untrusted clients (i.e. the reverse proxy "
+        "is the sole ingress) — otherwise a direct caller can forge extra "
+        "X-Forwarded-For hops to defeat the lockout entirely. A negative "
+        "value is rejected.",
     )
     assessment.add_argument(
         "--report",
@@ -1898,6 +1922,11 @@ def _validate_auth_rate_limit(args) -> None:
         raise DevTeamError("--auth-rate-limit-window-seconds must be at least 0")
     if args.auth_rate_limit_lockout_seconds < 0:
         raise DevTeamError("--auth-rate-limit-lockout-seconds must be at least 0")
+    if args.auth_rate_limit_trust_proxy_depth < 0:
+        raise DevTeamError(
+            "--auth-rate-limit-trust-proxy-depth must be at least 0 "
+            "(0 disables proxy-aware source keying)"
+        )
 
 
 def _serve_dashboard(args) -> int:
@@ -1960,6 +1989,7 @@ def _serve_dashboard(args) -> int:
         auth_rate_limit_threshold=args.auth_rate_limit_threshold,
         auth_rate_limit_window_seconds=args.auth_rate_limit_window_seconds,
         auth_rate_limit_lockout_seconds=args.auth_rate_limit_lockout_seconds,
+        auth_rate_limit_trust_proxy_depth=args.auth_rate_limit_trust_proxy_depth,
         secure=args.dashboard_cookie_secure,
     )
     print(
@@ -2152,6 +2182,7 @@ def _serve_dispatch(args, runner: Optional[AgentRunner]) -> int:
         auth_rate_limit_threshold=args.auth_rate_limit_threshold,
         auth_rate_limit_window_seconds=args.auth_rate_limit_window_seconds,
         auth_rate_limit_lockout_seconds=args.auth_rate_limit_lockout_seconds,
+        auth_rate_limit_trust_proxy_depth=args.auth_rate_limit_trust_proxy_depth,
     )
     print(
         f"dev-team dispatch service at {server.url} (Ctrl-C to stop)"

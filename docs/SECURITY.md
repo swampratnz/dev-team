@@ -144,11 +144,29 @@ Both HTTP surfaces require a bearer token compared with `hmac.compare_digest`
   `max_tracked_sources` (default 4096) distinct sources. `--auth-rate-limit-
   threshold 0` disables the guard (byte-identical to the prior unthrottled
   behaviour); a negative value for any of the three flags is a startup
-  error. Keying on source IP assumes the tailnet-only deployment model this
-  document and `docs/DISPATCH.md` already document — behind a reverse proxy
-  or shared NAT, every caller collapses to one source IP and shares one
-  lockout budget, a shared-fate risk that is a consequence of the deployment
-  model, not of the throttle itself.
+  error. Keying on the raw TCP peer address assumes the tailnet-only
+  deployment model this document and `docs/DISPATCH.md` already document —
+  behind a reverse proxy or shared NAT, every caller collapses to one source
+  IP and shares one lockout budget, a shared-fate risk that is a consequence
+  of the deployment model, not of the throttle itself.
+- **`--auth-rate-limit-trust-proxy-
+  depth N`** (default `0`, opt-in) fixes the
+  shared-fate case above for operators who terminate TLS at a reverse proxy
+  in front of `--dispatch`/`--dashboard`. `N = 0` never reads
+  `X-Forwarded-For` — byte-identical to the default above. `N > 0` resolves
+  the lockout key via `dev_team.authguard.resolve_source_key`: the
+  `X-Forwarded-For` entry `N` places from the right (the same trusted-hop-
+  count convention as Werkzeug's `ProxyFix(x_for=N)` and Express's numeric
+  `trust proxy`), falling back to the raw TCP peer address — never raising —
+  when the header is missing, has fewer entries than `N`, or the selected
+  entry isn't a syntactically valid IP address. **SAFE TO ENABLE ONLY when
+  the dispatch/dashboard port is not directly reachable by untrusted
+  clients** (i.e. the reverse proxy is the sole ingress): if the origin port
+  is still directly exposed, a direct caller can forge `N+1` forwarded-for
+  entries and supply an arbitrary, ever-different leftmost "source," turning
+  the throttle into a no-op — unlimited guessing with zero lockout, strictly
+  worse than the shared-fate bug it fixes. A negative value is a startup
+  error.
 
 ## Pipeline/CI guardrails
 

@@ -46,8 +46,13 @@ from typing import Callable, Dict, List, Optional
 from urllib.parse import parse_qs, quote, urlsplit
 
 from .assessment import calibration_summary
-from .authguard import DEFAULT_LOCKOUT_SECONDS, DEFAULT_THRESHOLD, DEFAULT_WINDOW_SECONDS
-from .authguard import FailedAuthTracker
+from .authguard import (
+    DEFAULT_LOCKOUT_SECONDS,
+    DEFAULT_THRESHOLD,
+    DEFAULT_TRUST_PROXY_DEPTH,
+    DEFAULT_WINDOW_SECONDS,
+)
+from .authguard import FailedAuthTracker, resolve_source_key
 from .backlog import BacklogStore
 from .conventions import ConventionsStore
 from .eventlog import read_events
@@ -595,6 +600,7 @@ def _make_handler(
     auth_rate_limit_window_seconds: float = DEFAULT_WINDOW_SECONDS,
     auth_rate_limit_lockout_seconds: float = DEFAULT_LOCKOUT_SECONDS,
     auth_guard: Optional[FailedAuthTracker] = None,
+    auth_rate_limit_trust_proxy_depth: int = DEFAULT_TRUST_PROXY_DEPTH,
 ) -> type:
     """A request handler class bound to ``workspace``.
 
@@ -615,6 +621,12 @@ def _make_handler(
     lets callers (tests) inject a tracker directly, e.g. with a fake clock;
     otherwise one is built from the three numeric knobs. A ``threshold`` of
     0 disables the guard.
+
+    ``auth_rate_limit_trust_proxy_depth`` is forwarded to
+    :func:`~dev_team.authguard.resolve_source_key` at every lockout call
+    site; ``0`` (the default) keeps the lockout key the raw TCP peer
+    address. See that function's docstring and ``docs/SECURITY.md`` before
+    setting it above 0.
 
     With BOTH ``dispatch_url`` and ``dispatch_token`` set, authorised writes
     under ``/api/backlog/`` are forwarded to the dispatch service's
@@ -704,7 +716,9 @@ def _make_handler(
             login-form prober from the same source share one budget.
             """
 
-            source = self.client_address[0]
+            source = resolve_source_key(
+                self.client_address[0], self.headers, auth_rate_limit_trust_proxy_depth
+            )
             retry_after = guard.is_locked_out(source)
             if retry_after is not None:
                 self._send_lockout(retry_after)
@@ -751,7 +765,9 @@ def _make_handler(
             if token is None:
                 self._redirect(None)  # nothing to log in to; the page is open
                 return
-            source = self.client_address[0]
+            source = resolve_source_key(
+                self.client_address[0], self.headers, auth_rate_limit_trust_proxy_depth
+            )
             retry_after = guard.is_locked_out(source)
             if retry_after is not None:
                 self._send_lockout(retry_after)
@@ -1157,6 +1173,7 @@ class DashboardServer:
         auth_rate_limit_window_seconds: float = DEFAULT_WINDOW_SECONDS,
         auth_rate_limit_lockout_seconds: float = DEFAULT_LOCKOUT_SECONDS,
         auth_guard: Optional[FailedAuthTracker] = None,
+        auth_rate_limit_trust_proxy_depth: int = DEFAULT_TRUST_PROXY_DEPTH,
     ) -> None:
         self.workspace = workspace
         self.httpd = ThreadingHTTPServer(
@@ -1171,6 +1188,7 @@ class DashboardServer:
                 auth_rate_limit_window_seconds=auth_rate_limit_window_seconds,
                 auth_rate_limit_lockout_seconds=auth_rate_limit_lockout_seconds,
                 auth_guard=auth_guard,
+                auth_rate_limit_trust_proxy_depth=auth_rate_limit_trust_proxy_depth,
             ),
         )
 
