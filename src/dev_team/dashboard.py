@@ -2129,7 +2129,8 @@ function calibrationRow(phase, b) {
   const rate = b.confirm_rate === null ? "\\u2014" : `${Math.round(b.confirm_rate * 100)}%`;
   return `<tr${phase === "overall" ? ' class="cal-overall"' : ""}><td>${esc(phase)}</td>`
     + `<td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td><td>${esc(b.needs_context)}</td>`
-    + `<td>${esc(b.total)}</td><td>${esc(rate)}</td></tr>`;
+    + `<td>${esc(b.total)}</td><td>${esc(rate)}</td>`
+    + `<td>${esc(b.multi_vote_total)}</td><td>${esc(b.unanimous_total)}</td></tr>`;
 }
 
 // Report-quality summary line: integers only (never model-authored strings,
@@ -2169,7 +2170,8 @@ function calibrationPanel(cal) {
   const rows = Object.keys(cal.phases).sort().map(p => calibrationRow(p, cal.phases[p])).join("")
     + calibrationRow("overall", cal.overall);
   return summary + `<table class="cal-table"><thead><tr><th>phase</th><th>confirmed</th><th>refuted</th>`
-    + `<th>needs context</th><th>total</th><th>confirm rate</th></tr></thead><tbody>${rows}</tbody></table>`
+    + `<th>needs context</th><th>total</th><th>confirm rate</th><th>multi-vote</th><th>unanimous</th></tr></thead>`
+    + `<tbody>${rows}</tbody></table>`
     + calibrationRepoTable(cal.by_repo);
 }
 

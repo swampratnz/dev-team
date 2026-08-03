@@ -295,6 +295,21 @@ def test_dashboard_html_calibration_panel_escapes_and_handles_empty():
     assert "<td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td><td>${esc(b.needs_context)}</td>" in DASHBOARD_HTML
     assert "<td>${esc(b.total)}</td><td>${esc(rate)}</td>" in DASHBOARD_HTML
     assert 'calibrationRow("overall", cal.overall)' in DASHBOARD_HTML
+    # #310: multi_vote_total/unanimous_total (already sent by #194's backend
+    # fix) reach the table as two more esc()'d columns, same discipline.
+    assert (
+        "<td>${esc(b.multi_vote_total)}</td><td>${esc(b.unanimous_total)}</td></tr>"
+        in DASHBOARD_HTML
+    )
+    assert "<th>multi-vote</th><th>unanimous</th>" in DASHBOARD_HTML
+    # regression: the by-repo sub-table is out of scope for #310 (DISPATCH.md
+    # does not gate these fields per-repo) — its row still has exactly the
+    # pre-existing 5 <td> cells, no accidental scope creep.
+    assert (
+        "<tr><td>${esc(repo)}</td><td>${esc(b.confirmed)}</td><td>${esc(b.refuted)}</td>"
+        in DASHBOARD_HTML
+    )
+    assert "<td>${esc(b.needs_context)}</td><td>${esc(rate)}</td></tr>" in DASHBOARD_HTML
 
 
 def test_dashboard_html_calibration_summary_renders_report_quality_totals():

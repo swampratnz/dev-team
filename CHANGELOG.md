@@ -1107,6 +1107,17 @@ sections below are reconstructed from the repository history.
   every other caller-supplied field. Purely additive to `costs()`'s
   response shape and `dashboard.py`'s rendering — no new HTTP route or
   query parameter.
+- **Calibration panel now renders `multi_vote_total`/`unanimous_total`**
+  (#310): #194's backend change already rolled a `--verify-votes N > 1`
+  call's vote-agreement signal into these two fields on every
+  `calibration_summary()` bucket, but `calibrationRow` never read them, so
+  a 5-0 unanimous confirm and a 3-2 bare-plurality confirm still looked
+  identical on the dashboard. Two more `esc()`'d integer columns
+  (`multi-vote`, `unanimous`) on the existing per-phase/overall table,
+  same discipline as every other column; the by-repo sub-table is
+  untouched since that schema doesn't gate these fields per repo. No
+  backend, HTTP, or dispatch change — purely wiring already-fetched
+  payload fields through to `<td>`.
 
 ### Sources
 - **`--repo owner/name` fetches the repository itself** (also full HTTPS /
