@@ -36,7 +36,8 @@ def render_finding(finding: SecurityFinding) -> str:
     """
 
     return (
-        f"[{finding.severity.value}] {finding.category}: "
+        f"[{finding.severity.value}] "
+        f"{defuse(finding.category, 'security-finding')}: "
         f"{defuse(finding.description, 'security-finding')}\n"
         "Remediation: "
         f"{defuse(finding.remediation, 'security-finding') or '(none given)'}"
