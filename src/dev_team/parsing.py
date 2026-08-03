@@ -7,7 +7,7 @@ missing keys fall back to sensible defaults and unexpected types are coerced.
 from __future__ import annotations
 
 import re
-from typing import Any, List, Type, TypeVar
+from typing import Any, List, Optional, Type, TypeVar
 
 from .models import (
     ChangeType,
@@ -19,6 +19,7 @@ from .models import (
     FileChange,
     Implementation,
     Plan,
+    PovCase,
     Rebuttal,
     ReliabilityReport,
     Review,
@@ -359,6 +360,24 @@ def security_report_from_dict(data: Any) -> SecurityReport:
     if report.approved and report.blocking_findings:
         report.approved = False
     return report
+
+
+def pov_case_from_dict(data: Any) -> Optional[PovCase]:
+    """Build a :class:`PovCase` from a JSON dict, or ``None`` if not proposable.
+
+    Mirrors :func:`dev_team.mutation.mutate_first_mutant`'s "return ``None``,
+    skip" contract: the model saying it cannot express the finding as an
+    executable assertion, or omitting the test source, is a silent, expected
+    skip rather than a parse failure.
+    """
+
+    data = as_dict(data)
+    if not as_bool(data, "proposable"):
+        return None
+    code = as_str(data, "test_code")
+    if not code.strip():
+        return None
+    return PovCase(code=code)
 
 
 def documentation_from_dict(data: Any) -> Documentation:

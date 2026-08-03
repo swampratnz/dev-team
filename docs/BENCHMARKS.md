@@ -57,7 +57,14 @@ beat either alone, and false-positive suppression is a first-class metric.**
 - **Adopted:** SAST + LLM triage ✅ — a scanner (`security_scan_command`,
   auto-suggested per project profile: bandit / npm audit) runs first and the
   agent triages its output; evidence discipline ✅ — blocking findings must
-  cite file, code, and attack path. Proof-of-vulnerability → roadmap.
+  cite file, code, and attack path. Proof-of-vulnerability ✅ — opt-in:
+  when the review raises a major/critical finding, the security agent
+  proposes a minimal pytest case reproducing the *first* one, which runs in
+  isolation through the existing command runner and is removed afterward; an
+  advisory `security_pov_confirmed`/`security_pov_unconfirmed` scorecard
+  signal only, never a change to the security verdict
+  (`EngineConfig.security_pov_check` / `--security-pov-check`, off by
+  default).
 
 ## Architect
 - **Benchmarks:** **R2ABench** (PRD→architecture vs expert references:

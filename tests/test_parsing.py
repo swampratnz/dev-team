@@ -324,6 +324,34 @@ def test_security_report_from_dict():
     assert report.findings[1].severity is Severity.INFO
 
 
+def test_pov_case_from_dict_proposable():
+    pov = parsing.pov_case_from_dict(
+        {"proposable": True, "test_code": "def test_x():\n    assert False\n"}
+    )
+    assert pov is not None
+    assert pov.code == "def test_x():\n    assert False\n"
+
+
+def test_pov_case_from_dict_not_proposable_returns_none():
+    pov = parsing.pov_case_from_dict({"proposable": False, "rationale": "no fixed sink"})
+    assert pov is None
+
+
+def test_pov_case_from_dict_missing_proposable_returns_none():
+    pov = parsing.pov_case_from_dict({"test_code": "def test_x():\n    assert False\n"})
+    assert pov is None
+
+
+def test_pov_case_from_dict_blank_test_code_returns_none():
+    pov = parsing.pov_case_from_dict({"proposable": True, "test_code": "   "})
+    assert pov is None
+
+
+def test_pov_case_from_dict_non_dict_returns_none():
+    assert parsing.pov_case_from_dict(None) is None
+    assert parsing.pov_case_from_dict("not a dict") is None
+
+
 def test_documentation_from_dict():
     docs = parsing.documentation_from_dict(
         {"summary": "s", "sections": [{"title": "T", "content": "C"}]}

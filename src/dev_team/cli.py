@@ -749,6 +749,18 @@ def build_parser() -> argparse.ArgumentParser:
         "docs/BENCHMARKS.md (DevOps).",
     )
     delivery.add_argument(
+        "--security-pov-check",
+        action="store_true",
+        help="When the security review raises a major/critical finding, ask "
+        "the security agent to propose a minimal pytest case reproducing the "
+        "first such finding and execute it in isolation through the "
+        "existing command runner (with --deliver). Off by default; advisory "
+        "only — records a security_pov_confirmed/security_pov_unconfirmed "
+        "scorecard signal, never blocks the delivery or changes the "
+        "security verdict. See docs/BENCHMARKS.md (Security, "
+        "'Proof-of-vulnerability').",
+    )
+    delivery.add_argument(
         "--finalization-reserve",
         type=float,
         default=0.10,
@@ -1243,6 +1255,7 @@ def _reject_deliver_only_flags(
         ("--allow-ci-workflows", args.allow_ci_workflows),
         ("--docker-build-gate", args.docker_build_gate),
         ("--docker-run-gate", args.docker_run_gate),
+        ("--security-pov-check", args.security_pov_check),
         (
             "--finalization-reserve",
             args.finalization_reserve != parser.get_default("finalization_reserve"),
@@ -1332,6 +1345,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         allow_ci_workflows=args.allow_ci_workflows,
         docker_build_gate=args.docker_build_gate,
         docker_run_gate=args.docker_run_gate,
+        security_pov_check=args.security_pov_check,
         finalization_reserve_fraction=args.finalization_reserve,
         frontend_craft=not args.no_frontend_craft,
         visual_review=args.visual_review,
