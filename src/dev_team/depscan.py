@@ -193,25 +193,77 @@ def parse_packages_config(text: str, manifest: str) -> List[Dependency]:
     return deps
 
 
+def _pom_dependency_fields(dependency: ET.Element) -> Dict[str, str]:
+    """``groupId``/``artifactId``/``version`` text of one ``<dependency>`` element."""
+
+    fields: Dict[str, str] = {}
+    for element in dependency:
+        tag = element.tag.rsplit("}", 1)[-1]
+        if tag in ("groupId", "artifactId", "version"):
+            fields[tag] = (element.text or "").strip()
+    return fields
+
+
+def _pom_managed_versions(root: ET.Element) -> Dict[str, str]:
+    """``"groupId:artifactId" -> version`` from the root's top-level
+    ``<dependencyManagement>/<dependencies>`` block.
+
+    Only a literal, non-empty, non-``${``-interpolated version is recorded —
+    the same acceptance test :func:`parse_pom_xml_deps` applies to a normal
+    entry — so a management entry that itself needs resolving (a
+    ``${property}`` reference) is left out of the map rather than guessed at.
+    Per-``<profile>``-scoped ``<dependencyManagement>`` is not read, for the
+    same no-build-context reason profile-scoped ``<dependencies>`` aren't.
+    """
+
+    managed: Dict[str, str] = {}
+    for child in root:
+        if child.tag.rsplit("}", 1)[-1] != "dependencyManagement":
+            continue
+        for nested in child:
+            if nested.tag.rsplit("}", 1)[-1] != "dependencies":
+                continue
+            for dependency in nested:
+                if dependency.tag.rsplit("}", 1)[-1] != "dependency":
+                    continue
+                fields = _pom_dependency_fields(dependency)
+                group_id = fields.get("groupId")
+                artifact_id = fields.get("artifactId")
+                version = fields.get("version")
+                if not group_id or not artifact_id or not version:
+                    continue
+                if "${" in version:
+                    continue
+                managed[f"{group_id}:{artifact_id}"] = version
+    return managed
+
+
 def parse_pom_xml_deps(text: str, manifest: str) -> List[Dependency]:
     """Maven ``pom.xml``: top-level ``<dependencies>`` entries with a literal pin.
 
     Only the root's top-level ``<dependencies>`` element is read — not
-    ``<dependencyManagement>`` and not per-``<profile>`` dependency blocks —
-    mirroring :func:`eolscan.parse_pom_xml_java`'s scoping rationale (profile
-    activation is conditional, and a ``dependencyManagement`` entry only
-    applies if referenced by an actual dependency; this module has no build
-    context to evaluate either). Namespace-stripped tag comparison
-    (``tag.rsplit("}", 1)[-1]``) is the same idiom :func:`eolscan.parse_pom_xml_java`
-    uses for this identical file format, since Maven POMs declare a default
-    XML namespace plain tag comparison would otherwise miss.
+    per-``<profile>`` dependency blocks — mirroring
+    :func:`eolscan.parse_pom_xml_java`'s scoping rationale (profile
+    activation is conditional; this module has no build context to evaluate
+    it). Namespace-stripped tag comparison (``tag.rsplit("}", 1)[-1]``) is
+    the same idiom :func:`eolscan.parse_pom_xml_java` uses for this
+    identical file format, since Maven POMs declare a default XML namespace
+    plain tag comparison would otherwise miss.
 
-    Only a literal, non-empty ``<version>`` counts as a pin: a
-    ``${property}``-interpolated version (requiring a ``<properties>``
-    lookup or parent-POM inheritance this module has no context for) or a
-    missing ``<version>`` (inherited from ``dependencyManagement``, possibly
-    in a parent POM never fetched) is skipped, never guessed at. A
-    ``<dependency>`` missing ``<groupId>`` or ``<artifactId>`` is skipped too.
+    A ``<dependency>`` with a literal, non-empty ``<version>`` counts as a
+    pin: a ``${property}``-interpolated version (requiring a
+    ``<properties>`` lookup or parent-POM inheritance this module has no
+    context for) is skipped, never guessed at. A ``<dependency>`` with a
+    missing/empty ``<version>`` is instead resolved against the root's own
+    top-level ``<dependencyManagement>/<dependencies>`` block (see
+    :func:`_pom_managed_versions`) by ``"groupId:artifactId"`` — Maven's
+    built-in idiom for centrally pinning a version once and referencing it
+    bare from every module — and left unresolved (skipped) if there is no
+    matching management entry with its own literal version.
+    Per-``<profile>``-scoped ``<dependencyManagement>`` and parent-POM/BOM-
+    imported management (``<scope>import</scope>`` in another file) are not
+    read. A ``<dependency>`` missing ``<groupId>`` or ``<artifactId>`` is
+    skipped too.
 
     ``ValueError`` is caught alongside ``ET.ParseError`` for the same
     multi-byte-encoding expat quirk :func:`eolscan.parse_pom_xml_java`
@@ -222,6 +274,7 @@ def parse_pom_xml_deps(text: str, manifest: str) -> List[Dependency]:
         root = ET.fromstring(text)
     except (ET.ParseError, ValueError):
         return []
+    managed_versions = _pom_managed_versions(root)
     deps = []
     for child in root:
         if child.tag.rsplit("}", 1)[-1] != "dependencies":
@@ -229,18 +282,19 @@ def parse_pom_xml_deps(text: str, manifest: str) -> List[Dependency]:
         for dependency in child:
             if dependency.tag.rsplit("}", 1)[-1] != "dependency":
                 continue
-            fields: Dict[str, str] = {}
-            for element in dependency:
-                tag = element.tag.rsplit("}", 1)[-1]
-                if tag in ("groupId", "artifactId", "version"):
-                    fields[tag] = (element.text or "").strip()
+            fields = _pom_dependency_fields(dependency)
             group_id = fields.get("groupId")
             artifact_id = fields.get("artifactId")
             version = fields.get("version")
-            if not group_id or not artifact_id or not version:
+            if not group_id or not artifact_id:
                 continue
-            if "${" in version:
-                continue
+            if version:
+                if "${" in version:
+                    continue
+            else:
+                version = managed_versions.get(f"{group_id}:{artifact_id}")
+                if not version:
+                    continue
             deps.append(Dependency(f"{group_id}:{artifact_id}", version, "Maven", manifest))
     return deps
 

@@ -1101,6 +1101,142 @@ def test_parse_pom_xml_deps_ignores_dependency_management():
     assert [d.name for d in deps] == ["org.springframework:spring-core"]
 
 
+def test_parse_pom_xml_deps_resolves_versionless_dependency_from_management():
+    text = (
+        "<project>"
+        "<dependencyManagement><dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId>"
+        "<version>1.0.0</version></dependency>"
+        "</dependencies></dependencyManagement>"
+        "<dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId></dependency>"
+        "</dependencies>"
+        "</project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert deps == [Dependency("com.example:managed-lib", "1.0.0", "Maven", "pom.xml")]
+    assert deps[0].approximate is False
+
+
+def test_parse_pom_xml_deps_versionless_with_no_management_match_still_skipped():
+    text = (
+        "<project>"
+        "<dependencyManagement><dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>unrelated-lib</artifactId>"
+        "<version>1.0.0</version></dependency>"
+        "</dependencies></dependencyManagement>"
+        "<dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId></dependency>"
+        "</dependencies>"
+        "</project>"
+    )
+    assert parse_pom_xml_deps(text, "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_management_entry_property_interpolated_stays_unresolved():
+    text = (
+        "<project>"
+        "<dependencyManagement><dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId>"
+        "<version>${managed.version}</version></dependency>"
+        "</dependencies></dependencyManagement>"
+        "<dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId></dependency>"
+        "</dependencies>"
+        "</project>"
+    )
+    assert parse_pom_xml_deps(text, "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_literal_version_unaffected_by_management_entry():
+    text = (
+        "<project>"
+        "<dependencyManagement><dependencies>"
+        "<dependency><groupId>org.springframework</groupId>"
+        "<artifactId>spring-core</artifactId>"
+        "<version>9.9.9</version></dependency>"
+        "</dependencies></dependencyManagement>"
+        f"<dependencies>{_POM_SPRING_DEP}</dependencies>"
+        "</project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert deps == [
+        Dependency("org.springframework:spring-core", "5.3.20", "Maven", "pom.xml")
+    ]
+
+
+def test_parse_pom_xml_deps_ignores_profile_scoped_dependency_management():
+    text = (
+        "<project>"
+        "<dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId></dependency>"
+        "</dependencies>"
+        "<profiles><profile><dependencyManagement><dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId>"
+        "<version>3.0.0</version></dependency>"
+        "</dependencies></dependencyManagement></profile></profiles>"
+        "</project>"
+    )
+    assert parse_pom_xml_deps(text, "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_management_skips_non_dependencies_and_non_dependency_children():
+    text = (
+        "<project>"
+        "<dependencyManagement>"
+        "<notDependencies><dependency><groupId>x</groupId></dependency></notDependencies>"
+        "<dependencies>"
+        "<notADependency><groupId>x</groupId></notADependency>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId>"
+        "<version>1.0.0</version></dependency>"
+        "</dependencies>"
+        "</dependencyManagement>"
+        "<dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId></dependency>"
+        "</dependencies>"
+        "</project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert deps == [Dependency("com.example:managed-lib", "1.0.0", "Maven", "pom.xml")]
+
+
+def test_parse_pom_xml_deps_management_entry_missing_version_not_recorded():
+    text = (
+        "<project>"
+        "<dependencyManagement><dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId></dependency>"
+        "</dependencies></dependencyManagement>"
+        "<dependencies>"
+        "<dependency><groupId>com.example</groupId>"
+        "<artifactId>managed-lib</artifactId></dependency>"
+        "</dependencies>"
+        "</project>"
+    )
+    assert parse_pom_xml_deps(text, "pom.xml") == []
+
+
+def test_parse_pom_xml_deps_management_without_nested_dependencies_never_raises():
+    text = (
+        "<project>"
+        "<dependencyManagement></dependencyManagement>"
+        f"<dependencies>{_POM_SPRING_DEP}</dependencies>"
+        "</project>"
+    )
+    deps = parse_pom_xml_deps(text, "pom.xml")
+    assert [d.name for d in deps] == ["org.springframework:spring-core"]
+
+
 def test_parse_pom_xml_deps_ignores_profile_dependencies():
     text = (
         "<project>"
