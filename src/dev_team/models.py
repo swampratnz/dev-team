@@ -238,6 +238,19 @@ class SecurityReport:
 
 
 @dataclass
+class PovCase:
+    """A proof-of-vulnerability pytest case proposed for one security finding.
+
+    Produced by ``SecurityEngineerAgent.propose_pov`` and executed, in
+    isolation, by the engine's opt-in ``security_pov_check``. Purely
+    advisory: it feeds a scorecard signal only and never affects
+    ``SecurityReport.approved``.
+    """
+
+    code: str
+
+
+@dataclass
 class DocSection:
     """A single documentation section."""
 

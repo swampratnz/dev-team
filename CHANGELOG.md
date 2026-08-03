@@ -54,6 +54,24 @@ sections below are reconstructed from the repository history.
   other filter on this route.
 
 ### Security
+- **Opt-in proof-of-vulnerability check for the security review gate**
+  (#312): closes `docs/BENCHMARKS.md`'s own named "Proof-of-vulnerability →
+  roadmap" gap — the one still-unshipped technique in the Security
+  section's otherwise fully-adopted list. When the security review raises a
+  major/critical finding, `SecurityEngineerAgent.propose_pov` proposes a
+  minimal, self-contained pytest case for the *first* such finding (mirrors
+  `_mutation_check`'s "first mutant only" scope discipline); the new engine
+  method `_security_pov_check` writes it to a scratch path under
+  `.dev_team/security_pov/` and executes it in isolation — the one
+  generated file, not the whole suite — through the existing
+  `command_runner`, then removes it in a `finally` block regardless of
+  outcome (a cleanup failure raises `_StashRestoreFailed`, the same
+  hard-stop `_mutation_check` uses). Records an advisory
+  `security_pov_confirmed`/`security_pov_unconfirmed` scorecard signal only
+  — it never affects `SecurityReport.approved` or the commit gate.
+  `EngineConfig.security_pov_check` / `--security-pov-check`, off by
+  default.
+
 - **Opt-in `--sandbox-userns` for per-job UID/GID separation** (#246):
   `SandboxConfig` gains `user_namespace`, wired to a new `--sandbox-userns`
   CLI flag (only valid with `--sandbox`, mirroring `--sandbox-network`).

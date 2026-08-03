@@ -50,6 +50,7 @@ def test_stale_roadmap_markers_are_gone():
     text = _benchmarks_text()
     assert "session continuity across attempts → roadmap" not in text
     assert "Dynamic re-planning on failure → roadmap" not in text
+    assert "Proof-of-vulnerability → roadmap" not in text
 
 
 def test_engineer_section_documents_session_continuity_as_shipped():
@@ -66,12 +67,20 @@ def test_pm_section_documents_dynamic_replanning_as_shipped():
     assert "ROADMAP #3" in text
 
 
+def test_security_section_documents_pov_check_as_shipped():
+    text = _section_text("Security")
+    assert "Proof-of-vulnerability ✅" in text
+    assert "EngineConfig.security_pov_check" in text
+    assert "--security-pov-check" in text
+
+
 def test_cited_config_fields_are_real_on_engineconfig():
     from dev_team.engine import EngineConfig
 
     field_names = {f.name for f in dataclasses.fields(EngineConfig)}
     assert "reuse_engineer_session" in field_names
     assert "max_replan_rounds" in field_names
+    assert "security_pov_check" in field_names
 
 
 def test_cited_cli_flags_are_real_on_build_parser():
@@ -85,6 +94,7 @@ def test_cited_cli_flags_are_real_on_build_parser():
     }
     assert "--no-reuse-engineer-session" in known_flags
     assert "--max-replan-rounds" in known_flags
+    assert "--security-pov-check" in known_flags
 
 
 def test_still_deferred_techniques_were_not_overcorrected():
@@ -93,7 +103,6 @@ def test_still_deferred_techniques_were_not_overcorrected():
         "multi-candidate generation with execution-based\n  reranking → roadmap"
         in text
     )
-    assert "Proof-of-vulnerability → roadmap" in text
 
 
 def test_changelog_unreleased_mentions_the_benchmarks_correction():

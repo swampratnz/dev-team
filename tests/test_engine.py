@@ -4208,6 +4208,310 @@ def test_run_evidence_surfaces_mutation_scorecard_keys():
     assert "mutation_killed=1" in text
 
 
+# --- security PoV check ---------------------------------------------------
+
+
+def _pov_finding(**overrides):
+    from dev_team.models import SecurityFinding, Severity
+
+    defaults = dict(
+        severity=Severity.CRITICAL,
+        category="injection",
+        description="sqli",
+        remediation="parameterize",
+    )
+    defaults.update(overrides)
+    return SecurityFinding(**defaults)
+
+
+def _pov_task() -> Task:
+    return Task(id="FEATURE", title="Login", description="Add login")
+
+
+def _pov_impl() -> Implementation:
+    return Implementation(task_id="FEATURE", summary="s", files=[])
+
+
+def test_security_pov_check_defaults_to_false():
+    assert EngineConfig().security_pov_check is False
+
+
+def test_security_pov_check_skipped_when_disabled():
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        command_runner=cmd,
+        config=EngineConfig(security_pov_check=False),
+    )
+    report = SecurityReport(approved=False, summary="s", findings=[_pov_finding()])
+    run(engine._security_pov_check(report, _pov_task(), _pov_impl()))
+    assert engine._scorecard == {}
+    assert cmd.calls == []
+
+
+def test_security_pov_check_skipped_for_dry_runs():
+    engine = DeliveryEngine(
+        ScriptedRunner([]),
+        budget=Budget(),
+        tracer=Tracer(clock=_Clock()),
+        config=EngineConfig(security_pov_check=True),
+    )  # in-memory + DryRunCommandRunner defaults
+    report = SecurityReport(approved=False, summary="s", findings=[_pov_finding()])
+    run(engine._security_pov_check(report, _pov_task(), _pov_impl()))
+    assert engine._scorecard == {}
+
+
+def test_security_pov_check_skipped_without_local_verification():
+    engine = DeliveryEngine(
+        ScriptedRunner([]),
+        command_runner=FakeCommandRunner(),
+        config=EngineConfig(
+            security_pov_check=True, remote_verify_status=("ci", "status")
+        ),
+    )
+    report = SecurityReport(approved=False, summary="s", findings=[_pov_finding()])
+    run(engine._security_pov_check(report, _pov_task(), _pov_impl()))
+    assert engine._scorecard == {}
+
+
+def test_security_pov_check_skipped_with_no_blocking_findings():
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        ScriptedRunner([]),
+        command_runner=cmd,
+        config=EngineConfig(security_pov_check=True),
+    )
+    report = SecurityReport(approved=True, summary="ok", findings=[])
+    run(engine._security_pov_check(report, _pov_task(), _pov_impl()))
+    assert engine._scorecard == {}
+    assert cmd.calls == []
+
+
+def test_security_pov_check_skipped_when_propose_pov_returns_none():
+    runner = ScriptedRunner(
+        [json_response({"proposable": False, "rationale": "no fixed sink"})]
+    )
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        runner, command_runner=cmd, config=EngineConfig(security_pov_check=True)
+    )
+    report = SecurityReport(approved=False, summary="s", findings=[_pov_finding()])
+    run(engine._security_pov_check(report, _pov_task(), _pov_impl()))
+    assert engine._scorecard == {}
+    assert cmd.calls == []
+    assert engine.workspace.list_files() == []
+
+
+def test_security_pov_check_records_confirmed_when_test_fails():
+    runner = ScriptedRunner(
+        [
+            json_response(
+                {
+                    "proposable": True,
+                    "test_code": "def test_sqli():\n    assert False\n",
+                }
+            )
+        ]
+    )
+    cmd = FakeCommandRunner()
+    cmd.add_rule("pytest", CommandResult(["pytest"], 1, "1 failed", ""))
+    engine = _engine(
+        runner, command_runner=cmd, config=EngineConfig(security_pov_check=True)
+    )
+    impl = _pov_impl()
+    report = SecurityReport(approved=False, summary="s", findings=[_pov_finding()])
+    run(engine._security_pov_check(report, _pov_task(), impl))
+    assert engine._scorecard == {"security_pov_confirmed": 1}
+    assert report.approved is False
+    assert impl.files == []
+    assert engine.workspace.list_files() == []
+    pytest_calls = [c for c in cmd.calls if c and c[0] == "pytest"]
+    assert len(pytest_calls) == 1
+    assert pytest_calls[0][1:4] == ["-q", "-o", "addopts="]
+    assert pytest_calls[0][-1] == ".dev_team/security_pov/FEATURE_pov.py"
+
+
+def test_security_pov_check_records_unconfirmed_when_test_passes():
+    runner = ScriptedRunner(
+        [
+            json_response(
+                {"proposable": True, "test_code": "def test_ok():\n    assert True\n"}
+            )
+        ]
+    )
+    cmd = FakeCommandRunner()  # default exit code 0
+    engine = _engine(
+        runner, command_runner=cmd, config=EngineConfig(security_pov_check=True)
+    )
+    report = SecurityReport(approved=False, summary="s", findings=[_pov_finding()])
+    run(engine._security_pov_check(report, _pov_task(), _pov_impl()))
+    assert engine._scorecard == {"security_pov_unconfirmed": 1}
+    assert report.approved is False
+    assert engine.workspace.list_files() == []
+
+
+def test_security_pov_check_skipped_when_pytest_binary_missing():
+    runner = ScriptedRunner(
+        [
+            json_response(
+                {"proposable": True, "test_code": "def test_x():\n    assert True\n"}
+            )
+        ]
+    )
+    cmd = FakeCommandRunner()
+    cmd.add_rule("pytest", CommandResult(["pytest"], EXIT_NOT_FOUND, "", "not found"))
+    engine = _engine(
+        runner, command_runner=cmd, config=EngineConfig(security_pov_check=True)
+    )
+    report = SecurityReport(approved=False, summary="s", findings=[_pov_finding()])
+    run(engine._security_pov_check(report, _pov_task(), _pov_impl()))
+    assert engine._scorecard == {}
+    assert engine.workspace.list_files() == []
+
+
+def test_security_pov_check_skipped_when_pytest_times_out():
+    runner = ScriptedRunner(
+        [
+            json_response(
+                {"proposable": True, "test_code": "def test_x():\n    assert True\n"}
+            )
+        ]
+    )
+    cmd = FakeCommandRunner()
+    cmd.add_rule(
+        "pytest", CommandResult(["pytest"], EXIT_TIMEOUT, "", "command timed out")
+    )
+    engine = _engine(
+        runner, command_runner=cmd, config=EngineConfig(security_pov_check=True)
+    )
+    report = SecurityReport(approved=False, summary="s", findings=[_pov_finding()])
+    run(engine._security_pov_check(report, _pov_task(), _pov_impl()))
+    assert engine._scorecard == {}
+
+
+def test_security_pov_check_uses_only_first_blocking_finding():
+    first = _pov_finding(description="first finding sqli")
+    second = _pov_finding(description="second finding xss NEVER SEEN")
+    runner = ScriptedRunner([json_response({"proposable": False})])
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        runner, command_runner=cmd, config=EngineConfig(security_pov_check=True)
+    )
+    report = SecurityReport(approved=False, summary="s", findings=[first, second])
+    run(engine._security_pov_check(report, _pov_task(), _pov_impl()))
+    call = runner.calls[0]
+    assert "first finding sqli" in call["prompt"]
+    assert "second finding xss NEVER SEEN" not in call["prompt"]
+
+
+def test_security_pov_check_cleanup_failure_is_a_hard_stop():
+    class _FailingDeleteWorkspace:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def write_text(self, path, content):
+            self._inner.write_text(path, content)
+
+        def delete(self, path):
+            raise OSError("disk full")
+
+    runner = ScriptedRunner(
+        [
+            json_response(
+                {"proposable": True, "test_code": "def test_x():\n    assert True\n"}
+            )
+        ]
+    )
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        runner, command_runner=cmd, config=EngineConfig(security_pov_check=True)
+    )
+    engine.workspace = _FailingDeleteWorkspace(InMemoryWorkspace())
+    report = SecurityReport(approved=False, summary="s", findings=[_pov_finding()])
+    with pytest.raises(_StashRestoreFailed):
+        run(engine._security_pov_check(report, _pov_task(), _pov_impl()))
+
+
+class _PovRunner(ScriptedRunner):
+    """Answers a `propose_pov` call distinctly from a `review` call, even
+    though both share the security agent's system prompt."""
+
+    async def run(self, prompt, *, system_prompt=None, **kwargs):
+        if (
+            system_prompt
+            and "application security engineer" in system_prompt
+            and "Propose a minimal proof-of-vulnerability test" in prompt
+        ):
+            return AgentResult(
+                text=json_response(self.pov_payload), num_turns=1
+            )
+        return await super().run(prompt, system_prompt=system_prompt, **kwargs)
+
+
+def test_security_review_wires_pov_check_and_records_confirmed():
+    mapping = engine_responses(security=False)
+    runner = _PovRunner(by_system_prompt=mapping)
+    runner.pov_payload = {
+        "proposable": True,
+        "test_code": "def test_x():\n    assert False\n",
+    }
+    cmd = FakeCommandRunner()
+    cmd.add_rule("pytest -q -o addopts=", CommandResult(["pytest"], 1, "1 failed", ""))
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(
+            verify_command=("true",),
+            fail_to_pass_check=False,
+            security_pov_check=True,
+            max_task_attempts=1,
+        ),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.scorecard.get("security_pov_confirmed") == 1
+    assert outcome.security is not None
+    assert outcome.security.approved is False
+    assert outcome.success is False
+
+
+def test_security_review_fails_closed_when_pov_cleanup_fails():
+    mapping = engine_responses(security=False)
+    runner = _PovRunner(by_system_prompt=mapping)
+    runner.pov_payload = {
+        "proposable": True,
+        "test_code": "def test_x():\n    assert True\n",
+    }
+    ws = InMemoryWorkspace()
+    real_delete = ws.delete
+
+    def flaky_delete(path):
+        if "security_pov" in path:
+            raise OSError("disk full")
+        real_delete(path)
+
+    ws.delete = flaky_delete  # type: ignore[method-assign]
+
+    cmd = FakeCommandRunner()
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(
+            verify_command=("true",),
+            fail_to_pass_check=False,
+            security_pov_check=True,
+            max_task_attempts=1,
+        ),
+    )
+    outcome = run(engine.deliver(_request()))
+
+    assert outcome.success is False
+    assert outcome.security is not None
+    assert outcome.security.approved is False
+    assert outcome.scorecard.get("gate_failures", 0) >= 1
+
+
 def test_devops_artifacts_are_written_and_committed():
     responses = engine_responses()
     responses["DevOps engineer"] = json_response(

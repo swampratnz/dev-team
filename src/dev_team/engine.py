@@ -224,6 +224,23 @@ class EngineConfig:
       rollback (mirrors ``mutation_check``'s advisory-only precedent). Off by
       default. A best-effort ``docker rmi`` cleanup always runs afterwards,
       success or failure. See ``docs/BENCHMARKS.md`` (DevOps) and ROADMAP.
+    - ``security_pov_check``: after the security review runs, if it raised a
+      major/critical finding, ask the security agent to propose a minimal,
+      self-contained pytest case that reproduces the *first* such finding
+      (mirrors ``mutation_check``'s "first mutant only" scope discipline),
+      execute that one generated file in isolation through the existing
+      ``command_runner``, then remove it — success or failure — in a
+      ``finally`` block. Records an advisory
+      ``security_pov_confirmed``/``security_pov_unconfirmed`` scorecard
+      signal; **never** affects ``SecurityReport.approved`` or the commit
+      gate. Off by default. Skipped, with no scorecard change, no file
+      written, and no gate re-run, when: disabled; verification is remote or
+      degraded; a dry run; there is no major/critical finding; or the agent
+      cannot express the finding as an executable assertion. A cleanup
+      failure raises :class:`_StashRestoreFailed`, the same hard-stop class
+      ``mutation_check`` uses, rather than risk a generated test file left on
+      disk or slipping into the feature commit. See ``docs/BENCHMARKS.md``
+      (Security, "Proof-of-vulnerability").
     - ``docker_run_gate``: requires ``docker_build_gate`` and only engages
       when that build reports ``docker_build_verified is True`` for the same
       run. Starts the just-built image detached, networkless, and hardened
@@ -363,6 +380,17 @@ class EngineConfig:
     #: never-blocks-the-commit stance). See ``docs/BENCHMARKS.md``
     #: ("Mutation-lite scoring") and ROADMAP.
     mutation_check: bool = False
+    #: Advisory-only proof-of-vulnerability signal: when the security review
+    #: raises a major/critical finding, ask the security agent to propose a
+    #: minimal pytest case reproducing the first such finding, execute it in
+    #: isolation, and record a ``security_pov_confirmed``/
+    #: ``security_pov_unconfirmed`` scorecard counter. Never affects
+    #: ``SecurityReport.approved`` or the commit gate. Off by default — a
+    #: new, less-proven signal, mirroring ``mutation_check``'s off-by-default,
+    #: advisory-only stance. See ``docs/BENCHMARKS.md`` (Security,
+    #: "Proof-of-vulnerability") and the class docstring for the full
+    #: contract.
+    security_pov_check: bool = False
     remote_verify_status: Optional[Sequence[str]] = None
     remote_verify_trigger: Optional[Sequence[str]] = None
     remote_verify_max_polls: int = 30
@@ -3207,6 +3235,92 @@ class DeliveryEngine:
                 self._scorecard.get("mutation_killed", 0) + 1
             )
 
+    async def _security_pov_check(
+        self,
+        report: SecurityReport,
+        task: Task,
+        implementation: Implementation,
+    ) -> None:
+        """Advisory proof-of-vulnerability signal: does the first blocking
+        finding reproduce?
+
+        Asks the security agent for a minimal, self-contained pytest case for
+        the *first* major/critical finding in ``report`` (mirrors
+        :meth:`_mutation_check`'s "first mutant only" scope discipline),
+        writes it to a scratch path under ``.dev_team/security_pov/`` (never a
+        real ``tests/`` path — :data:`_INTERNAL_PREFIX` already keeps it out
+        of the feature commit and ``changed_files()``), and executes it in
+        isolation — the one generated file, not the whole suite — through the
+        existing ``command_runner``. ``-o addopts=`` overrides whatever the
+        target project's own ``pytest`` config adds (e.g. a coverage-fail-
+        under gate), so a single-file run is judged on its own merits, never
+        on unrelated suite-wide settings.
+
+        A test that still fails against the current implementation means the
+        finding reproduces (``security_pov_confirmed``); a test that passes
+        means it did not (``security_pov_unconfirmed``). Never a rejection,
+        retry, or rollback, and **never** changes ``report.approved`` — purely
+        advisory, like :meth:`_mutation_check`. Skipped, with no scorecard
+        change, no file written, and no gate re-run, when: disabled; a dry
+        run; verification is remote or degraded; ``report`` has no
+        major/critical finding; the agent proposes no case; or the ``pytest``
+        binary itself could not be found or timed out (an environment gap,
+        not a signal about the finding).
+
+        The scratch file is always removed, success or failure, via a
+        ``finally`` block; a restore that itself fails raises
+        :class:`_StashRestoreFailed` (the same hard-stop class
+        :meth:`_mutation_check` uses) rather than risking the generated test
+        left on disk or, worse, reaching the feature commit.
+        """
+
+        if not self.config.security_pov_check:
+            return
+        if not self._local_verification:
+            return
+        if isinstance(self.command_runner.inner, DryRunCommandRunner):
+            return
+        blocking = report.blocking_findings
+        if not blocking:
+            return
+        finding = blocking[0]
+
+        pov = await self.security.propose_pov(
+            task,
+            implementation,
+            finding,
+            file_contents=self._contents(implementation),
+            workspace_root=self.workdir,
+        )
+        if pov is None:
+            return
+
+        path = f"{_INTERNAL_PREFIX}security_pov/{task.id}_pov.py"
+        self.workspace.write_text(path, pov.code)
+        try:
+            result = await asyncio.to_thread(
+                self.command_runner.run,
+                ["pytest", "-q", "-o", "addopts=", path],
+                cwd=self.workdir,
+                timeout=self.config.gate_timeout_seconds,
+            )
+        finally:
+            try:
+                self.workspace.delete(path)
+            except Exception as exc:
+                raise _StashRestoreFailed from exc
+
+        if result.exit_code in (EXIT_NOT_FOUND, EXIT_TIMEOUT):
+            return
+        if result.ok:
+            self._scorecard["security_pov_unconfirmed"] = (
+                self._scorecard.get("security_pov_unconfirmed", 0) + 1
+            )
+        else:
+            self._scorecard["security_pov_confirmed"] = (
+                self._scorecard.get("security_pov_confirmed", 0) + 1
+            )
+
     def _inherited_failures_only(self, dod: DoDReport) -> bool:
         """Whether every failing test in ``dod`` was already failing at baseline.
 
@@ -3406,6 +3520,18 @@ class DeliveryEngine:
         )
         report.scanner_failed = scanner_failed
         report.scanner_error = scanner_error
+        try:
+            await self._security_pov_check(report, pseudo_task, aggregate)
+        except _StashRestoreFailed:
+            # The generated PoV file could not be confirmed removed from the
+            # workspace: fail closed exactly like an unresolved blocking
+            # finding (mirrors _mutation_check's call-site handling) rather
+            # than let a cleanup failure either crash the whole delivery or
+            # risk the generated test slipping into the commit.
+            report.approved = False
+            self._scorecard["gate_failures"] = (
+                self._scorecard.get("gate_failures", 0) + 1
+            )
         self.blackboard.post_artifact("security", "FEATURE", report.summary)
         return report
 

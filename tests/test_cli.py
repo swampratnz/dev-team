@@ -394,6 +394,23 @@ def test_engine_config_threads_docker_run_gate():
     assert _engine_config(off).docker_run_gate is False
 
 
+def test_main_security_pov_check_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--security-pov-check"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--security-pov-check" in err and "--deliver" in err
+
+
+def test_engine_config_threads_security_pov_check():
+    from dev_team.cli import _engine_config, build_parser
+
+    on = build_parser().parse_args(["T", "D", "--deliver", "--security-pov-check"])
+    assert _engine_config(on).security_pov_check is True
+    off = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(off).security_pov_check is False
+
+
 def test_main_finalization_reserve_rejected_without_deliver(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["Login", "Add login", "--finalization-reserve", "0.2"], runner=ScriptedRunner([]))
