@@ -708,6 +708,15 @@ def test_parse_rust_toolchain_legacy_empty_or_whitespace_only_is_none():
     assert parse_rust_toolchain_legacy("   \n") is None
 
 
+def test_parse_rust_toolchain_legacy_non_toml_whitespace_only_is_none():
+    # A form feed is whitespace to str.strip() but not to TOML's own
+    # (narrower) whitespace set, so tomllib.loads raises TOMLDecodeError
+    # here and this falls through to the plain-text branch with content
+    # that strips down to "" -- must not raise IndexError indexing
+    # splitlines()[0] on that empty string.
+    assert parse_rust_toolchain_legacy("\x0c") is None
+
+
 def test_parse_rust_toolchain_legacy_toml_shape_concrete_version():
     # Rustup accepts a [toolchain] TOML table in the bare-named file too,
     # tried before the plain-text "first line" convention.

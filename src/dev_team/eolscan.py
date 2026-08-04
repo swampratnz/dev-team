@@ -432,9 +432,6 @@ def parse_rust_toolchain_legacy(text: str) -> Optional[Tuple[str, str]]:
     except tomllib.TOMLDecodeError:
         data = None
     if isinstance(data, dict):
-        # Whitespace/comments-only (including "") text is valid, empty
-        # TOML -- never raises -- so every genuine TOMLDecodeError below
-        # implies non-empty content; `stripped` there is never empty.
         toolchain = data.get("toolchain")
         if not isinstance(toolchain, dict):
             return None
@@ -444,7 +441,15 @@ def parse_rust_toolchain_legacy(text: str) -> Optional[Tuple[str, str]]:
         version = _leading_version(channel)
         return ("rust", version) if version else None
 
-    first_line = text.strip().splitlines()[0]
+    # TOML's own whitespace set (space/tab only) is narrower than
+    # ``str.strip()``'s -- a lone form feed, vertical tab, NBSP, or other
+    # Unicode space character makes ``tomllib.loads`` raise (falling
+    # through to here) while ``text.strip()`` reduces to "", so this guard
+    # is required, not redundant with the TOML branch above.
+    stripped = text.strip()
+    if not stripped:
+        return None
+    first_line = stripped.splitlines()[0]
     version = _leading_version(first_line)
     return ("rust", version) if version else None
 
