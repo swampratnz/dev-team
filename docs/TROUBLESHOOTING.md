@@ -42,13 +42,22 @@ It does **not** drop anything already persisted to disk under
   wrote;
 - verification records.
 
+A **succeeded assess job** recovers automatically — no operator action
+needed. `GET /jobs/{id}` and `GET /jobs/{id}/result` reconstruct it from
+disk (`meta.json` + `assessment.json`) on a registry miss and return it as
+if the registry still held it, so just re-poll the same job id instead of
+resubmitting — see [`docs/DISPATCH.md`](DISPATCH.md)'s *Restart survival*
+note.
+
 **Before resubmitting**, check whether the job's directory already has a
-completed result on disk — if it does, resubmitting duplicates work instead
-of recovering it. If the job is still `queued`, cancel just that one with
-`POST /jobs/{id}/cancel` (auth) instead of restarting the whole service —
-see [`docs/DISPATCH.md`](DISPATCH.md)'s *Cancel* section. A full service
-restart is only necessary for a job that has already moved to `running`,
-which Cancel does not cover.
+completed result on disk — this still applies to a
+`deliver`/`verify`-mode job, or an assess job that never reached success:
+those still 404 permanently after a restart, since only a succeeded assess
+job is reconstructed automatically. If the job is still `queued`, cancel
+just that one with `POST /jobs/{id}/cancel` (auth) instead of restarting
+the whole service — see [`docs/DISPATCH.md`](DISPATCH.md)'s *Cancel*
+section. A full service restart is only necessary for a job that has
+already moved to `running`, which Cancel does not cover.
 
 ## "I need to see the access/request log"
 
