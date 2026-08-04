@@ -161,6 +161,19 @@ def test_job_vanished_section_documents_the_shipped_cancel_route():
     assert 'cancel a queued job" workaround' not in text
 
 
+def test_job_vanished_section_documents_disk_recovery_for_assess():
+    text = _troubleshooting_text()
+    assert "GET /jobs/{id}" in text
+    assert "GET /jobs/{id}/result" in text
+    assert "reconstructed automatically" in text
+
+
+def test_job_vanished_section_states_the_recovery_boundary():
+    text = _troubleshooting_text()
+    assert "`deliver`/`verify`-mode job" in text
+    assert "never reached success" in text
+
+
 def test_routes_cited_in_ignores_unfenced_prose():
     text = "We use GET and POST verbs for HTTP requests, but not shown here."
     assert _routes_cited_in(text) == set()
