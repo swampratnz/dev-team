@@ -157,12 +157,13 @@ machinery understands them now:
   `targetCompatibility`; regex-literal extraction only, not a Groovy/
   Kotlin DSL parser, so the legacy space-call syntax and values sourced
   from variables/`gradle.properties`/`ext` blocks fall back to model
-  knowledge rather than being guessed at), or `rust-toolchain.toml`'s
-  `[toolchain].channel` (a concrete version only — a named channel like
+  knowledge rather than being guessed at), `rust-toolchain.toml`'s
+  `[toolchain].channel`, or the legacy plain-text `rust-toolchain` file's
+  first line (either form: a concrete version only — a named channel like
   `stable`/`beta`/`nightly`, or a dated nightly like
   `nightly-2024-01-15`, falls back to model knowledge rather than being
-  guessed at; the legacy plain-text `rust-toolchain` file and `Cargo.toml`'s
-  `rust-version` MSRV are not read); an unresolved release cycle reports
+  guessed at; `Cargo.toml`'s `rust-version` MSRV is not read); an unresolved
+  release cycle reports
   `unknown` rather than guessing. Treat EOL findings outside those eight
   runtimes as a triage list, not a compliance scan.
 - Phase evidence is as good as what the auditors read: on very large repos

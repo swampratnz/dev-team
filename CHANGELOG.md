@@ -5,6 +5,26 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Assessment
+- **Live EOL scan now reads the legacy plain-text `rust-toolchain` file**
+  (#314, `eolscan.py`): closes the exact gap #261's own CHANGELOG entry and
+  `docs/ASSESSMENT.md`'s "Honest limitations" named as deliberately
+  deferred — Rustup's older convention (no extension, a single line: a bare
+  version like `1.75.0`, or a channel string like
+  `stable-x86_64-unknown-linux-gnu`) predates `rust-toolchain.toml` and is
+  still common, but previously got zero live EOL signal. A new
+  `parse_rust_toolchain_legacy` mirrors `parse_ruby_version`/
+  `parse_python_version`'s "first line, leading version" shape (not
+  `parse_rust_toolchain_toml`, since this file isn't TOML): a concrete
+  version resolves via the shared `_leading_version` helper; a named
+  channel or dated nightly degrades to "not detected" rather than being
+  guessed at, matching the `.toml` parser's own discipline. Registered in
+  `_PARSERS["rust-toolchain"]` — no changes to `detect_runtimes`'s dedup,
+  `query_eol`, or `scan_eol`. `Cargo.toml`'s `rust-version` (MSRV, #273,
+  not yet merged) remains deferred; once it lands, `detect_runtimes` will
+  need a precedence rule so this legacy pin wins over an MSRV floor, the
+  same reasoning #273 established for `rust-toolchain.toml` vs `Cargo.toml`.
+
 ### QA
 - **Mutation-lite now flips augmented-assignment arithmetic
   (`total += 1`↔`total -= 1`, `x *= 2`↔`x /= 2`), the exact follow-up #226

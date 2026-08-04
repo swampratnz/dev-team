@@ -408,6 +408,27 @@ def parse_rust_toolchain_toml(text: str) -> Optional[Tuple[str, str]]:
     return ("rust", version) if version else None
 
 
+def parse_rust_toolchain_legacy(text: str) -> Optional[Tuple[str, str]]:
+    """Rustup's legacy plain-text ``rust-toolchain``: the first line's
+    channel, if version-shaped.
+
+    Predates ``rust-toolchain.toml`` and still common; same "first line,
+    leading version" shape as :func:`parse_ruby_version`/
+    :func:`parse_python_version`, not the TOML parser, since this file
+    isn't TOML. A named channel (``stable``, ``nightly``) or a dated
+    nightly (``nightly-2024-01-15``) has no leading digit and degrades to
+    ``None``, matching :func:`parse_rust_toolchain_toml`'s discipline for
+    the identical non-goal.
+    """
+
+    stripped = text.strip()
+    if not stripped:
+        return None
+    first_line = stripped.splitlines()[0]
+    version = _leading_version(first_line)
+    return ("rust", version) if version else None
+
+
 _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "package.json": parse_package_json_engines,
     ".nvmrc": parse_nvmrc,
@@ -421,6 +442,10 @@ _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "build.gradle": parse_gradle_java,
     "build.gradle.kts": parse_gradle_java,
     "rust-toolchain.toml": parse_rust_toolchain_toml,
+    # Legacy plain-text manifest, predates the .toml one above. Once #273
+    # (Cargo.toml's rust-version) lands, detect_runtimes will need this
+    # entry to take precedence over a Cargo.toml-sourced result too.
+    "rust-toolchain": parse_rust_toolchain_legacy,
 }
 
 
