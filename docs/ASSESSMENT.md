@@ -158,11 +158,15 @@ machinery understands them now:
   Kotlin DSL parser, so the legacy space-call syntax and values sourced
   from variables/`gradle.properties`/`ext` blocks fall back to model
   knowledge rather than being guessed at), `rust-toolchain.toml`'s
-  `[toolchain].channel`, or the legacy plain-text `rust-toolchain` file's
-  first line (either form: a concrete version only — a named channel like
+  `[toolchain].channel`, or the legacy extensionless `rust-toolchain` file
+  (either a `[toolchain].channel` TOML table like the `.toml` file, or a
+  plain first line, mirroring rustup's own dispatch between the two
+  shapes; when both `rust-toolchain` and `rust-toolchain.toml` are
+  present, the `.toml` file takes precedence, matching rustup). In every
+  form: a concrete version only — a named channel like
   `stable`/`beta`/`nightly`, or a dated nightly like
   `nightly-2024-01-15`, falls back to model knowledge rather than being
-  guessed at; `Cargo.toml`'s `rust-version` MSRV is not read); an unresolved
+  guessed at; `Cargo.toml`'s `rust-version` MSRV is not read. An unresolved
   release cycle reports
   `unknown` rather than guessing. Treat EOL findings outside those eight
   runtimes as a triage list, not a compliance scan.

