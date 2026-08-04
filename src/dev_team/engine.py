@@ -2546,11 +2546,16 @@ class DeliveryEngine:
         same query shape as the described-mode path
         (:meth:`_attempt_described`), so the agentic engineer gets the same
         retrieved context regardless of session reuse or worktree mode.
+        It is computed lazily: a continuation never puts it in the prompt
+        (see :meth:`agents.engineer.EngineerAgent.implement_over_session`),
+        so retrieval only runs when the value will actually be used — on a
+        first attempt, or on the cold fallback below, which always needs a
+        fresh (non-continued) prompt regardless of the original
+        ``continued`` value.
         """
 
-        relevant_code = self._retrieve_context(
-            "\n".join([task.title, task.description, *task.acceptance_criteria])
-        )
+        query = "\n".join([task.title, task.description, *task.acceptance_criteria])
+        relevant_code = None if continued else self._retrieve_context(query)
         if session is not None:
             try:
                 implementation = await self.engineer.implement_over_session(
@@ -2566,6 +2571,8 @@ class DeliveryEngine:
                     f"Engineer session failed for {task.id}; falling back to a cold attempt",
                 )
                 session = None
+                if relevant_code is None:
+                    relevant_code = self._retrieve_context(query)
         implementation = await self.engineer.implement_in_place(
             task,
             design,

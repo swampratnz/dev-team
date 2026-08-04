@@ -6664,7 +6664,22 @@ def test_engineer_attempt_cold_path_includes_retrieved_context(tmp_path):
     assert '<file-content path="src/thing.py">' in runner.calls[0]["prompt"]
 
 
-def test_engineer_attempt_session_path_includes_retrieved_context(tmp_path):
+def _spy_retrieve_context(eng, monkeypatch):
+    # Wraps the real _retrieve_context so behaviour is unchanged; only the
+    # call count is observed (issue #320's fix is about *when* retrieval
+    # runs, not what it returns).
+    original = eng._retrieve_context
+    calls = []
+
+    def spy(query):
+        calls.append(query)
+        return original(query)
+
+    monkeypatch.setattr(eng, "_retrieve_context", spy)
+    return calls
+
+
+def test_engineer_attempt_session_path_includes_retrieved_context(tmp_path, monkeypatch):
     from dev_team.instrument import InstrumentedSession
     from dev_team.sdk import AgentResult, FakeAgentSession
 
@@ -6674,6 +6689,7 @@ def test_engineer_attempt_session_path_includes_retrieved_context(tmp_path):
         workspace=LocalWorkspace(str(tmp_path)),
         config=EngineConfig(retrieval=True),
     )
+    calls = _spy_retrieve_context(eng, monkeypatch)
     fake = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
     session = InstrumentedSession(fake, "engineer")
     impl, out = run(
@@ -6683,9 +6699,10 @@ def test_engineer_attempt_session_path_includes_retrieved_context(tmp_path):
     assert isinstance(impl, Implementation)
     assert out is session
     assert '<file-content path="src/thing.py">' in fake.prompts[0]
+    assert len(calls) == 1  # AC2: computed exactly once on a first attempt
 
 
-def test_engineer_attempt_session_continuation_never_gets_retrieved_context(tmp_path):
+def test_engineer_attempt_session_continuation_never_gets_retrieved_context(tmp_path, monkeypatch):
     from dev_team.instrument import InstrumentedSession
     from dev_team.sdk import AgentResult, FakeAgentSession
 
@@ -6695,6 +6712,7 @@ def test_engineer_attempt_session_continuation_never_gets_retrieved_context(tmp_
         workspace=LocalWorkspace(str(tmp_path)),
         config=EngineConfig(retrieval=True),
     )
+    calls = _spy_retrieve_context(eng, monkeypatch)
     fake = FakeAgentSession(results=[AgentResult(text=json_response(impl_dict()))])
     session = InstrumentedSession(fake, "engineer")
     run(
@@ -6702,6 +6720,7 @@ def test_engineer_attempt_session_continuation_never_gets_retrieved_context(tmp_
                               continued=True, model=None)
     )
     assert "Most relevant existing code" not in fake.prompts[0]
+    assert calls == []  # AC1: a successful continuation never calls retrieval
 
 
 def test_engineer_attempt_no_relevant_code_when_retrieval_off(tmp_path):
@@ -6714,6 +6733,100 @@ def test_engineer_attempt_no_relevant_code_when_retrieval_off(tmp_path):
     )
     assert isinstance(impl, Implementation)
     assert "Most relevant existing code" not in runner.calls[0]["prompt"]
+
+
+def test_engineer_attempt_continuation_session_error_computes_retrieval_once_for_fallback(
+    tmp_path, monkeypatch,
+):
+    # AC3: a continuation whose session errors falls back to a cold,
+    # non-continued implement_in_place prompt — which does need
+    # relevant_code, so the lazy computation must happen at the fallback
+    # point rather than never.
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    _write_retrievable_file(tmp_path)
+    runner = ScriptedRunner([json_response(impl_dict())])
+    eng = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(retrieval=True, json_retries=0),
+    )
+    calls = _spy_retrieve_context(eng, monkeypatch)
+    fake = FakeAgentSession(results=[AgentResult(text="", is_error=True)])
+    session = InstrumentedSession(fake, "engineer")
+    impl, out = run(
+        eng._engineer_attempt(_retrieval_task(), Design(overview="o"), None, session,
+                              continued=True, model=None)
+    )
+    assert isinstance(impl, Implementation)  # came from the cold fallback
+    assert out is None
+    assert len(calls) == 1  # computed once, after the fallback decision
+    assert '<file-content path="src/thing.py">' in runner.calls[0]["prompt"]
+
+
+def test_engineer_attempt_non_continuation_session_error_reuses_retrieval(
+    tmp_path, monkeypatch,
+):
+    # AC4: a first-attempt (non-continued) session error must not recompute
+    # retrieval for the cold fallback — the eager value from before the
+    # session call is reused.
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    _write_retrievable_file(tmp_path)
+    runner = ScriptedRunner([json_response(impl_dict())])
+    eng = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(retrieval=True, json_retries=0),
+    )
+    calls = _spy_retrieve_context(eng, monkeypatch)
+    fake = FakeAgentSession(results=[AgentResult(text="", is_error=True)])
+    session = InstrumentedSession(fake, "engineer")
+    impl, out = run(
+        eng._engineer_attempt(_retrieval_task(), Design(overview="o"), None, session,
+                              continued=False, model=None)
+    )
+    assert isinstance(impl, Implementation)
+    assert out is None
+    assert len(calls) == 1  # not recomputed for the fallback
+    assert '<file-content path="src/thing.py">' in runner.calls[0]["prompt"]
+
+
+def test_engineer_attempt_retrieval_off_never_calls_retrieve_function(tmp_path, monkeypatch):
+    # AC5: with retrieval disabled, the module-level retrieve() must never
+    # run (the corpus-build cost this issue is about), for both a plain
+    # attempt and a continuation whose session errors into the cold path.
+    from dev_team import engine as engine_mod
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    _write_retrievable_file(tmp_path)
+
+    def exploding_retrieve(*args, **kwargs):
+        raise AssertionError("retrieve() must not be called when retrieval is off")
+
+    monkeypatch.setattr(engine_mod, "retrieve", exploding_retrieve)
+
+    runner = ScriptedRunner([json_response(impl_dict()), json_response(impl_dict())])
+    eng = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(json_retries=0),  # retrieval off (default)
+    )
+    run(
+        eng._engineer_attempt(_retrieval_task(), Design(overview="o"), None, None,
+                              continued=False, model=None)
+    )
+
+    fake = FakeAgentSession(results=[AgentResult(text="", is_error=True)])
+    session = InstrumentedSession(fake, "engineer")
+    run(
+        eng._engineer_attempt(_retrieval_task(), Design(overview="o"), None, session,
+                              continued=True, model=None,
+                              cwd=str(tmp_path))
+    )
 
 
 def test_worktree_engineer_receives_retrieved_context(tmp_path):
