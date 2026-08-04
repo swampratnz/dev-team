@@ -131,16 +131,28 @@ class GitHubPRCommentChannel:
                     return Reply(choice=choice.key)
         return Reply(choice=question.fail_safe.key)
 
+    def post_comment(self, body: str) -> Dict:
+        """Post a plain, non-question comment to the PR (e.g. an incident report).
+
+        Shares :meth:`_send`'s HTTP-call and error-handling with :meth:`_post`
+        — the one ``Question``-specific step (rendering the prompt/context/
+        choice menu) is skipped in favour of the caller's already-rendered
+        ``body``.
+        """
+
+        return self._send(body, "posting the comment")
+
     def _post(self, question: Question) -> Dict:
+        return self._send(_render_comment_body(question), "posting the CI-fix question")
+
+    def _send(self, body: str, action: str) -> Dict:
         url = f"{self.api_base}/repos/{self.owner}/{self.name}/issues/{self.pr_number}/comments"
-        payload = {"body": _render_comment_body(question)}
+        payload = {"body": body}
         http = self.http_post or _http_post
         try:
             response = http(url, json.dumps(payload).encode("utf-8"), self._headers())
         except urllib.error.HTTPError as exc:
-            raise GitHubPRCommentChannelError(
-                self._describe(exc, "posting the CI-fix question")
-            ) from exc
+            raise GitHubPRCommentChannelError(self._describe(exc, action)) from exc
         except urllib.error.URLError as exc:
             raise GitHubPRCommentChannelError(
                 self._scrub(f"could not reach {self.api_base}: {exc.reason}")

@@ -2475,6 +2475,36 @@ def test_main_watch_fix_rounds_negative_rejected():
     assert exc.value.code == 2
 
 
+def test_main_incident_report_on_exhaustion_requires_watch_fix_rounds():
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["T", "D", "--deliver", "--repo", "acme/mono", "--pull-request",
+             "--watch-checks", "--incident-report-on-exhaustion"],
+            runner=ScriptedRunner([]),
+        )
+    assert exc.value.code == 2
+
+
+def test_main_incident_report_on_exhaustion_with_watch_fix_rounds_is_valid(tmp_path, monkeypatch):
+    import dev_team.cli as cli_module
+    from dev_team.checks import ChecksOutcome
+
+    monkeypatch.setattr(
+        cli_module, "watch_checks", lambda *a, **k: ChecksOutcome("success", summary="ok")
+    )
+    called = []
+
+    async def fake_loop(engine, team, outcome, args, ref, token):
+        called.append(args.incident_report_on_exhaustion)
+
+    monkeypatch.setattr(cli_module, "_run_ci_fix_loop", fake_loop)
+    _pr_deliver(
+        tmp_path, monkeypatch, {}, "--watch-checks", "--watch-fix-rounds", "1",
+        "--incident-report-on-exhaustion",
+    )
+    assert called == [True]  # parsed through to the loop, no parser.error
+
+
 def test_main_watch_fix_rounds_invokes_the_loop(tmp_path, monkeypatch):
     import dev_team.cli as cli_module
     from dev_team.checks import ChecksOutcome
@@ -2509,9 +2539,10 @@ def _fix_outcome(state="failure"):
 
 
 class _FakeEngine:
-    def __init__(self, results):
+    def __init__(self, results, *, sre=None):
         self._results = list(results)
         self.calls = []
+        self.sre = sre
 
     async def remediate_checks(self, summary):
         self.calls.append(summary)
@@ -2519,6 +2550,28 @@ class _FakeEngine:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+class _FakeSRE:
+    """Records `incident_report` calls and returns a canned report."""
+
+    def __init__(self, report=None):
+        from dev_team.models import IncidentReport
+
+        self.report = report or IncidentReport(
+            summary="CI kept failing", likely_cause="flaky dependency",
+            attempted_fixes=["retried the install"], recommended_action="rerun manually",
+            rollback_steps=["revert the branch"],
+        )
+        self.calls = []
+        self.workspace_roots = []
+
+    async def incident_report(
+        self, request, prior_reliability, deployment, round_history, *, workspace_root=None
+    ):
+        self.calls.append((request, prior_reliability, deployment, list(round_history)))
+        self.workspace_roots.append(workspace_root)
+        return self.report
 
 
 def _fix_team(interaction=None):
@@ -2529,7 +2582,10 @@ def _fix_team(interaction=None):
     return types.SimpleNamespace(interaction=interaction, roster=Roster.default())
 
 
-def _run_fix_loop(monkeypatch, engine, outcome, *, team=None, rounds=2, rewatch=()):
+def _run_fix_loop(
+    monkeypatch, engine, outcome, *, team=None, rounds=2, rewatch=(),
+    incident_report_on_exhaustion=False,
+):
     import types
 
     import dev_team.cli as cli_module
@@ -2551,6 +2607,7 @@ def _run_fix_loop(monkeypatch, engine, outcome, *, team=None, rounds=2, rewatch=
     args = types.SimpleNamespace(
         watch_fix_rounds=rounds, workspace="/ws", watch_timeout=600.0,
         interactive_pr_comments=False, interactive_pr_comment_author=None,
+        incident_report_on_exhaustion=incident_report_on_exhaustion,
     )
     run(
         cli_module._run_ci_fix_loop(
@@ -2603,14 +2660,17 @@ def test_watch_fix_loop_human_skip_first_round(monkeypatch):
     assert engine.calls == [] and pushes == []  # never remediated
 
 
-def test_watch_fix_loop_exhausts_rounds(monkeypatch):
+def test_watch_fix_loop_exhausts_rounds(monkeypatch, capsys):
     from dev_team.engine import RemediationOutcome
 
+    # AC9 (default off): engine.sre stays None (a stray call raises) and the
+    # loop stays silent on this path exactly as before the incident report.
     engine = _FakeEngine([RemediationOutcome(True, "f1"), RemediationOutcome(True, "f2")])
     outcome = _fix_outcome("failure")
     pushes = _run_fix_loop(monkeypatch, engine, outcome, rounds=2, rewatch=["failure", "failure"])
     assert len(engine.calls) == 2 and pushes == [True, True]
     assert outcome.checks.state == "failure"
+    assert "exhausted" not in capsys.readouterr().err
 
 
 def test_watch_fix_loop_stops_on_budget(monkeypatch):
@@ -2629,6 +2689,9 @@ def test_watch_fix_loop_does_not_chase_a_timeout(monkeypatch):
 
 
 def test_watch_fix_loop_stops_on_push_failure(monkeypatch):
+    # AC4 (negative): a push failure is not one of the three autonomous
+    # exhaustion exits, so no incident report is synthesized even opted in —
+    # engine.sre stays untouched (a stray call would raise on the None sre).
     import dev_team.cli as cli_module
     from dev_team.engine import RemediationOutcome
     from dev_team.git import GitError
@@ -2647,6 +2710,7 @@ def test_watch_fix_loop_stops_on_push_failure(monkeypatch):
     args = types.SimpleNamespace(
         watch_fix_rounds=2, workspace="/ws", watch_timeout=600.0,
         interactive_pr_comments=False, interactive_pr_comment_author=None,
+        incident_report_on_exhaustion=True,
     )
     run(
         cli_module._run_ci_fix_loop(
@@ -2815,6 +2879,7 @@ def test_run_ci_fix_loop_uses_pr_comment_channel_when_opted_in(monkeypatch):
     args = types.SimpleNamespace(
         watch_fix_rounds=1, workspace="/ws", watch_timeout=600.0,
         interactive_pr_comments=True, interactive_pr_comment_author=["ada"],
+        incident_report_on_exhaustion=False,
     )
     run(
         cli_module._run_ci_fix_loop(
@@ -2845,6 +2910,7 @@ def test_run_ci_fix_loop_pr_comment_error_stops_gracefully(monkeypatch, capsys):
     args = types.SimpleNamespace(
         watch_fix_rounds=1, workspace="/ws", watch_timeout=600.0,
         interactive_pr_comments=True, interactive_pr_comment_author=["ada"],
+        incident_report_on_exhaustion=False,
     )
     run(
         cli_module._run_ci_fix_loop(
@@ -2854,6 +2920,252 @@ def test_run_ci_fix_loop_pr_comment_error_stops_gracefully(monkeypatch, capsys):
     )
     assert engine.calls == []  # never reached remediation
     assert "could not reach the PR comments" in capsys.readouterr().err
+
+
+# --- --incident-report-on-exhaustion (SRE incident report, issue #322) -----
+
+
+class _FakeChannelWithPost:
+    """A PR-comment channel double exposing ``ask``, ``post_comment``, ``token``."""
+
+    def __init__(self, replies, token="ghtok", post_error=None):
+        self._pending = list(replies)
+        self.token = token
+        self.questions = []
+        self.posted = []
+        self.post_error = post_error
+
+    def ask(self, question):
+        self.questions.append(question)
+        return self._pending.pop(0)
+
+    def post_comment(self, body):
+        if self.post_error is not None:
+            raise self.post_error
+        self.posted.append(body)
+        return {}
+
+
+def test_incident_report_on_all_rounds_exhausted_prints_when_no_pr_channel(monkeypatch, capsys):
+    from dev_team.engine import RemediationOutcome
+
+    sre = _FakeSRE()
+    engine = _FakeEngine([RemediationOutcome(True, "f1")], sre=sre)
+    outcome = _fix_outcome("failure")
+    pushes = _run_fix_loop(
+        monkeypatch, engine, outcome, rounds=1, rewatch=["failure"],
+        incident_report_on_exhaustion=True,
+    )
+    assert pushes == [True]
+    assert len(sre.calls) == 1
+    request, prior_reliability, deployment, history = sre.calls[0]
+    assert request is outcome.request
+    assert history == [(1, "boom", "f1")]
+    assert sre.workspace_roots == ["/ws"]
+    err = capsys.readouterr().err
+    assert "CI fix exhausted after 1 round(s)" in err
+    assert "Likely cause" in err  # the rendered report, printed since no channel
+
+
+def test_incident_report_not_synthesized_when_flag_off_even_if_sre_present(monkeypatch, capsys):
+    # Belt-and-braces regression alongside AC9: the flag gates the call, not
+    # merely whether engine.sre happens to be set.
+    from dev_team.engine import RemediationOutcome
+
+    sre = _FakeSRE()
+    engine = _FakeEngine([RemediationOutcome(True, "f1")], sre=sre)
+    outcome = _fix_outcome("failure")
+    _run_fix_loop(monkeypatch, engine, outcome, rounds=1, rewatch=["failure"])
+    assert sre.calls == []
+    assert "exhausted" not in capsys.readouterr().err
+
+
+def test_incident_report_on_no_fix_applied(monkeypatch, capsys):
+    from dev_team.engine import RemediationOutcome
+
+    sre = _FakeSRE()
+    engine = _FakeEngine([RemediationOutcome(False, "could not fix")], sre=sre)
+    outcome = _fix_outcome("failure")
+    _run_fix_loop(monkeypatch, engine, outcome, rounds=2, incident_report_on_exhaustion=True)
+    assert len(sre.calls) == 1
+    assert sre.calls[0][3] == [(1, "boom", "could not fix")]
+    err = capsys.readouterr().err
+    assert "no fix applied" in err
+    assert "Likely cause" in err
+
+
+def test_incident_report_on_budget_exhausted(monkeypatch, capsys):
+    from dev_team.budget import BudgetExceededError
+
+    sre = _FakeSRE()
+    engine = _FakeEngine([BudgetExceededError(1.0, 0.5)], sre=sre)
+    outcome = _fix_outcome("failure")
+    _run_fix_loop(monkeypatch, engine, outcome, incident_report_on_exhaustion=True)
+    assert len(sre.calls) == 1
+    round_num, checks_summary, result_summary = sre.calls[0][3][0]
+    assert (round_num, checks_summary) == (1, "boom")
+    assert result_summary == "budget exhausted before a fix could be attempted"
+    err = capsys.readouterr().err
+    assert "budget exhausted" in err.lower()
+    assert "Likely cause" in err
+
+
+def test_incident_report_posted_to_pr_when_channel_configured(monkeypatch):
+    import types
+
+    import dev_team.cli as cli_module
+    from dev_team.engine import RemediationOutcome
+    from dev_team.interaction import Reply
+    from dev_team.sources import RepoRef, StaticTokenProvider
+    from helpers import run
+
+    channel = _FakeChannelWithPost([Reply("apply")])
+    monkeypatch.setattr(cli_module, "GitHubPRCommentChannel", lambda **kw: channel)
+    monkeypatch.setattr(cli_module, "push_branch", lambda *a, **k: None)
+    monkeypatch.setattr(cli_module, "_watch_pr_checks", lambda *a, **k: None)  # stays failing
+    sre = _FakeSRE()
+    engine = _FakeEngine([RemediationOutcome(True, "fixed")], sre=sre)
+    outcome = _fix_outcome("failure")
+    outcome.pull_request_number = 7
+    args = types.SimpleNamespace(
+        watch_fix_rounds=1, workspace="/ws", watch_timeout=600.0,
+        interactive_pr_comments=True, interactive_pr_comment_author=["ada"],
+        incident_report_on_exhaustion=True,
+    )
+    run(
+        cli_module._run_ci_fix_loop(
+            engine, _fix_team(), outcome, args,
+            RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), StaticTokenProvider("tok"),
+        )
+    )
+    assert len(sre.calls) == 1
+    assert len(channel.posted) == 1
+    assert "Likely cause" in channel.posted[0]
+
+
+def test_incident_report_post_failure_degrades_to_stderr(monkeypatch, capsys):
+    import types
+
+    import dev_team.cli as cli_module
+    from dev_team.engine import RemediationOutcome
+    from dev_team.interaction import Reply
+    from dev_team.pr_comment_channel import GitHubPRCommentChannelError
+    from dev_team.sources import RepoRef, StaticTokenProvider
+    from helpers import run
+
+    channel = _FakeChannelWithPost(
+        [Reply("apply")], post_error=GitHubPRCommentChannelError("GitHub returned 500")
+    )
+    monkeypatch.setattr(cli_module, "GitHubPRCommentChannel", lambda **kw: channel)
+    monkeypatch.setattr(cli_module, "push_branch", lambda *a, **k: None)
+    monkeypatch.setattr(cli_module, "_watch_pr_checks", lambda *a, **k: None)  # stays failing
+    sre = _FakeSRE()
+    engine = _FakeEngine([RemediationOutcome(True, "fixed")], sre=sre)
+    outcome = _fix_outcome("failure")
+    outcome.pull_request_number = 7
+    args = types.SimpleNamespace(
+        watch_fix_rounds=1, workspace="/ws", watch_timeout=600.0,
+        interactive_pr_comments=True, interactive_pr_comment_author=["ada"],
+        incident_report_on_exhaustion=True,
+    )
+    run(
+        cli_module._run_ci_fix_loop(
+            engine, _fix_team(), outcome, args,
+            RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"), StaticTokenProvider("tok"),
+        )
+    )
+    assert channel.posted == []  # posting failed
+    err = capsys.readouterr().err
+    assert "could not post incident report" in err
+    assert "Likely cause" in err  # the report is still surfaced, never dropped
+
+
+def test_incident_report_scrubs_the_token(monkeypatch, capsys):
+    import types
+
+    import dev_team.cli as cli_module
+    from dev_team.engine import RemediationOutcome
+    from dev_team.models import IncidentReport
+    from dev_team.sources import RepoRef, StaticTokenProvider
+    from helpers import run
+
+    secret = "ghp_leakedtoken1234567890"
+    report = IncidentReport(
+        summary="ok", likely_cause=f"possibly caused by credential {secret} in the log"
+    )
+    sre = _FakeSRE(report=report)
+    engine = _FakeEngine([RemediationOutcome(True, "fixed")], sre=sre)
+    outcome = _fix_outcome("failure")
+    monkeypatch.setattr(cli_module, "push_branch", lambda *a, **k: None)
+    monkeypatch.setattr(cli_module, "_watch_pr_checks", lambda *a, **k: None)  # stays failing
+    args = types.SimpleNamespace(
+        watch_fix_rounds=1, workspace="/ws", watch_timeout=600.0,
+        interactive_pr_comments=False, interactive_pr_comment_author=None,
+        incident_report_on_exhaustion=True,
+    )
+    run(
+        cli_module._run_ci_fix_loop(
+            engine, _fix_team(), outcome, args,
+            RepoRef(owner="acme", name="mono", url="https://github.com/acme/mono.git"),
+            StaticTokenProvider(secret),
+        )
+    )
+    err = capsys.readouterr().err
+    assert secret not in err
+    assert "***" in err
+
+
+def test_incident_report_not_called_on_success(monkeypatch):
+    from dev_team.engine import RemediationOutcome
+    from dev_team.interaction import Reply, ScriptedChannel
+
+    sre = _FakeSRE()
+    engine = _FakeEngine([RemediationOutcome(True, "fixed")], sre=sre)
+    outcome = _fix_outcome("failure")
+    team = _fix_team(interaction=ScriptedChannel(script=[Reply("apply")]))
+    _run_fix_loop(
+        monkeypatch, engine, outcome, team=team, rounds=2, rewatch=["success"],
+        incident_report_on_exhaustion=True,
+    )
+    assert sre.calls == []
+
+
+def test_incident_report_not_called_on_human_skip(monkeypatch):
+    from dev_team.interaction import Reply, ScriptedChannel
+
+    sre = _FakeSRE()
+    engine = _FakeEngine([], sre=sre)
+    outcome = _fix_outcome("failure")
+    team = _fix_team(interaction=ScriptedChannel(script=[Reply("skip")]))
+    _run_fix_loop(monkeypatch, engine, outcome, team=team, incident_report_on_exhaustion=True)
+    assert sre.calls == []
+
+
+def test_render_incident_report_omits_empty_optional_sections():
+    import dev_team.cli as cli_module
+    from dev_team.models import IncidentReport
+
+    body = cli_module._render_incident_report(
+        IncidentReport(summary="s", likely_cause="c")
+    )
+    assert "Attempted fixes" not in body
+    assert "Recommended action" not in body
+    assert "Rollback steps" not in body
+
+
+def test_render_incident_report_includes_populated_sections():
+    import dev_team.cli as cli_module
+    from dev_team.models import IncidentReport
+
+    body = cli_module._render_incident_report(
+        IncidentReport(
+            summary="s", likely_cause="c", attempted_fixes=["a"],
+            recommended_action="do x", rollback_steps=["r"],
+        )
+    )
+    assert "**Attempted fixes:**" in body and "- a" in body
+    assert "**Recommended action:** do x" in body
+    assert "**Rollback steps:**" in body and "- r" in body
 
 
 def test_main_deliver_pull_request_sets_pull_request_number(tmp_path, monkeypatch, capsys):
