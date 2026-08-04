@@ -147,6 +147,12 @@ _INTERNAL_PREFIX = ".dev_team/"
 # Dockerfile concurrently on one host can't collide.
 _RUN_ID_COUNTER = itertools.count()
 
+# Sentinel for "not yet computed" in _engineer_attempt's lazy relevant_code,
+# distinct from None so a legitimate empty-retrieval result (retrieval
+# enabled, no BM25 hits) isn't mistaken for "still needs computing" and
+# recomputed.
+_UNSET = object()
+
 
 @dataclass
 class EngineConfig:
@@ -2551,16 +2557,22 @@ class DeliveryEngine:
         so retrieval only runs when the value will actually be used — on a
         first attempt, or on the cold fallback below, which always needs a
         fresh (non-continued) prompt regardless of the original
-        ``continued`` value.
+        ``continued`` value. Computed-ness is tracked with its own sentinel
+        rather than by testing the value for ``None``, because
+        ``_retrieve_context`` legitimately returns ``None`` when retrieval
+        is enabled but the corpus has no relevant hits — the already-computed
+        value (even when it is ``None``) is reused for the cold fallback,
+        never recomputed.
         """
 
         query = "\n".join([task.title, task.description, *task.acceptance_criteria])
-        relevant_code = None if continued else self._retrieve_context(query)
+        relevant_code = _UNSET if continued else self._retrieve_context(query)
         if session is not None:
             try:
                 implementation = await self.engineer.implement_over_session(
                     session, task, design, feedback,
-                    conventions=self._conventions, relevant_code=relevant_code,
+                    conventions=self._conventions,
+                    relevant_code=None if relevant_code is _UNSET else relevant_code,
                     continued=continued,
                 )
                 return implementation, session
@@ -2571,8 +2583,12 @@ class DeliveryEngine:
                     f"Engineer session failed for {task.id}; falling back to a cold attempt",
                 )
                 session = None
-                if relevant_code is None:
-                    relevant_code = self._retrieve_context(query)
+        # The cold path below (whether reached because there was never a
+        # session, or via the fallback above) always needs a fresh,
+        # non-continued prompt, so an as-yet-unresolved value is computed
+        # here — exactly once, regardless of how the cold path was reached.
+        if relevant_code is _UNSET:
+            relevant_code = self._retrieve_context(query)
         implementation = await self.engineer.implement_in_place(
             task,
             design,

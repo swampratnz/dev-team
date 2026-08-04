@@ -6794,6 +6794,62 @@ def test_engineer_attempt_non_continuation_session_error_reuses_retrieval(
     assert '<file-content path="src/thing.py">' in runner.calls[0]["prompt"]
 
 
+def test_engineer_attempt_non_continuation_session_error_reuses_empty_retrieval(
+    tmp_path, monkeypatch,
+):
+    # Regression for the review on #321: _retrieve_context legitimately
+    # returns None when retrieval is enabled but the corpus has no relevant
+    # hits (an empty tmp_path here) — that must still count as "already
+    # computed" for the cold fallback, not be mistaken for "not yet
+    # computed" and recomputed via a second, redundant retrieve() call.
+    from dev_team.instrument import InstrumentedSession
+    from dev_team.sdk import AgentResult, FakeAgentSession
+
+    runner = ScriptedRunner([json_response(impl_dict())])
+    eng = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(retrieval=True, json_retries=0),
+    )
+    calls = _spy_retrieve_context(eng, monkeypatch)
+    fake = FakeAgentSession(results=[AgentResult(text="", is_error=True)])
+    session = InstrumentedSession(fake, "engineer")
+    impl, out = run(
+        eng._engineer_attempt(_retrieval_task(), Design(overview="o"), None, session,
+                              continued=False, model=None)
+    )
+    assert isinstance(impl, Implementation)
+    assert out is None
+    assert len(calls) == 1  # the empty result from the eager call is reused, not recomputed
+    assert "Most relevant existing code" not in runner.calls[0]["prompt"]
+
+
+def test_engineer_attempt_continuation_with_no_session_computes_retrieval(
+    tmp_path, monkeypatch,
+):
+    # A continuation attempt (attempts > 1) with no session at all — e.g.
+    # reuse_engineer_session=False, or a prior attempt's session failure
+    # that leaves every later attempt cold — goes straight to the cold
+    # implement_in_place path, which always needs a real relevant_code
+    # regardless of the (session-only) continued concept.
+    _write_retrievable_file(tmp_path)
+    runner = ScriptedRunner([json_response(impl_dict())])
+    eng = _engine(
+        runner,
+        workspace=LocalWorkspace(str(tmp_path)),
+        config=EngineConfig(retrieval=True),
+    )
+    calls = _spy_retrieve_context(eng, monkeypatch)
+    impl, out = run(
+        eng._engineer_attempt(_retrieval_task(), Design(overview="o"), None, None,
+                              continued=True, model=None)
+    )
+    assert isinstance(impl, Implementation)
+    assert out is None
+    assert len(calls) == 1
+    assert '<file-content path="src/thing.py">' in runner.calls[0]["prompt"]
+
+
 def test_engineer_attempt_retrieval_off_never_calls_retrieve_function(tmp_path, monkeypatch):
     # AC5: with retrieval disabled, the module-level retrieve() must never
     # run (the corpus-build cost this issue is about), for both a plain
