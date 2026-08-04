@@ -110,8 +110,11 @@ beat either alone, and false-positive suppression is a first-class metric.**
   the de-facto rubric.
 - **Adopted:** PRR-rubric review over evidence ✅ — the SRE sees the delivered
   code, gate results, and the deployment plan's rollback, and must ground
-  verdicts in what it saw. Incident-response capability → after PR/CI
-  integration.
+  verdicts in what it saw. Incident-response capability ✅ — `incident_report()`
+  diagnoses a `--watch-fix-rounds` CI-fix loop that exhausted without going
+  green, grounded in the prior reliability review, the deployment rollback
+  plan, and the round-by-round fix history (opt-in via
+  `--incident-report-on-exhaustion`; #322).
 
 ## DevOps
 - **Benchmarks:** IaC-Eval / Multi-IaC-Eval (`terraform plan` + intent checks

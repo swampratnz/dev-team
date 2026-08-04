@@ -59,7 +59,7 @@ from .interaction import (
     triage_review_question,
 )
 from .triage import decision_to_dict, equivalent_command
-from .models import FeatureRequest
+from .models import FeatureRequest, IncidentReport
 from .persona import Roster
 from .pr_comment_channel import GitHubPRCommentChannel, GitHubPRCommentChannelError
 from .pullrequest import GitHubPullRequestPublisher, PullRequestError
@@ -79,6 +79,7 @@ from .sources import (
     clone_or_update,
     default_env_file,
     parse_repo,
+    scrub_credentials,
 )
 from .team import DevTeam
 from .trace import Tracer
@@ -931,6 +932,18 @@ def build_parser() -> argparse.ArgumentParser:
         "is ignored. Required at least once when --interactive-pr-comments "
         "is set — there is no implicit default.",
     )
+    delivery.add_argument(
+        "--incident-report-on-exhaustion",
+        action="store_true",
+        help="When the --watch-fix-rounds CI-fix loop exhausts without "
+        "reaching green (all rounds still failing, a round produces no fix, "
+        "or the budget runs out), have the SRE agent diagnose the round "
+        "history and post an incident report (likely cause, attempted "
+        "fixes, recommended action, rollback steps) as a PR comment when "
+        "--interactive-pr-comments is configured, or print it to stderr "
+        "otherwise. Off by default (zero marginal cost on the common path "
+        "where CI eventually goes green); requires --watch-fix-rounds > 0.",
+    )
     misc.add_argument(
         "--json",
         action="store_true",
@@ -1108,6 +1121,11 @@ def _validate_args(
         parser.error("--watch-fix-rounds must be non-negative")
     if args.watch_fix_rounds and not args.watch_checks:
         parser.error("--watch-fix-rounds requires --watch-checks (there is no watch to fix)")
+    if args.incident_report_on_exhaustion and not args.watch_fix_rounds:
+        parser.error(
+            "--incident-report-on-exhaustion requires --watch-fix-rounds > 0 "
+            "(there is no CI-fix loop to report on)"
+        )
     if args.docker_run_gate and not args.docker_build_gate:
         parser.error(
             "--docker-run-gate requires --docker-build-gate "
@@ -1586,11 +1604,15 @@ async def _run_ci_fix_loop(engine, team, outcome, args, ref, provider) -> None:
     produces no committed fix, when the rounds or the budget run out, or when a
     human skips. ``--interactive-pr-comments`` swaps the channel used for this
     loop's questions to the PR's own comments instead of ``team.interaction``.
+    On an autonomous exhaustion (no fix applied, budget exhausted, or rounds
+    run out still failing), ``--incident-report-on-exhaustion`` has the SRE
+    agent diagnose the round history collected below.
     """
 
     asked_by = team.roster.display_name("engineer")
     pr_channel = _pr_comment_channel(outcome, args, ref, _mint_token(provider, ref))
     channel = pr_channel if pr_channel is not None else team.interaction
+    history: List[Tuple[int, str, str]] = []
     for round_num in range(1, args.watch_fix_rounds + 1):
         checks = outcome.checks
         if checks is None or checks.state != "failure":
@@ -1610,10 +1632,17 @@ async def _run_ci_fix_loop(engine, team, outcome, args, ref, provider) -> None:
             result = await engine.remediate_checks(checks.summary)
         except BudgetExceededError:
             print("CI fix stopped: budget exhausted", file=sys.stderr)
+            history.append(
+                (round_num, checks.summary, "budget exhausted before a fix could be attempted")
+            )
+            await _report_incident_on_exhaustion(engine, outcome, args, ref, provider, pr_channel, history)
             return
         if not result.fixed:
             print(f"CI fix round {round_num}: no fix applied ({result.summary})", file=sys.stderr)
+            history.append((round_num, checks.summary, result.summary))
+            await _report_incident_on_exhaustion(engine, outcome, args, ref, provider, pr_channel, history)
             return
+        history.append((round_num, checks.summary, result.summary))
         # Re-mint per round: a fix round can start long after the loop did,
         # and an App installation token lives only an hour.
         token = _mint_token(provider, ref)
@@ -1630,6 +1659,72 @@ async def _run_ci_fix_loop(engine, team, outcome, args, ref, provider) -> None:
             return
         print(f"CI fix round {round_num}: pushed a fix; re-watching checks", file=sys.stderr)
         _watch_pr_checks(outcome, args, ref, token)
+    # Falling off the loop means the rounds ran out; only treat it as a
+    # failing exhaustion (vs. the last round happening to fix it) when the
+    # final re-watch is still failing — a success here needs no report.
+    if outcome.checks is not None and outcome.checks.state == "failure":
+        if args.incident_report_on_exhaustion:
+            print(
+                f"CI fix exhausted after {args.watch_fix_rounds} round(s); checks still failing",
+                file=sys.stderr,
+            )
+        await _report_incident_on_exhaustion(engine, outcome, args, ref, provider, pr_channel, history)
+
+
+def _render_incident_report(report: IncidentReport) -> str:
+    """Render an :class:`IncidentReport` as a PR-comment-ready markdown body."""
+
+    lines = [
+        "**CI-fix incident report**",
+        "",
+        report.summary,
+        "",
+        f"**Likely cause:** {report.likely_cause}",
+    ]
+    if report.attempted_fixes:
+        lines.append("")
+        lines.append("**Attempted fixes:**")
+        lines.extend(f"- {step}" for step in report.attempted_fixes)
+    if report.recommended_action:
+        lines.append("")
+        lines.append(f"**Recommended action:** {report.recommended_action}")
+    if report.rollback_steps:
+        lines.append("")
+        lines.append("**Rollback steps:**")
+        lines.extend(f"- {step}" for step in report.rollback_steps)
+    return "\n".join(lines)
+
+
+async def _report_incident_on_exhaustion(
+    engine, outcome, args, ref, provider, pr_channel, history: List[Tuple[int, str, str]]
+) -> None:
+    """Diagnose an exhausted CI-fix loop and surface it. Opt-in; never raises.
+
+    Off by default (``--incident-report-on-exhaustion``): zero marginal cost
+    on the common path where CI eventually goes green. Posts to the PR when a
+    PR-comment channel is configured (``--interactive-pr-comments``); a post
+    failure — or no channel at all — degrades to a stderr print, so the
+    report is never silently dropped. The rendered body is scrubbed of the
+    token that would be used to post it, so a credential the round history or
+    the model's own output happens to echo never reaches a repo-visible
+    comment or the log.
+    """
+
+    if not args.incident_report_on_exhaustion:
+        return
+    report = await engine.sre.incident_report(
+        outcome.request, outcome.reliability, outcome.deployment, history,
+        workspace_root=args.workspace,
+    )
+    token = pr_channel.token if pr_channel is not None else _mint_token(provider, ref)
+    body = scrub_credentials(_render_incident_report(report), token)
+    if pr_channel is not None:
+        try:
+            pr_channel.post_comment(body)
+            return
+        except GitHubPRCommentChannelError as exc:
+            print(f"could not post incident report: {exc}", file=sys.stderr)
+    print(body, file=sys.stderr)
 
 
 async def _assess(

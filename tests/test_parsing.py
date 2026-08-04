@@ -347,6 +347,32 @@ def test_reliability_from_dict():
     assert report.runbook == ["c"]
 
 
+def test_incident_report_from_dict():
+    report = parsing.incident_report_from_dict(
+        {
+            "summary": "s",
+            "likely_cause": "flaky network call",
+            "attempted_fixes": ["retried install"],
+            "recommended_action": "rerun manually",
+            "rollback_steps": ["revert branch"],
+        }
+    )
+    assert report.summary == "s"
+    assert report.likely_cause == "flaky network call"
+    assert report.attempted_fixes == ["retried install"]
+    assert report.recommended_action == "rerun manually"
+    assert report.rollback_steps == ["revert branch"]
+
+
+def test_incident_report_from_dict_defaults_on_missing_keys():
+    report = parsing.incident_report_from_dict({})
+    assert report.summary == ""
+    assert report.likely_cause == ""
+    assert report.attempted_fixes == []
+    assert report.recommended_action == ""
+    assert report.rollback_steps == []
+
+
 def test_review_blocking_comment_forces_rejection():
     data = {
         "approved": True,

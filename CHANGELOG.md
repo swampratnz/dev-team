@@ -5,6 +5,29 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Reliability
+- **SRE incident report on CI-fix exhaustion** (#322): the SRE role's
+  incident-response capability, deferred in `docs/BENCHMARKS.md` pending PR/CI
+  integration — now unblocked. `SREAgent.incident_report` (mirroring
+  `assess()`'s `ask_json` shape) diagnoses a `--watch-fix-rounds` CI-fix loop
+  that exhausted without reaching green (all rounds still failing, a round
+  produced no fix, or the budget ran out), returning a new `IncidentReport`
+  (summary, likely cause, attempted fixes, recommended action, rollback
+  steps) grounded in the prior `ReliabilityReport`/`DeploymentPlan` and the
+  round-by-round history `_run_ci_fix_loop` previously discarded past its
+  per-round stderr print. The round history is untrusted CI-derived text, so
+  it is `fences.defuse`d into a delimited `<ci-fix-history>` block before
+  reaching the prompt, same discipline `remediate_checks` already applies to
+  its own CI-output fence. Opt-in via `--incident-report-on-exhaustion`
+  (default off, requires `--watch-fix-rounds > 0`): the report posts to the
+  PR via a new `GitHubPRCommentChannel.post_comment` (sharing `_post`'s
+  HTTP-call/error-handling through one `_send` helper) when
+  `--interactive-pr-comments` is configured, or prints to stderr otherwise; a
+  post failure degrades to the stderr print rather than dropping the report
+  or raising out of an already-completing delivery. The rendered body is
+  scrubbed of the token that would post it before it ever reaches a
+  repo-visible comment or the log.
+
 ### QA
 - **Mutation-lite now flips augmented-assignment arithmetic
   (`total += 1`↔`total -= 1`, `x *= 2`↔`x /= 2`), the exact follow-up #226

@@ -18,6 +18,7 @@ from .models import (
     Documentation,
     FileChange,
     Implementation,
+    IncidentReport,
     Plan,
     Rebuttal,
     ReliabilityReport,
@@ -382,4 +383,17 @@ def reliability_from_dict(data: Any) -> ReliabilityReport:
         slos=as_str_list(data, "slos"),
         risks=as_str_list(data, "risks"),
         runbook=as_str_list(data, "runbook"),
+    )
+
+
+def incident_report_from_dict(data: Any) -> IncidentReport:
+    """Build an :class:`IncidentReport` from a JSON dict."""
+
+    data = as_dict(data)
+    return IncidentReport(
+        summary=as_str(data, "summary"),
+        likely_cause=as_str(data, "likely_cause"),
+        attempted_fixes=as_str_list(data, "attempted_fixes"),
+        recommended_action=as_str(data, "recommended_action"),
+        rollback_steps=as_str_list(data, "rollback_steps"),
     )

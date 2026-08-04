@@ -360,6 +360,63 @@ def test_default_http_post_and_get_use_urllib(monkeypatch):
     assert captured["auth"] == "Bearer TOK"
 
 
+# --- post_comment(): a plain-body sibling of _post (issue #322) ------------
+
+
+def test_post_comment_posts_the_given_body_verbatim():
+    http_post = _RecordingPost()
+    channel = _channel(http_post=http_post)
+    result = channel.post_comment("a plain incident report body")
+    assert result == http_post.response
+    url, payload, headers = http_post.calls[0]
+    assert url == "https://api.github.com/repos/acme/mono/issues/42/comments"
+    assert payload["body"] == "a plain incident report body"
+    assert headers["Authorization"] == "Bearer TOK"
+
+
+def test_post_comment_raises_channel_error_on_http_error():
+    http_post = _RecordingPost(raises=_http_error(500, b'{"message": "boom"}'))
+    channel = _channel(http_post=http_post)
+    with pytest.raises(GitHubPRCommentChannelError) as exc:
+        channel.post_comment("body")
+    assert "500" in str(exc.value) and "boom" in str(exc.value)
+
+
+def test_post_comment_transport_error_is_scrubbed_of_the_token():
+    secret = "ghp_secretvalue123"
+    http_post = _RecordingPost(raises=urllib.error.URLError(f"host {secret} refused"))
+    channel = _channel(token=secret, http_post=http_post)
+    with pytest.raises(GitHubPRCommentChannelError) as exc:
+        channel.post_comment("body")
+    msg = str(exc.value)
+    assert "could not reach" in msg
+    assert secret not in msg and "***" in msg
+
+
+def test_post_comment_returns_empty_dict_on_non_dict_response():
+    http_post = _RecordingPost(response=["not", "a", "dict"])
+    channel = _channel(http_post=http_post)
+    assert channel.post_comment("body") == {}
+
+
+def test_post_comment_and_ask_share_the_same_send_helper(monkeypatch):
+    # AC6: no duplicated request/error-handling logic between the two.
+    http_post = _RecordingPost()
+    http_get = _ScriptedGet([[]])
+    channel = _channel(http_post=http_post, http_get=http_get, max_polls=1, sleep=lambda s: None)
+    actions = []
+    original_send = channel._send
+
+    def spy(body, action):
+        actions.append(action)
+        return original_send(body, action)
+
+    monkeypatch.setattr(channel, "_send", spy)
+    channel.post_comment("plain body")
+    channel.ask(_question())
+    assert actions == ["posting the comment", "posting the CI-fix question"]
+
+
 # --- repr / protocol ---------------------------------------------------------
 
 

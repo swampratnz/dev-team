@@ -266,6 +266,17 @@ class ReliabilityReport:
 
 
 @dataclass
+class IncidentReport:
+    """The SRE's diagnosis of a CI-fix loop that exhausted without going green."""
+
+    summary: str
+    likely_cause: str
+    attempted_fixes: List[str] = field(default_factory=list)
+    recommended_action: str = ""
+    rollback_steps: List[str] = field(default_factory=list)
+
+
+@dataclass
 class TaskResult:
     """The full outcome of developing a single task."""
 
