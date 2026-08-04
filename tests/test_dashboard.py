@@ -2918,6 +2918,92 @@ def test_dashboard_html_foreman_run_form():
     assert 'btn.disabled = !$("foreman-run-budget").value;' in foreman_run_fn_body
 
 
+def test_dashboard_html_foreman_run_job_row_is_clickable_to_filter_runs():
+    """#316 AC1/AC2/AC3/AC7: a freshly-enqueued foreman-run job id links
+
+    forward into the existing Runs-panel cross-filter convention, the same
+    ``[data-run]`` / ``toggleRun`` primitive ``#runs`` already uses — no new
+    filter-state variable, no new backend/HTTP call, just the same primitive
+    reused on a second container.
+    """
+
+    row_fn = DASHBOARD_HTML.index("function foremanRunJobRow(j)")
+    row_fn_end = DASHBOARD_HTML.index("\n}\n", row_fn)
+    row_fn_body = DASHBOARD_HTML[row_fn:row_fn_end]
+    assert 'data-run="${esc(j.job_id)}"' in row_fn_body
+    assert 'role="button"' in row_fn_body
+    assert 'tabindex="0"' in row_fn_body
+
+    # AC2: click delegation on #foreman-run-result calling the existing
+    # toggleRun — not a new/parallel filter function.
+    wiring = DASHBOARD_HTML.index('$("foreman-run-result").addEventListener("click"')
+    wiring_end = DASHBOARD_HTML.index("});", wiring)
+    click_body = DASHBOARD_HTML[wiring:wiring_end]
+    assert 'e.target.closest("[data-run]")' in click_body
+    assert "toggleRun(card.dataset.run)" in click_body
+
+    # AC3: matching keydown handler for Enter/Space, same as #runs.
+    keydown_wiring = DASHBOARD_HTML.index(
+        '$("foreman-run-result").addEventListener("keydown"'
+    )
+    keydown_end = DASHBOARD_HTML.index("});", keydown_wiring)
+    keydown_body = DASHBOARD_HTML[keydown_wiring:keydown_end]
+    assert 'e.target.closest("[data-run]")' in keydown_body
+    assert 'e.key === "Enter" || e.key === " "' in keydown_body
+    assert "toggleRun(card.dataset.run)" in keydown_body
+
+    # AC7: no new filter-state variable was introduced — filters.run is the
+    # only run-filter key anywhere in the module.
+    assert DASHBOARD_HTML.count("filters.run") >= 2  # toggleRun + f-run wiring
+    assert "filters.foremanRun" not in DASHBOARD_HTML
+    assert "filters.jobId" not in DASHBOARD_HTML
+
+
+def test_dashboard_html_foreman_run_skip_row_stays_inert():
+    """#316 AC4: a skipped story (no job id to filter by) keeps its original,
+
+    unclickable markup — no ``data-run``, no ``role``/``tabindex`` — so it
+    never grows an unclickable-but-styled-as-clickable affordance.
+    """
+
+    assert (
+        'function foremanRunSkipRow(s) {\n'
+        '  return `<li class="muted">${esc(s.story_id)}: ${esc(s.reason)}</li>`;\n'
+        '}'
+    ) in DASHBOARD_HTML
+    skip_fn = DASHBOARD_HTML.index("function foremanRunSkipRow(s)")
+    skip_fn_end = DASHBOARD_HTML.index("\n}\n", skip_fn)
+    skip_fn_body = DASHBOARD_HTML[skip_fn:skip_fn_end]
+    assert "data-run" not in skip_fn_body
+    assert "role=" not in skip_fn_body
+    assert "tabindex" not in skip_fn_body
+
+
+def test_dashboard_html_foreman_run_job_row_escapes_data_run_attribute():
+    """SECURITY (#316 AC5): ``job_id``/``story_id``/``title`` are dispatch-
+
+    service-supplied (ultimately can originate from an LLM assessment
+    finding, same provenance the file's own comment above this function
+    calls out) — the new ``data-run`` attribute must be built from the same
+    ``esc()`` call already used for ``job_id`` in this row's visible text,
+    not a raw/unescaped value, so a job id containing ``"`` or ``<``/``>``
+    cannot break out of the attribute or inject a tag into the row's text
+    content.
+    """
+
+    row_fn = DASHBOARD_HTML.index("function foremanRunJobRow(j)")
+    row_fn_end = DASHBOARD_HTML.index("\n}\n", row_fn)
+    row_fn_body = DASHBOARD_HTML[row_fn:row_fn_end]
+    assert 'data-run="${esc(j.job_id)}"' in row_fn_body
+    assert 'data-run="${j.job_id}"' not in row_fn_body
+    assert "${esc(j.job_id)}" in row_fn_body
+    assert "${esc(j.story_id)}" in row_fn_body
+    assert "${esc(j.title)}" in row_fn_body
+    assert "${j.job_id}" not in row_fn_body
+    assert "${j.story_id}" not in row_fn_body
+    assert "${j.title}" not in row_fn_body
+
+
 # --- the pending-question proxy (GET /api/jobs/{id}/question → dispatch) -----
 
 

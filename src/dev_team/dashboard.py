@@ -2317,7 +2317,7 @@ async function loadForemanPlan() {
 // assessment finding or the dispatch service's own text — esc() before
 // innerHTML, same discipline as every other panel.
 function foremanRunJobRow(j) {
-  return `<li>job ${esc(j.job_id)}: ${esc(j.story_id)} — ${esc(j.title)}`
+  return `<li data-run="${esc(j.job_id)}" role="button" tabindex="0" title="filter the activity feed to ${esc(j.job_id)}">job ${esc(j.job_id)}: ${esc(j.story_id)} — ${esc(j.title)}`
     + ` (position ${esc(j.position)})</li>`;
 }
 
@@ -2852,6 +2852,14 @@ $("runs").addEventListener("click", e => {
 });
 $("runs").addEventListener("keydown", e => {
   if (e.target.closest("[data-archjob]") || e.target.closest("[data-purgejob]")) return; // real <button>s: handle their own Enter/Space
+  const card = e.target.closest("[data-run]");
+  if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleRun(card.dataset.run); }
+});
+$("foreman-run-result").addEventListener("click", e => {
+  const card = e.target.closest("[data-run]");
+  if (card) toggleRun(card.dataset.run);
+});
+$("foreman-run-result").addEventListener("keydown", e => {
   const card = e.target.closest("[data-run]");
   if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleRun(card.dataset.run); }
 });
