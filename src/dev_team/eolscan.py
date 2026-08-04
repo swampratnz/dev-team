@@ -408,6 +408,52 @@ def parse_rust_toolchain_toml(text: str) -> Optional[Tuple[str, str]]:
     return ("rust", version) if version else None
 
 
+def parse_rust_toolchain_legacy(text: str) -> Optional[Tuple[str, str]]:
+    """Rustup's extensionless ``rust-toolchain`` file: TOML if it parses as
+    TOML, else the first line's channel, if version-shaped.
+
+    Predates ``rust-toolchain.toml`` and still common in either of two
+    shapes: rustup itself accepts a ``[toolchain]`` TOML table in this
+    bare-named file too (so tooling that only looks for the bare filename
+    didn't break when a project adopted the TOML schema), falling back to
+    the plain-text "single line" convention only when the content isn't
+    valid TOML. This mirrors that dispatch: a TOML parse is attempted
+    first (delegating to the same ``[toolchain].channel`` extraction as
+    :func:`parse_rust_toolchain_toml`), and only invalid TOML falls
+    through to the "first line, leading version" shape shared with
+    :func:`parse_ruby_version`/:func:`parse_python_version`. A named
+    channel (``stable``, ``nightly``) or a dated nightly
+    (``nightly-2024-01-15``) has no leading digit in either shape and
+    degrades to ``None`` rather than being guessed at, in both cases.
+    """
+
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        data = None
+    if isinstance(data, dict):
+        toolchain = data.get("toolchain")
+        if not isinstance(toolchain, dict):
+            return None
+        channel = toolchain.get("channel")
+        if not isinstance(channel, str):
+            return None
+        version = _leading_version(channel)
+        return ("rust", version) if version else None
+
+    # TOML's own whitespace set (space/tab only) is narrower than
+    # ``str.strip()``'s -- a lone form feed, vertical tab, NBSP, or other
+    # Unicode space character makes ``tomllib.loads`` raise (falling
+    # through to here) while ``text.strip()`` reduces to "", so this guard
+    # is required, not redundant with the TOML branch above.
+    stripped = text.strip()
+    if not stripped:
+        return None
+    first_line = stripped.splitlines()[0]
+    version = _leading_version(first_line)
+    return ("rust", version) if version else None
+
+
 _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "package.json": parse_package_json_engines,
     ".nvmrc": parse_nvmrc,
@@ -421,7 +467,28 @@ _PARSERS: Dict[str, Callable[[str], Optional[Tuple[str, str]]]] = {
     "build.gradle": parse_gradle_java,
     "build.gradle.kts": parse_gradle_java,
     "rust-toolchain.toml": parse_rust_toolchain_toml,
+    # Legacy plain-text manifest, predates the .toml one above. Once #273
+    # (Cargo.toml's rust-version) lands, detect_runtimes will need this
+    # entry to take precedence over a Cargo.toml-sourced result too.
+    "rust-toolchain": parse_rust_toolchain_legacy,
 }
+
+
+def _runtime_file_sort_key(path: str) -> str:
+    """Sort key for :func:`detect_runtimes`'s file scan.
+
+    Plain path order, except the legacy extensionless ``rust-toolchain``
+    is nudged to sort after ``rust-toolchain.toml`` in the same directory.
+    Lexicographically ``"rust-toolchain" < "rust-toolchain.toml"`` (the
+    former is a string-prefix of the latter), which would otherwise make
+    the legacy file win detect_runtimes's "first in sorted order" dedup
+    when both are present — the opposite of rustup's own resolution order,
+    where ``rust-toolchain.toml`` takes precedence.
+    """
+
+    if path.rsplit("/", 1)[-1] == "rust-toolchain":
+        return path + "￿"
+    return path
 
 
 def detect_runtimes(workspace: Workspace) -> List[Runtime]:
@@ -430,12 +497,14 @@ def detect_runtimes(workspace: Workspace) -> List[Runtime]:
     When more than one recognised file agrees on the same product (e.g.
     both ``.nvmrc`` and ``package.json``'s ``engines.node``), only the
     first (in sorted path order) is kept — a second live query for the
-    same product would be redundant, not more informative.
+    same product would be redundant, not more informative. Sorted order
+    is plain path order except for ``rust-toolchain`` vs
+    ``rust-toolchain.toml``; see :func:`_runtime_file_sort_key`.
     """
 
     seen: set = set()
     runtimes: List[Runtime] = []
-    for path in sorted(workspace.list_files()):
+    for path in sorted(workspace.list_files(), key=_runtime_file_sort_key):
         parser = _PARSERS.get(path.rsplit("/", 1)[-1])
         if parser is None:
             continue

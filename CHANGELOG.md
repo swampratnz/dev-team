@@ -5,6 +5,33 @@ sections below are reconstructed from the repository history.
 
 ## [Unreleased]
 
+### Assessment
+- **Live EOL scan now reads the legacy extensionless `rust-toolchain`
+  file** (#314, `eolscan.py`): closes the exact gap #261's own CHANGELOG
+  entry and `docs/ASSESSMENT.md`'s "Honest limitations" named as
+  deliberately deferred — Rustup's older convention (no extension) predates
+  `rust-toolchain.toml` and is still common, but previously got zero live
+  EOL signal. It accepts either shape rustup itself accepts there: a
+  `[toolchain]` TOML table (tried first, reusing
+  `parse_rust_toolchain_toml`'s `channel` extraction) or, when that fails
+  to parse, a plain single line — a bare version like `1.75.0`, or a
+  channel string like `stable-x86_64-unknown-linux-gnu` — via the same
+  "first line, leading version" shape as `parse_ruby_version`/
+  `parse_python_version`. Either shape: a concrete version resolves via the
+  shared `_leading_version` helper; a named channel or dated nightly
+  degrades to "not detected" rather than being guessed at, matching the
+  `.toml` parser's own discipline. Registered in
+  `_PARSERS["rust-toolchain"]`. `detect_runtimes`'s file-sort key now also
+  special-cases this pair: `rust-toolchain` is a string-prefix of
+  `rust-toolchain.toml`, so plain path-sort order would silently make the
+  legacy file win when a repo has both — the opposite of rustup's own
+  resolution order, where `rust-toolchain.toml` takes precedence. Neither
+  `query_eol` nor `scan_eol` changed. `Cargo.toml`'s `rust-version` (MSRV,
+  #273, not yet merged) remains deferred; once it lands, `detect_runtimes`
+  will need a further precedence rule so this legacy pin (and
+  `rust-toolchain.toml`) win over an MSRV floor, the same reasoning #273
+  established for `rust-toolchain.toml` vs `Cargo.toml`.
+
 ### QA
 - **Mutation-lite now flips augmented-assignment arithmetic
   (`total += 1`↔`total -= 1`, `x *= 2`↔`x /= 2`), the exact follow-up #226
