@@ -44,7 +44,7 @@ beat either alone, and false-positive suppression is a first-class metric.**
   expressions and augmented assignment — `x + y` and `x += y` alike) flip in
   the task's one product file and reruns the gates; a surviving mutant is an advisory
   `mutation_survived` scorecard signal only (never a rejection, unlike
-  fail-to-pass) (`EngineConfig.mutation_check`,
+  fail-to-pass) (`EngineConfig.mutation_check`, CLI `--mutation-check`,
   off by default). Per-profile mutators for other languages remain future
   work.
 

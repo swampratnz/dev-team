@@ -749,6 +749,17 @@ def build_parser() -> argparse.ArgumentParser:
         "docs/BENCHMARKS.md (DevOps).",
     )
     delivery.add_argument(
+        "--mutation-check",
+        action="store_true",
+        help="After gates pass, flip the first comparison/boolean/arithmetic "
+        "operator in the task's one Python product file and re-run the "
+        "gates (with --deliver). Off by default; advisory only — records a "
+        "mutation_survived/mutation_killed scorecard signal, never blocks "
+        "the delivery. Skipped for dry runs, non-local verification, "
+        "non-Python or multi-file changes. See docs/BENCHMARKS.md "
+        "(Mutation-lite scoring).",
+    )
+    delivery.add_argument(
         "--finalization-reserve",
         type=float,
         default=0.10,
@@ -1243,6 +1254,7 @@ def _reject_deliver_only_flags(
         ("--allow-ci-workflows", args.allow_ci_workflows),
         ("--docker-build-gate", args.docker_build_gate),
         ("--docker-run-gate", args.docker_run_gate),
+        ("--mutation-check", args.mutation_check),
         (
             "--finalization-reserve",
             args.finalization_reserve != parser.get_default("finalization_reserve"),
@@ -1332,6 +1344,7 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
         allow_ci_workflows=args.allow_ci_workflows,
         docker_build_gate=args.docker_build_gate,
         docker_run_gate=args.docker_run_gate,
+        mutation_check=args.mutation_check,
         finalization_reserve_fraction=args.finalization_reserve,
         frontend_craft=not args.no_frontend_craft,
         visual_review=args.visual_review,

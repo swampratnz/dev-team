@@ -394,6 +394,62 @@ def test_engine_config_threads_docker_run_gate():
     assert _engine_config(off).docker_run_gate is False
 
 
+def test_main_mutation_check_rejected_without_deliver(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["Login", "Add login", "--mutation-check"], runner=ScriptedRunner([]))
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--mutation-check" in err and "--deliver" in err
+
+
+def test_engine_config_threads_mutation_check():
+    from dev_team.cli import _engine_config, build_parser
+
+    on = build_parser().parse_args(["T", "D", "--deliver", "--mutation-check"])
+    assert _engine_config(on).mutation_check is True
+    off = build_parser().parse_args(["T", "D", "--deliver"])
+    assert _engine_config(off).mutation_check is False
+
+
+def test_main_mutation_check_allowed_with_chat(monkeypatch, capsys):
+    # deliver-only flags compose with --chat per
+    # _reject_deliver_only_flags's allow-list, mirroring the other
+    # deliver-only flags' regression coverage.
+    import io as _io
+
+    from test_chat import FakeBackend
+
+    monkeypatch.setattr("sys.stdin", _io.StringIO("/quit\n"))
+    code = main(
+        ["--chat", "--mutation-check"],
+        runner=ScriptedRunner([]),
+        chat_backend=FakeBackend(),
+    )
+    assert code == 0
+
+
+def test_main_mutation_check_allowed_with_intake():
+    intake_runner = ScriptedRunner([json_response(_triage_payload())])
+    code = main(
+        ["--intake", "build login", "--mutation-check"], runner=intake_runner
+    )
+    assert code == 0
+
+
+def test_main_help_documents_mutation_check(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "--mutation-check" in out
+
+
+def test_mutation_check_defaults_to_false_when_unset():
+    from dev_team.cli import build_parser
+
+    args = build_parser().parse_args(["T", "D", "--deliver"])
+    assert args.mutation_check is False
+
+
 def test_main_finalization_reserve_rejected_without_deliver(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["Login", "Add login", "--finalization-reserve", "0.2"], runner=ScriptedRunner([]))
