@@ -179,6 +179,27 @@ def test_delivery_to_dict_checks_absent_defaults():
     assert data["checks_state"] is None and data["checks_failed"] == []
 
 
+def test_delivery_to_dict_visual_review_sandboxed():
+    # AC4 (case 1): scorecard forwards visual_review_sandboxed=False verbatim.
+    data = delivery_to_dict(_outcome(scorecard={"visual_review_sandboxed": False}))
+    assert data["scorecard"]["visual_review_sandboxed"] is False
+
+
+def test_delivery_to_dict_visual_review_sandboxed_absent_by_default():
+    # AC4 (case 3): no scorecard entry -> key is absent, never a positive claim.
+    data = delivery_to_dict(_outcome())
+    assert "visual_review_sandboxed" not in data["scorecard"]
+
+
+def test_render_delivery_summary_shows_visual_review_sandboxed():
+    # AC5: the existing generic "Scorecard: k=v, ..." line covers the new key
+    # with no dedicated rendering code.
+    text = render_delivery_summary(
+        _outcome(committed=True, scorecard={"visual_review_sandboxed": False})
+    )
+    assert "visual_review_sandboxed=False" in text
+
+
 def test_render_delivery_summary_shows_failed_checks():
     from dev_team.checks import ChecksOutcome
 

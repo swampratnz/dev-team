@@ -857,7 +857,8 @@ def test_visual_review_skips_when_no_pages_captured():
 
 def test_visual_review_warns_once_when_sandboxed(tmp_path):
     # AC1: sandbox set + a successful capture/critique -> exactly one "visual"
-    # event carrying the fixed marker, emitted before the serve/capture event.
+    # event carrying the fixed marker, emitted before the serve/capture event,
+    # and the same call site sets scorecard["visual_review_sandboxed"] = False.
     from dev_team.sandbox import SandboxConfig
 
     events = []
@@ -878,10 +879,12 @@ def test_visual_review_warns_once_when_sandboxed(tmp_path):
     assert visual_events.index(warnings[0]) < next(
         i for i, e in enumerate(visual_events) if "serving the app and capturing" in e.message
     )
+    assert engine._scorecard["visual_review_sandboxed"] is False
 
 
 def test_visual_review_no_sandbox_warning_when_sandbox_unset():
-    # AC2: sandbox=None (default) -> no such warning event appears anywhere.
+    # AC2/AC3: sandbox=None (default) -> no such warning event appears
+    # anywhere, and the scorecard key is never set (absent, never True).
     events = []
     engine = _engine(
         ScriptedRunner([]),
@@ -890,6 +893,7 @@ def test_visual_review_no_sandbox_warning_when_sandbox_unset():
     )
     run(engine._visual_review())
     assert not any("unsandboxed" in e.message for e in events)
+    assert "visual_review_sandboxed" not in engine._scorecard
 
 
 def test_visual_review_off_by_default_emits_no_visual_events():
@@ -964,8 +968,9 @@ def test_visual_review_no_sandbox_warning_when_seams_unwired():
 
 
 def test_visual_review_sandbox_warning_fires_exactly_once_across_rounds(tmp_path):
-    # AC5: two _visual_review() calls in the same run (via visual_fix_rounds)
-    # -> the warning appears exactly once, not once per call.
+    # AC5/AC2: two _visual_review() calls in the same run (via
+    # visual_fix_rounds) -> the warning appears exactly once, not once per
+    # call, and the scorecard key is set once and not re-touched thereafter.
     from dev_team.sandbox import SandboxConfig
 
     engine, runner, cmd, reviewer = _visual_fix_engine(
@@ -979,6 +984,7 @@ def test_visual_review_sandbox_warning_fires_exactly_once_across_rounds(tmp_path
     assert report.clean is True
     warnings = [e for e in events if e.stage == "visual" and "unsandboxed" in e.message]
     assert len(warnings) == 1
+    assert engine._scorecard["visual_review_sandboxed"] is False
 
 
 def test_visual_review_sandbox_warning_is_advisory_only():
@@ -1011,6 +1017,7 @@ def test_visual_review_sandbox_warning_is_advisory_only():
     assert outcome.visual.findings  # a normally-populated report, not swallowed
     # advisory: the sandbox warning never sinks an otherwise-successful run
     assert outcome.success is True
+    assert outcome.scorecard.get("visual_review_sandboxed") is False
 
 
 def test_visual_review_wired_into_delivery_is_advisory():
