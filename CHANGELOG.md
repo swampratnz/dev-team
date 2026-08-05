@@ -26,6 +26,25 @@ sections below are reconstructed from the repository history.
   external service credential, out of scope per the standing guardrail).
 
 ### Dispatch
+- **Submission-time `meta.json` mirror + `"interrupted"` restart-recovery
+  state** (#326, `docs/DISPATCH.md`): `Dispatcher.submit()` now writes
+  `audit/{id}/meta.json` immediately, before the job is ever dequeued,
+  instead of only after a successful `assess` run — the pre-existing
+  `_mirror_meta` call from #265 reused unchanged, now invoked from two call
+  sites (idempotent — the second, completion-time call overwrites with the
+  same unchanged dict). A restart while a job is still `queued`/`running`,
+  or one that `failed`, of any mode, previously left literally nothing on
+  disk (see the exact gap `docs/TROUBLESHOOTING.md`'s own runbook already
+  named). `GET /jobs/{id}` and `/result` gain a second, later registry-miss
+  fallback tier — tried only after the existing succeeded-assess tier — that
+  reconstructs `id`/`mode`/`repo` from a `meta.json`-only mirror as
+  `state: "interrupted"` (`started`/`ended`/`cost_usd: null`) and `409
+  {"error":"not finished","state":"interrupted"}` respectively, rather than
+  a bare `404`. `"interrupted"` is a disk-reconstruction-only label — never
+  written to `record.state`, never added to `_TERMINAL`. A job with no
+  `meta.json` at all is unaffected (still `404`), and the tenant-scoping
+  `_session_sees` gate runs before either fallback tier, so a foreign
+  tenant's interrupted job still 404s exactly like a nonexistent one.
 - **On-demand bulk purge** (`docs/DISPATCH.md`): `GET`/`POST
   /jobs/purge?archived_before=<epoch-seconds>` — the still-deferred second
   half of the purge "Natural growth" note, now that the single-job

@@ -29,24 +29,32 @@ The dispatch service has exactly one worker and keeps its queue **in
 memory**. Restarting the service (`systemctl restart
 dev-team-dispatch.service`, a crash, a host reboot) drops:
 
-- every job still sitting in `queued` (not yet started) — gone, with no
-  trace;
+- the registry entry for every job still sitting in `queued` (not yet
+  started);
 - the in-memory job registry's view of a job that was `running` at the
   moment of restart.
 
 It does **not** drop anything already persisted to disk under
 `/opt/dev-team/jobs/<id>/`:
 
-- `audit/<id>/meta.json` — the job's submitted parameters;
+- `audit/<id>/meta.json` — the job's submitted parameters, written the
+  moment the job is **submitted**, not only on completion;
 - any assessment report or structured result a **completed** job already
   wrote;
 - verification records.
 
+So the job is not gone without trace: `GET /jobs/{id}` after a restart still
+resolves it from `meta.json` — `state: "interrupted"` if it had not
+succeeded yet, `state: "succeeded"` with its full result if it had (assess
+mode only) — see [`docs/DISPATCH.md`](DISPATCH.md)'s *Restart survival*
+notes on `GET /jobs/{id}` and `/result`.
+
 **Before resubmitting**, check whether the job's directory already has a
-completed result on disk — if it does, resubmitting duplicates work instead
-of recovering it. If the job is still `queued`, cancel just that one with
-`POST /jobs/{id}/cancel` (auth) instead of restarting the whole service —
-see [`docs/DISPATCH.md`](DISPATCH.md)'s *Cancel* section. A full service
+completed result on disk (or query `GET /jobs/{id}`, which now surfaces the
+`"interrupted"` state directly) — if it does, resubmitting duplicates work
+instead of recovering it. If the job is still `queued`, cancel just that one
+with `POST /jobs/{id}/cancel` (auth) instead of restarting the whole service
+— see [`docs/DISPATCH.md`](DISPATCH.md)'s *Cancel* section. A full service
 restart is only necessary for a job that has already moved to `running`,
 which Cancel does not cover.
 
