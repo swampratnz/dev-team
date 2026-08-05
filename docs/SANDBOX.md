@@ -102,11 +102,15 @@ dev-team --assess --workspace /path/to/repo --build-probe \
 # per-job UID separation on a shared host (rootless podman only — see below):
 dev-team "Health endpoint" "Add /health returning 200" --deliver --workspace ./build \
     --sandbox --sandbox-engine podman --sandbox-userns auto
+
+# read-only root, with an explicit writable allowlist for caches/$HOME:
+dev-team "Health endpoint" "Add /health returning 200" --deliver --workspace ./build \
+    --sandbox --sandbox-read-only --sandbox-tmpfs /tmp --sandbox-tmpfs /home/sandbox
 ```
 
 `--sandbox-image` / `--sandbox-network` / `--sandbox-engine` / `--sandbox-userns`
-override the matching `SandboxConfig` field; everything else keeps its secure
-default.
+/ `--sandbox-read-only` / `--sandbox-tmpfs` override the matching
+`SandboxConfig` field; everything else keeps its secure default.
 
 **`--sandbox-userns auto` requires rootless podman with subuid/subgid ranges
 provisioned for the operator's user** (standard rootless-podman setup). It

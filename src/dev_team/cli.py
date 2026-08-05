@@ -633,6 +633,24 @@ def build_parser() -> argparse.ArgumentParser:
         "Docker only supports 'host' or its daemon-wide userns-remap "
         "range, not distinct per-container ranges. Only with --sandbox.",
     )
+    sandbox.add_argument(
+        "--sandbox-read-only",
+        action="store_true",
+        default=None,
+        help="Mount the sandbox container's root filesystem read-only "
+        "(container --read-only); many toolchains write to $HOME/caches "
+        "outside the workspace, so pair this with --sandbox-tmpfs for any "
+        "path your stack needs writable. Only with --sandbox.",
+    )
+    sandbox.add_argument(
+        "--sandbox-tmpfs",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Mount PATH as a writable tmpfs inside the sandbox container "
+        "(container --tmpfs, repeatable); typically used with "
+        "--sandbox-read-only. Only with --sandbox.",
+    )
     misc.add_argument(
         "--workspace",
         default="./build",
@@ -1139,6 +1157,8 @@ def _validate_args(
         ("--sandbox-network", args.sandbox_network is not None),
         ("--sandbox-engine", args.sandbox_engine is not None),
         ("--sandbox-userns", args.sandbox_userns is not None),
+        ("--sandbox-read-only", args.sandbox_read_only is not None),
+        ("--sandbox-tmpfs", args.sandbox_tmpfs is not None),
     ]
     if not args.sandbox:
         extra = [name for name, passed in sandbox_tuning if passed]
@@ -1303,6 +1323,10 @@ def _sandbox_config(args: argparse.Namespace) -> Optional[SandboxConfig]:
         overrides["engine"] = args.sandbox_engine
     if args.sandbox_userns is not None:
         overrides["user_namespace"] = args.sandbox_userns
+    if args.sandbox_read_only is not None:
+        overrides["read_only_rootfs"] = True
+    if args.sandbox_tmpfs is not None:
+        overrides["tmpfs"] = tuple(args.sandbox_tmpfs)
     return SandboxConfig(**overrides)
 
 
