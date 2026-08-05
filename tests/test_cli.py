@@ -3693,12 +3693,17 @@ def test_sandbox_config_from_flags():
             "--sandbox-network", "bridge",
             "--sandbox-engine", "podman",
             "--sandbox-userns", "auto",
+            "--sandbox-read-only",
+            "--sandbox-tmpfs", "/tmp",
+            "--sandbox-tmpfs", "/run",
             "T", "D",
         ]
     )
     sc = _sandbox_config(args)
     assert (sc.engine, sc.image, sc.network) == ("podman", "node:22", "bridge")
     assert sc.user_namespace == "auto"
+    assert sc.read_only_rootfs is True
+    assert sc.tmpfs == ("/tmp", "/run")
 
 
 def test_sandbox_config_absent_and_defaults():
@@ -3710,6 +3715,79 @@ def test_sandbox_config_absent_and_defaults():
     assert sc is not None
     assert sc.network == "none"  # secure default preserved when not overridden
     assert sc.user_namespace is None  # --sandbox-userns unset stays unset
+    assert sc.read_only_rootfs is False  # --sandbox-read-only unset stays unset
+    assert sc.tmpfs == ()  # --sandbox-tmpfs unset stays unset
+
+
+def test_main_sandbox_read_only_tuning_without_sandbox_exits_2(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["T", "D", "--deliver", "--sandbox-read-only"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--sandbox-read-only" in err
+
+
+def test_main_sandbox_tmpfs_tuning_without_sandbox_exits_2(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["T", "D", "--deliver", "--sandbox-tmpfs", "/tmp"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--sandbox-tmpfs" in err
+
+
+def test_main_dispatch_sandbox_read_only_without_sandbox_exits_2(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--dispatch", "--sandbox-read-only"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--sandbox-read-only" in err
+
+
+def test_main_dispatch_sandbox_tmpfs_without_sandbox_exits_2(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--dispatch", "--sandbox-tmpfs", "/tmp"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--sandbox-tmpfs" in err
+
+
+def test_sandbox_config_read_only_and_tmpfs_reach_the_container_argv():
+    # Criterion 6: prove the CLI flags reach the actual containment boundary
+    # (the container argv), not just the argparse namespace.
+    from test_sandbox import _argv, _Spy
+
+    from dev_team.cli import _sandbox_config
+    from dev_team.sandbox import ContainerCommandRunner
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--deliver", "--sandbox",
+            "--sandbox-read-only",
+            "--sandbox-tmpfs", "/tmp",
+            "--sandbox-tmpfs", "/run",
+            "T", "D",
+        ]
+    )
+    sc = _sandbox_config(args)
+    spy = _Spy()
+    ContainerCommandRunner(spy, sc).run(["pytest"], cwd="/ws")
+    argv = _argv(spy)
+    assert "--read-only" in argv
+    tmpfs_values = [argv[i + 1] for i, a in enumerate(argv) if a == "--tmpfs"]
+    assert tmpfs_values == ["/tmp", "/run"]
 
 
 def test_tracer_helper_returns_none_without_a_run_id():
