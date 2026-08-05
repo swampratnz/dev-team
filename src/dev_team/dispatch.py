@@ -975,6 +975,15 @@ class Dispatcher:
             self._registry[job_id] = JobRecord(spec=spec)
             self._order.append(job_id)
             self._events[job_id] = threading.Event()
+        # Mirror the job's identity to disk BEFORE it is ever dequeued, not
+        # only after it succeeds (the historical, and still-existing, call
+        # in run_job's assess branch) -- a restart before this job produces
+        # any outcome would otherwise leave nothing on disk to recover (see
+        # disk_status/disk_result's "interrupted" fallback tier below).
+        # Idempotent: spec never changes after submission, so the later
+        # completion-time call is a harmless no-op overwrite of the same
+        # {"repo", "mode", "id"} dict.
+        self._mirror_meta(spec)
         self._queue.put(job_id)
         return job_id, queued
 
@@ -1349,10 +1358,16 @@ class Dispatcher:
         """Persist the job's repo identity beside its mirrored assessment.
 
         ``audit/<id>/meta.json`` is what a later ``verify`` submit reads to
-        know WHICH repository to re-clone. The in-memory registry also knows
-        the repo but is lost on restart, so verify must key off disk — same
-        rule as :meth:`make_backlog`. No-op without a dashboard workspace
-        (mirrors :meth:`_mirror_assessment_json`).
+        know WHICH repository to re-clone, and what :meth:`disk_status`/
+        :meth:`disk_result` reconstruct a registry-miss job from after a
+        restart. The in-memory registry also knows the repo but is lost on
+        restart, so verify (and restart-recovery) must key off disk — same
+        rule as :meth:`make_backlog`. Called twice per job — once from
+        :meth:`submit`, immediately, and once more from ``run_job``'s assess
+        branch on success — both writing the same ``{repo, mode, id}`` dict
+        from ``spec``, which never changes after submission, so the second
+        call is a harmless no-op overwrite. No-op without a dashboard
+        workspace (mirrors :meth:`_mirror_assessment_json`).
         """
 
         if self._dashboard_workspace is None:
@@ -2640,60 +2655,93 @@ class Dispatcher:
         """The ``GET /jobs/{id}`` payload reconstructed from disk.
 
         Used only after a registry miss (a service restart lost the
-        in-memory :class:`JobRecord`) — see :meth:`_read_disk_assessment`
-        for when this returns ``None`` rather than fabricating a
-        ``succeeded`` state. ``started``/``ended``/``progress`` are honestly
-        ``None``/empty: unlike ``repo``/``mode``/``cost_usd`` they were never
-        mirrored to disk (named limitation, see docs/DISPATCH.md).
+        in-memory :class:`JobRecord`). Two fallback tiers, tried in order:
+
+        1. :meth:`_read_disk_assessment` — a succeeded assess job (``meta.json``
+           + ``assessment.json`` both present). ``started``/``ended``/``progress``
+           are honestly ``None``/empty: unlike ``repo``/``mode``/``cost_usd``
+           they were never mirrored to disk (named limitation, see
+           docs/DISPATCH.md).
+        2. A ``meta.json``-only job (now written at submission time, see
+           :meth:`submit`) with no corroborating succeeded outcome — queued,
+           running, or failed at the moment of restart, or any non-assess
+           mode. Reported as ``state: "interrupted"``, a disk-reconstruction
+           label that never appears as a live ``record.state`` value.
+
+        ``None`` only when neither tier finds a ``meta.json`` at all — a
+        genuinely unknown id, or one that predates this mirror.
         """
 
         found = self._read_disk_assessment(job_id)
-        if found is None:
+        if found is not None:
+            meta, assessment = found
+            return {
+                "id": job_id,
+                "mode": meta.get("mode"),
+                "repo": meta.get("repo"),
+                "state": "succeeded",
+                "started": None,
+                "ended": None,
+                "cost_usd": assessment.get("cost_usd"),
+                "error": None,
+                "progress": [],
+            }
+        meta = self._read_meta(job_id)
+        if meta is None:
             return None
-        meta, assessment = found
         return {
             "id": job_id,
             "mode": meta.get("mode"),
             "repo": meta.get("repo"),
-            "state": "succeeded",
+            "state": "interrupted",
             "started": None,
             "ended": None,
-            "cost_usd": assessment.get("cost_usd"),
-            "error": None,
+            "cost_usd": None,
+            "error": (
+                "service restarted before this job's outcome was recorded; "
+                "last known status unavailable"
+            ),
             "progress": [],
         }
 
     def disk_result(self, job_id: str) -> Optional[Tuple[int, Dict[str, Any]]]:
         """The ``GET /jobs/{id}/result`` ``(status_code, payload)`` from disk.
 
-        Used only after a registry miss; see :meth:`_read_disk_assessment`
-        for the presence rules. Mirrors the shape the live assess-success
-        branch of :meth:`result` returns, sourced from the mirrored dict
-        directly rather than by calling :meth:`result` itself: that method
-        dereferences ``outcome`` by attribute (``outcome.success``, ...) —
-        the live in-process ``AssessmentOutcome``'s shape — whereas the
-        mirrored ``assessment.json`` on disk is a plain dict.
+        Used only after a registry miss; mirrors :meth:`disk_status`'s two
+        fallback tiers. The first (succeeded assess) mirrors the shape the
+        live assess-success branch of :meth:`result` returns, sourced from
+        the mirrored dict directly rather than by calling :meth:`result`
+        itself: that method dereferences ``outcome`` by attribute
+        (``outcome.success``, ...) — the live in-process
+        ``AssessmentOutcome``'s shape — whereas the mirrored
+        ``assessment.json`` on disk is a plain dict. The second (a
+        ``meta.json``-only, interrupted job) returns the same ``409`` the
+        live, non-terminal branch of :meth:`result` returns, never a
+        fabricated ``200``.
         """
 
         found = self._read_disk_assessment(job_id)
-        if found is None:
+        if found is not None:
+            _, assessment = found
+            report_path = f"audit/{job_id}/assessment.md"
+            report_markdown = (
+                self._dashboard_workspace.read_text(report_path)
+                if self._exists(report_path)
+                else None
+            )
+            return 200, {
+                "kind": "assess",
+                "success": assessment.get("success"),
+                "classification": assessment.get("classification"),
+                "executive_summary": assessment.get("executive_summary"),
+                "report_path": assessment.get("report_path"),
+                "report_markdown": report_markdown,
+                "cost_usd": assessment.get("cost_usd"),
+            }
+        meta = self._read_meta(job_id)
+        if meta is None:
             return None
-        _, assessment = found
-        report_path = f"audit/{job_id}/assessment.md"
-        report_markdown = (
-            self._dashboard_workspace.read_text(report_path)
-            if self._exists(report_path)
-            else None
-        )
-        return 200, {
-            "kind": "assess",
-            "success": assessment.get("success"),
-            "classification": assessment.get("classification"),
-            "executive_summary": assessment.get("executive_summary"),
-            "report_path": assessment.get("report_path"),
-            "report_markdown": report_markdown,
-            "cost_usd": assessment.get("cost_usd"),
-        }
+        return 409, {"error": "not finished", "state": "interrupted"}
 
 
 def _archived_job_ids_before(
@@ -3479,9 +3527,10 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 self._json(200, dispatcher.status(record))
                 return
             # Registry miss: the service may have restarted since this job
-            # ran. Fall back to disk (assess-mode jobs only — see
-            # Dispatcher.disk_status) rather than 404ing a job that
-            # actually succeeded.
+            # ran. Fall back to disk — a succeeded assess job, or (any mode)
+            # an interrupted one with only its submission-time meta.json —
+            # see Dispatcher.disk_status, rather than 404ing a job that
+            # actually has something to report.
             payload = dispatcher.disk_status(job_id)
             if payload is None:
                 self._json(404, {"error": "unknown job"})

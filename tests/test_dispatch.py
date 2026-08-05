@@ -200,6 +200,39 @@ def test_submit_raises_queue_full_at_cap():
         disp.submit(disp.build_spec({"mode": "assess", "repo": "a/three"}))
 
 
+def test_submit_mirrors_meta_synchronously_before_the_worker_ever_runs():
+    # Finalized criterion 1 (#326): submit() must write audit/{id}/meta.json
+    # immediately, before the job is ever dequeued, for each of
+    # assess/deliver/verify. The dispatcher here is never started (no
+    # disp.start() call), so no worker thread exists to dequeue or run
+    # anything -- if meta.json is present the instant submit() returns, it
+    # can only have been written by submit() itself, never by run_job's
+    # pre-existing completion-time call.
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    for mode in ("assess", "deliver", "verify"):
+        spec = JobSpec(
+            mode=mode, repo="acme/mono", title="t", description="",
+            budget_usd=None,
+        )
+        job_id, _ = disp.submit(spec)
+        assert dash.exists(f"audit/{job_id}/meta.json")
+        assert json.loads(dash.read_text(f"audit/{job_id}/meta.json")) == {
+            "repo": "acme/mono", "mode": mode, "id": job_id,
+        }
+        assert disp.get(job_id).state == "queued"  # still untouched by a worker
+
+
+def test_submit_without_dashboard_workspace_does_not_mirror_meta():
+    # Finalized criterion 2: no dashboard workspace configured -> submit()
+    # no-ops exactly as _mirror_meta already does, byte-identical to before
+    # this change (regression test).
+    disp = Dispatcher(token="x")
+    job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
+    assert disp.disk_status(job_id) is None
+    assert disp.disk_result(job_id) is None
+
+
 def test_wait_on_unknown_job_returns_false():
     assert Dispatcher(token="x").wait("nope", timeout=0.1) is False
 
@@ -1296,6 +1329,48 @@ def test_archive_refuses_queued_and_running_jobs():
             disp.build_spec({"mode": "assess", "repo": "a/two"}))
         assert disp.archive_job(running_id) == (409, {"error": "job is running"})
         assert disp.archive_job(queued_id) == (409, {"error": "job is running"})
+    finally:
+        release.set()
+        disp.wait(running_id, 5)
+        disp.wait(queued_id, 5)
+        disp.stop()
+
+
+def test_archive_and_purge_still_refuse_queued_and_running_jobs_with_early_meta(tmp_path):
+    # Finalized criterion 9 (#326): submit() now mirrors meta.json BEFORE a
+    # job even starts, so a queued/running job's meta.json exists earlier
+    # than it used to. Confirm this creates no purge/archive eligibility
+    # gap -- both still 409 on a still-running-or-queued job exactly as
+    # before, since _job_running gates on the in-memory registry state, not
+    # on meta.json's mere presence.
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def materialise(spec, dest):
+        first_in.set()
+        release.wait(5)
+        return InMemoryWorkspace()
+
+    dash = LocalWorkspace(str(tmp_path / "dash"))
+    disp = Dispatcher(
+        token="x", runner=_assess_runner(), materialise=materialise,
+        dashboard_workspace=dash, jobs_root=str(tmp_path / "jobs"),
+    )
+    disp.start()
+    try:
+        running_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/one"}))
+        assert first_in.wait(5)
+        queued_id, _ = disp.submit(
+            disp.build_spec({"mode": "assess", "repo": "a/two"}))
+        # the earlier mirror really did write meta.json for both already
+        assert dash.exists(f"audit/{running_id}/meta.json")
+        assert dash.exists(f"audit/{queued_id}/meta.json")
+
+        assert disp.archive_job(running_id) == (409, {"error": "job is running"})
+        assert disp.archive_job(queued_id) == (409, {"error": "job is running"})
+        assert disp.purge_job(running_id) == (409, {"error": "job is running"})
+        assert disp.purge_job(queued_id) == (409, {"error": "job is running"})
     finally:
         release.set()
         disp.wait(running_id, 5)
@@ -2787,16 +2862,22 @@ def test_cancel_result_and_status_shape():
     )
 
 
-def test_cancelled_job_is_listed_but_not_archivable():
+def test_cancelled_job_is_listed_and_now_archivable():
     dash = InMemoryWorkspace()
     disp = Dispatcher(token="x", dashboard_workspace=dash)  # worker never started
     job_id, _ = disp.submit(disp.build_spec({"mode": "assess", "repo": "a/one"}))
     disp.cancel_job(job_id)
     assert [r.spec.id for r in disp.recent()] == [job_id]
-    # A cancelled job is cancelled before run_job ever runs, so its
-    # audit/<id>/meta.json is never written — archive_job 404s exactly like
-    # it already does for any job whose assessment was never mirrored.
-    assert disp.archive_job(job_id) == (404, {"error": "no assessment for that job"})
+    # A cancelled job is cancelled before run_job ever runs, but (#326)
+    # submit() now mirrors audit/<id>/meta.json at submission time, before
+    # cancellation can even happen -- so a cancelled job now HAS a meta.json
+    # and archive_job succeeds for it, same as any other terminal job.
+    # Previously (meta.json only ever written by a successful assess
+    # completion) a cancelled job could never be archived or purged at all;
+    # this closes that inconsistency as a side effect, not a regression --
+    # _set_archived's only precondition is a persisted meta.json, and
+    # _job_running (still gating the running/queued 409 case) is unaffected.
+    assert disp.archive_job(job_id) == (200, {"id": job_id, "archived": True})
 
 
 def test_cancel_frees_a_queue_cap_slot():
@@ -4450,9 +4531,10 @@ def test_disk_status_and_result_are_none_with_corrupt_meta():
     assert disp.disk_result("assess-corrupt-meta") is None
 
 
-def test_disk_status_and_result_do_not_fabricate_success_without_assessment_json():
-    # Criterion 4: meta.json present (job never reached success, or predates
-    # this fix) but no assessment.json -- must never claim a succeeded state.
+def test_disk_status_and_result_report_interrupted_without_assessment_json():
+    # meta.json present (job never reached success, or predates this fix)
+    # but no assessment.json -- must never claim a succeeded state; falls to
+    # the "interrupted" tier instead of 404ing (finalized criterion 3/4).
     dash = InMemoryWorkspace()
     job_id = "assess-never-finished"
     dash.write_text(
@@ -4460,13 +4542,30 @@ def test_disk_status_and_result_do_not_fabricate_success_without_assessment_json
         json.dumps({"id": job_id, "repo": "acme/mono", "mode": "assess"}),
     )
     disp = Dispatcher(token="x", dashboard_workspace=dash)
-    assert disp.disk_status(job_id) is None
-    assert disp.disk_result(job_id) is None
+    assert disp.disk_status(job_id) == {
+        "id": job_id,
+        "mode": "assess",
+        "repo": "acme/mono",
+        "state": "interrupted",
+        "started": None,
+        "ended": None,
+        "cost_usd": None,
+        "error": (
+            "service restarted before this job's outcome was recorded; "
+            "last known status unavailable"
+        ),
+        "progress": [],
+    }
+    assert disp.disk_result(job_id) == (
+        409,
+        {"error": "not finished", "state": "interrupted"},
+    )
 
 
-def test_disk_status_and_result_are_none_with_corrupt_assessment_json():
+def test_disk_status_and_result_report_interrupted_with_corrupt_assessment_json():
     # Criterion 9: a corrupt assessment.json mirror is treated as "no
-    # assessment" (case 4's behaviour), never a 500.
+    # assessment" (the case above's behaviour), never a 500 -- degrades to
+    # the "interrupted" tier since meta.json alone is still present.
     dash = InMemoryWorkspace()
     job_id = "assess-corrupt-assessment"
     dash.write_text(
@@ -4475,13 +4574,19 @@ def test_disk_status_and_result_are_none_with_corrupt_assessment_json():
     )
     dash.write_text(f"audit/{job_id}/assessment.json", "{not json")
     disp = Dispatcher(token="x", dashboard_workspace=dash)
-    assert disp.disk_status(job_id) is None
-    assert disp.disk_result(job_id) is None
+    assert disp.disk_status(job_id)["state"] == "interrupted"
+    assert disp.disk_result(job_id) == (
+        409,
+        {"error": "not finished", "state": "interrupted"},
+    )
 
 
 def test_disk_status_and_result_reconstruct_from_disk_after_registry_miss():
-    # Criterion 5: meta.json + assessment.json + assessment.md present ->
-    # both disk_status and disk_result serve a reconstructed 200.
+    # Criterion 5; also finalized criterion 6 (ordering): meta.json +
+    # assessment.json + assessment.md present -> both disk_status and
+    # disk_result serve a reconstructed "succeeded" 200 -- the new
+    # "interrupted" fallback tier, tried only when the succeeded tier finds
+    # nothing, must never shadow this pre-existing, higher-precedence path.
     dash = InMemoryWorkspace()
     job_id = "assess-restart-survivor"
     _write_assessment_mirror(dash, job_id, cost_usd=2.5)
@@ -4523,9 +4628,10 @@ def test_disk_result_with_no_mirrored_report_markdown():
     assert payload["report_markdown"] is None
 
 
-def test_disk_status_and_result_none_for_a_deliver_mode_mirror():
-    # Criterion 7: deliver/verify jobs never mirror assessment.json, so they
-    # stay permanently 404 post-restart -- a named, honest asymmetry.
+def test_disk_status_and_result_interrupted_for_a_deliver_mode_mirror():
+    # deliver/verify jobs never mirror assessment.json, so the succeeded
+    # tier never fires for them -- but the "interrupted" tier now reports
+    # their submission-time meta.json instead of a bare 404.
     dash = InMemoryWorkspace()
     job_id = "deliver-post-restart"
     dash.write_text(
@@ -4533,8 +4639,41 @@ def test_disk_status_and_result_none_for_a_deliver_mode_mirror():
         json.dumps({"id": job_id, "repo": "acme/mono", "mode": "deliver"}),
     )
     disp = Dispatcher(token="x", dashboard_workspace=dash)
-    assert disp.disk_status(job_id) is None
-    assert disp.disk_result(job_id) is None
+    assert disp.disk_status(job_id) == {
+        "id": job_id,
+        "mode": "deliver",
+        "repo": "acme/mono",
+        "state": "interrupted",
+        "started": None,
+        "ended": None,
+        "cost_usd": None,
+        "error": (
+            "service restarted before this job's outcome was recorded; "
+            "last known status unavailable"
+        ),
+        "progress": [],
+    }
+    assert disp.disk_result(job_id) == (
+        409,
+        {"error": "not finished", "state": "interrupted"},
+    )
+
+
+def test_interrupted_is_never_a_live_state():
+    # Finalized criterion 8: "interrupted" is exclusively a disk-
+    # reconstruction label -- it is never written to record.state, never
+    # added to _TERMINAL, and a live (registry-present) job's status() never
+    # reports it regardless of the job's actual state.
+    assert "interrupted" not in dispatch_mod._TERMINAL
+    disp = Dispatcher(token="x", dashboard_workspace=InMemoryWorkspace())
+    spec = JobSpec(
+        mode="assess", repo="acme/mono", title="t", description="",
+        budget_usd=None, id="assess-live",
+    )
+    for state in ("queued", "running", "succeeded", "failed", "cancelled"):
+        record = JobRecord(spec=spec, state=state)
+        assert disp.status(record)["state"] == state
+        assert disp.status(record)["state"] != "interrupted"
 
 
 def test_job_and_result_routes_fall_back_to_disk_after_registry_miss():
@@ -4561,7 +4700,10 @@ def test_job_and_result_routes_fall_back_to_disk_after_registry_miss():
         assert result["report_markdown"] == "# report"
 
 
-def test_job_and_result_routes_still_404_on_meta_only_registry_miss():
+def test_job_and_result_routes_report_interrupted_on_meta_only_registry_miss():
+    # HTTP-level wiring: a meta.json-only registry miss (job never reached
+    # success -- queued/running/failed at restart) now reports "interrupted"
+    # via the new fallback tier instead of 404ing (finalized criterion 3/4).
     dash = InMemoryWorkspace()
     job_id = "assess-http-unfinished"
     dash.write_text(
@@ -4569,8 +4711,29 @@ def test_job_and_result_routes_still_404_on_meta_only_registry_miss():
         json.dumps({"id": job_id, "repo": "acme/mono", "mode": "assess"}),
     )
     with running(dashboard_workspace=dash) as server:
-        assert _call(server, f"/jobs/{job_id}") == (404, {"error": "unknown job"})
+        status, job = _call(server, f"/jobs/{job_id}")
+        assert status == 200
+        assert job["state"] == "interrupted"
+        assert job["mode"] == "assess"
+        assert job["repo"] == "acme/mono"
+        assert job["started"] is None
+        assert job["ended"] is None
+        assert job["cost_usd"] is None
+        assert job["progress"] == []
+
         assert _call(server, f"/jobs/{job_id}/result") == (
+            409,
+            {"error": "not finished", "state": "interrupted"},
+        )
+
+
+def test_job_and_result_routes_still_404_with_no_meta_at_all():
+    # Finalized criterion 5, HTTP level: a genuinely unknown id (or one that
+    # predates this mirror) still 404s -- byte-identical regression, even
+    # with a dashboard workspace configured.
+    with running(dashboard_workspace=InMemoryWorkspace()) as server:
+        assert _call(server, "/jobs/ghost") == (404, {"error": "unknown job"})
+        assert _call(server, "/jobs/ghost/result") == (
             404,
             {"error": "unknown job"},
         )
@@ -4597,6 +4760,34 @@ def test_session_foreign_tenant_registry_miss_job_still_404s_pre_fallback():
         )
         # the operator (no session) still sees the restart-surviving job
         assert _call(server, f"/jobs/{job_id}")[0] == 200
+
+
+def test_session_foreign_tenant_interrupted_job_still_404s_pre_fallback():
+    # Finalized criterion 7 [security]: same tenant-scoping guarantee as
+    # above, exercised specifically against the NEW "interrupted" tier (a
+    # meta.json-only mirror, no assessment.json) rather than the pre-existing
+    # succeeded-assess tier.
+    oauth, _ = _oauth_fixture()
+    dash = InMemoryWorkspace()
+    job_id = "assess-foreign-interrupted"
+    dash.write_text(
+        f"audit/{job_id}/meta.json",
+        json.dumps({"id": job_id, "repo": "other/mono", "mode": "assess"}),
+    )
+    with running(oauth=oauth, dashboard_workspace=dash) as server:
+        session_token = _sign_in(server)
+        assert _call(server, f"/jobs/{job_id}", token=session_token) == (
+            404,
+            {"error": "unknown job"},
+        )
+        assert _call(server, f"/jobs/{job_id}/result", token=session_token) == (
+            404,
+            {"error": "unknown job"},
+        )
+        # the operator (no session) still sees the interrupted job
+        status, job = _call(server, f"/jobs/{job_id}")
+        assert status == 200
+        assert job["state"] == "interrupted"
 
 
 def test_post_jobs_with_backlog_true_flows_to_stories():

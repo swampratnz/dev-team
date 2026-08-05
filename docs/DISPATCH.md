@@ -238,17 +238,28 @@ id → `404 {"error":"unknown job"}`.
 
 **Restart survival:** the in-memory job registry is lost on a service
 restart (see *Dashboard visibility* above), so a registry miss here is not
-automatically "unknown" — a **succeeded assess job** (the only mode that
-mirrors `meta.json` **and** `assessment.json` to the dashboard workspace,
-see *Purge* → *Registry-miss fallback* for the same pattern) is
-reconstructed from those two files instead of 404ing: `state` reads
-`"succeeded"`, `id`/`mode`/`repo`/`cost_usd` come from disk, and
-`started`/`ended`/`progress` are honestly `null`/`[]` — they were never
-mirrored, so this payload is not byte-identical to the live one, only
-schema-compatible. A `deliver`/`verify`-mode job, or an assess job that
-never reached success (or predates this fallback), still 404s permanently
-after a restart — mirroring `deliver`/`verify` metadata is a possible
-follow-up, not yet done.
+automatically "unknown" — two fallback tiers are tried against the
+dashboard workspace before answering `404`:
+
+1. A **succeeded assess job** (the only mode that mirrors `meta.json`
+   **and** `assessment.json`, see *Purge* → *Registry-miss fallback* for the
+   same pattern) is reconstructed from those two files: `state` reads
+   `"succeeded"`, `id`/`mode`/`repo`/`cost_usd` come from disk, and
+   `started`/`ended`/`progress` are honestly `null`/`[]` — they were never
+   mirrored, so this payload is not byte-identical to the live one, only
+   schema-compatible.
+2. Any job — any mode, at any pre-completion state — has `meta.json` mirrored
+   the moment it is **submitted**, not only on success, so a registry miss
+   with a `meta.json` but no corroborating succeeded outcome (queued,
+   running, or failed at the moment of restart; or any `deliver`/`verify`
+   job) reads `state: "interrupted"` instead of 404ing: `id`/`mode`/`repo`
+   come from disk, `started`/`ended`/`cost_usd` are `null`, and `error`
+   explains that the service restarted before this job's outcome was
+   recorded. `"interrupted"` is a disk-reconstruction-only label — it never
+   appears as a live `record.state` value.
+
+A job with no `meta.json` at all (pre-feature job, or a genuinely unknown
+id) still 404s permanently.
 
 ### `GET /jobs/{id}/result` (auth) — result
 
@@ -272,14 +283,15 @@ State machine: `queued → running → succeeded | failed`, plus `queued →
 cancelled` (see *Cancel* below) — `cancelled` is reachable only from
 `queued`, never from `running`.
 
-**Restart survival:** same registry-miss fallback as `GET /jobs/{id}` above
-— a succeeded assess job's result is rendered from `assessment.json` (plus
-`assessment.md` for `report_markdown`, `null` if that mirror is absent) with
-the same `success`/`classification`/`executive_summary`/`report_path`/
-`cost_usd` shape the live path returns. Anything short of that (no
-`meta.json`, or `meta.json` without a corroborating `assessment.json`) still
-404s — this endpoint never fabricates a `queued`/`running`/`failed`/
-`cancelled` result it cannot actually reconstruct from disk.
+**Restart survival:** same two-tier registry-miss fallback as `GET /jobs/{id}`
+above. A succeeded assess job's result is rendered from `assessment.json`
+(plus `assessment.md` for `report_markdown`, `null` if that mirror is
+absent) with the same `success`/`classification`/`executive_summary`/
+`report_path`/`cost_usd` shape the live path returns. A `meta.json`-only
+(interrupted) job answers `409 {"error":"not finished","state":"interrupted"}`
+— the same 409 contract a live non-terminal job gets, never a fabricated
+`200`. Only a job with no `meta.json` at all still 404s — this endpoint
+never fabricates a result it cannot actually reconstruct from disk.
 
 ### `POST /jobs/{id}/backlog` (auth, no body) — generate the backlog later
 
