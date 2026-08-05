@@ -86,7 +86,7 @@ from .engine import EngineConfig
 from .errors import DependencyCycleError, DevTeamError
 from .eventlog import EventLog, compose, read_events, remove_run
 from .trace import Tracer
-from .tracelog import TraceLog
+from .tracelog import TraceLog, read_trace_log
 from .execution import (
     LocalWorkspace,
     SubprocessCommandRunner,
@@ -2531,6 +2531,23 @@ class Dispatcher:
             "progress": self._progress(record),
         }
 
+    def trace(self, job_id: str) -> Tuple[int, Dict[str, Any]]:
+        """The ``GET /jobs/{id}/trace`` core: audit spans, journal order.
+
+        In-memory-registry only, exactly like :meth:`_progress` (the
+        ``progress`` field of ``GET /jobs/{id}``) — inherits that same
+        restart-survival limitation rather than inventing a new one; disk
+        persistence for job state is separately covered (#275/#326/#299/
+        #265) and out of scope here.
+        """
+
+        record = self.get(job_id)
+        if record is None:
+            return 404, {"error": "unknown job"}
+        if record.workspace is None:
+            return 200, {"job_id": job_id, "spans": []}
+        return 200, {"job_id": job_id, "spans": read_trace_log(record.workspace)}
+
     def summary(self, record: JobRecord) -> Dict[str, Any]:
         """One entry in the ``GET /jobs`` list."""
 
@@ -3192,6 +3209,12 @@ def _make_handler(dispatcher: Dispatcher) -> type:
                 if not self._session_sees(session, parts[1]):
                     return
                 status, payload = dispatcher.get_question(parts[1])
+                self._json(status, payload)
+                return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "trace":
+                if not self._session_sees(session, parts[1]):
+                    return
+                status, payload = dispatcher.trace(parts[1])
                 self._json(status, payload)
                 return
             self._json(404, {"error": "not found"})
