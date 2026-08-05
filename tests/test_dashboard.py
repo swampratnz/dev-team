@@ -3023,6 +3023,100 @@ def test_question_route_scope_is_exact_match_only(proxy_server, monkeypatch):
     assert seen == []
 
 
+# --- the job trace proxy (GET /api/jobs/{id}/trace → dispatch) --------------
+
+
+def test_trace_proxy_forwards_and_relays_verbatim(proxy_server, monkeypatch):
+    seen = _capture_urlopen(
+        monkeypatch,
+        body=b'{"job_id": "deliver-1", "spans": [{"ts": 1.0, "seq": 0,'
+        b' "kind": "agent", "name": "architect", "status": "ok",'
+        b' "duration": 1.5, "attributes": {}}]}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/jobs/deliver-1/trace", headers=AUTH
+    )
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {
+        "job_id": "deliver-1",
+        "spans": [{"ts": 1.0, "seq": 0, "kind": "agent", "name": "architect",
+                    "status": "ok", "duration": 1.5, "attributes": {}}],
+    }
+    (request,) = seen
+    assert request.full_url == f"{DISPATCH_URL}/jobs/deliver-1/trace"
+    assert request.get_method() == "GET"
+    assert request.get_header("Authorization") == f"Bearer {DISPATCH_TOKEN}"
+    assert request.data is None
+
+
+def test_trace_proxy_relays_unknown_job_404_verbatim(proxy_server, monkeypatch):
+    rejection = urllib.error.HTTPError(
+        f"{DISPATCH_URL}/jobs/nope/trace", 404, "Not Found", None,
+        io.BytesIO(b'{"error": "unknown job"}'),
+    )
+    _capture_urlopen(monkeypatch, error=rejection)
+    status, _, body = _request(
+        proxy_server, "GET", "/api/jobs/nope/trace", headers=AUTH
+    )
+    assert status == 404
+    assert json.loads(body) == {"error": "unknown job"}
+
+
+def test_trace_proxy_unconfigured_is_501(token_server, monkeypatch):
+    # AC6: token_server has no dispatch_url/dispatch_token wired — answers
+    # 501 and makes no outbound call.
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        token_server, "GET", "/api/jobs/deliver-1/trace", headers=AUTH
+    )
+    assert status == 501
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "trace not configured"}
+    assert seen == []
+
+
+def test_trace_proxy_requires_dashboard_auth_first(proxy_server, monkeypatch):
+    seen = _capture_urlopen(monkeypatch)
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/jobs/deliver-1/trace"
+    )
+    assert status == 401
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body) == {"error": "unauthorized"}
+    assert seen == []
+
+
+def test_trace_proxy_never_echoes_the_dispatch_token(proxy_server, monkeypatch):
+    # SECURITY: matches the question/costs/backlog proxies' own non-leak
+    # assertion — the dispatch bearer token must never reach the browser.
+    _capture_urlopen(
+        monkeypatch,
+        body=b'{"job_id": "deliver-1", "spans": []}',
+    )
+    status, headers, body = _request(
+        proxy_server, "GET", "/api/jobs/deliver-1/trace", headers=AUTH
+    )
+    assert status == 200
+    assert DISPATCH_TOKEN not in body
+    assert DISPATCH_TOKEN not in str(headers)
+
+
+def test_trace_route_scope_is_exact_match_only(proxy_server, monkeypatch):
+    # SECURITY/scope: a path that merely ends with "/trace" but doesn't
+    # exactly match .../{id}/trace falls through to the ordinary 404, never
+    # forwarded — proving the suffix match is exact, not a loose
+    # startswith/endswith check.
+    seen = _capture_urlopen(monkeypatch)
+    for path in (
+        "/api/jobs/trace",
+        "/api/jobs/deliver-1/a/trace",
+    ):
+        status, _, body = _request(proxy_server, "GET", path, headers=AUTH)
+        assert status == 404
+    assert seen == []
+
+
 # --- the interactive answer proxy (POST /api/jobs/{id}/answer → dispatch) ----
 
 
@@ -3155,6 +3249,42 @@ def test_dashboard_html_question_panel():
     assert "/api/jobs/" not in DASHBOARD_HTML[refresh_start:refresh_end]
 
 
+def test_dashboard_html_trace_panel():
+    # Static desk-check of the on-demand trace panel JS (CI has no
+    # browser), mirroring test_dashboard_html_question_panel's approach.
+    # AC9: the trace button/fetch is wired to an explicit click, never the
+    # setInterval(refresh, 2500) /api/state poll.
+    assert 'function traceButton(id) {' in DASHBOARD_HTML
+    assert 'data-tracejob="${esc(id)}"' in DASHBOARD_HTML
+    assert 'const trace = e.target.closest("[data-tracejob]");' in DASHBOARD_HTML
+    assert "if (trace) { openTrace(trace.dataset.tracejob); return; }" in DASHBOARD_HTML
+    assert 'fetch("/api/jobs/" + encodeURIComponent(id) + "/trace")' in DASHBOARD_HTML
+
+    refresh_start = DASHBOARD_HTML.index("async function refresh()")
+    refresh_end = DASHBOARD_HTML.index("refresh();", refresh_start)
+    assert "openTrace" not in DASHBOARD_HTML[refresh_start:refresh_end]
+    assert "/trace" not in DASHBOARD_HTML[refresh_start:refresh_end]
+
+    # AC8 [security]: every trace span field (kind/name/status/duration, and
+    # each attributes key/value) flows through esc() before touching
+    # innerHTML — a <script>-shaped name or attribute value must render as
+    # inert text, never parsed markup.
+    row_start = DASHBOARD_HTML.index("function traceRow(span) {")
+    row_end = DASHBOARD_HTML.index("\n}", row_start)
+    row_body = DASHBOARD_HTML[row_start:row_end]
+    assert "esc(k)" in row_body and "esc(v)" in row_body
+    assert "esc(span.kind)" in row_body
+    assert "esc(span.name)" in row_body
+    assert "esc(span.status)" in row_body
+    assert "esc(span.duration)" in row_body
+    assert "esc(attrs)" in row_body
+    assert "innerHTML" not in row_body  # only the caller touches innerHTML
+
+    render_start = DASHBOARD_HTML.index("function renderTrace(data) {")
+    render_end = DASHBOARD_HTML.index("\n}", render_start)
+    assert "spans.map(traceRow)" in DASHBOARD_HTML[render_start:render_end]
+
+
 def test_dashboard_html_run_card_waiting_chip():
     # A paused (interactive, question-pending) job previously fell through
     # runChip's else branch and showed the exact same "running" chip as an
@@ -3233,12 +3363,15 @@ def test_dashboard_html_run_card_waiting_chip():
     assert 'if (STAGE_GOOD.has(s)) return chip("\\u2713 finished", "done");' in DASHBOARD_HTML
     assert 'return chip("\\u25B6 running", "active");' in DASHBOARD_HTML
 
-    # 6. Cost-story regression: no new fetch( call site and no new
+    # 6. Cost-story regression: no new fetch( call site here and no new
     #    interval/timer — loadQuestion/pollQuestions still perform exactly
     #    the one GET /api/jobs/{id}/question request per running job per
-    #    5s tick that they did before this change, and the page still has
-    #    exactly the same total number of fetch(/setInterval( call sites.
-    assert DASHBOARD_HTML.count("fetch(") == 14
+    #    5s tick that they did before this change. The page's total
+    #    fetch( count is 15 (was 14): the +1 is openTrace's on-click-only
+    #    /api/jobs/{id}/trace request, added by issue #336, which is not
+    #    part of pollQuestions/setInterval and so doesn't affect this
+    #    regression guard's own setInterval( count.
+    assert DASHBOARD_HTML.count("fetch(") == 15
     assert DASHBOARD_HTML.count("setInterval(") == 3
     assert body.count("fetch(") == 1  # loadQuestion's one existing request
     assert "setInterval(pollQuestions, 5000)" in DASHBOARD_HTML

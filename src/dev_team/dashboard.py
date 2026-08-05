@@ -951,6 +951,10 @@ def _make_handler(
                 self._access_log(parts.query)
             elif parts.path == "/api/foreman/plan":
                 self._foreman_plan(parts.query)
+            elif parts.path.startswith(_JOBS_PROXY_PREFIX) and parts.path.endswith(
+                "/trace"
+            ):
+                self._trace(parts.path)
             elif parts.path.startswith(_JOBS_PROXY_PREFIX):
                 self._question(parts.path)
             else:
@@ -1084,6 +1088,26 @@ def _make_handler(
                     501,
                     "application/json",
                     json.dumps({"error": "pending question not configured"}),
+                )
+                return
+            self._proxy("GET", f"/jobs/{rest}", None)
+
+        # -- job trace: a sixth narrow read-only proxy, same shape as the
+        # pending-question route above. Scope is exactly
+        # /api/jobs/{id}/trace; any other suffix under the jobs prefix falls
+        # through to the ordinary 404 (see do_GET's exact-match dispatch).
+
+        def _trace(self, path: str) -> None:
+            rest = path[len(_JOBS_PROXY_PREFIX):]
+            parts = rest.split("/")
+            if len(parts) != 2 or parts[1] != "trace":
+                self._send(404, "text/plain", "not found")
+                return
+            if not (dispatch_url and dispatch_token):
+                self._send(
+                    501,
+                    "application/json",
+                    json.dumps({"error": "trace not configured"}),
                 )
                 return
             self._proxy("GET", f"/jobs/{rest}", None)
@@ -1433,6 +1457,10 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
            color: var(--ink-2); font-size: 11px; padding: 2px 8px; cursor: pointer;
            margin-left: 6px; }
 .archbtn:hover { color: var(--ink); border-color: var(--ink-3); }
+.tracebtn { background: none; border: 1px solid var(--line); border-radius: 6px;
+            color: var(--ink-2); font-size: 11px; padding: 2px 8px; cursor: pointer;
+            margin-left: 6px; }
+.tracebtn:hover { color: var(--ink); border-color: var(--ink-3); }
 .purgebtn { background: none; border: 1px solid var(--critical); border-radius: 6px;
             color: var(--critical); font-size: 11px; padding: 2px 8px; cursor: pointer;
             margin-left: 6px; }
@@ -1644,6 +1672,15 @@ details.tx summary { font-weight: 500; font-variant-numeric: tabular-nums; }
       <button id="agent-close" aria-label="close agent history">&#x2715;</button>
     </div>
     <div class="modal-body" id="agent-body"></div>
+  </div>
+</div>
+<div class="overlay" id="trace-overlay" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="trace-title">
+    <div class="modal-head">
+      <code id="trace-title"></code>
+      <button id="trace-close" aria-label="close trace">&#x2715;</button>
+    </div>
+    <div class="modal-body" id="trace-body"></div>
   </div>
 </div>
 <div class="overlay" id="story-overlay" hidden>
@@ -1922,6 +1959,13 @@ function purgeButton(id, archived) {
   return `<button class="purgebtn" data-purgejob="${esc(id)}" title="permanently delete this job">delete permanently</button>`;
 }
 
+// A "view trace" button, fetched on click only via the dashboard's own
+// /api/jobs/{id}/trace proxy — never part of the 2.5s /api/state poll, same
+// on-demand discipline as Spend/Access-Log/Foreman-Plan.
+function traceButton(id) {
+  return `<button class="tracebtn" data-tracejob="${esc(id)}" title="view this run's audit trace">trace</button>`;
+}
+
 // The run ids currently shown as running (not yet good/bad per STAGE_GOOD/
 // STAGE_BAD, and not archived) — the same set the pending-question poll
 // below scopes itself to, so a finished or archived job is never polled.
@@ -1951,7 +1995,7 @@ function runsPanel(s) {
     ].filter(Boolean).join("");
     return `<div class="run${filters.run === r.id ? " selected" : ""}" data-run="${esc(r.id)}" role="button" tabindex="0" title="filter the activity feed to ${esc(r.id)}">
       <div class="top"><code>${esc(r.id)}</code><span id="chip-${esc(r.id)}">${statusChip}</span>${isArchived ? chip("archived", "archived") : ""}</div>
-      <div class="meta">${meta}${archiveButton(r.id, isArchived)}${purgeButton(r.id, isArchived)}</div>
+      <div class="meta">${meta}${archiveButton(r.id, isArchived)}${purgeButton(r.id, isArchived)}${traceButton(r.id)}</div>
       ${r.last_message ? `<div class="msg" title="${esc(r.last_message)}">${esc(r.last_message)}</div>` : ""}
       ${runningSet.has(r.id) ? `<div class="question" id="q-${esc(r.id)}"></div>` : ""}
     </div>`;
@@ -2474,6 +2518,46 @@ function openModal(path) {
 
 function closeModal() { $("overlay").hidden = true; }
 
+// ---- trace modal ----
+// SECURITY: kind/name/status/attributes are agent/task-influenced strings
+// (never prompt/response text — TraceSpan is metadata-only by construction),
+// so every field flows through esc() before touching innerHTML, same
+// discipline as every other panel — a <script>-shaped name or attribute
+// value renders as inert text.
+function traceRow(span) {
+  const attrs = Object.entries(span.attributes || {})
+    .map(([k, v]) => `${esc(k)}=${esc(v)}`).join(", ");
+  return `<tr><td>${esc(span.kind)}</td><td>${esc(span.name)}</td>`
+    + `<td>${esc(span.status)}</td><td>${esc(span.duration)}</td><td>${esc(attrs)}</td></tr>`;
+}
+
+function renderTrace(data) {
+  const spans = (data && data.spans) || [];
+  if (!spans.length) return '<p class="muted">No trace spans recorded for this run.</p>';
+  const rows = spans.map(traceRow).join("");
+  return `<table class="cal-table"><thead><tr><th>kind</th><th>name</th><th>status</th>`
+    + `<th>duration</th><th>attributes</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// Fetched only on explicit click of a run card's "trace" button — never part
+// of the 2.5s /api/state poll timer, same on-demand discipline as
+// Spend/Access-Log/Foreman-Plan.
+async function openTrace(id) {
+  $("trace-title").textContent = id;
+  $("trace-body").innerHTML = '<p class="muted">loading\\u2026</p>';
+  $("trace-overlay").hidden = false;
+  $("trace-close").focus();
+  try {
+    const res = await fetch("/api/jobs/" + encodeURIComponent(id) + "/trace");
+    if (!res.ok) throw new Error(String(res.status));
+    $("trace-body").innerHTML = renderTrace(await res.json());
+  } catch (err) {
+    $("trace-body").innerHTML = '<p class="muted">failed to load trace</p>';
+  }
+}
+
+function closeTrace() { $("trace-overlay").hidden = true; }
+
 // ---- agent history modal ----
 // A per-entry stage class, reusing the feed's good/bad stage vocabulary.
 function stageClass(stage) {
@@ -2847,11 +2931,13 @@ $("runs").addEventListener("click", e => {
   }
   const arch = e.target.closest("[data-archjob]");
   if (arch) { archiveJob(arch.dataset.archjob, arch.dataset.archAction); return; }
+  const trace = e.target.closest("[data-tracejob]");
+  if (trace) { openTrace(trace.dataset.tracejob); return; }
   const card = e.target.closest("[data-run]");
   if (card) toggleRun(card.dataset.run);
 });
 $("runs").addEventListener("keydown", e => {
-  if (e.target.closest("[data-archjob]") || e.target.closest("[data-purgejob]")) return; // real <button>s: handle their own Enter/Space
+  if (e.target.closest("[data-archjob]") || e.target.closest("[data-purgejob]") || e.target.closest("[data-tracejob]")) return; // real <button>s: handle their own Enter/Space
   const card = e.target.closest("[data-run]");
   if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleRun(card.dataset.run); }
 });
@@ -2936,6 +3022,8 @@ $("story-body").addEventListener("submit", e => {
 });
 $("modal-close").addEventListener("click", closeModal);
 $("overlay").addEventListener("click", e => { if (e.target === $("overlay")) closeModal(); });
+$("trace-close").addEventListener("click", closeTrace);
+$("trace-overlay").addEventListener("click", e => { if (e.target === $("trace-overlay")) closeTrace(); });
 $("agent-close").addEventListener("click", closeAgent);
 $("agent-overlay").addEventListener("click", e => { if (e.target === $("agent-overlay")) closeAgent(); });
 $("story-close").addEventListener("click", closeStory);

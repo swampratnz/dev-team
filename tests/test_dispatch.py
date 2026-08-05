@@ -3679,6 +3679,98 @@ def test_answer_http_route_rejects_malformed_body():
         assert "error" in payload
 
 
+def test_trace_returns_spans_from_the_job_workspace_in_journal_order():
+    # AC1: a job whose record carries a workspace with a non-empty
+    # trace.jsonl returns 200 {"job_id": id, "spans": [...]} in journal
+    # order, via read_trace_log's own default limit — no new bound.
+    from dev_team.trace import Tracer
+    from dev_team.tracelog import TraceLog
+
+    disp = Dispatcher(token="x")
+    ws = InMemoryWorkspace()
+    tracer = Tracer(clock=lambda: 1.0, sink=TraceLog(ws, run="trace-1", clock=lambda: 1.0))
+    tracer.end(tracer.start("agent", "architect", cost_usd="0.01"), "ok")
+    tracer.end(tracer.start("agent", "engineer"), "ok")
+    spec = JobSpec(mode="assess", repo="acme/mono", title="T", description="D",
+                    budget_usd=None, id="trace-1")
+    disp._registry["trace-1"] = JobRecord(spec=spec, workspace=ws)
+
+    status, payload = disp.trace("trace-1")
+    assert status == 200
+    assert payload["job_id"] == "trace-1"
+    assert [s["name"] for s in payload["spans"]] == ["architect", "engineer"]
+
+
+def test_trace_on_a_job_with_no_workspace_yet_is_200_empty_spans():
+    # AC2: queued job (record.workspace is None) -> 200 {"spans": []}, never
+    # an error.
+    disp = Dispatcher(token="x")
+    spec = JobSpec(mode="assess", repo="acme/mono", title="T", description="D",
+                    budget_usd=None, id="trace-queued")
+    disp._registry["trace-queued"] = JobRecord(spec=spec)
+    assert disp.trace("trace-queued") == (
+        200, {"job_id": "trace-queued", "spans": []})
+
+
+def test_trace_on_a_job_with_a_workspace_but_no_trace_file_yet_is_200_empty():
+    # AC2 (the other half): a workspace exists but trace.jsonl hasn't been
+    # written yet -- still 200 {"spans": []}, not an error.
+    disp = Dispatcher(token="x")
+    spec = JobSpec(mode="assess", repo="acme/mono", title="T", description="D",
+                    budget_usd=None, id="trace-empty")
+    disp._registry["trace-empty"] = JobRecord(spec=spec, workspace=InMemoryWorkspace())
+    assert disp.trace("trace-empty") == (
+        200, {"job_id": "trace-empty", "spans": []})
+
+
+def test_trace_unknown_job_is_404():
+    # AC3
+    disp = Dispatcher(token="x")
+    assert disp.trace("ghost") == (404, {"error": "unknown job"})
+
+
+def test_trace_http_route_round_trips_and_404s_unknown_job():
+    with running(materialise=_mem_materialise) as server:
+        disp = server.dispatcher
+        spec = JobSpec(mode="assess", repo="acme/mono", title="T", description="D",
+                        budget_usd=None, id="trace-http")
+        disp._registry["trace-http"] = JobRecord(spec=spec)
+        disp._order.append("trace-http")
+
+        assert _call(server, "/jobs/trace-http/trace") == (
+            200, {"job_id": "trace-http", "spans": []})
+        assert _call(server, "/jobs/unknown/trace") == (
+            404, {"error": "unknown job"})
+
+
+def test_trace_http_route_requires_auth():
+    # AC5: missing/invalid bearer -> 401, consistent with every other
+    # dispatch route.
+    with running(materialise=_mem_materialise) as server:
+        assert _call(server, "/jobs/x/trace", token=None) == (
+            401, {"error": "unauthorized"})
+
+
+def test_trace_http_route_foreign_tenant_404s_like_unknown_job():
+    # AC4 [security]: a signed-in session's request for a job id belonging
+    # to a different tenant answers the identical 404 {"error": "unknown
+    # job"} via the existing session_sees_job/_session_sees check -- a
+    # foreign-tenant trace request must be indistinguishable from a
+    # nonexistent job.
+    oauth, _ = _oauth_fixture()
+    with running(oauth=oauth, materialise=_mem_materialise) as server:
+        foreign = JobSpec(mode="assess", repo="other/mono", title="T",
+                          description="D", budget_usd=None, id="trace-foreign")
+        server.dispatcher._registry["trace-foreign"] = JobRecord(spec=foreign)
+        server.dispatcher._order.append("trace-foreign")
+        session_token = _sign_in(server)
+
+        assert _call(server, "/jobs/trace-foreign/trace", token=session_token) == (
+            404, {"error": "unknown job"})
+        # the operator (no session) still sees it
+        assert _call(server, "/jobs/trace-foreign/trace")[0] == 200
+
+
 def test_jobs_list_archived_query_param_reveals_archived_jobs():
     dash = InMemoryWorkspace()
     with running(runner=_assess_runner(), materialise=_mem_materialise,
