@@ -19,6 +19,7 @@ from dev_team.depscan import (
     parse_composer_json,
     parse_composer_lock,
     parse_csproj_package_references,
+    parse_gemfile,
     parse_gemfile_lock,
     parse_go_mod,
     parse_package_json,
@@ -900,6 +901,86 @@ GEM
     assert parse_gemfile_lock(text, "Gemfile.lock") == []
 
 
+def test_parse_gemfile_bare_exact_and_tilde_wakka():
+    text = 'gem "foo", "1.2.3"\n' "gem 'bar', '~> 1.2.3'\n"
+    deps = parse_gemfile(text, "Gemfile")
+    assert [
+        (d.name, d.version, d.ecosystem, d.manifest, d.approximate) for d in deps
+    ] == [
+        ("foo", "1.2.3", "RubyGems", "Gemfile", False),
+        ("bar", "1.2.3", "RubyGems", "Gemfile", True),
+    ]
+
+
+def test_parse_gemfile_no_version_argument_skipped():
+    assert parse_gemfile('gem "foo"\n', "Gemfile") == []
+
+
+def test_parse_gemfile_multi_constraint_skipped():
+    assert parse_gemfile('gem "foo", ">= 1.0", "< 2.0"\n', "Gemfile") == []
+
+
+def test_parse_gemfile_bare_comparison_operator_skipped():
+    assert parse_gemfile('gem "foo", ">= 1.0"\n', "Gemfile") == []
+    assert parse_gemfile('gem "foo", "< 2.0"\n', "Gemfile") == []
+    assert parse_gemfile('gem "foo", "= 1.0"\n', "Gemfile") == []
+
+
+def test_parse_gemfile_git_and_path_sourced_skipped():
+    text = 'gem "foo", git: "https://github.com/x/foo"\n' 'gem "bar", path: "../bar"\n'
+    assert parse_gemfile(text, "Gemfile") == []
+
+
+def test_parse_gemfile_non_version_bare_string_skipped():
+    # Not a comparison operator or "~>" prefix, but also not a version --
+    # exercises the version-is-None fallback rather than being guessed at.
+    assert parse_gemfile('gem "foo", "some-branch"\n', "Gemfile") == []
+
+
+def test_parse_gemfile_full_line_and_inline_trailing_comments():
+    text = (
+        "# just a comment, no gem call here\n"
+        'gem "foo", "~> 1.2.3" # trailing comment must not corrupt the version\n'
+    )
+    deps = parse_gemfile(text, "Gemfile")
+    assert [(d.name, d.version, d.approximate) for d in deps] == [
+        ("foo", "1.2.3", True)
+    ]
+
+
+def test_parse_gemfile_mixed_good_and_bad_lines():
+    text = (
+        'gem "good", "1.0.0"\n'
+        'gem "bad", ">= 1.0", "< 2.0"\n'
+        'gem "also_good", "~> 2.0"\n'
+    )
+    deps = parse_gemfile(text, "Gemfile")
+    assert [d.name for d in deps] == ["good", "also_good"]
+
+
+def test_parse_gemfile_empty_and_no_gem_calls():
+    assert parse_gemfile("", "Gemfile") == []
+    assert parse_gemfile("source 'https://rubygems.org'\nruby '3.2.0'\n", "Gemfile") == []
+
+
+def test_parse_gemfile_metaprogramming_content_never_executes(monkeypatch):
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("parse_gemfile must never invoke subprocess/eval/exec")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    monkeypatch.setattr(os, "system", _boom)
+    monkeypatch.setattr(builtins, "eval", _boom)
+    monkeypatch.setattr(builtins, "exec", _boom)
+
+    text = 'gem "foo", ENV["V"]\n' 'gem "bar", "~> #{x}"\n'
+    deps = parse_gemfile(text, "Gemfile")
+    # ENV["V"] is not a quoted-string argument at all, so nothing is
+    # extracted for "foo"; the interpolation in "bar"'s value is captured
+    # (if at all) as a literal string, never evaluated -- either way, no
+    # dependency is produced and no execution ever happens.
+    assert deps == []
+
+
 def test_parse_composer_lock_packages_and_packages_dev():
     text = json.dumps(
         {
@@ -1240,6 +1321,7 @@ def test_parsers_registered_in_parsers_table():
 
     assert _PARSERS["go.mod"] is parse_go_mod
     assert _PARSERS["Gemfile.lock"] is parse_gemfile_lock
+    assert _PARSERS["Gemfile"] is parse_gemfile
     assert _PARSERS["composer.json"] is parse_composer_json
     assert _PARSERS["composer.lock"] is parse_composer_lock
     assert _PARSERS["pom.xml"] is parse_pom_xml_deps
@@ -1321,6 +1403,29 @@ def test_collect_dependencies_composer_lock_supersedes_composer_json_range():
     # dropped, proving the existing supersede rule generalises unmodified.
     assert [(d.name, d.version, d.approximate) for d in deps] == [
         ("vendor/pkg", "9.2.3", False)
+    ]
+
+
+def test_collect_dependencies_reads_bare_gemfile_with_no_lockfile():
+    ws = InMemoryWorkspace({"Gemfile": 'gem "rack", "~> 2.2.0"\n'})
+    deps = collect_dependencies(ws)
+    assert [(d.name, d.version, d.ecosystem, d.approximate) for d in deps] == [
+        ("rack", "2.2.0", "RubyGems", True)
+    ]
+
+
+def test_collect_dependencies_gemfile_lock_supersedes_gemfile_range():
+    ws = InMemoryWorkspace(
+        {
+            "Gemfile": 'gem "rack", "~> 2.2.0"\n',
+            "Gemfile.lock": "GEM\n  specs:\n    rack (2.2.3)\n",
+        }
+    )
+    deps = collect_dependencies(ws)
+    # Only the lockfile-resolved 2.2.3 survives; the ~> 2.2.0 floor is
+    # dropped, proving the existing supersede rule generalises unmodified.
+    assert [(d.name, d.version, d.approximate) for d in deps] == [
+        ("rack", "2.2.3", False)
     ]
 
 
