@@ -5,7 +5,7 @@ stale, and unverifiable. This module is the deterministic counterpart: exact
 pins are parsed straight out of the manifests (NuGet ``packages.config`` and
 SDK-style ``.csproj`` ``<PackageReference>``, ``package.json``,
 ``requirements.txt``, PEP 621 ``pyproject.toml``,
-``Cargo.toml``, Go ``go.mod``, PHP ``composer.json``, Maven ``pom.xml``)
+``Cargo.toml``, Go ``go.mod``, Ruby ``Gemfile``, PHP ``composer.json``, Maven ``pom.xml``)
 *and* the lockfiles
 (``package-lock.json``, ``poetry.lock``, ``Cargo.lock``, NuGet
 ``packages.lock.json``, Ruby ``Gemfile.lock``, PHP ``composer.lock``) and checked against
@@ -20,6 +20,7 @@ that the live scan was unavailable.
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -652,6 +653,99 @@ def parse_gemfile_lock(text: str, manifest: str) -> List[Dependency]:
     return deps
 
 
+_GEM_CALL_RE = re.compile(
+    r"""^\s*gem\s+(?P<quote>['"])(?P<name>[^'"]+)(?P=quote)\s*(?:,\s*(?P<rest>.*))?$"""
+)
+_QUOTED_ARG_RE = re.compile(r"""^(?P<quote>['"])(?P<value>.*)(?P=quote)$""")
+
+
+def _split_gemfile_args(rest: str) -> List[str]:
+    """Split a ``gem`` call's trailing arguments on top-level commas only.
+
+    A naive ``str.split(",")`` would also split inside a quoted value (an
+    unlikely but possible ``git:``/``source:`` URL); tracking quote state
+    keeps a single quoted argument intact.
+    """
+
+    args: List[str] = []
+    current: List[str] = []
+    quote: Optional[str] = None
+    for char in rest:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+            current.append(char)
+        elif char == ",":
+            args.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    args.append("".join(current))
+    return [arg.strip() for arg in args]
+
+
+def parse_gemfile(text: str, manifest: str) -> List[Dependency]:
+    """Ruby bare ``Gemfile``: ``gem "name", "constraint"`` calls with exactly
+    one bare-string version-constraint argument, mirroring
+    :func:`parse_composer_json`'s discipline for Composer's analogous
+    range-specified, lockfile-optional manifest.
+
+    A pure text scan over ``gem`` call lines — never a Ruby ``eval``/
+    ``require``/subprocess — since a real ``Gemfile`` is itself an
+    executable Ruby script and this module never executes untrusted content
+    (CLAUDE.md's "never execute model output/untrusted content" posture).
+
+    Only a bare-exact (``"1.2.3"``) or tilde-wakka (``"~> 1.2.3"``, Ruby's
+    "pessimistic constraint", the counterpart to npm/Composer's ``^``/``~``)
+    single constraint argument is scanned; ``~>`` is treated as an
+    approximate lower bound the same way :func:`_is_range_spec` treats
+    ``^``/``~`` elsewhere, since ``~>``'s own operator isn't in
+    :func:`_exact_version`'s ``^~=v`` prefix set. A second constraint
+    argument, a bare comparison operator alone (``>=``/``<=``/``>``/``<``/
+    ``=``), a missing version, or a ``git:``/``github:``/``path:``/
+    ``source:`` keyword argument all fall back to model knowledge, never
+    guessed at — the same "wider forms stay unparsed" rule
+    :func:`parse_composer_json` already documents for Composer's OR-lists/
+    AND-lists/branch-aliases.
+    """
+
+    deps = []
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        match = _GEM_CALL_RE.match(line)
+        if not match:
+            continue
+        rest = match.group("rest")
+        if not rest:
+            continue
+        args = _split_gemfile_args(rest)
+        if len(args) != 1:
+            continue
+        arg_match = _QUOTED_ARG_RE.match(args[0])
+        if not arg_match:
+            continue
+        value = arg_match.group("value").strip()
+        approximate = value.startswith("~>")
+        if approximate:
+            value = value[2:].strip()
+        elif value[:1] in (">", "<", "="):
+            continue
+        version = _exact_version(value)
+        if version is not None:
+            deps.append(
+                Dependency(
+                    match.group("name"), version, "RubyGems", manifest,
+                    approximate=approximate,
+                )
+            )
+    return deps
+
+
 def parse_composer_lock(text: str, manifest: str) -> List[Dependency]:
     """PHP ``composer.lock``: ``packages``/``packages-dev`` are exact resolved
     pins, mirroring ``package-lock.json``'s flat-array shape.
@@ -736,6 +830,7 @@ _PARSERS = {
     "packages.lock.json": parse_packages_lock_json,
     "go.mod": parse_go_mod,
     "Gemfile.lock": parse_gemfile_lock,
+    "Gemfile": parse_gemfile,
     "composer.json": parse_composer_json,
     "composer.lock": parse_composer_lock,
     "pom.xml": parse_pom_xml_deps,

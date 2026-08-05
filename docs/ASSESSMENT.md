@@ -119,8 +119,14 @@ machinery understands them now:
   `pyproject.toml` still falls back to model knowledge. Go `go.mod`
   `require` entries are always exact pins (Go's module resolution has no
   version-range syntax) and are live-scanned with no lockfile needed;
-  Ruby's bare `Gemfile` (a range-specified manifest with no lockfile) is
-  not parsed — only `Gemfile.lock`'s resolved pins are. PHP `composer.json`
+  Ruby's bare `Gemfile` `gem` calls with a single bare-exact or
+  tilde-wakka (`~>`) version-constraint argument are live-scanned the same
+  way (`~>` is a lower bound, superseded by `Gemfile.lock` when present); a
+  `gem` call with no version, more than one constraint argument, a bare
+  comparison operator (`>=`/`<=`/`>`/`<`/`=`) alone, or a
+  `git:`/`github:`/`path:`/`source:`-sourced gem still falls back to model
+  knowledge, since resolving those needs Bundler's own dependency resolver.
+  PHP `composer.json`
   `require`/`require-dev` caret (`^`), tilde (`~`), and bare-exact
   constraints are live-scanned the same way as `package.json`'s `^`/`~`
   ranges (lower bound only, superseded by `composer.lock` when present);
@@ -205,9 +211,10 @@ involved, so their findings are exact and citable:
 - **Live dependency scan** — exact pins from the manifests
   (`packages.config`, `.csproj` `<PackageReference>`, `package.json`,
   `requirements.txt`, `Cargo.toml`,
-  Go `go.mod`, Maven `pom.xml`) and the lockfiles (`package-lock.json`,
-  `poetry.lock`, `Cargo.lock`, NuGet `packages.lock.json`, Ruby
-  `Gemfile.lock`, PHP `composer.lock`) queried against OSV.dev in one batch
+  Go `go.mod`, Ruby `Gemfile`, Maven `pom.xml`) and the lockfiles
+  (`package-lock.json`, `poetry.lock`, `Cargo.lock`, NuGet
+  `packages.lock.json`, Ruby `Gemfile.lock`, PHP `composer.lock`) queried
+  against OSV.dev in one batch
   (`--no-osv-scan` opts out; offline degrades to a labelled
   model-knowledge fallback).
 - **Live EOL/support-status scan** — Node.js/Python/.NET/Ruby/Go/PHP/Java/
