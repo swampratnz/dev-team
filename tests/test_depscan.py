@@ -6,6 +6,7 @@ import builtins
 import json
 import os
 import subprocess
+import tomllib
 
 from dev_team.depscan import (
     Dependency,
@@ -26,6 +27,7 @@ from dev_team.depscan import (
     parse_pom_xml_deps,
     parse_pyproject_toml,
     parse_requirements_txt,
+    parse_yarn_lock,
     scan_dependencies,
 )
 from dev_team.execution import InMemoryWorkspace
@@ -900,6 +902,62 @@ GEM
     assert parse_gemfile_lock(text, "Gemfile.lock") == []
 
 
+def test_parse_yarn_lock_single_spec_block():
+    text = """\
+lodash@^4.17.21:
+  version "4.17.21"
+  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"
+  integrity sha512-abc
+"""
+    deps = parse_yarn_lock(text, "yarn.lock")
+    assert deps == [Dependency("lodash", "4.17.21", "npm", "yarn.lock")]
+
+
+def test_parse_yarn_lock_multi_spec_scoped_block():
+    # A naive last-"@" split with no scope guard would wrongly split
+    # "@babel/code-frame" itself instead of stopping before "^7.0.0".
+    text = """\
+"@babel/code-frame@^7.0.0", "@babel/code-frame@^7.12.13":
+  version "7.16.7"
+  resolved "https://registry.yarnpkg.com/@babel/code-frame/-/code-frame-7.16.7.tgz"
+  dependencies:
+    "@babel/highlight" "^7.16.7"
+
+lodash@^4.17.21:
+  version "4.17.21"
+"""
+    deps = parse_yarn_lock(text, "yarn.lock")
+    assert [(d.name, d.version, d.ecosystem) for d in deps] == [
+        ("@babel/code-frame", "7.16.7", "npm"),
+        ("lodash", "4.17.21", "npm"),
+    ]
+
+
+def test_parse_yarn_lock_block_with_no_version_line_contributes_nothing():
+    text = """\
+lodash@^4.17.21:
+  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"
+
+rack@^1.0:
+  version "1.0.0"
+"""
+    deps = parse_yarn_lock(text, "yarn.lock")
+    assert [(d.name, d.version) for d in deps] == [("rack", "1.0.0")]
+
+
+def test_parse_yarn_lock_malformed_or_empty():
+    assert parse_yarn_lock("", "yarn.lock") == []
+    assert parse_yarn_lock("   \n\n  \n", "yarn.lock") == []
+    assert parse_yarn_lock("not a lockfile at all\n", "yarn.lock") == []
+    assert parse_yarn_lock("# yarn lockfile v1\n", "yarn.lock") == []
+    # A header that doesn't parse to a name (no "@" past position 0, or a
+    # bare scope with nothing following it) contributes nothing.
+    assert parse_yarn_lock("noatsign:\n  version \"1.0.0\"\n", "yarn.lock") == []
+    assert parse_yarn_lock('"@justscope":\n  version "1.0.0"\n', "yarn.lock") == []
+    # An empty version string is treated the same as a missing version.
+    assert parse_yarn_lock('lodash@^4.17.21:\n  version ""\n', "yarn.lock") == []
+
+
 def test_parse_composer_lock_packages_and_packages_dev():
     text = json.dumps(
         {
@@ -1240,6 +1298,7 @@ def test_parsers_registered_in_parsers_table():
 
     assert _PARSERS["go.mod"] is parse_go_mod
     assert _PARSERS["Gemfile.lock"] is parse_gemfile_lock
+    assert _PARSERS["yarn.lock"] is parse_yarn_lock
     assert _PARSERS["composer.json"] is parse_composer_json
     assert _PARSERS["composer.lock"] is parse_composer_lock
     assert _PARSERS["pom.xml"] is parse_pom_xml_deps
@@ -1339,6 +1398,46 @@ def test_collect_dependencies_keeps_unresolved_composer_json_range():
     assert "lower bound only" in rendered
 
 
+def test_collect_dependencies_reads_yarn_lock():
+    ws = InMemoryWorkspace(
+        {
+            "yarn.lock": 'lodash@^4.17.21:\n  version "4.17.21"\n',
+            "requirements.txt": "requests==2.31.0\n",
+        }
+    )
+    deps = collect_dependencies(ws)
+    assert {(d.ecosystem, d.name, d.version) for d in deps} == {
+        ("npm", "lodash", "4.17.21"),
+        ("PyPI", "requests", "2.31.0"),
+    }
+
+
+def test_collect_dependencies_dedupes_yarn_lock():
+    ws = InMemoryWorkspace(
+        {
+            "a/yarn.lock": 'lodash@^4.17.21:\n  version "4.17.21"\n',
+            "b/yarn.lock": 'lodash@^4.17.21:\n  version "4.17.21"\n',
+        }
+    )
+    deps = collect_dependencies(ws)
+    assert len(deps) == 1
+
+
+def test_collect_dependencies_yarn_lock_supersedes_package_json_range():
+    ws = InMemoryWorkspace(
+        {
+            "package.json": json.dumps({"dependencies": {"lodash": "^4.0.0"}}),
+            "yarn.lock": 'lodash@^4.0.0:\n  version "4.17.21"\n',
+        }
+    )
+    deps = collect_dependencies(ws)
+    # Only the yarn.lock-resolved 4.17.21 survives; the ^4.0.0 floor (4.0.0)
+    # is dropped, proving the existing supersede rule generalises unmodified.
+    assert [(d.name, d.version, d.approximate) for d in deps] == [
+        ("lodash", "4.17.21", False)
+    ]
+
+
 def test_scan_dependencies_go_and_rubygems_vulnerabilities():
     ws = InMemoryWorkspace(
         {
@@ -1373,6 +1472,7 @@ def test_crafted_manifest_content_never_raises():
     for content in malicious:
         parse_go_mod(f"require {content} v1.0.0\n", "go.mod")
         parse_gemfile_lock(f"GEM\n  specs:\n    {content} (1.0)\n", "Gemfile.lock")
+        parse_yarn_lock(f'{content}@^1.0.0:\n  version "1.0.0"\n', "yarn.lock")
         parse_composer_lock(
             json.dumps({"packages": [{"name": content, "version": "1.0.0"}]}),
             "composer.lock",
@@ -1408,6 +1508,32 @@ def test_crafted_manifest_content_causes_no_subprocess_or_eval(monkeypatch):
     # None of these crash, and the module never touched subprocess/os.system
     # or eval/exec — verified by the monkeypatched raisers above.
     assert isinstance(scan, DependencyScan)
+
+
+def test_parse_yarn_lock_never_uses_subprocess_eval_or_a_yaml_json_parser(monkeypatch):
+    # yarn.lock is a custom text block format, not YAML or JSON despite the
+    # superficial resemblance — this asserts parse_yarn_lock never routes
+    # through subprocess/eval/exec or this module's own JSON/TOML parsing,
+    # even on adversarial content shaped like a lockfile.
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("parse_yarn_lock must never invoke this")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    monkeypatch.setattr(os, "system", _boom)
+    monkeypatch.setattr(builtins, "eval", _boom)
+    monkeypatch.setattr(builtins, "exec", _boom)
+    monkeypatch.setattr(json, "loads", _boom)
+    monkeypatch.setattr(tomllib, "loads", _boom)
+
+    text = (
+        '"; rm -rf /@^1.0.0", "$(whoami)@^2.0.0":\n'
+        '  version "../../etc/passwd"\n'
+        "\n"
+        "`id`@^1.0.0:\n"
+        "  resolved \"nope\"\n"
+    )
+    deps = parse_yarn_lock(text, "yarn.lock")
+    assert deps == [Dependency("; rm -rf /", "../../etc/passwd", "npm", "yarn.lock")]
 
 
 def test_parse_csproj_package_references_attribute_form():

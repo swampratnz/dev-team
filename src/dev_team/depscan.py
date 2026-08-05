@@ -8,7 +8,8 @@ SDK-style ``.csproj`` ``<PackageReference>``, ``package.json``,
 ``Cargo.toml``, Go ``go.mod``, PHP ``composer.json``, Maven ``pom.xml``)
 *and* the lockfiles
 (``package-lock.json``, ``poetry.lock``, ``Cargo.lock``, NuGet
-``packages.lock.json``, Ruby ``Gemfile.lock``, PHP ``composer.lock``) and checked against
+``packages.lock.json``, Ruby ``Gemfile.lock``, classic Yarn v1 ``yarn.lock``,
+PHP ``composer.lock``) and checked against
 the OSV.dev batch API, which covers every major
 ecosystem through one endpoint. Lockfiles matter on range-specified projects:
 a ``package.json`` full of ``^`` ranges yields nothing scannable, but its
@@ -652,6 +653,53 @@ def parse_gemfile_lock(text: str, manifest: str) -> List[Dependency]:
     return deps
 
 
+def parse_yarn_lock(text: str, manifest: str) -> List[Dependency]:
+    """Classic Yarn v1 ``yarn.lock``: exact resolved pins from a custom
+    text block format (not YAML or JSON, despite the superficial
+    resemblance) -- the same block-parsing discipline
+    :func:`parse_gemfile_lock` already uses for Ruby's non-JSON/YAML/XML
+    lockfile shape. Yarn Berry (v2+, a different YAML schema) and
+    ``pnpm-lock.yaml`` are out of scope for v1 (see the module docstring's
+    honest-limitations note) -- this module has no YAML dependency today.
+
+    A block header is any non-blank, non-``#``-comment, unindented line
+    ending in ``:``; every spec in a header resolves to the same installed
+    version, so only the first comma-separated spec is parsed. The package
+    name is the header spec up to its *last* ``@`` that is not position 0,
+    which correctly handles a scoped package's leading ``@`` (``"@babel/
+    code-frame@^7.0.0"`` -> ``@babel/code-frame``, not a split at the scope's
+    own ``@``). The block's resolved version comes from the next indented
+    ``version "x.y.z"`` line. A block with no parseable name, or no
+    ``version`` line, contributes nothing -- matching every sibling parser's
+    degrade-per-entry-never-raise contract.
+    """
+
+    deps = []
+    name: Optional[str] = None
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            continue
+        if not raw_line[0].isspace():
+            name = None
+            stripped = raw_line.strip()
+            if stripped.startswith("#") or not stripped.endswith(":"):
+                continue
+            first_spec = stripped[:-1].split(",", 1)[0].strip().strip('"')
+            at = first_spec.rfind("@")
+            if at > 0:
+                name = first_spec[:at]
+            continue
+        if name is None:
+            continue
+        stripped = raw_line.strip()
+        if stripped.startswith('version "') and stripped.endswith('"'):
+            version = stripped[len('version "'):-1]
+            if version:
+                deps.append(Dependency(name, version, "npm", manifest))
+            name = None
+    return deps
+
+
 def parse_composer_lock(text: str, manifest: str) -> List[Dependency]:
     """PHP ``composer.lock``: ``packages``/``packages-dev`` are exact resolved
     pins, mirroring ``package-lock.json``'s flat-array shape.
@@ -736,6 +784,7 @@ _PARSERS = {
     "packages.lock.json": parse_packages_lock_json,
     "go.mod": parse_go_mod,
     "Gemfile.lock": parse_gemfile_lock,
+    "yarn.lock": parse_yarn_lock,
     "composer.json": parse_composer_json,
     "composer.lock": parse_composer_lock,
     "pom.xml": parse_pom_xml_deps,

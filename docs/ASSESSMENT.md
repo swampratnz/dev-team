@@ -107,10 +107,14 @@ machinery understands them now:
 - **Exactly-pinned dependencies get a live OSV.dev scan; everything else
   is model knowledge** — the report footer says which mode produced the
   claims. Lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`,
-  NuGet `packages.lock.json`, Ruby `Gemfile.lock`, PHP `composer.lock`) are
-  parsed alongside the manifests, so a range-specified project still gets
-  its *resolved* versions scanned; only dependencies with no lockfile and no
-  exact pin fall back to training data. PEP 621 `pyproject.toml`
+  NuGet `packages.lock.json`, Ruby `Gemfile.lock`, classic Yarn v1
+  `yarn.lock`, PHP `composer.lock`) are parsed alongside the manifests, so a
+  range-specified project still gets its *resolved* versions scanned; only
+  dependencies with no lockfile and no exact pin fall back to training data.
+  Yarn Berry (v2+, a different YAML-based lockfile schema) and
+  `pnpm-lock.yaml` (also YAML) are not parsed — this scanner has no YAML
+  dependency today — so those projects fall back to model knowledge the same
+  way an unrecognised lockfile format always has. PEP 621 `pyproject.toml`
   `[project.dependencies]` and `[project.optional-dependencies]` `==`
   pins are live-scanned too, even with no lockfile present; PEP 735
   `[dependency-groups]` `==` pins are live-scanned the same way, and
