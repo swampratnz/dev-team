@@ -446,7 +446,10 @@ class DeliveryOutcome:
     #: ``docker_build_gate`` additionally sets ``docker_build_verified``
     #: (``bool``) and, on failure, ``docker_build_detail`` (``str``);
     #: ``docker_run_gate`` additionally sets ``docker_run_verified``
-    #: (``bool``) and, on an early exit, ``docker_run_detail`` (``str``).
+    #: (``bool``) and, on an early exit, ``docker_run_detail`` (``str``);
+    #: ``_visual_review`` additionally sets ``visual_review_sandboxed`` to
+    #: ``False`` (never ``True``) the first time it serves the app under
+    #: ``--sandbox``.
     scorecard: Dict[str, Any] = field(default_factory=dict)
     #: URL of the pull request opened for this delivery, when the caller asked
     #: for one (``--pull-request``) and the delivery had a committed branch to
@@ -1886,6 +1889,7 @@ class DeliveryEngine:
             return None
         if self.config.sandbox is not None and not self._visual_sandbox_warned:
             self._visual_sandbox_warned = True
+            self._scorecard["visual_review_sandboxed"] = False
             self._event(
                 "visual",
                 "the served app runs as a bare, unsandboxed host subprocess "
