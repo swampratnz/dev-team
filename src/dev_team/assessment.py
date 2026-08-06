@@ -73,6 +73,7 @@ from .interaction import (
 )
 from .persona import Roster
 from .profile import ProjectProfile, detect_project
+from .report import sorted_cost_by_role
 from .sandbox import ContainerCommandRunner, SandboxConfig
 from .sdk import AgentRunner
 from .trace import Tracer
@@ -2338,6 +2339,13 @@ def render_report(outcome: AssessmentOutcome) -> str:
         ]
     lines.append("")
     lines.append(f"_Cost: ${outcome.cost_usd:.4f}. " + _live_scan_footer(outcome) + "_")
+    cost_by_role = outcome.budget.meter.cost_by_role()
+    if cost_by_role:
+        lines.append("")
+        lines.append("Cost by role:")
+        lines.extend(
+            f"- {role}: ${cost:.4f}" for role, cost in sorted_cost_by_role(cost_by_role)
+        )
     return "\n".join(lines)
 
 

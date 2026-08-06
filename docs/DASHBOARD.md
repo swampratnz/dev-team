@@ -198,6 +198,12 @@ evidence string a *model* wrote, not a deterministic path like
 `innerHTML` — the same precedent the Access log panel's `path` field
 already established for caller/model-influenced text.
 
+Opened reports also carry a per-run cost breakdown: the markdown's cost
+footer lists a `Cost by role:` line for each auditing role once more than
+one recorded a cost, sorted highest spender first (see
+[`docs/ASSESSMENT.md`](ASSESSMENT.md)). This is a different axis from the
+Spend panel below — intra-run, per-specialist — not a duplicate of it.
+
 ### Spend
 
 The **Spend** panel (next to Memory & conventions) shows the dispatch

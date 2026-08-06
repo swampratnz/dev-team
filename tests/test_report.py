@@ -403,3 +403,85 @@ def test_render_delivery_summary_omits_unverified_claims_when_absent():
 
     no_docs = render_delivery_summary(_outcome())
     assert "Unverified doc claims" not in no_docs
+
+
+def _budget_result(cost):
+    from dev_team.sdk import AgentResult
+
+    return AgentResult(text="", cost_usd=cost, num_turns=1)
+
+
+def test_delivery_to_dict_cost_by_role_empty_without_budget():
+    assert delivery_to_dict(_outcome())["cost_by_role"] == {}
+
+
+def test_delivery_to_dict_cost_by_role_empty_when_budget_has_no_records():
+    from dev_team.budget import Budget
+
+    assert delivery_to_dict(_outcome(budget=Budget()))["cost_by_role"] == {}
+
+
+def test_delivery_to_dict_cost_by_role_matches_meter():
+    from dev_team.budget import Budget
+
+    budget = Budget()
+    budget.record("engineer", _budget_result(0.5))
+    budget.record("reviewer", _budget_result(0.1))
+    data = delivery_to_dict(_outcome(budget=budget))
+    assert data["cost_by_role"] == budget.meter.cost_by_role()
+    assert data["cost_by_role"] == {"engineer": 0.5, "reviewer": 0.1}
+
+
+def test_render_delivery_summary_omits_cost_by_role_block_without_budget():
+    # Golden regression: byte-identical to pre-change output when there is no
+    # budget to break down.
+    before = (
+        "Feature: F\n"
+        "Result:  INCOMPLETE\n"
+        "Cost:    $0.0000\n"
+        "\n"
+        "Tasks:\n"
+        "  (no tasks were produced)\n"
+        "Committed: no"
+    )
+    assert render_delivery_summary(_outcome()) == before
+    assert "Cost by role" not in render_delivery_summary(_outcome())
+
+
+def test_render_delivery_summary_omits_cost_by_role_block_when_budget_empty():
+    from dev_team.budget import Budget
+
+    text = render_delivery_summary(_outcome(budget=Budget()))
+    assert "Cost by role" not in text
+
+
+def test_render_delivery_summary_shows_cost_by_role_sorted_descending():
+    from dev_team.budget import Budget
+
+    budget = Budget()
+    budget.record("engineer", _budget_result(0.1))
+    budget.record("security-engineer", _budget_result(0.5))
+    budget.record("architect", _budget_result(0.3))
+    text = render_delivery_summary(_outcome(budget=budget))
+    lines = text.splitlines()
+    idx = lines.index("Cost by role:")
+    assert lines[idx + 1 : idx + 4] == [
+        "  security-engineer: $0.5000",
+        "  architect: $0.3000",
+        "  engineer: $0.1000",
+    ]
+
+
+def test_render_delivery_summary_cost_by_role_tie_break_is_alphabetical():
+    from dev_team.budget import Budget
+
+    budget = Budget()
+    budget.record("reviewer", _budget_result(0.2))
+    budget.record("architect", _budget_result(0.2))
+    text = render_delivery_summary(_outcome(budget=budget))
+    lines = text.splitlines()
+    idx = lines.index("Cost by role:")
+    assert lines[idx + 1 : idx + 3] == [
+        "  architect: $0.2000",
+        "  reviewer: $0.2000",
+    ]
