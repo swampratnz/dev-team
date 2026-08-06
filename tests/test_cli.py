@@ -2512,6 +2512,7 @@ class _FakeEngine:
     def __init__(self, results):
         self._results = list(results)
         self.calls = []
+        self.remediation_closes = 0
 
     async def remediate_checks(self, summary):
         self.calls.append(summary)
@@ -2519,6 +2520,9 @@ class _FakeEngine:
         if isinstance(result, Exception):
             raise result
         return result
+
+    async def aclose_remediation_session(self):
+        self.remediation_closes += 1
 
 
 def _fix_team(interaction=None):
@@ -2569,6 +2573,7 @@ def test_watch_fix_loop_fixes_and_repushes(monkeypatch):
     assert engine.calls == ["boom"]  # remediated once, keyed on the CI summary
     assert pushes == [True]  # force-with-lease push of the fix
     assert outcome.checks.state == "success"  # re-watch saw green, loop stopped
+    assert engine.remediation_closes == 1  # exit path (a): watch turned success
 
 
 def test_watch_fix_loop_stops_when_no_fix(monkeypatch):
@@ -2579,6 +2584,7 @@ def test_watch_fix_loop_stops_when_no_fix(monkeypatch):
     pushes = _run_fix_loop(monkeypatch, engine, outcome)
     assert engine.calls == ["boom"] and pushes == []
     assert outcome.checks.state == "failure"
+    assert engine.remediation_closes == 1  # exit path (b): a round produced no fix
 
 
 def test_watch_fix_loop_human_apply_then_skip(monkeypatch):
@@ -2591,6 +2597,7 @@ def test_watch_fix_loop_human_apply_then_skip(monkeypatch):
     team = _fix_team(interaction=ScriptedChannel(script=[Reply("apply"), Reply("skip")]))
     pushes = _run_fix_loop(monkeypatch, engine, outcome, team=team, rewatch=["failure"])
     assert engine.calls == ["boom"] and pushes == [True]
+    assert engine.remediation_closes == 1  # exit path (e): human skip
 
 
 def test_watch_fix_loop_human_skip_first_round(monkeypatch):
@@ -2601,6 +2608,8 @@ def test_watch_fix_loop_human_skip_first_round(monkeypatch):
     team = _fix_team(interaction=ScriptedChannel(script=[Reply("skip")]))
     pushes = _run_fix_loop(monkeypatch, engine, outcome, team=team)
     assert engine.calls == [] and pushes == []  # never remediated
+    # exit path (e): human skip, even before any remediate_checks() call
+    assert engine.remediation_closes == 1
 
 
 def test_watch_fix_loop_exhausts_rounds(monkeypatch):
@@ -2611,6 +2620,7 @@ def test_watch_fix_loop_exhausts_rounds(monkeypatch):
     pushes = _run_fix_loop(monkeypatch, engine, outcome, rounds=2, rewatch=["failure", "failure"])
     assert len(engine.calls) == 2 and pushes == [True, True]
     assert outcome.checks.state == "failure"
+    assert engine.remediation_closes == 1  # rounds exhausted: still closed exactly once
 
 
 def test_watch_fix_loop_stops_on_budget(monkeypatch):
@@ -2620,12 +2630,15 @@ def test_watch_fix_loop_stops_on_budget(monkeypatch):
     outcome = _fix_outcome("failure")
     pushes = _run_fix_loop(monkeypatch, engine, outcome)
     assert engine.calls == ["boom"] and pushes == []
+    assert engine.remediation_closes == 1  # exit path (c): BudgetExceededError
 
 
 def test_watch_fix_loop_does_not_chase_a_timeout(monkeypatch):
     engine = _FakeEngine([])
     pushes = _run_fix_loop(monkeypatch, engine, _fix_outcome("timeout"))
     assert engine.calls == [] and pushes == []
+    # never entered a round at all, but the finally still closes exactly once
+    assert engine.remediation_closes == 1
 
 
 def test_watch_fix_loop_stops_on_push_failure(monkeypatch):
@@ -2655,6 +2668,7 @@ def test_watch_fix_loop_stops_on_push_failure(monkeypatch):
     )
     assert engine.calls == ["boom"]  # fixed once, but the push failed -> stopped
     assert outcome.checks.state == "failure"  # never re-watched
+    assert engine.remediation_closes == 1  # exit path (d): push failure
 
 
 # --- --interactive-pr-comments (ROADMAP #7: PR-comment CI-fix supervision) --
@@ -2854,6 +2868,7 @@ def test_run_ci_fix_loop_pr_comment_error_stops_gracefully(monkeypatch, capsys):
     )
     assert engine.calls == []  # never reached remediation
     assert "could not reach the PR comments" in capsys.readouterr().err
+    assert engine.remediation_closes == 1  # still closed exactly once on this exit path
 
 
 def test_main_deliver_pull_request_sets_pull_request_number(tmp_path, monkeypatch, capsys):
