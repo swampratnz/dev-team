@@ -1629,6 +1629,60 @@ def test_run_build_probe_verify_only_profile_and_output_truncation():
     assert len(probe.commands[0].output_tail) == 4_000
 
 
+class _RunSetupSpyRunner:
+    """A CommandRunner exposing run_setup, recording which method each call
+    used — mirrors ContainerCommandRunner's extra method (issue #340)."""
+
+    def __init__(self, rules=()):
+        self.rules = list(rules)
+        self.dispatch_log = []
+
+    def add_rule(self, match, result):
+        self.rules.append((match, result))
+        return self
+
+    def _result(self, args):
+        joined = " ".join(args)
+        for match, result in self.rules:
+            if match in joined:
+                return result
+        return CommandResult(args, 0, "", "")
+
+    def run(self, command, *, cwd=None, timeout=None, env=None):
+        args = list(command)
+        self.dispatch_log.append(("run", args))
+        return self._result(args)
+
+    def run_setup(self, command, *, cwd=None, timeout=None, env=None):
+        args = list(command)
+        self.dispatch_log.append(("run_setup", args))
+        return self._result(args)
+
+
+def test_run_build_probe_dispatches_setup_via_run_setup_verify_via_run():
+    # Acceptance criterion 7 (issue #340): with a runner exposing run_setup,
+    # setup_command goes through it; verify_command always goes through
+    # .run(), never run_setup, even when both are present.
+    runner = _RunSetupSpyRunner()
+    probe = run_build_probe(_NODE_PROFILE, runner, "/repo", timeout=60.0)
+    assert probe.ran and probe.succeeded is True
+    assert runner.dispatch_log == [
+        ("run_setup", ["npm", "install"]),
+        ("run", ["npm", "test"]),
+    ]
+
+
+def test_run_build_probe_never_calls_run_setup_without_a_setup_command():
+    # Acceptance criterion 8 (issue #340): a profile with no setup_command
+    # (only verify_command) never calls run_setup — the single command goes
+    # through .run(), unchanged from today's behaviour.
+    profile = ProjectProfile(kind="rust", verify_command=("cargo", "test"))
+    runner = _RunSetupSpyRunner()
+    probe = run_build_probe(profile, runner, "/repo", timeout=60.0)
+    assert probe.ran and probe.succeeded is True
+    assert runner.dispatch_log == [("run", ["cargo", "test"])]
+
+
 def test_build_probe_render_and_dict_when_never_requested():
     probe = BuildProbe()
     assert probe.render() == ""

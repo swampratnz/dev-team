@@ -3710,6 +3710,26 @@ def test_sandbox_config_absent_and_defaults():
     assert sc is not None
     assert sc.network == "none"  # secure default preserved when not overridden
     assert sc.user_namespace is None  # --sandbox-userns unset stays unset
+    assert sc.setup_network is None  # --sandbox-setup-network unset stays unset
+
+
+def test_sandbox_config_setup_network_from_flag():
+    # Acceptance criterion 9 (issue #340): --sandbox-setup-network parses and
+    # threads into SandboxConfig.setup_network via _sandbox_config().
+    from dev_team.cli import _sandbox_config
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--deliver", "--sandbox",
+            "--sandbox-network", "none",
+            "--sandbox-setup-network", "bridge",
+            "T", "D",
+        ]
+    )
+    sc = _sandbox_config(args)
+    assert sc.network == "none"
+    assert sc.setup_network == "bridge"
 
 
 def test_tracer_helper_returns_none_without_a_run_id():
@@ -3772,6 +3792,20 @@ def test_main_sandbox_userns_tuning_without_sandbox_exits_2(capsys):
     err = capsys.readouterr().err
     assert excinfo.value.code == 2
     assert "--sandbox-userns" in err
+
+
+def test_main_sandbox_setup_network_tuning_without_sandbox_exits_2(capsys):
+    # Acceptance criterion 10 (issue #340): --sandbox-setup-network shares the
+    # same "only valid with --sandbox" validation branch the other
+    # --sandbox-* tuning flags already use.
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["T", "D", "--deliver", "--sandbox-setup-network", "bridge"],
+            runner=ScriptedRunner([]),
+        )
+    err = capsys.readouterr().err
+    assert excinfo.value.code == 2
+    assert "--sandbox-setup-network" in err
 
 
 def test_main_assess_with_sandbox_succeeds(tmp_path):

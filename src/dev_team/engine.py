@@ -1148,9 +1148,14 @@ class DeliveryEngine:
                 return halted
 
         if self.config.setup_command is not None:
-            result = self.command_runner.run(
-                list(self.config.setup_command), cwd=self.workdir
-            )
+            # A sandboxed runner exposes run_setup() to give this command (a
+            # dependency restore, typically) a scoped network override without
+            # relaxing it for the gate commands that follow via the same
+            # runner/config — see SandboxConfig.setup_network. Plain runners
+            # (e.g. SubprocessCommandRunner) have no such method, so fall back
+            # to .run() unchanged.
+            run_setup = getattr(self.command_runner, "run_setup", self.command_runner.run)
+            result = run_setup(list(self.config.setup_command), cwd=self.workdir)
             if not result.ok:
                 self.tracer.end(run_span, "halted")
                 return self._halted(

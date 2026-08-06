@@ -89,6 +89,13 @@ class SandboxConfig:
     #: ``docker run --network`` value. ``none`` is the secure default; a setup
     #: command that must fetch dependencies needs an explicit override.
     network: str = "none"
+    #: ``--network`` override used only by :meth:`ContainerCommandRunner.
+    #: run_setup`. ``None`` (the default) means "no override" — ``run_setup``
+    #: falls back to :attr:`network`, so behaviour is byte-identical to
+    #: ``.run()`` unless a caller opts in. Lets a setup command (dependency
+    #: restore) get network access without relaxing it for the gate/verify
+    #: command that runs after it through the same config.
+    setup_network: Optional[str] = None
     #: ``--user`` value (e.g. ``"1000:1000"``). ``None`` omits the flag and
     #: relies on a rootless engine mapping to the host user.
     user: Optional[str] = None
@@ -146,13 +153,45 @@ class ContainerCommandRunner:
         timeout: Optional[float] = None,
         env: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
+        return self._run(command, cwd=cwd, timeout=timeout, env=env, network=None)
+
+    def run_setup(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Optional[str] = None,
+        timeout: Optional[float] = None,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> CommandResult:
+        """Like :meth:`run`, but the container's ``--network`` uses
+        :attr:`SandboxConfig.setup_network` when set (falling back to
+        :attr:`SandboxConfig.network` otherwise) — for the one command in a
+        run (dependency restore) that may legitimately need network access
+        the gate/verify command that follows should not also get."""
+
+        network = self.config.setup_network
+        if network is None:
+            network = self.config.network
+        return self._run(command, cwd=cwd, timeout=timeout, env=env, network=network)
+
+    def _run(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Optional[str],
+        timeout: Optional[float],
+        env: Optional[Mapping[str, str]],
+        network: Optional[str],
+    ) -> CommandResult:
         args = list(command)
         if args and _program(args[0]) in self.config.host_programs:
             # Host orchestration (git): run outside the sandbox, unchanged.
             return self.inner.run(args, cwd=cwd, timeout=timeout, env=env)
         forwarded = _clean_env(env)
         if not forwarded:
-            wrapped = self._containerise(args, cwd=cwd, env_file=None)
+            wrapped = self._containerise(
+                args, cwd=cwd, env_file=None, network=network
+            )
             return self.inner.run(wrapped, cwd=cwd, timeout=timeout)
         # Forwarded env goes via a mode-0600, workspace-external, always
         # cleaned-up --env-file, never inline --env KEY=VALUE: a secret handed
@@ -164,7 +203,9 @@ class ContainerCommandRunner:
             with os.fdopen(fd, "w") as handle:
                 for key, value in forwarded.items():
                     handle.write(f"{key}={value}\n")
-            wrapped = self._containerise(args, cwd=cwd, env_file=env_path)
+            wrapped = self._containerise(
+                args, cwd=cwd, env_file=env_path, network=network
+            )
             return self.inner.run(wrapped, cwd=cwd, timeout=timeout)
         finally:
             os.unlink(env_path)
@@ -175,6 +216,7 @@ class ContainerCommandRunner:
         *,
         cwd: Optional[str],
         env_file: Optional[str],
+        network: Optional[str] = None,
     ) -> List[str]:
         """Build the ``docker run`` argv that runs ``args`` in a container."""
 
@@ -191,7 +233,7 @@ class ContainerCommandRunner:
         host_dir = os.path.realpath(cwd)
         mount = cfg.workspace_mount
         run: List[str] = [cfg.engine, "run", "--rm"]
-        run += ["--network", cfg.network]
+        run += ["--network", network if network is not None else cfg.network]
         if cfg.user is not None:
             run += ["--user", cfg.user]
         if cfg.user_namespace is not None:

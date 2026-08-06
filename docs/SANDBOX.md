@@ -76,7 +76,8 @@ runner = ContainerCommandRunner(
     SandboxConfig(
         engine="podman",                       # rootless by default
         image="python:3.12-slim",              # must carry your toolchain
-        network="none",                        # override for a setup that fetches deps
+        network="none",                        # secure default for gate/verify commands
+        setup_network=None,                    # scoped override for run_setup() only
         memory="2g", cpus="2", pids_limit=512,
         read_only_rootfs=False,                # opt-in; pair with tmpfs when your stack tolerates it
         user_namespace=None,                   # opt-in per-job UID separation; see below
@@ -95,18 +96,19 @@ delivery gates, the assessment build probe); git stays on the host.
 dev-team "Health endpoint" "Add /health returning 200" --deliver --workspace ./build \
     --sandbox --sandbox-image python:3.12-slim
 
-# a build probe that must restore dependencies needs a network:
+# a build probe that must restore dependencies needs a network — scope it to
+# just the setup command, leaving the gate/verify command at "none":
 dev-team --assess --workspace /path/to/repo --build-probe \
-    --sandbox --sandbox-network bridge --sandbox-engine podman
+    --sandbox --sandbox-setup-network bridge --sandbox-engine podman
 
 # per-job UID separation on a shared host (rootless podman only — see below):
 dev-team "Health endpoint" "Add /health returning 200" --deliver --workspace ./build \
     --sandbox --sandbox-engine podman --sandbox-userns auto
 ```
 
-`--sandbox-image` / `--sandbox-network` / `--sandbox-engine` / `--sandbox-userns`
-override the matching `SandboxConfig` field; everything else keeps its secure
-default.
+`--sandbox-image` / `--sandbox-network` / `--sandbox-setup-network` /
+`--sandbox-engine` / `--sandbox-userns` override the matching `SandboxConfig`
+field; everything else keeps its secure default.
 
 **`--sandbox-userns auto` requires rootless podman with subuid/subgid ranges
 provisioned for the operator's user** (standard rootless-podman setup). It
@@ -134,9 +136,12 @@ Notes and gotchas:
   default; the default is a small Python base. A .NET or Node gate needs the
   matching SDK in the image.
 - **`network="none"` blocks dependency restore.** A test command usually needs
-  no network, but `npm install` / `dotnet restore` / `pip install` do — give the
-  setup step an override (or a pre-provisioned image) rather than opening the
-  network for the tests.
+  no network, but `npm install` / `dotnet restore` / `pip install` do — use
+  `setup_network` (`--sandbox-setup-network` on the CLI) to give just the
+  setup command an override, or a pre-provisioned image, rather than opening
+  the network for the gate/verify command too. `setup_network=None` (the
+  default) falls back to `network`, so an operator who never sets it gets
+  today's single-shared-value behaviour unchanged.
 - **`read_only_rootfs` is opt-in.** Many toolchains write to `$HOME`/caches
   outside the workspace; enable it with `tmpfs=("/tmp",)` (and a workspace
   `$HOME`) only when your stack tolerates it.
