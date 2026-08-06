@@ -115,7 +115,12 @@ read later — the in-memory job registry is lost on a service restart, but
 the persisted assessments are not (`meta.json` is how a verify job knows
 which repository to re-clone after a restart). Verify verdicts append to
 `DIR/audit/<source-job-id>/verifications.jsonl`, which is what
-`GET /jobs/{id}/verifications` reads. The job's own workspace stays the source of truth; this
+`GET /jobs/{id}/verifications` reads. A **deliver** run mirrors its headline
+metrics to `DIR/.dev_team/score-history.json` (the same `RunScore` shape a
+local `--deliver` run records to its own workspace), on both success and
+failure, so the dashboard's Score History panel — which only ever reads
+`ScoreHistory.load()` on `DIR` — sees dispatched deliveries too, not just
+runs made by hand on the box. The job's own workspace stays the source of truth; this
 is a read-only visibility copy (the shared backlog in `DIR` is the one
 deliberate exception — see `backlog` below). Point the dashboard and the
 dispatcher at the same `DIR` (e.g. `/opt/dev-team/workspace`) to watch

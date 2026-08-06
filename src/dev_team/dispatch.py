@@ -97,6 +97,7 @@ from .interaction import QueueChannel, Question, Reply
 from .models import FeatureRequest
 from .report import delivery_to_dict
 from .sandbox import SandboxConfig
+from .scores import RunScore, ScoreHistory
 from .sdk import AgentRunner
 from .foreman import (
     DEFAULT_MAX_STORIES,
@@ -1236,6 +1237,7 @@ class Dispatcher:
                 approval=PolicyApprovalGate(block_risks=("high",)),
                 **kwargs,
             )
+            self._mirror_score(spec, outcome)
         return outcome, outcome.cost_usd
 
     async def _run_verify(
@@ -1360,6 +1362,32 @@ class Dispatcher:
         self._dashboard_workspace.write_text(
             f"audit/{spec.id}/meta.json",
             json.dumps({"repo": spec.repo, "mode": spec.mode, "id": spec.id}),
+        )
+
+    def _mirror_score(self, spec: JobSpec, outcome: Any) -> None:
+        """Append a dispatched deliver run's score into the dashboard trail.
+
+        Builds the identical :class:`~dev_team.scores.RunScore` fields
+        ``engine.py:_record_score`` builds from the same outcome, so a
+        dispatched deliver job's Score History entry is byte-for-byte what
+        the local ``--deliver`` path would have produced. No-op without a
+        dashboard workspace (mirrors :meth:`_mirror_meta`) — unlike the
+        report/assessment/meta mirrors this runs for `deliver`, not `assess`.
+        """
+
+        if self._dashboard_workspace is None:
+            return
+        ScoreHistory(self._dashboard_workspace).record(
+            RunScore(
+                feature=outcome.request.title,
+                success=outcome.success,
+                tasks_total=len(outcome.task_results),
+                tasks_succeeded=sum(1 for tr in outcome.task_results if tr.succeeded),
+                total_attempts=sum(tr.attempts for tr in outcome.task_results),
+                cost_usd=outcome.cost_usd,
+                committed=outcome.committed,
+                scorecard=dict(outcome.scorecard),
+            )
         )
 
     def _mirror_verification(self, source_job: str, entry: Dict[str, Any]) -> None:
