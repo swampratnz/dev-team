@@ -248,6 +248,25 @@ sections below are reconstructed from the repository history.
   `docs/ASSESSMENT.md`'s honest-limitations note is updated accordingly.
 
 ### Efficiency
+- **The CI-fix loop (`--watch-fix-rounds`) now reuses one engineer session
+  across its rounds** (#348), the one retry loop the on-by-default
+  `reuse_engineer_session` feature never reached. `DeliveryEngine` opens a
+  lazily-created, engine-lifetime session on the first `remediate_checks()`
+  call (mirroring `_develop_task_in_worktree`'s per-task session, scoped
+  instead to the whole CI-fix loop) and sends the round-1 prompt over it
+  exactly like today's cold path; every later round on the same engine sends
+  only the new CI failure as a continuation turn instead of re-sending the
+  full task/design prompt — the same `defuse(..., "ci-output")` fencing
+  round 1 already applies is preserved on every later round too, so
+  untrusted CI log text still can't be read as an instruction. A
+  session-turn failure permanently falls back to the cold path for the rest
+  of that engine's rounds (mirrors `_engineer_attempt`'s existing fallback;
+  it never retries opening a fresh session). `_run_ci_fix_loop` closes the
+  held session exactly once, in a `try`/`finally` around the round loop, on
+  every exit path. No new CLI flag or config surface — this closes a gap in
+  a feature that was already on by default, using machinery
+  (`_open_engineer_session`/`_engineer_attempt`) that already existed and
+  was already tested.
 - **Engineer session reuse is now on by default** (ROADMAP #5's own named
   remaining follow-up, closing it out). `EngineConfig.reuse_engineer_session`
   defaults to `True` and the CLI flag flips polarity from opt-in

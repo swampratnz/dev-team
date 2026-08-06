@@ -1591,45 +1591,56 @@ async def _run_ci_fix_loop(engine, team, outcome, args, ref, provider) -> None:
     asked_by = team.roster.display_name("engineer")
     pr_channel = _pr_comment_channel(outcome, args, ref, _mint_token(provider, ref))
     channel = pr_channel if pr_channel is not None else team.interaction
-    for round_num in range(1, args.watch_fix_rounds + 1):
-        checks = outcome.checks
-        if checks is None or checks.state != "failure":
-            return
-        if channel is not None:
-            question = ci_fix_question(round_num, checks.failed, checks.summary, asked_by=asked_by)
+    try:
+        for round_num in range(1, args.watch_fix_rounds + 1):
+            checks = outcome.checks
+            if checks is None or checks.state != "failure":
+                return
+            if channel is not None:
+                question = ci_fix_question(
+                    round_num, checks.failed, checks.summary, asked_by=asked_by
+                )
+                try:
+                    reply = await ask_in_thread(channel, question)
+                except GitHubPRCommentChannelError as exc:
+                    print(f"CI fix round {round_num}: could not reach the PR comments: {exc}",
+                          file=sys.stderr)
+                    return
+                if reply.choice != "apply":
+                    print(f"CI fix skipped by human at round {round_num}", file=sys.stderr)
+                    return
             try:
-                reply = await ask_in_thread(channel, question)
-            except GitHubPRCommentChannelError as exc:
-                print(f"CI fix round {round_num}: could not reach the PR comments: {exc}",
+                result = await engine.remediate_checks(checks.summary)
+            except BudgetExceededError:
+                print("CI fix stopped: budget exhausted", file=sys.stderr)
+                return
+            if not result.fixed:
+                print(f"CI fix round {round_num}: no fix applied ({result.summary})",
                       file=sys.stderr)
                 return
-            if reply.choice != "apply":
-                print(f"CI fix skipped by human at round {round_num}", file=sys.stderr)
+            # Re-mint per round: a fix round can start long after the loop did,
+            # and an App installation token lives only an hour.
+            token = _mint_token(provider, ref)
+            try:
+                push_branch(
+                    outcome.branch,
+                    ref=ref,
+                    token=token,
+                    git=GitRepo(SubprocessCommandRunner(cwd=args.workspace), cwd=args.workspace),
+                    force_with_lease=True,
+                )
+            except (DeliveryTargetError, GitError) as exc:
+                print(f"CI fix round {round_num}: could not push the fix: {exc}", file=sys.stderr)
                 return
-        try:
-            result = await engine.remediate_checks(checks.summary)
-        except BudgetExceededError:
-            print("CI fix stopped: budget exhausted", file=sys.stderr)
-            return
-        if not result.fixed:
-            print(f"CI fix round {round_num}: no fix applied ({result.summary})", file=sys.stderr)
-            return
-        # Re-mint per round: a fix round can start long after the loop did,
-        # and an App installation token lives only an hour.
-        token = _mint_token(provider, ref)
-        try:
-            push_branch(
-                outcome.branch,
-                ref=ref,
-                token=token,
-                git=GitRepo(SubprocessCommandRunner(cwd=args.workspace), cwd=args.workspace),
-                force_with_lease=True,
-            )
-        except (DeliveryTargetError, GitError) as exc:
-            print(f"CI fix round {round_num}: could not push the fix: {exc}", file=sys.stderr)
-            return
-        print(f"CI fix round {round_num}: pushed a fix; re-watching checks", file=sys.stderr)
-        _watch_pr_checks(outcome, args, ref, token)
+            print(f"CI fix round {round_num}: pushed a fix; re-watching checks", file=sys.stderr)
+            _watch_pr_checks(outcome, args, ref, token)
+    finally:
+        # The remediation session (if remediate_checks opened one) is scoped
+        # to this whole loop, not to one round — close it exactly once here,
+        # on every exit path (success, no-fix, budget, push failure, human
+        # skip, or rounds exhausted), mirroring _develop_task_in_worktree's
+        # try/finally around its own per-task session.
+        await engine.aclose_remediation_session()
 
 
 async def _assess(
