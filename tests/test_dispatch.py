@@ -45,6 +45,7 @@ from dev_team.dashboard import agent_history, collect_state
 from dev_team.eventlog import EVENTS_PATH, read_events
 from dev_team.execution import InMemoryWorkspace, LocalWorkspace
 from dev_team.interaction import Choice, Question, Reply
+from dev_team.scores import RunScore, ScoreHistory
 from dev_team.testing import ScriptedRunner
 from dev_team.transcripts import TRANSCRIPTS_DIR
 
@@ -5220,6 +5221,179 @@ def test_mirror_verification_appends_and_reader_is_chronological():
     status, payload = disp.verifications("assess-old")
     assert status == 200
     assert [e["finding_id"] for e in payload["verifications"]] == ["a", "b"]
+
+
+# --- #344: dispatched deliver jobs mirror their score into the dashboard ------
+
+
+def test_mirror_score_is_a_noop_without_a_dashboard_workspace():
+    # No dashboard configured -> returns immediately, never touches outcome.
+    spec = JobSpec(mode="deliver", repo="a/b", title="t", description="d",
+                   budget_usd=None, id="deliver-x")
+    Dispatcher(token="x")._mirror_score(spec, object())
+
+
+def test_mirror_score_builds_the_same_run_score_engine_record_score_would():
+    import types
+
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(token="x", dashboard_workspace=dash)
+    spec = JobSpec(mode="deliver", repo="a/b", title="t", description="d",
+                   budget_usd=None, id="deliver-unit")
+    outcome = types.SimpleNamespace(
+        request=types.SimpleNamespace(title="Add widget"),
+        success=False,
+        task_results=[
+            types.SimpleNamespace(succeeded=True, attempts=2),
+            types.SimpleNamespace(succeeded=False, attempts=3),
+        ],
+        cost_usd=1.23,
+        committed=False,
+        scorecard={"security_issues": 1},
+    )
+    disp._mirror_score(spec, outcome)
+    assert ScoreHistory(dash).load() == [
+        RunScore(
+            feature="Add widget",
+            success=False,
+            tasks_total=2,
+            tasks_succeeded=1,
+            total_attempts=5,
+            cost_usd=1.23,
+            committed=False,
+            scorecard={"security_issues": 1},
+        )
+    ]
+
+
+def test_run_job_deliver_mirrors_score_into_the_dashboard_workspace():
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_deliver_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d"}
+    )
+    spec.id = "deliver-score"
+    outcome, _ = asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert outcome.success is True
+
+    # ScoreHistory.load() against the dashboard workspace (the same load path
+    # the dashboard's /api/state handler calls) sees the new entry, field for
+    # field what engine.py:_record_score would have built from this outcome.
+    (entry,) = ScoreHistory(dash).load()
+    assert entry == RunScore(
+        feature=outcome.request.title,
+        success=outcome.success,
+        tasks_total=len(outcome.task_results),
+        tasks_succeeded=sum(1 for tr in outcome.task_results if tr.succeeded),
+        total_attempts=sum(tr.attempts for tr in outcome.task_results),
+        cost_usd=outcome.cost_usd,
+        committed=outcome.committed,
+        scorecard=dict(outcome.scorecard),
+    )
+
+
+def test_run_job_deliver_without_dashboard_workspace_is_unchanged():
+    # No --dashboard-workspace configured: no dashboard-side write attempted,
+    # no error, and the job's own local score-history.json (written by the
+    # engine's own internal ScoreHistory in its isolated workspace) still
+    # gets an entry exactly as it does today.
+    job_ws = _clone_ws()
+    disp = Dispatcher(
+        token="x", runner=_deliver_runner(), materialise=lambda spec, dest: job_ws
+    )
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d"}
+    )
+    spec.id = "deliver-no-dash"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert ScoreHistory(job_ws).load()
+
+
+def test_run_job_assess_never_writes_dashboard_score_history():
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_assess_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec({"mode": "assess", "repo": "acme/mono"})
+    spec.id = "assess-no-score"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert not dash.exists(".dev_team/score-history.json")
+
+
+def test_run_job_verify_never_writes_dashboard_score_history():
+    dash = _seeded_dash()
+    disp = Dispatcher(
+        token="x",
+        runner=_verifier_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec(
+        {"mode": "verify", "source_job": "assess-old",
+         "finding_id": "recommendation.plan[0]"}
+    )
+    spec.id = "verify-no-score"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert not dash.exists(".dev_team/score-history.json")
+
+
+def test_run_job_deliver_crash_before_outcome_mirrors_nothing(monkeypatch):
+    async def boom(self, request, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dispatch_mod.DevTeam, "deliver", boom)
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_deliver_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec(
+        {"mode": "deliver", "repo": "acme/mono", "title": "F", "description": "d"}
+    )
+    spec.id = "deliver-crash"
+    with pytest.raises(RuntimeError):
+        asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    assert not dash.exists(".dev_team/score-history.json")
+
+
+def test_run_job_deliver_mirrors_a_path_traversal_title_only_as_an_inert_value():
+    # SECURITY: a caller-supplied title shaped like a path traversal must
+    # never be used to build a filesystem path — it lands only as the inert
+    # `feature` JSON value inside the fixed score-history.json path.
+    dash = InMemoryWorkspace()
+    disp = Dispatcher(
+        token="x",
+        runner=_deliver_runner(),
+        materialise=_mem_materialise,
+        dashboard_workspace=dash,
+    )
+    spec = disp.build_spec(
+        {
+            "mode": "deliver",
+            "repo": "acme/mono",
+            "title": "../../etc/passwd",
+            "description": "d",
+        }
+    )
+    spec.id = "deliver-traversal"
+    asyncio.run(disp.run_job(JobRecord(spec=spec)))
+    # The mirrored entry lands only inside the fixed score-history.json path
+    # (never a path built from the title) — no other file's PATH contains
+    # the traversal string; it appears solely as inert JSON data.
+    assert dash.exists(".dev_team/score-history.json")
+    assert not any("etc/passwd" in p for p in dash.list_files())
+    (entry,) = ScoreHistory(dash).load()
+    assert entry.feature == "../../etc/passwd"
 
 
 def test_verifications_reader_tolerates_blank_lines():

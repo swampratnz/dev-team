@@ -177,6 +177,14 @@ score-history entries, and it rides the existing `/api/state` poll like
 Memory/Conventions/Calibration — no new HTTP route. Renders a muted empty
 state until the first delivery run is recorded.
 
+The trail is not local-only: a **dispatched** `deliver` job (see
+[`DISPATCH.md`](DISPATCH.md), *Dashboard visibility*) mirrors its
+`RunScore` into `DIR/.dev_team/score-history.json` right after the run
+completes, on both success and failure, so a dashboard pointed at the
+dispatch service's `--dashboard-workspace` shows the same trail for jobs
+submitted remotely as it would for a local `--deliver` run — the panel's
+`ScoreHistory.load()` call needs no changes to see them.
+
 ### Report quality chips
 
 Each row in the **Reports** panel additionally shows up to two chips, read
