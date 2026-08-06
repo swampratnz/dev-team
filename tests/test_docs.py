@@ -207,6 +207,92 @@ def test_status_table_documents_foreman_500():
     assert lines_with_500_and_foreman_run
 
 
+# #342 AC1: the quick-reference table's Status column, in full.
+_STATUS_TABLE_CODES = [
+    "400",
+    "401",
+    "404",
+    "409",
+    "429",
+    "500",
+    "501",
+    "502",
+    "503",
+]
+
+# #342 AC4: the five pre-existing rows, verbatim — confirms this issue's four
+# new rows don't alter them.
+_PRE_EXISTING_STATUS_ROWS = [
+    '| `401` | Missing or wrong bearer token / dashboard session | '
+    "[`docs/DASHBOARD.md`](DASHBOARD.md) (Authentication), "
+    "[`docs/DISPATCH.md`](DISPATCH.md) (every route) |",
+    "| `409` | A state-transition conflict — e.g. archiving a still-"
+    "`queued`/`running` job, or a backlog request with no dashboard "
+    "workspace configured | [`docs/DASHBOARD.md`](DASHBOARD.md) "
+    "(Archived jobs), [`docs/DISPATCH.md`](DISPATCH.md) (backlog) |",
+    "| `500` | POST /foreman/run's post-submit backlog write failed — "
+    "the just-enqueued jobs were compensated (cancelled) rather than "
+    "left to double-spend on a re-run | [`docs/DISPATCH.md`](DISPATCH.md) "
+    "(The backlog foreman) |",
+    "| `501` | The dashboard proxy feature isn't configured — no dispatch "
+    'URL/token wired up, so board editing, job actions, or the cost '
+    'rollup answer "not configured" instead of erroring | '
+    "[`docs/DASHBOARD.md`](DASHBOARD.md) (The board write model, "
+    "costs panel) |",
+    "| `502` | The dashboard's proxy to the dispatch service couldn't "
+    "reach it (dispatch service down/unreachable) | "
+    "[`docs/DASHBOARD.md`](DASHBOARD.md) (The board write model) |",
+]
+
+# #342 AC1/AC2: the four rows this issue adds, keyed by status code.
+_NEW_STATUS_ROWS = {
+    "400": "| `400` |",
+    "404": "| `404` |",
+    "429": "| `429` |",
+    "503": "| `503` |",
+}
+
+
+def _status_table_text() -> str:
+    text = _troubleshooting_text()
+    start = text.index("## Dashboard/dispatch HTTP status quick-reference")
+    end = text.index(
+        "Each row links to the section that documents that code in full", start
+    )
+    return text[start:end]
+
+
+def test_status_table_lists_all_nine_codes_exactly_once():
+    table = _status_table_text()
+    for code in _STATUS_TABLE_CODES:
+        assert table.count(f"| `{code}` |") == 1, code
+
+
+def test_status_table_new_rows_link_to_dispatch_or_dashboard():
+    table = _status_table_text()
+    for prefix in _NEW_STATUS_ROWS.values():
+        row = next(line for line in table.splitlines() if line.startswith(prefix))
+        assert "](" in row
+        assert "DISPATCH.md" in row or "DASHBOARD.md" in row
+
+
+def test_status_table_429_row_notes_rate_limit_lockout_both_paths():
+    table = _status_table_text()
+    row = next(
+        line for line in table.splitlines() if line.startswith(_NEW_STATUS_ROWS["429"])
+    )
+    lowered = row.lower()
+    assert "rate limit" in lowered or "lockout" in lowered
+    assert "dispatch bearer" in lowered
+    assert "dashboard login" in lowered or "dashboard" in lowered and "cookie" in lowered
+
+
+def test_status_table_pre_existing_rows_are_unchanged():
+    text = _troubleshooting_text()
+    for row in _PRE_EXISTING_STATUS_ROWS:
+        assert row in text
+
+
 def test_pr_comment_section_documents_the_allowlist_and_failsafe():
     text = _troubleshooting_text()
     assert "--interactive-pr-comment-author" in text
