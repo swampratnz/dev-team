@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import json
+import posixpath
 import re
 from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -267,4 +268,51 @@ def doc_claim_issues(
                     json.loads(block)
                 except ValueError as exc:
                     issues.append(f"{doc.path}: json fence is not valid JSON ({exc})")
+    return issues
+
+
+#: A Markdown inline link: ``[text](target)``. The target group is greedy
+#: only up to the first ``)``, so a malformed/unterminated ``[text`` (no
+#: closing bracket) simply fails to match rather than raising.
+_MD_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]*)\)")
+
+
+def broken_relative_links(
+    doc_contents: Mapping[str, str], known_files: Iterable[str]
+) -> List[str]:
+    """Cross-doc Markdown links (``[text](path)``) whose target doesn't resolve.
+
+    ``doc_contents`` maps each doc's repo-relative path (e.g.
+    ``"docs/DASHBOARD.md"``) to its full text; ``known_files`` is the set of
+    repo-relative paths considered to exist. Deterministic and $0: no
+    filesystem I/O, ``subprocess``, ``eval``, or ``exec`` of its own — driven
+    purely by set membership against the arguments passed in, mirroring
+    ``doc_claim_issues()``'s "parse-only" posture in this module.
+
+    A link target is skipped, never flagged, when it is an external
+    ``http://``/``https://``/``mailto:`` link, or a pure same-page anchor
+    (``#section``, no path component before the ``#``). A trailing
+    ``#anchor`` on an otherwise real target is stripped before the existence
+    check. The remaining path is resolved relative to the *citing* doc's own
+    directory — a target ``B.md`` cited from ``docs/A.md`` resolves to
+    ``docs/B.md``, while the same target cited from a repo-root doc resolves
+    to ``B.md`` — not the repo root, matching how GitHub/a Markdown renderer
+    resolves a relative link. Malformed or empty link syntax (``[text]()``,
+    unmatched brackets) is skipped without raising.
+    """
+
+    known = set(known_files)
+    issues: List[str] = []
+    for doc_path, content in doc_contents.items():
+        doc_dir = posixpath.dirname(doc_path)
+        for raw_target in _MD_LINK_RE.findall(content):
+            target = raw_target.strip()
+            if not target or target.startswith(("http://", "https://", "mailto:")):
+                continue
+            if target.startswith("#"):
+                continue
+            file_part = target.split("#", 1)[0]
+            resolved = posixpath.normpath(posixpath.join(doc_dir, file_part))
+            if resolved not in known:
+                issues.append(f"{doc_path}: links to {target!r}, not found in workspace")
     return issues
