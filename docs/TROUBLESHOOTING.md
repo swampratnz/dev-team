@@ -200,11 +200,15 @@ False` result; look at `docker_run_detail` instead.
 
 | Status | Meaning | Source |
 |---|---|---|
+| `400` | Malformed `POST /jobs` request body — bad `mode`/`repo`/`budget_usd`, missing `title`/`description` for a deliver job, or unparseable JSON | [`docs/DISPATCH.md`](DISPATCH.md) (`POST /jobs`) |
 | `401` | Missing or wrong bearer token / dashboard session | [`docs/DASHBOARD.md`](DASHBOARD.md) (Authentication), [`docs/DISPATCH.md`](DISPATCH.md) (every route) |
+| `404` | Unknown job id, an unrecognised route, no persisted assessment for a job, or an unknown `finding_id`/`source_job` on a `verify` submit | [`docs/DISPATCH.md`](DISPATCH.md) (`GET /jobs/{id}`, `GET /jobs/{id}/result`, Finding re-verification) |
 | `409` | A state-transition conflict — e.g. archiving a still-`queued`/`running` job, or a backlog request with no dashboard workspace configured | [`docs/DASHBOARD.md`](DASHBOARD.md) (Archived jobs), [`docs/DISPATCH.md`](DISPATCH.md) (backlog) |
+| `429` | Auth rate-limit lockout — too many failed attempts against the dispatch bearer-token check or the dashboard login/cookie, both journaled the same way | [`docs/DISPATCH.md`](DISPATCH.md) (Auth), [`docs/DASHBOARD.md`](DASHBOARD.md) (Authentication, Access log) |
 | `500` | POST /foreman/run's post-submit backlog write failed — the just-enqueued jobs were compensated (cancelled) rather than left to double-spend on a re-run | [`docs/DISPATCH.md`](DISPATCH.md) (The backlog foreman) |
 | `501` | The dashboard proxy feature isn't configured — no dispatch URL/token wired up, so board editing, job actions, or the cost rollup answer "not configured" instead of erroring | [`docs/DASHBOARD.md`](DASHBOARD.md) (The board write model, costs panel) |
 | `502` | The dashboard's proxy to the dispatch service couldn't reach it (dispatch service down/unreachable) | [`docs/DASHBOARD.md`](DASHBOARD.md) (The board write model) |
+| `503` | `POST /jobs` submitted past the pending-queue cap (default 16) — the submit queue is full | [`docs/DISPATCH.md`](DISPATCH.md) (Single-flight) |
 
 Each row links to the section that documents that code in full — this table
 is an index, not a replacement for reading the source section.

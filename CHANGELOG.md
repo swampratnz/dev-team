@@ -18,6 +18,16 @@ sections below are reconstructed from the repository history.
   no new flip table, no `engine.py` changes.
 
 ### Documentation
+- **`docs/TROUBLESHOOTING.md`'s HTTP status quick-reference table now
+  indexes `400`/`404`/`429`/`503`** (#342): the table presented itself as
+  a complete index of the codes DISPATCH.md/DASHBOARD.md document but was
+  missing four of nine, including `429` — the auth rate-limit lockout
+  DASHBOARD.md's own Access log section tells operators to watch for. New
+  rows: `400` (malformed `POST /jobs` body), `404` (unknown job id/route,
+  missing assessment, unknown `verify` target), `429` (dispatch
+  bearer-token and dashboard login/cookie rate-limit lockout — same
+  mechanism, both paths), and `503` (`POST /jobs` past the pending-queue
+  cap). Docs-only; the five pre-existing rows are untouched.
 - **`docs/ROADMAP.md` item 7 correction:** the closing sentence claiming
   "the dashboard and Slack adapters remain future work" was stale for its
   dashboard half — the dashboard's "Pending questions" panel
