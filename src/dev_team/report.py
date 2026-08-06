@@ -2,12 +2,34 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
 from .models import ProjectResult, TaskResult
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, types only
     from .engine import DeliveryOutcome
+
+
+def sorted_cost_by_role(cost_by_role: Dict[str, float]) -> List[Tuple[str, float]]:
+    """``cost_by_role()`` entries ordered worst-offender-first.
+
+    Sorted by descending cost; ties broken alphabetically by role so the
+    order is deterministic rather than dependent on dict iteration order.
+    """
+
+    return sorted(cost_by_role.items(), key=lambda item: (-item[1], item[0]))
+
+
+def cost_by_role_lines(cost_by_role: Dict[str, float]) -> List[str]:
+    """Render a ``Cost by role:`` block, or ``[]`` when there's nothing to show."""
+
+    if not cost_by_role:
+        return []
+    lines = ["Cost by role:"]
+    lines.extend(
+        f"  {role}: ${cost:.4f}" for role, cost in sorted_cost_by_role(cost_by_role)
+    )
+    return lines
 
 
 def _task_to_dict(result: TaskResult) -> Dict[str, Any]:
@@ -127,6 +149,9 @@ def delivery_to_dict(outcome: "DeliveryOutcome") -> Dict[str, Any]:
         "budget_exhausted": outcome.budget_exhausted,
         "resumed_task_ids": list(outcome.resumed_task_ids),
         "cost_usd": outcome.cost_usd,
+        "cost_by_role": (
+            outcome.budget.meter.cost_by_role() if outcome.budget is not None else {}
+        ),
         "workspace_files": list(outcome.workspace_files),
         "branch": outcome.branch,
         "halted_reason": outcome.halted_reason,
@@ -145,6 +170,8 @@ def render_delivery_summary(outcome: "DeliveryOutcome") -> str:
     verdict = "SUCCESS" if outcome.success else "INCOMPLETE"
     lines.append(f"Result:  {verdict}")
     lines.append(f"Cost:    ${outcome.cost_usd:.4f}")
+    if outcome.budget is not None:
+        lines.extend(cost_by_role_lines(outcome.budget.meter.cost_by_role()))
     if outcome.halted_reason:
         lines.append(f"Halted:  {outcome.halted_reason}")
         if outcome.baseline is not None:

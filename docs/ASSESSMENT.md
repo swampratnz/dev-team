@@ -65,6 +65,12 @@ tree + manifest heads) and an exact inventory (LOC per top-level directory,
 files by extension) are computed in Python, not by a model, and fed into
 every prompt. Both appear in the report's appendix.
 
+The report's cost footer states the run's total spend and, once more than
+one role has recorded a cost, a `Cost by role:` breakdown — one line per
+auditing role (architect, DevOps, security-engineer, ...), sorted highest
+spender first — so a run that costs more than expected shows which
+specialist to look at, not just the aggregate figure.
+
 ## Interactive scope check
 
 With `--interactive` (or any `InteractionChannel`), the run pauses once —

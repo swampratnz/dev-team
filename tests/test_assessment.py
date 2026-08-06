@@ -1066,6 +1066,35 @@ def _bare_outcome(phases=None, **overrides):
     return AssessmentOutcome(**defaults)
 
 
+def _budget_result(cost):
+    from dev_team.sdk import AgentResult
+
+    return AgentResult(text="", cost_usd=cost, num_turns=1)
+
+
+def test_render_report_omits_cost_by_role_block_when_budget_empty():
+    report = render_report(_bare_outcome())
+    assert "Cost by role" not in report
+    assert "_Cost: $0.0000. " in report
+
+
+def test_render_report_shows_cost_by_role_sorted_descending_with_tie_break():
+    budget = Budget()
+    budget.record("engineer", _budget_result(0.1))
+    budget.record("security-engineer", _budget_result(0.5))
+    budget.record("architect", _budget_result(0.3))
+    budget.record("qa", _budget_result(0.5))  # ties security-engineer at 0.5
+    report = render_report(_bare_outcome(budget=budget))
+    lines = report.splitlines()
+    idx = lines.index("Cost by role:")
+    assert lines[idx + 1 : idx + 5] == [
+        "- qa: $0.5000",
+        "- security-engineer: $0.5000",
+        "- architect: $0.3000",
+        "- engineer: $0.1000",
+    ]
+
+
 def test_effort_points_mapping():
     assert _effort_points("about 2 months") == 13
     assert _effort_points("1 week") == 8

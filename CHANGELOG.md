@@ -248,6 +248,18 @@ sections below are reconstructed from the repository history.
   `docs/ASSESSMENT.md`'s honest-limitations note is updated accordingly.
 
 ### Efficiency
+- **Run summaries and reports now surface a per-role cost breakdown**
+  (#346). `UsageMeter.cost_by_role()` (`budget.py`) was already computed,
+  tested, and wired into every specialist's metering, but had zero
+  production callers — the only cost story a summary could tell was the
+  flat aggregate. `delivery_to_dict` now includes a `cost_by_role` dict
+  (`{}` when there's no budget or no recorded calls),
+  `render_delivery_summary` appends a `Cost by role:` block sorted by
+  descending cost (alphabetical tie-break) once more than one role has
+  spent, and the assessment report's cost footer gets the same breakdown.
+  Byte-identical output in the no-budget/empty-budget case — no new blank
+  section. Pure read-and-render of data already held in memory; no new
+  agent calls, subprocess, network, or persisted field.
 - **Engineer session reuse is now on by default** (ROADMAP #5's own named
   remaining follow-up, closing it out). `EngineConfig.reuse_engineer_session`
   defaults to `True` and the CLI flag flips polarity from opt-in
