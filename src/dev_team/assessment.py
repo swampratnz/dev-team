@@ -417,18 +417,27 @@ def run_build_probe(
     if runner is None or workdir is None:
         probe.skipped_reason = "no real workspace directory to run commands in"
         return probe
-    commands = [
-        tuple(command)
-        for command in (profile.setup_command, profile.verify_command)
+    labeled_commands = [
+        (tuple(command), is_setup)
+        for command, is_setup in (
+            (profile.setup_command, True),
+            (profile.verify_command, False),
+        )
         if command
     ]
+    commands = [command for command, _ in labeled_commands]
     if not commands:
         probe.skipped_reason = (
             f"the {profile.kind} profile proposes no locally runnable commands"
         )
         return probe
-    for index, command in enumerate(commands):
-        result = runner.run(list(command), cwd=workdir, timeout=timeout)
+    for index, (command, is_setup) in enumerate(labeled_commands):
+        # Only the setup command (dependency restore) gets the scoped
+        # run_setup() network override, when the sandboxed runner exposes
+        # one — see SandboxConfig.setup_network. verify_command always goes
+        # through .run(), even on a profile with no setup_command at all.
+        dispatch = getattr(runner, "run_setup", runner.run) if is_setup else runner.run
+        result = dispatch(list(command), cwd=workdir, timeout=timeout)
         probe.commands.append(
             ProbeCommandResult(
                 command=command,

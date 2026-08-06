@@ -270,6 +270,35 @@ class GuardedCommandRunner:
         timeout: Optional[float] = None,
         env: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
+        return self._run(self.inner.run, command, cwd=cwd, timeout=timeout, env=env)
+
+    def run_setup(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Optional[str] = None,
+        timeout: Optional[float] = None,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> CommandResult:
+        """Like :meth:`run`, enforcing the same policy/approval gate, but
+        dispatched through ``inner.run_setup`` when the wrapped runner is
+        sandbox-aware (falling back to ``inner.run`` otherwise) — so a
+        ``ContainerCommandRunner``'s scoped setup-network override
+        (``SandboxConfig.setup_network``) still reaches it from behind this
+        guard, exactly as :meth:`run` reaches its plain ``.run``."""
+
+        inner_run = getattr(self.inner, "run_setup", self.inner.run)
+        return self._run(inner_run, command, cwd=cwd, timeout=timeout, env=env)
+
+    def _run(
+        self,
+        inner_run,
+        command: Sequence[str],
+        *,
+        cwd: Optional[str],
+        timeout: Optional[float],
+        env: Optional[Mapping[str, str]],
+    ) -> CommandResult:
         args = list(command)
         verdict = self.policy.evaluate(args)
         if not verdict.allowed:
@@ -283,7 +312,7 @@ class GuardedCommandRunner:
                     args, EXIT_DENIED, "", f"approval denied: {decision.reason}"
                 )
         if env is not None:
-            return self.inner.run(args, cwd=cwd, timeout=timeout, env=env)
+            return inner_run(args, cwd=cwd, timeout=timeout, env=env)
         # Omit env entirely when unused so pre-env CommandRunner
         # implementations (user-supplied doubles included) keep working.
-        return self.inner.run(args, cwd=cwd, timeout=timeout)
+        return inner_run(args, cwd=cwd, timeout=timeout)

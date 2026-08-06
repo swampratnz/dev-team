@@ -2397,6 +2397,98 @@ def test_deliver_setup_success_proceeds():
     assert ["pip", "install", "-e", "."] in cmd.calls
 
 
+class _RunSetupSpyRunner(GateCycleRunner):
+    """A CommandRunner that also exposes run_setup, recording which method
+    each call used — mirrors ContainerCommandRunner's extra method."""
+
+    def __init__(self):
+        super().__init__()
+        self.dispatch_log = []
+
+    def run(self, command, *, cwd=None, timeout=None, env=None):
+        self.dispatch_log.append(("run", list(command)))
+        return super().run(command, cwd=cwd, timeout=timeout)
+
+    def run_setup(self, command, *, cwd=None, timeout=None, env=None):
+        self.dispatch_log.append(("run_setup", list(command)))
+        return super().run(command, cwd=cwd, timeout=timeout)
+
+
+def test_deliver_setup_command_dispatched_via_run_setup_when_available():
+    # Acceptance criterion 6 (issue #340): a sandboxed runner exposing
+    # run_setup() gets the setup command via that method, not .run().
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    cmd = _RunSetupSpyRunner()
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(setup_command=("npm", "install")),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert cmd.dispatch_log[0] == ("run_setup", ["npm", "install"])
+
+
+def test_sandbox_setup_network_scoped_end_to_end(tmp_path):
+    # [security] Acceptance criterion 11 (issue #340): a full deliver() run,
+    # through the REAL production wiring (GuardedCommandRunner wrapping a
+    # ContainerCommandRunner — not just the sandbox-module unit tests),
+    # proves the setup command's network is scoped to --network bridge while
+    # the gate/verify command that runs right after it, through the same
+    # command_runner/config, still gets --network none.
+    from dev_team.sandbox import SandboxConfig
+
+    class _EnvAwareGateCycleRunner(GateCycleRunner):
+        # ContainerCommandRunner's host-program (git) delegation always
+        # forwards env=...; GateCycleRunner's plain .run() predates env
+        # support, so accept and drop it while keeping the alternating
+        # pass/fail gate-cycle behaviour.
+        def run(self, command, *, cwd=None, timeout=None, env=None):
+            return super().run(command, cwd=cwd, timeout=timeout)
+
+    ws = LocalWorkspace(str(tmp_path))
+    cmd = _EnvAwareGateCycleRunner()
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    engine = _engine(
+        runner,
+        workspace=ws,
+        command_runner=cmd,
+        config=EngineConfig(
+            setup_command=("npm", "install"),
+            verify_command=("pytest", "-q"),
+            sandbox=SandboxConfig(network="none", setup_network="bridge"),
+        ),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+
+    setup_calls = [c for c in cmd.calls if "npm" in c and "install" in c]
+    assert setup_calls, "setup command never reached the inner runner"
+    assert setup_calls[0][setup_calls[0].index("--network") + 1] == "bridge"
+
+    verify_calls = [c for c in cmd.calls if "pytest" in c]
+    assert verify_calls, "verify/gate command never reached the inner runner"
+    for call in verify_calls:
+        assert call[call.index("--network") + 1] == "none"
+
+
+def test_deliver_setup_command_falls_back_to_run_without_run_setup():
+    # Acceptance criterion 6 (issue #340): a plain runner with no run_setup
+    # attribute (e.g. SubprocessCommandRunner) dispatches via .run() with no
+    # AttributeError — today's exact behaviour, unchanged.
+    runner = ScriptedRunner(by_system_prompt=engine_responses())
+    cmd = GateCycleRunner()
+    assert not hasattr(cmd, "run_setup")
+    engine = _engine(
+        runner,
+        command_runner=cmd,
+        config=EngineConfig(setup_command=("npm", "install")),
+    )
+    outcome = run(engine.deliver(_request()))
+    assert outcome.success is True
+    assert ["npm", "install"] in cmd.calls
+
+
 def test_gates_auto_detected_from_workspace():
     ws = InMemoryWorkspace({"package.json": "{}"})
     cmd = GateCycleRunner()

@@ -617,6 +617,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--sandbox.",
     )
     sandbox.add_argument(
+        "--sandbox-setup-network",
+        default=None,
+        metavar="MODE",
+        help="Container --network override for just the setup command (e.g. "
+        "'bridge' for 'npm install'/'dotnet restore'/'pip install'), leaving "
+        "--sandbox-network (default 'none') in place for the gate/verify "
+        "command that runs after it. Only with --sandbox.",
+    )
+    sandbox.add_argument(
         "--sandbox-engine",
         default=None,
         metavar="CLI",
@@ -1137,6 +1146,7 @@ def _validate_args(
     sandbox_tuning = [
         ("--sandbox-image", args.sandbox_image is not None),
         ("--sandbox-network", args.sandbox_network is not None),
+        ("--sandbox-setup-network", args.sandbox_setup_network is not None),
         ("--sandbox-engine", args.sandbox_engine is not None),
         ("--sandbox-userns", args.sandbox_userns is not None),
     ]
@@ -1299,6 +1309,8 @@ def _sandbox_config(args: argparse.Namespace) -> Optional[SandboxConfig]:
         overrides["image"] = args.sandbox_image
     if args.sandbox_network is not None:
         overrides["network"] = args.sandbox_network
+    if args.sandbox_setup_network is not None:
+        overrides["setup_network"] = args.sandbox_setup_network
     if args.sandbox_engine is not None:
         overrides["engine"] = args.sandbox_engine
     if args.sandbox_userns is not None:

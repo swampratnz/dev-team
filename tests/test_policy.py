@@ -195,3 +195,66 @@ def test_guarded_runner_passes_env_through():
     guarded = GuardedCommandRunner(inner)
     guarded.run(["git", "clone", "x"], env={"GIT_TERMINAL_PROMPT": "0"})
     assert inner.envs == [{"GIT_TERMINAL_PROMPT": "0"}]
+
+
+# --- run_setup (issue #340: the sandboxed-runner network scoping must reach
+# through this guard too, since engine.py's command_runner is always a
+# GuardedCommandRunner) --------------------------------------------------
+
+
+class _RunSetupInner:
+    """A CommandRunner exposing run_setup, recording which method ran."""
+
+    def __init__(self):
+        self.dispatch_log = []
+        self.envs = []
+
+    def run(self, command, *, cwd=None, timeout=None, env=None):
+        self.dispatch_log.append(("run", list(command)))
+        self.envs.append(env)
+        return CommandResult(list(command), 0, "ok", "")
+
+    def run_setup(self, command, *, cwd=None, timeout=None, env=None):
+        self.dispatch_log.append(("run_setup", list(command)))
+        self.envs.append(env)
+        return CommandResult(list(command), 0, "ok", "")
+
+
+def test_guarded_runner_run_setup_dispatches_to_inner_run_setup():
+    inner = _RunSetupInner()
+    guarded = GuardedCommandRunner(inner)
+    result = guarded.run_setup(["npm", "install"])
+    assert result.ok
+    assert inner.dispatch_log == [("run_setup", ["npm", "install"])]
+
+
+def test_guarded_runner_run_setup_falls_back_without_inner_run_setup():
+    inner = FakeCommandRunner().add_rule("npm", CommandResult(["npm"], 0, "ok", ""))
+    guarded = GuardedCommandRunner(inner)
+    result = guarded.run_setup(["npm", "install"])
+    assert result.ok
+    assert inner.calls == [["npm", "install"]]
+
+
+def test_guarded_runner_run_setup_blocks_denied_command():
+    guarded = GuardedCommandRunner(_RunSetupInner())
+    result = guarded.run_setup(["sudo", "reboot"])
+    assert result.exit_code == EXIT_DENIED
+    assert "blocked" in result.stderr
+
+
+def test_guarded_runner_run_setup_approval_denied():
+    inner = _RunSetupInner()
+    guarded = GuardedCommandRunner(inner, approval=DenyAll())
+    result = guarded.run_setup(["git", "push"])
+    assert result.exit_code == EXIT_DENIED
+    assert "approval denied" in result.stderr
+    assert inner.dispatch_log == []  # inner never ran
+
+
+def test_guarded_runner_run_setup_passes_env_through():
+    inner = _RunSetupInner()
+    guarded = GuardedCommandRunner(inner)
+    guarded.run_setup(["npm", "install"], env={"NPM_TOKEN": "s3cr3t"})
+    assert inner.dispatch_log == [("run_setup", ["npm", "install"])]
+    assert inner.envs == [{"NPM_TOKEN": "s3cr3t"}]

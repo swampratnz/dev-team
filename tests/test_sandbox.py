@@ -284,3 +284,83 @@ def test_empty_command_runs_the_image_default():
     ContainerCommandRunner(spy).run([], cwd="/ws")
     argv = _argv(spy)
     assert argv[-1] == "python:3.12-slim"  # nothing appended after the image
+
+
+# -- run_setup (issue #340: scoped network override for the setup command) --
+
+
+def test_setup_network_defaults_to_none():
+    # Acceptance criterion 1.
+    assert SandboxConfig().setup_network is None
+
+
+def test_run_setup_with_no_override_matches_run_byte_for_byte():
+    # Acceptance criterion 2: setup_network=None means run_setup() and run()
+    # produce identical argv for the same config/command/env.
+    spy_run = _Spy()
+    spy_setup = _Spy()
+    cfg = SandboxConfig()
+    env = {"A": "1"}
+    ContainerCommandRunner(spy_run, cfg).run(["pytest", "-q"], cwd="/ws", env=env)
+    ContainerCommandRunner(spy_setup, cfg).run_setup(
+        ["pytest", "-q"], cwd="/ws", env=env
+    )
+    run_argv = _argv(spy_run)
+    setup_argv = _argv(spy_setup)
+    # both go through an env-file, so compare everything except the (distinct,
+    # each cleaned-up) --env-file path
+    run_argv[run_argv.index("--env-file") + 1] = "<envfile>"
+    setup_argv[setup_argv.index("--env-file") + 1] = "<envfile>"
+    assert run_argv == setup_argv
+
+
+def test_run_setup_overrides_network_without_affecting_run():
+    # Acceptance criteria 3 and 4: setup_network diverges ONLY the --network
+    # flag; every other flag (and a subsequent .run() call on the same
+    # runner/config) is untouched.
+    spy = _Spy()
+    cfg = SandboxConfig(
+        network="none",
+        setup_network="bridge",
+        user="1000:1000",
+        user_namespace="auto",
+        read_only_rootfs=True,
+        tmpfs=("/tmp",),
+        memory="4g",
+        cpus="2",
+        pids_limit=256,
+    )
+    runner = ContainerCommandRunner(spy, cfg)
+
+    runner.run_setup(["npm", "install"], cwd="/ws")
+    setup_argv = _argv(spy)
+    assert setup_argv[setup_argv.index("--network") + 1] == "bridge"
+
+    runner.run(["pytest", "-q"], cwd="/ws")
+    run_argv = _argv(spy)
+    assert run_argv[run_argv.index("--network") + 1] == "none"
+
+    # every other flag matches between the two calls (only --network and the
+    # trailing command/image differ)
+    def _without_network_and_tail(argv):
+        idx = argv.index("--network")
+        without_network = argv[:idx] + argv[idx + 2 :]
+        # drop the image + trailing command, which legitimately differ
+        image_at = without_network.index(cfg.image)
+        return without_network[:image_at]
+
+    assert _without_network_and_tail(setup_argv) == _without_network_and_tail(
+        run_argv
+    )
+
+
+def test_run_setup_delegates_git_to_the_host_unboxed():
+    # Acceptance criterion 5: run_setup mirrors run()'s git-passthrough.
+    spy = _Spy()
+    cfg = SandboxConfig(setup_network="bridge")
+    env = {"GIT_CONFIG_COUNT": "1"}
+    result = ContainerCommandRunner(spy, cfg).run_setup(
+        ["git", "status"], cwd="/ws", timeout=5.0, env=env
+    )
+    assert spy.calls == [(["git", "status"], "/ws", 5.0, env)]
+    assert result is spy.result
